@@ -50,6 +50,16 @@ Otherwise set `ZIG` to a Zig 0.15.2 executable.
 cargo run -p ocherdr
 ```
 
+For local acceptance, install [`just`](https://github.com/casey/just) and run:
+
+```sh
+just accept
+```
+
+This checks the toolchain, runs the same format/Clippy/test gate as CI, creates an
+ad-hoc signed `target/qa/OcHerdr.app`, and opens a fresh instance. Use `just --list`
+for the shorter development commands.
+
 Start Herdr first if no running session appears:
 
 ```sh
