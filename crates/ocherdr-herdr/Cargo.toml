@@ -1,0 +1,17 @@
+[package]
+name = "ocherdr-herdr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+dirs.workspace = true
+libc.workspace = true
+ocherdr-core = { path = "../ocherdr-core" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true

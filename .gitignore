@@ -1,0 +1,5 @@
+/target/
+/.DS_Store
+*.log
+vendor/libghostty-vt/zig-out/
+vendor/libghostty-vt/.zig-cache/

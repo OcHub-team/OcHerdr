@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Install Zig 0.15
+        run: brew install zig@0.15
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        env:
+          ZIG: /opt/homebrew/opt/zig@0.15/bin/zig
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        env:
+          ZIG: /opt/homebrew/opt/zig@0.15/bin/zig
+        run: cargo test --workspace --locked

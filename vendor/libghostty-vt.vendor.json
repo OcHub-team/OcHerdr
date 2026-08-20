@@ -1,0 +1,8 @@
+{
+  "name": "libghostty-vt",
+  "upstream": "https://github.com/ghostty-org/ghostty",
+  "commit": "c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3",
+  "version": "1.3.2-HEAD-+c5a21edfc",
+  "license": "MIT",
+  "purpose": "VT parsing, terminal state, input encoding and render snapshots"
+}

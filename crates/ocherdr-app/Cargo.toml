@@ -1,0 +1,24 @@
+[package]
+name = "ocherdr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A native macOS GUI client for Herdr"
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+gpui-platform.workspace = true
+ochub-ui.workspace = true
+ocherdr-core = { path = "../ocherdr-core" }
+ocherdr-herdr = { path = "../ocherdr-herdr" }
+ocherdr-terminal = { path = "../ocherdr-terminal" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "ocherdr"
+path = "src/main.rs"

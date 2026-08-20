@@ -1,0 +1,26 @@
+OcHerdr
+Copyright 2026 OcHub contributors
+
+This project is available under the MIT License or Apache License 2.0, at your option.
+
+Third-party components
+----------------------
+
+ochub-ui 0.4.0
+Copyright OcHub contributors
+MIT OR Apache-2.0
+https://github.com/OcHub-team/ochub-ui
+
+libghostty-vt (Ghostty commit c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3)
+Copyright Ghostty contributors
+MIT
+https://github.com/ghostty-org/ghostty
+
+Herdr is not linked into OcHerdr. OcHerdr interoperates with a separately installed
+Herdr executable through its public CLI and socket APIs. Herdr is Apache-2.0 licensed.
+
+The pinned GPUI/Zed dependency graph may include GPL-3.0-or-later transitive crates.
+The permissive license of OcHerdr's own source does not override third-party terms.
+Distributors must audit and comply with the complete dependency graph before shipping
+binary artifacts. This repository does not publish binary releases until that audit is
+complete.
