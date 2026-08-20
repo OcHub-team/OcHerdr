@@ -18,6 +18,7 @@ OcHerdr is intentionally a client, not another multiplexer:
 The repository currently targets macOS and Herdr `0.8.1+`. The first milestone includes:
 
 - local and SSH-host session discovery;
+- an OcHub-style node manager for switching, adding, and removing SSH nodes;
 - live workspace, tab, pane, layout, and agent status rendering;
 - interactive `--takeover` control for the focused pane;
 - read-only observation of the other panes in the selected tab;

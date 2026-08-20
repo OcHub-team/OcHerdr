@@ -89,7 +89,9 @@ struct OcHerdrView {
     snapshot_refreshing: bool,
     terminal_epoch: u64,
     panes: HashMap<String, PaneRuntime>,
+    node_manager_open: bool,
     add_remote_open: bool,
+    pending_remove_profile: Option<usize>,
     pending_close_pane: Option<String>,
     remote_label: Entity<TextInput>,
     remote_destination: Entity<TextInput>,
@@ -141,7 +143,9 @@ impl OcHerdrView {
             snapshot_refreshing: false,
             terminal_epoch: 0,
             panes: HashMap::new(),
+            node_manager_open: false,
             add_remote_open: false,
+            pending_remove_profile: None,
             pending_close_pane: None,
             remote_label: cx.new(|cx| TextInput::new(cx, "Production")),
             remote_destination: cx.new(|cx| TextInput::new(cx, "user@example.com or SSH alias")),
@@ -364,6 +368,68 @@ impl OcHerdrView {
         cx.notify();
     }
 
+    fn open_node_manager(&mut self, cx: &mut Context<Self>) {
+        self.node_manager_open = true;
+        self.error = None;
+        cx.notify();
+    }
+
+    fn close_node_manager(&mut self, cx: &mut Context<Self>) {
+        self.node_manager_open = false;
+        self.pending_remove_profile = None;
+        cx.notify();
+    }
+
+    fn choose_node(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.node_manager_open = false;
+        if index == self.profile_index {
+            cx.notify();
+        } else {
+            self.select_profile(index, cx);
+        }
+    }
+
+    fn request_remove_node(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self
+            .profiles
+            .get(index)
+            .is_some_and(|profile| profile.id().starts_with("manual-"))
+        {
+            self.pending_remove_profile = Some(index);
+            cx.notify();
+        }
+    }
+
+    fn cancel_remove_node(&mut self, cx: &mut Context<Self>) {
+        self.pending_remove_profile = None;
+        cx.notify();
+    }
+
+    fn confirm_remove_node(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.pending_remove_profile.take() else {
+            return;
+        };
+        if index == 0 || index >= self.profiles.len() {
+            return;
+        }
+        let removed = self.profiles.remove(index);
+        if let Err(error) = save_settings(&self.profiles) {
+            self.profiles.insert(index, removed);
+            self.error = Some(error.into());
+            cx.notify();
+            return;
+        }
+        if index == self.profile_index {
+            self.profile_index = 0;
+            self.reload(None, cx);
+        } else {
+            if index < self.profile_index {
+                self.profile_index -= 1;
+            }
+            cx.notify();
+        }
+    }
+
     fn close_add_remote(&mut self, cx: &mut Context<Self>) {
         self.add_remote_open = false;
         cx.notify();
@@ -424,6 +490,7 @@ impl OcHerdrView {
         }
         self.profile_index = self.profiles.len() - 1;
         self.add_remote_open = false;
+        self.node_manager_open = false;
         self.remote_label
             .update(cx, |input, cx| input.set_content("", cx));
         self.remote_destination
@@ -941,16 +1008,6 @@ impl OcHerdrView {
                     .child(div().flex_1())
                     .child(
                         icon_button_tone(
-                            "add-remote",
-                            "Add SSH",
-                            IconName::Add,
-                            ButtonTone::Ghost,
-                            ButtonSize::Sm,
-                        )
-                        .on_click(cx.listener(|this, _, _window, cx| this.open_add_remote(cx))),
-                    )
-                    .child(
-                        icon_button_tone(
                             "refresh-connections",
                             "Refresh",
                             IconName::Refresh,
@@ -974,7 +1031,7 @@ impl OcHerdrView {
                     .overflow_scroll()
                     .px_2()
                     .pb_3()
-                    .child(section_label("CONNECTIONS"))
+                    .child(section_label("NODES"))
                     .children(profile_rows)
                     .child(section_label("SESSIONS"))
                     .children(session_rows)
@@ -1033,6 +1090,8 @@ impl OcHerdrView {
         let pane_id_down = self.selection.pane_id.clone();
         let pane_id_zoom = self.selection.pane_id.clone();
         let pane_id_close = self.selection.pane_id.clone();
+        let node_count = self.profiles.len();
+        let node_manager_open = self.node_manager_open;
         div()
             .flex().items_center().h(px(HEADER_HEIGHT)).px_4().gap_3().border_b_1().border_color(theme::border())
             .child(div().flex().flex_col().flex_1().min_w_0().child(div().truncate().text_base().font_weight(FontWeight::SEMIBOLD).child(title)).child(div().truncate().text_xs().text_color(theme::muted()).child(subtitle)))
@@ -1052,6 +1111,14 @@ impl OcHerdrView {
             .child(icon_button_tone("close-pane", "Close", IconName::Close, ButtonTone::Danger, ButtonSize::Sm).on_click(cx.listener(move |this, _, _window, cx| {
                 if let Some(pane_id) = pane_id_close.clone() { this.request_close_pane(pane_id, cx) }
             })))
+            .child(div().h(px(24.)).w(px(1.)).mx_1().bg(theme::border()))
+            .child(icon_button_tone(
+                "manage-nodes",
+                format!("Nodes · {node_count}"),
+                IconName::Desktop,
+                if node_manager_open { ButtonTone::Primary } else { ButtonTone::Neutral },
+                ButtonSize::Sm,
+            ).on_click(cx.listener(|this, _, _window, cx| this.open_node_manager(cx))))
     }
 
     fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1256,8 +1323,13 @@ impl Render for OcHerdrView {
             .bg(theme::window_base_background())
             .child(self.render_sidebar(cx))
             .child(main);
+        if self.node_manager_open {
+            root = root.child(self.render_node_manager(cx));
+        }
         if self.add_remote_open {
             root = root.child(self.render_add_remote(cx));
+        } else if self.pending_remove_profile.is_some() {
+            root = root.child(self.render_remove_node(cx));
         } else if self.pending_close_pane.is_some() {
             root = root.child(self.render_close_pane(cx));
         }
@@ -1266,6 +1338,301 @@ impl Render for OcHerdrView {
 }
 
 impl OcHerdrView {
+    fn render_node_manager(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_label = self.current_profile().label().to_owned();
+        let node_count = self.profiles.len();
+        let rows = self
+            .profiles
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, profile)| {
+                let selected = index == self.profile_index;
+                let saved = profile.id().starts_with("manual-");
+                let (node_icon, endpoint, source) = match &profile {
+                    ConnectionProfile::Local { herdr_path } => (
+                        IconName::Desktop,
+                        format!("This Mac · {herdr_path}"),
+                        "LOCAL",
+                    ),
+                    ConnectionProfile::Ssh {
+                        destination, port, ..
+                    } => (
+                        IconName::Globe,
+                        port.map_or_else(
+                            || destination.clone(),
+                            |port| format!("{destination}:{port}"),
+                        ),
+                        if saved { "SAVED" } else { "SSH CONFIG" },
+                    ),
+                };
+                let (state_color, state_label, detail) = if selected {
+                    if self.operation.is_some() {
+                        (
+                            theme::yellow(),
+                            "Connecting",
+                            "Discovering Herdr sessions".to_owned(),
+                        )
+                    } else if self.error.is_some() {
+                        (
+                            theme::red(),
+                            "Needs attention",
+                            "Connection unavailable".to_owned(),
+                        )
+                    } else {
+                        (
+                            theme::green(),
+                            "Active",
+                            format!(
+                                "{} session{}",
+                                self.sessions.len(),
+                                if self.sessions.len() == 1 { "" } else { "s" }
+                            ),
+                        )
+                    }
+                } else {
+                    (
+                        theme::muted(),
+                        "Available",
+                        "Select to discover sessions".to_owned(),
+                    )
+                };
+                let select = cx.listener(move |this: &mut Self, _: &(), _window, cx| {
+                    this.choose_node(index, cx)
+                });
+                let remove = cx.listener(move |this: &mut Self, _: &(), _window, cx| {
+                    this.request_remove_node(index, cx)
+                });
+                div()
+                    .id(("managed-node", index))
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .min_h(px(78.))
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .bg(if selected {
+                        theme::selection()
+                    } else {
+                        theme::surface().alpha(0.)
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(34.))
+                            .h(px(34.))
+                            .rounded_md()
+                            .bg(if selected {
+                                theme::accent_soft()
+                            } else {
+                                theme::inset()
+                            })
+                            .child(icon(
+                                node_icon,
+                                if selected {
+                                    theme::accent()
+                                } else {
+                                    theme::muted()
+                                },
+                                16.,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::text())
+                                            .child(profile.label().to_owned()),
+                                    )
+                                    .child(badge(BadgeTone::Neutral, source)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(endpoint),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .w(px(132.))
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::subtext())
+                                    .child(status_dot(state_color))
+                                    .child(state_label),
+                            )
+                            .child(div().text_xs().text_color(theme::muted()).child(detail)),
+                    )
+                    .child(if selected {
+                        badge(BadgeTone::Success, "CURRENT").into_any_element()
+                    } else {
+                        button(
+                            ("select-managed-node", index),
+                            "Use node",
+                            ButtonTone::Neutral,
+                            ButtonSize::Sm,
+                        )
+                        .on_click(move |_event, window, cx| select(&(), window, cx))
+                        .into_any_element()
+                    })
+                    .when(saved, |row| {
+                        row.child(
+                            icon_button_tone(
+                                ("remove-managed-node", index),
+                                "Remove",
+                                IconName::Trash,
+                                ButtonTone::Ghost,
+                                ButtonSize::Sm,
+                            )
+                            .on_click(move |_event, window, cx| remove(&(), window, cx)),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let refresh = cx.listener(|this: &mut Self, _: &(), _window, cx| {
+            let preferred = this.current_session().map(|session| session.name.clone());
+            this.reload(preferred, cx);
+        });
+        modal_overlay(
+            modal_card()
+                .w(px(760.))
+                .h(px(620.))
+                .child(
+                    modal_header("Node management").child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                icon_button_tone(
+                                    "refresh-managed-nodes",
+                                    "Refresh",
+                                    IconName::Refresh,
+                                    ButtonTone::Ghost,
+                                    ButtonSize::Sm,
+                                )
+                                .on_click(move |_event, window, cx| refresh(&(), window, cx)),
+                            )
+                            .child(
+                                icon_button_tone(
+                                    "add-managed-node",
+                                    "Add SSH node",
+                                    IconName::Add,
+                                    ButtonTone::Primary,
+                                    ButtonSize::Sm,
+                                )
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.open_add_remote(cx)
+                                })),
+                            )
+                            .child(
+                                icon_button_tone(
+                                    "close-node-manager",
+                                    "Close",
+                                    IconName::Close,
+                                    ButtonTone::Ghost,
+                                    ButtonSize::Sm,
+                                )
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.close_node_manager(cx)
+                                })),
+                            ),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_5()
+                        .py_3()
+                        .bg(theme::inset())
+                        .border_b_1()
+                        .border_color(theme::border())
+                        .child(status_dot(if self.error.is_some() {
+                            theme::red()
+                        } else {
+                            theme::green()
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(active_label),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child("Current Herdr execution scope"),
+                                ),
+                        )
+                        .child(badge(
+                            BadgeTone::Neutral,
+                            format!("{node_count} NODES"),
+                        )),
+                )
+                .child(
+                    div()
+                        .id("managed-node-scroll")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_scroll()
+                        .children(rows),
+                )
+                .child(
+                    div()
+                        .px_5()
+                        .py_3()
+                        .border_t_1()
+                        .border_color(theme::border())
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(
+                            "SSH nodes use your system OpenSSH config, keys, agent, and known_hosts.",
+                        ),
+                ),
+        )
+        .top_0()
+        .left_0()
+    }
+
     fn render_add_remote(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let cancel = button(
             "cancel-add-remote",
@@ -1312,6 +1679,57 @@ impl OcHerdrView {
                 )
                 .child(modal_footer(vec![cancel, connect])),
         )
+        .top_0()
+        .left_0()
+    }
+
+    fn render_remove_node(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let node_name = self
+            .pending_remove_profile
+            .and_then(|index| self.profiles.get(index))
+            .map(ConnectionProfile::label)
+            .unwrap_or("this node")
+            .to_owned();
+        let cancel = button(
+            "cancel-remove-node",
+            "Cancel",
+            ButtonTone::Neutral,
+            ButtonSize::Sm,
+        )
+        .on_click(cx.listener(|this, _, _window, cx| this.cancel_remove_node(cx)))
+        .into_any_element();
+        let remove = button(
+            "confirm-remove-node",
+            "Remove node",
+            ButtonTone::Danger,
+            ButtonSize::Sm,
+        )
+        .on_click(cx.listener(|this, _, _window, cx| this.confirm_remove_node(cx)))
+        .into_any_element();
+        modal_overlay(
+            modal_card()
+                .child(modal_header("Remove SSH node?"))
+                .child(
+                    modal_body()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::text())
+                                .child(format!("Remove {node_name} from OcHerdr?")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(
+                                    "This only removes the saved node profile. SSH keys and ~/.ssh/config are not changed.",
+                                ),
+                        ),
+                )
+                .child(modal_footer(vec![cancel, remove])),
+        )
+        .top_0()
+        .left_0()
     }
 
     fn render_close_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1347,6 +1765,8 @@ impl OcHerdrView {
                 )
                 .child(modal_footer(vec![cancel, close])),
         )
+        .top_0()
+        .left_0()
     }
 }
 
@@ -1528,7 +1948,10 @@ fn main() {
                     window_background: theme::window_background_appearance(),
                     ..Default::default()
                 },
-                |_window, cx| cx.new(OcHerdrView::new),
+                |window, cx| {
+                    window.set_window_title("OcHerdr");
+                    cx.new(OcHerdrView::new)
+                },
             )
             .expect("open OcHerdr window");
             cx.activate(true);
