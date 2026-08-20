@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use ocherdr_herdr::{
 };
 use ocherdr_terminal::Terminal;
 use ochub_ui::components::{
-    BadgeTone, ButtonSize, ButtonTone, badge, button, empty_state, field, icon_button_tone,
+    ButtonSize, ButtonTone, button, empty_state, field, icon_button_tone, icon_only_button_tone,
     modal_body, modal_card, modal_footer, modal_header, modal_overlay, spinner, status_dot,
 };
 use ochub_ui::gpui::{
@@ -31,9 +31,9 @@ use ochub_ui::{assets, theme};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const SIDEBAR_WIDTH: f32 = 292.;
-const HEADER_HEIGHT: f32 = 58.;
-const TAB_BAR_HEIGHT: f32 = 38.;
+const SIDEBAR_WIDTH: f32 = 252.;
+const HEADER_HEIGHT: f32 = 46.;
+const STATUS_BAR_HEIGHT: f32 = 28.;
 const PANE_HEADER_HEIGHT: f32 = 26.;
 const CELL_WIDTH: f32 = 8.4;
 const CELL_HEIGHT: f32 = 17.;
@@ -376,6 +376,7 @@ impl OcHerdrView {
 
     fn close_node_manager(&mut self, cx: &mut Context<Self>) {
         self.node_manager_open = false;
+        self.add_remote_open = false;
         self.pending_remove_profile = None;
         cx.notify();
     }
@@ -551,8 +552,22 @@ impl OcHerdrView {
     }
 
     fn select_pane(&mut self, pane_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selection.pane_id.as_deref() != Some(&pane_id) {
-            self.selection.pane_id = Some(pane_id);
+        let pane_context = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .pane(&pane_id)
+                .map(|pane| (pane.workspace_id.clone(), pane.tab_id.clone()))
+        });
+        let changed = self.selection.pane_id.as_deref() != Some(&pane_id)
+            || pane_context.as_ref().is_some_and(|(workspace_id, tab_id)| {
+                self.selection.workspace_id.as_deref() != Some(workspace_id)
+                    || self.selection.tab_id.as_deref() != Some(tab_id)
+            });
+        if let Some((workspace_id, tab_id)) = pane_context {
+            self.selection.workspace_id = Some(workspace_id);
+            self.selection.tab_id = Some(tab_id);
+        }
+        self.selection.pane_id = Some(pane_id);
+        if changed {
             self.start_visible_terminals(cx);
         }
         self.focus.focus(window, cx);
@@ -656,7 +671,7 @@ impl OcHerdrView {
         let viewport = window.viewport_size();
         let available_width = (f32::from(viewport.width) - SIDEBAR_WIDTH).max(320.);
         let available_height =
-            (f32::from(viewport.height) - HEADER_HEIGHT - TAB_BAR_HEIGHT).max(180.);
+            (f32::from(viewport.height) - HEADER_HEIGHT - STATUS_BAR_HEIGHT).max(180.);
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -797,62 +812,6 @@ impl OcHerdrView {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let profile_rows = self
-            .profiles
-            .iter()
-            .enumerate()
-            .map(|(index, profile)| {
-                let selected = index == self.profile_index;
-                let icon_name = if matches!(profile, ConnectionProfile::Local { .. }) {
-                    IconName::Desktop
-                } else {
-                    IconName::Cloud
-                };
-                div()
-                    .id(("profile", index))
-                    .role(ochub_ui::gpui::Role::Button)
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(34.))
-                    .px_3()
-                    .rounded_md()
-                    .bg(if selected {
-                        theme::sidebar_selected()
-                    } else {
-                        theme::surface().alpha(0.)
-                    })
-                    .hover(|style| style.bg(theme::surface_hover()))
-                    .cursor_pointer()
-                    .on_click(
-                        cx.listener(move |this, _, _window, cx| this.select_profile(index, cx)),
-                    )
-                    .child(icon(
-                        icon_name,
-                        if selected {
-                            theme::accent()
-                        } else {
-                            theme::muted()
-                        },
-                        14.,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .truncate()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(profile.label().to_owned()),
-                    )
-                    .child(status_dot(if selected && self.error.is_none() {
-                        theme::green()
-                    } else {
-                        theme::muted()
-                    }))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-
         let session_rows = self
             .sessions
             .iter()
@@ -863,12 +822,12 @@ impl OcHerdrView {
                 div()
                     .id(("session", index))
                     .role(ochub_ui::gpui::Role::Button)
+                    .aria_label(session.display_name().to_owned())
                     .flex()
                     .items_center()
                     .gap_2()
                     .h(px(32.))
-                    .pl(px(18.))
-                    .pr_3()
+                    .px_3()
                     .rounded_md()
                     .bg(if selected {
                         theme::sidebar_selected()
@@ -892,16 +851,13 @@ impl OcHerdrView {
                             .text_sm()
                             .child(session.display_name().to_owned()),
                     )
-                    .child(if running {
-                        badge(BadgeTone::Success, "LIVE")
-                    } else {
-                        badge(BadgeTone::Neutral, "START")
-                    })
                     .into_any_element()
             })
             .collect::<Vec<_>>();
 
         let mut hierarchy = Vec::new();
+        let mut agent_rows = Vec::new();
+        let mut seen_agents = HashSet::new();
         if let Some(snapshot) = &self.snapshot {
             for workspace in &snapshot.workspaces {
                 let workspace_id = workspace.workspace_id.clone();
@@ -910,7 +866,7 @@ impl OcHerdrView {
                     tree_row(
                         ("workspace", workspace.number),
                         &workspace.label,
-                        18.,
+                        12.,
                         IconName::Folder,
                         selected,
                         status_color(workspace.agent_status),
@@ -920,44 +876,51 @@ impl OcHerdrView {
                     }))
                     .into_any_element(),
                 );
-                for tab in snapshot.tabs_for(&workspace.workspace_id) {
-                    let tab_id = tab.tab_id.clone();
-                    let selected = self.selection.tab_id.as_deref() == Some(&tab_id);
-                    hierarchy.push(
-                        tree_row(
-                            ("tab", tab.number),
-                            &tab.label,
-                            34.,
-                            IconName::Layers,
-                            selected,
-                            status_color(tab.agent_status),
-                        )
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.select_tab(tab_id.clone(), cx)
-                        }))
-                        .into_any_element(),
-                    );
-                    for pane in snapshot.panes_for(&tab.tab_id) {
-                        let pane_id = pane.pane_id.clone();
-                        let selected = self.selection.pane_id.as_deref() == Some(&pane_id);
-                        hierarchy.push(
-                            tree_row(
-                                ochub_ui::gpui::ElementId::Name(
-                                    format!("tree-pane-{}", pane.pane_id).into(),
-                                ),
-                                pane.display_name(),
-                                50.,
-                                IconName::Terminal,
-                                selected,
-                                status_color(pane.agent_status),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_pane(pane_id.clone(), window, cx)
-                            }))
-                            .into_any_element(),
-                        );
-                    }
+            }
+            for pane in &snapshot.panes {
+                let Some(agent_name) = pane.display_agent.as_deref().or(pane.agent.as_deref())
+                else {
+                    continue;
+                };
+                if !seen_agents.insert(agent_name.to_owned()) {
+                    continue;
                 }
+                let pane_id = pane.pane_id.clone();
+                let status = pane.agent_status;
+                agent_rows.push(
+                    div()
+                        .id(ochub_ui::gpui::ElementId::Name(
+                            format!("agent-{pane_id}").into(),
+                        ))
+                        .role(ochub_ui::gpui::Role::Button)
+                        .aria_label(agent_name.to_owned())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(30.))
+                        .px_3()
+                        .rounded_md()
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_pane(pane_id.clone(), window, cx)
+                        }))
+                        .child(status_dot(status_color(status)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .text_sm()
+                                .child(agent_name.to_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(status.label()),
+                        )
+                        .into_any_element(),
+                );
             }
         }
 
@@ -967,57 +930,34 @@ impl OcHerdrView {
             .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_none()
-            .bg(theme::sidebar_background())
+            .bg(theme::c(0x17191d))
+            .text_color(theme::sidebar_text())
             .border_r_1()
             .border_color(theme::border())
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .h(px(58.))
+                    .h(px(HEADER_HEIGHT))
                     .px_4()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(28.))
-                            .h(px(28.))
-                            .rounded_md()
-                            .bg(theme::text())
-                            .child(icon(IconName::Terminal, theme::content_background(), 15.)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("OcHerdr"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::muted())
-                                    .child("HERDR DESKTOP"),
-                            ),
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Spaces"),
                     )
                     .child(div().flex_1())
                     .child(
-                        icon_button_tone(
-                            "refresh-connections",
-                            "Refresh",
-                            IconName::Refresh,
+                        icon_only_button_tone(
+                            "new-workspace",
+                            "New workspace",
+                            IconName::Add,
                             ButtonTone::Ghost,
                             ButtonSize::Sm,
                         )
                         .on_click(cx.listener(|this, _, _window, cx| {
-                            let preferred =
-                                this.current_session().map(|session| session.name.clone());
-                            this.reload(preferred, cx);
+                            this.invoke("workspace.create", json!({ "focus": true, "env": {} }), cx)
                         })),
                     ),
             )
@@ -1031,94 +971,44 @@ impl OcHerdrView {
                     .overflow_scroll()
                     .px_2()
                     .pb_3()
-                    .child(section_label("NODES"))
-                    .children(profile_rows)
                     .child(section_label("SESSIONS"))
                     .children(session_rows)
-                    .child(section_label("WORKSPACE TREE"))
+                    .child(section_label("WORKSPACES"))
                     .children(hierarchy),
             )
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .h(px(34.))
-                    .px_3()
+                    .flex_col()
+                    .max_h(px(220.))
+                    .px_2()
+                    .pb_3()
                     .border_t_1()
                     .border_color(theme::border())
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child(if let Some(operation) = &self.operation {
+                    .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .child(spinner(theme::muted(), 12.))
-                            .child(operation.clone())
-                    } else {
-                        div().child("PUBLIC API · GHOSTTY VT")
-                    }),
+                            .justify_between()
+                            .px_2()
+                            .pt_3()
+                            .pb_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::muted())
+                            .child("AGENTS")
+                            .child("STATUS"),
+                    )
+                    .child(
+                        div()
+                            .id("agent-scroll")
+                            .flex()
+                            .flex_col()
+                            .min_h_0()
+                            .overflow_scroll()
+                            .children(agent_rows),
+                    ),
             )
-    }
-
-    fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                self.selection.workspace_id.as_deref().and_then(|id| {
-                    snapshot
-                        .workspaces
-                        .iter()
-                        .find(|workspace| workspace.workspace_id == id)
-                })
-            })
-            .map(|workspace| workspace.label.clone())
-            .unwrap_or_else(|| "No workspace selected".into());
-        let subtitle = self
-            .current_session()
-            .map(|session| {
-                format!(
-                    "{}  /  {}",
-                    self.current_profile().label(),
-                    session.display_name()
-                )
-            })
-            .unwrap_or_else(|| self.current_profile().label().into());
-        let workspace_id = self.selection.workspace_id.clone();
-        let pane_id_right = self.selection.pane_id.clone();
-        let pane_id_down = self.selection.pane_id.clone();
-        let pane_id_zoom = self.selection.pane_id.clone();
-        let pane_id_close = self.selection.pane_id.clone();
-        let node_count = self.profiles.len();
-        let node_manager_open = self.node_manager_open;
-        div()
-            .flex().items_center().h(px(HEADER_HEIGHT)).px_4().gap_3().border_b_1().border_color(theme::border())
-            .child(div().flex().flex_col().flex_1().min_w_0().child(div().truncate().text_base().font_weight(FontWeight::SEMIBOLD).child(title)).child(div().truncate().text_xs().text_color(theme::muted()).child(subtitle)))
-            .child(icon_button_tone("new-workspace", "Workspace", IconName::Add, ButtonTone::Neutral, ButtonSize::Sm).on_click(cx.listener(|this, _, _window, cx| this.invoke("workspace.create", json!({ "focus": true, "env": {} }), cx))))
-            .child(icon_button_tone("new-tab", "Tab", IconName::Layers, ButtonTone::Neutral, ButtonSize::Sm).on_click(cx.listener(move |this, _, _window, cx| {
-                if let Some(workspace_id) = workspace_id.clone() { this.invoke("tab.create", json!({ "workspace_id": workspace_id, "focus": true, "env": {} }), cx) }
-            })))
-            .child(icon_button_tone("split-right", "Split", IconName::Blocks, ButtonTone::Primary, ButtonSize::Sm).on_click(cx.listener(move |this, _, _window, cx| {
-                if let Some(pane_id) = pane_id_right.clone() { this.invoke("pane.split", json!({ "target_pane_id": pane_id, "direction": SplitDirection::Right, "focus": true, "right_click": "herdr", "env": {} }), cx) }
-            })))
-            .child(icon_button_tone("split-down", "Down", IconName::Blocks, ButtonTone::Neutral, ButtonSize::Sm).on_click(cx.listener(move |this, _, _window, cx| {
-                if let Some(pane_id) = pane_id_down.clone() { this.invoke("pane.split", json!({ "target_pane_id": pane_id, "direction": SplitDirection::Down, "focus": true, "right_click": "herdr", "env": {} }), cx) }
-            })))
-            .child(icon_button_tone("zoom-pane", "Zoom", IconName::Eye, ButtonTone::Ghost, ButtonSize::Sm).on_click(cx.listener(move |this, _, _window, cx| {
-                if let Some(pane_id) = pane_id_zoom.clone() { this.invoke("pane.zoom", json!({ "pane_id": pane_id, "mode": "toggle" }), cx) }
-            })))
-            .child(icon_button_tone("close-pane", "Close", IconName::Close, ButtonTone::Danger, ButtonSize::Sm).on_click(cx.listener(move |this, _, _window, cx| {
-                if let Some(pane_id) = pane_id_close.clone() { this.request_close_pane(pane_id, cx) }
-            })))
-            .child(div().h(px(24.)).w(px(1.)).mx_1().bg(theme::border()))
-            .child(icon_button_tone(
-                "manage-nodes",
-                format!("Nodes · {node_count}"),
-                IconName::Desktop,
-                if node_manager_open { ButtonTone::Primary } else { ButtonTone::Neutral },
-                ButtonSize::Sm,
-            ).on_click(cx.listener(|this, _, _window, cx| this.open_node_manager(cx))))
     }
 
     fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1132,9 +1022,12 @@ impl OcHerdrView {
                 tabs.push(
                     div()
                         .id(("main-tab", tab.number))
+                        .role(ochub_ui::gpui::Role::Button)
                         .flex()
                         .items_center()
                         .h_full()
+                        .min_w(px(108.))
+                        .max_w(px(180.))
                         .px_3()
                         .gap_2()
                         .border_b_2()
@@ -1143,38 +1036,230 @@ impl OcHerdrView {
                         } else {
                             theme::surface().alpha(0.)
                         })
-                        .text_xs()
+                        .bg(if selected {
+                            theme::selection()
+                        } else {
+                            theme::surface().alpha(0.)
+                        })
+                        .text_sm()
                         .text_color(if selected {
                             theme::text()
                         } else {
                             theme::muted()
-                        })
-                        .font_weight(if selected {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
                         })
                         .hover(|style| style.bg(theme::surface_hover()))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.select_tab(tab_id.clone(), cx)
                         }))
-                        .child(status_dot(status_color(tab.agent_status)))
-                        .child(tab.label.clone())
+                        .child(icon(IconName::Terminal, theme::muted(), 13.))
+                        .child(div().truncate().child(tab.label.clone()))
                         .into_any_element(),
                 );
             }
         }
+        let workspace_id = self.selection.workspace_id.clone();
+        let pane_id_right = self.selection.pane_id.clone();
+        let pane_id_down = self.selection.pane_id.clone();
+        let pane_id_zoom = self.selection.pane_id.clone();
+        let pane_id_close = self.selection.pane_id.clone();
+        let node_manager_open = self.node_manager_open;
         div()
             .flex()
             .items_center()
-            .h(px(TAB_BAR_HEIGHT))
-            .px_2()
-            .gap_1()
+            .h(px(HEADER_HEIGHT))
             .border_b_1()
             .border_color(theme::border())
-            .bg(theme::surface())
-            .children(tabs)
+            .bg(theme::c(0x17191d))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .children(tabs),
+            )
+            .child(
+                icon_only_button_tone(
+                    "new-tab",
+                    "New tab",
+                    IconName::Add,
+                    ButtonTone::Ghost,
+                    ButtonSize::Sm,
+                )
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(workspace_id) = workspace_id.clone() {
+                        this.invoke(
+                            "tab.create",
+                            json!({ "workspace_id": workspace_id, "focus": true, "env": {} }),
+                            cx,
+                        )
+                    }
+                })),
+            )
+            .child(div().flex_1())
+            .child(div().flex().items_center().gap_1().px_2()
+            .child(
+                icon_only_button_tone(
+                    "split-right",
+                    "Split pane right",
+                    IconName::Blocks,
+                    ButtonTone::Primary,
+                    ButtonSize::Sm,
+                )
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(pane_id) = pane_id_right.clone() {
+                        this.invoke(
+                            "pane.split",
+                            json!({ "target_pane_id": pane_id, "direction": SplitDirection::Right, "focus": true, "right_click": "herdr", "env": {} }),
+                            cx,
+                        )
+                    }
+                })),
+            )
+            .child(
+                icon_only_button_tone(
+                    "split-down",
+                    "Split pane down",
+                    IconName::ChevronDown,
+                    ButtonTone::Ghost,
+                    ButtonSize::Sm,
+                )
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(pane_id) = pane_id_down.clone() {
+                        this.invoke(
+                            "pane.split",
+                            json!({ "target_pane_id": pane_id, "direction": SplitDirection::Down, "focus": true, "right_click": "herdr", "env": {} }),
+                            cx,
+                        )
+                    }
+                })),
+            )
+            .child(
+                icon_only_button_tone(
+                    "zoom-pane",
+                    "Zoom pane",
+                    IconName::Eye,
+                    ButtonTone::Ghost,
+                    ButtonSize::Sm,
+                )
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(pane_id) = pane_id_zoom.clone() {
+                        this.invoke(
+                            "pane.zoom",
+                            json!({ "pane_id": pane_id, "mode": "toggle" }),
+                            cx,
+                        )
+                    }
+                })),
+            )
+            .child(
+                icon_only_button_tone(
+                    "close-pane",
+                    "Close pane",
+                    IconName::Close,
+                    ButtonTone::Ghost,
+                    ButtonSize::Sm,
+                )
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(pane_id) = pane_id_close.clone() {
+                        this.request_close_pane(pane_id, cx)
+                    }
+                })),
+            )
+            )
+            .child(div().h(px(22.)).w(px(1.)).bg(theme::border()))
+            .child(icon_button_tone(
+                "manage-nodes",
+                "Remote",
+                IconName::Settings,
+                if node_manager_open { ButtonTone::Primary } else { ButtonTone::Neutral },
+                ButtonSize::Sm,
+            ).mr_3().on_click(cx.listener(|this, _, _window, cx| this.open_node_manager(cx))))
+    }
+
+    fn render_status_bar(&self) -> impl IntoElement {
+        let profile = self.current_profile();
+        let profile_icon = if matches!(profile, ConnectionProfile::Local { .. }) {
+            IconName::Desktop
+        } else {
+            IconName::Cloud
+        };
+        let profile_label = profile.label().to_owned();
+        let status = if let Some(operation) = &self.operation {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(spinner(theme::muted(), 11.))
+                .child(operation.clone())
+                .into_any_element()
+        } else if self.error.is_some() {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(status_dot(theme::red()))
+                .child("Connection unavailable")
+                .into_any_element()
+        } else if let Some(snapshot) = &self.snapshot {
+            let subscription = if self.events.is_some() {
+                "subscription active"
+            } else {
+                "snapshot"
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(status_dot(theme::green()))
+                .child(format!(
+                    "Herdr {} · protocol {} · connected · {} · {} workspace{}",
+                    snapshot.version,
+                    snapshot.protocol,
+                    subscription,
+                    snapshot.workspaces.len(),
+                    if snapshot.workspaces.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(status_dot(theme::muted()))
+                .child("No Herdr session")
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .items_center()
+            .h(px(STATUS_BAR_HEIGHT))
+            .flex_none()
+            .border_t_1()
+            .border_color(theme::border())
+            .bg(theme::c(0x17191d))
+            .text_xs()
+            .text_color(theme::muted())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w(px(SIDEBAR_WIDTH))
+                    .h_full()
+                    .px_3()
+                    .border_r_1()
+                    .border_color(theme::border())
+                    .child(icon(profile_icon, theme::muted(), 13.))
+                    .child(div().truncate().child(profile_label)),
+            )
+            .child(div().flex().items_center().min_w_0().px_3().child(status))
     }
 
     fn render_terminal(
@@ -1201,7 +1286,7 @@ impl OcHerdrView {
                 .child(empty_state(
                     IconName::Terminal,
                     "No running Herdr session",
-                    "Start Herdr locally or choose an SSH host in the sidebar.",
+                    "Start Herdr locally or open Remote in the top-right.",
                     Some(cta),
                 ))
                 .into_any_element();
@@ -1222,7 +1307,7 @@ impl OcHerdrView {
         };
         let viewport = window.viewport_size();
         let width = (f32::from(viewport.width) - SIDEBAR_WIDTH).max(320.);
-        let height = (f32::from(viewport.height) - HEADER_HEIGHT - TAB_BAR_HEIGHT).max(180.);
+        let height = (f32::from(viewport.height) - HEADER_HEIGHT - STATUS_BAR_HEIGHT).max(180.);
         let layout = snapshot.layout_for(tab_id).cloned();
         let panes = snapshot.panes_for(tab_id).cloned().collect::<Vec<_>>();
         let mut elements = Vec::new();
@@ -1292,8 +1377,7 @@ impl Render for OcHerdrView {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(theme::content_background())
-            .child(self.render_header(cx))
+            .bg(theme::c(0x111416))
             .child(self.render_tab_bar(cx))
             .child(self.render_terminal(window, cx));
         if let Some(error) = &self.error {
@@ -1314,21 +1398,27 @@ impl Render for OcHerdrView {
                     .child(error.clone()),
             );
         }
+        let body = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(self.render_sidebar(cx))
+            .child(main);
         let mut root = div()
             .relative()
             .flex()
-            .flex_row()
+            .flex_col()
             .w_full()
             .h_full()
-            .bg(theme::window_base_background())
-            .child(self.render_sidebar(cx))
-            .child(main);
+            .bg(theme::c(0x111416))
+            .child(body)
+            .child(self.render_status_bar());
         if self.node_manager_open {
             root = root.child(self.render_node_manager(cx));
         }
-        if self.add_remote_open {
-            root = root.child(self.render_add_remote(cx));
-        } else if self.pending_remove_profile.is_some() {
+        if self.pending_remove_profile.is_some() {
             root = root.child(self.render_remove_node(cx));
         } else if self.pending_close_pane.is_some() {
             root = root.child(self.render_close_pane(cx));
@@ -1339,8 +1429,6 @@ impl Render for OcHerdrView {
 
 impl OcHerdrView {
     fn render_node_manager(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_label = self.current_profile().label().to_owned();
-        let node_count = self.profiles.len();
         let rows = self
             .profiles
             .iter()
@@ -1349,12 +1437,10 @@ impl OcHerdrView {
             .map(|(index, profile)| {
                 let selected = index == self.profile_index;
                 let saved = profile.id().starts_with("manual-");
-                let (node_icon, endpoint, source) = match &profile {
-                    ConnectionProfile::Local { herdr_path } => (
-                        IconName::Desktop,
-                        format!("This Mac · {herdr_path}"),
-                        "LOCAL",
-                    ),
+                let (node_icon, endpoint) = match &profile {
+                    ConnectionProfile::Local { herdr_path } => {
+                        (IconName::Desktop, format!("This Mac · {herdr_path}"))
+                    }
                     ConnectionProfile::Ssh {
                         destination, port, ..
                     } => (
@@ -1363,39 +1449,18 @@ impl OcHerdrView {
                             || destination.clone(),
                             |port| format!("{destination}:{port}"),
                         ),
-                        if saved { "SAVED" } else { "SSH CONFIG" },
                     ),
                 };
-                let (state_color, state_label, detail) = if selected {
+                let (state_color, state_label) = if selected {
                     if self.operation.is_some() {
-                        (
-                            theme::yellow(),
-                            "Connecting",
-                            "Discovering Herdr sessions".to_owned(),
-                        )
+                        (theme::yellow(), "Connecting")
                     } else if self.error.is_some() {
-                        (
-                            theme::red(),
-                            "Needs attention",
-                            "Connection unavailable".to_owned(),
-                        )
+                        (theme::red(), "Unavailable")
                     } else {
-                        (
-                            theme::green(),
-                            "Active",
-                            format!(
-                                "{} session{}",
-                                self.sessions.len(),
-                                if self.sessions.len() == 1 { "" } else { "s" }
-                            ),
-                        )
+                        (theme::green(), "Connected")
                     }
                 } else {
-                    (
-                        theme::muted(),
-                        "Available",
-                        "Select to discover sessions".to_owned(),
-                    )
+                    (theme::muted(), "Available")
                 };
                 let select = cx.listener(move |this: &mut Self, _: &(), _window, cx| {
                     this.choose_node(index, cx)
@@ -1407,10 +1472,10 @@ impl OcHerdrView {
                     .id(("managed-node", index))
                     .flex()
                     .items_center()
-                    .gap_4()
-                    .min_h(px(78.))
+                    .gap_3()
+                    .min_h(px(58.))
                     .px_4()
-                    .py_3()
+                    .py_2()
                     .border_b_1()
                     .border_color(theme::border())
                     .bg(if selected {
@@ -1423,14 +1488,8 @@ impl OcHerdrView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .w(px(34.))
-                            .h(px(34.))
-                            .rounded_md()
-                            .bg(if selected {
-                                theme::accent_soft()
-                            } else {
-                                theme::inset()
-                            })
+                            .w(px(28.))
+                            .h(px(28.))
                             .child(icon(
                                 node_icon,
                                 if selected {
@@ -1449,19 +1508,14 @@ impl OcHerdrView {
                             .min_w_0()
                             .gap_1()
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme::text())
-                                            .child(profile.label().to_owned()),
-                                    )
-                                    .child(badge(BadgeTone::Neutral, source)),
+                                div().flex().items_center().gap_1().child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::text())
+                                        .child(profile.label().to_owned()),
+                                ),
                             )
                             .child(
                                 div()
@@ -1471,32 +1525,20 @@ impl OcHerdrView {
                                     .child(endpoint),
                             ),
                     )
-                    .child(
+                    .child(if selected {
                         div()
                             .flex()
-                            .flex_col()
-                            .items_end()
-                            .w(px(132.))
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::subtext())
-                                    .child(status_dot(state_color))
-                                    .child(state_label),
-                            )
-                            .child(div().text_xs().text_color(theme::muted()).child(detail)),
-                    )
-                    .child(if selected {
-                        badge(BadgeTone::Success, "CURRENT").into_any_element()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(theme::subtext())
+                            .child(status_dot(state_color))
+                            .child(state_label)
+                            .into_any_element()
                     } else {
                         button(
                             ("select-managed-node", index),
-                            "Use node",
+                            "Connect",
                             ButtonTone::Neutral,
                             ButtonSize::Sm,
                         )
@@ -1505,7 +1547,7 @@ impl OcHerdrView {
                     })
                     .when(saved, |row| {
                         row.child(
-                            icon_button_tone(
+                            icon_only_button_tone(
                                 ("remove-managed-node", index),
                                 "Remove",
                                 IconName::Trash,
@@ -1518,119 +1560,67 @@ impl OcHerdrView {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let refresh = cx.listener(|this: &mut Self, _: &(), _window, cx| {
-            let preferred = this.current_session().map(|session| session.name.clone());
-            this.reload(preferred, cx);
-        });
-        modal_overlay(
-            modal_card()
-                .w(px(760.))
-                .h(px(620.))
-                .child(
-                    modal_header("Node management").child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                icon_button_tone(
-                                    "refresh-managed-nodes",
-                                    "Refresh",
-                                    IconName::Refresh,
-                                    ButtonTone::Ghost,
-                                    ButtonSize::Sm,
-                                )
-                                .on_click(move |_event, window, cx| refresh(&(), window, cx)),
-                            )
-                            .child(
+        let card = modal_card()
+            .w(px(640.))
+            .h(px(520.))
+            .child(
+                modal_header("Remote connections").child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(!self.add_remote_open, |actions| {
+                            actions.child(
                                 icon_button_tone(
                                     "add-managed-node",
-                                    "Add SSH node",
+                                    "New SSH",
                                     IconName::Add,
                                     ButtonTone::Primary,
                                     ButtonSize::Sm,
                                 )
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.open_add_remote(cx)
-                                })),
-                            )
-                            .child(
-                                icon_button_tone(
-                                    "close-node-manager",
-                                    "Close",
-                                    IconName::Close,
-                                    ButtonTone::Ghost,
-                                    ButtonSize::Sm,
-                                )
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.close_node_manager(cx)
-                                })),
-                            ),
-                    ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_5()
-                        .py_3()
-                        .bg(theme::inset())
-                        .border_b_1()
-                        .border_color(theme::border())
-                        .child(status_dot(if self.error.is_some() {
-                            theme::red()
-                        } else {
-                            theme::green()
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(active_label),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme::muted())
-                                        .child("Current Herdr execution scope"),
+                                .on_click(
+                                    cx.listener(|this, _, _window, cx| this.open_add_remote(cx)),
                                 ),
-                        )
-                        .child(badge(
-                            BadgeTone::Neutral,
-                            format!("{node_count} NODES"),
-                        )),
-                )
-                .child(
-                    div()
-                        .id("managed-node-scroll")
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_scroll()
-                        .children(rows),
-                )
-                .child(
-                    div()
-                        .px_5()
-                        .py_3()
-                        .border_t_1()
-                        .border_color(theme::border())
-                        .text_xs()
-                        .text_color(theme::muted())
+                            )
+                        })
                         .child(
-                            "SSH nodes use your system OpenSSH config, keys, agent, and known_hosts.",
+                            icon_only_button_tone(
+                                "close-node-manager",
+                                "Close",
+                                IconName::Close,
+                                ButtonTone::Ghost,
+                                ButtonSize::Sm,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, _window, cx| this.close_node_manager(cx)),
+                            ),
                         ),
                 ),
-        )
-        .top_0()
-        .left_0()
+            )
+            .when(self.add_remote_open, |card| {
+                card.child(self.render_add_remote(cx))
+            })
+            .child(
+                div()
+                    .id("managed-node-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .px_5()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("Uses your OpenSSH config, keys, agent, and known_hosts."),
+            );
+        modal_overlay(card).top_0().left_0()
     }
 
     fn render_add_remote(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1650,37 +1640,48 @@ impl OcHerdrView {
         )
         .on_click(cx.listener(|this, _, _window, cx| this.save_remote(cx)))
         .into_any_element();
-        modal_overlay(
-            modal_card()
-                .child(modal_header("Add SSH connection"))
-                .child(
-                    modal_body()
-                        .child(field(
-                            "Label",
-                            false,
-                            Some("A short name shown in the connection tree.".into()),
-                            self.remote_label.clone(),
-                        ))
-                        .child(field(
-                            "Destination",
-                            true,
-                            Some(
-                                "Uses system OpenSSH and may be an alias from ~/.ssh/config."
-                                    .into(),
-                            ),
-                            self.remote_destination.clone(),
-                        ))
-                        .child(field(
-                            "Port",
-                            false,
-                            Some("Leave empty to use SSH config or the default port.".into()),
-                            self.remote_port.clone(),
-                        )),
-                )
-                .child(modal_footer(vec![cancel, connect])),
-        )
-        .top_0()
-        .left_0()
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .px_5()
+            .py_4()
+            .bg(theme::inset())
+            .border_b_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("New SSH connection"),
+            )
+            .child(field(
+                "Label",
+                false,
+                Some("Name shown in OcHerdr.".into()),
+                self.remote_label.clone(),
+            ))
+            .child(field(
+                "Destination",
+                true,
+                Some("SSH alias or user@host from ~/.ssh/config.".into()),
+                self.remote_destination.clone(),
+            ))
+            .child(field(
+                "Port",
+                false,
+                Some("Optional; uses SSH config when empty.".into()),
+                self.remote_port.clone(),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(cancel)
+                    .child(connect),
+            )
     }
 
     fn render_remove_node(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1820,6 +1821,7 @@ fn tree_row(
     div()
         .id(id)
         .role(ochub_ui::gpui::Role::Button)
+        .aria_label(label.to_owned())
         .flex()
         .items_center()
         .gap_2()
@@ -1863,7 +1865,6 @@ fn render_pane(
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
     let (left, top, width, height) = geometry;
     let pane_name = pane.display_name().to_owned();
-    let pane_id = pane.pane_id.clone();
     div()
         .id(ochub_ui::gpui::ElementId::Name(
             format!("terminal-pane-{}", pane.pane_id).into(),
@@ -1899,8 +1900,7 @@ fn render_pane(
                 .text_xs()
                 .text_color(theme::c(0xc9d1d4))
                 .child(status_dot(status_color(pane.agent_status)))
-                .child(div().truncate().flex_1().child(pane_name))
-                .child(div().text_color(theme::c(0x717b80)).child(pane_id)),
+                .child(div().truncate().flex_1().child(pane_name)),
         )
         .child(
             div()
@@ -1934,7 +1934,7 @@ fn main() {
             ochub_ui::install(cx);
             theme::install_family(
                 &theme::ochub_family(),
-                theme::ThemeMode::System,
+                theme::ThemeMode::Dark,
                 cx.window_appearance(),
             );
             cx.open_window(
