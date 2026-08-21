@@ -10,7 +10,7 @@ OcHerdr is intentionally a client, not another multiplexer:
 - local and remote sessions share the same typed model;
 - remote transport uses the system OpenSSH client and SSH config;
 - terminal frames use Herdr's public NDJSON terminal bridge;
-- ANSI state, scrollback, Unicode handling, and reflow use native `libghostty-vt`;
+- ANSI state, font shaping, colors, images, and terminal rendering use native Ghostty Metal;
 - application controls come from [`ochub-ui`](https://github.com/OcHub-team/ochub-ui).
 
 ## Status
@@ -37,17 +37,14 @@ passwords or private keys.
 
 - macOS 14 or newer
 - Rust 1.97.1 (selected by `rust-toolchain.toml`)
-- Zig 0.15.2
+- Xcode Command Line Tools
 - Herdr 0.8.1 or newer
 
-Homebrew can install the build dependency without replacing a newer global Zig:
+Install the pinned GhosttyKit artifact once before the first build:
 
 ```sh
-brew install zig@0.15
+./scripts/bootstrap-ghosttykit.sh
 ```
-
-The build script automatically uses `/opt/homebrew/opt/zig@0.15/bin/zig` when present.
-Otherwise set `ZIG` to a Zig 0.15.2 executable.
 
 ## Run
 
@@ -96,9 +93,12 @@ to open Herdr settings.
 | `ocherdr-app` | GPUI shell, `ochub-ui` composition, selection and terminal surfaces |
 | `ocherdr-core` | Connection/session hierarchy, layout snapshots, compatibility model |
 | `ocherdr-herdr` | Public JSON socket, OpenSSH tunneling, CLI and terminal NDJSON streams |
-| `ocherdr-terminal` | Safe owned wrapper around vendored native `libghostty-vt` |
+| `ocherdr-terminal` | GhosttyKit runtime, leased IOSurface frames, and native input encoding |
 
-The vendored Ghostty source is pinned in `vendor/libghostty-vt.vendor.json`.
+GhosttyKit is pinned and checksum-verified by `scripts/bootstrap-ghosttykit.sh`. GPUI
+is pinned to OcHerdr's leased-BGRA surface extension in the OcHub-team Zed fork. The
+surface path keeps Ghostty's frame lease alive through Metal completion and converts
+its premultiplied Display-P3 output into GPUI's sRGB target on the GPU.
 
 ## License
 

@@ -16,15 +16,11 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
-      - name: Install Zig 0.15
-        run: brew install zig@0.15
+      - name: Bootstrap GhosttyKit
+        run: ./scripts/bootstrap-ghosttykit.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        env:
-          ZIG: /opt/homebrew/opt/zig@0.15/bin/zig
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        env:
-          ZIG: /opt/homebrew/opt/zig@0.15/bin/zig
         run: cargo test --workspace --locked

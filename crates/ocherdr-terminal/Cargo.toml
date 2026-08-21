@@ -8,7 +8,10 @@ repository.workspace = true
 build = "build.rs"
 
 [dependencies]
+core-foundation = "0.10"
+core-video = "0.5.2"
+io-surface = "0.16"
 thiserror.workspace = true
 
 [build-dependencies]
-cc = "1.2"
+bindgen = "0.72"

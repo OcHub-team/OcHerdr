@@ -112,15 +112,75 @@ fn command_for(profile: &ConnectionProfile, args: &[&str]) -> Result<Command> {
         } => {
             let mut command = Command::new("/usr/bin/ssh");
             add_ssh_common(&mut command, destination, *port, identity_file.as_deref());
-            let remote = std::iter::once(herdr_path.as_str())
-                .chain(args.iter().copied())
-                .map(posix_quote)
-                .collect::<Vec<_>>()
-                .join(" ");
+            let remote = remote_herdr_command(herdr_path, args);
             command.arg("--").arg(remote);
             Ok(command)
         }
     }
+}
+
+fn remote_herdr_command(configured: &str, args: &[&str]) -> String {
+    let arguments = args
+        .iter()
+        .copied()
+        .map(posix_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let arguments = if arguments.is_empty() {
+        String::new()
+    } else {
+        format!(" {arguments}")
+    };
+
+    if configured != "herdr" {
+        return format!(
+            "exec {}{arguments}",
+            remote_configured_executable(configured)
+        );
+    }
+
+    format!(
+        r#"herdr_path=$(command -v herdr 2>/dev/null || true)
+case "$herdr_path" in
+    */mise/shims/herdr) herdr_path= ;;
+esac
+if [ -n "$herdr_path" ] && [ -x "$herdr_path" ]; then
+    exec "$herdr_path"{arguments}
+fi
+for herdr_path in \
+    "$HOME/.local/bin/herdr" \
+    "$HOME/.cargo/bin/herdr" \
+    /opt/homebrew/bin/herdr \
+    /usr/local/bin/herdr \
+    /home/linuxbrew/.linuxbrew/bin/herdr \
+    "$HOME/.nix-profile/bin/herdr" \
+    "/etc/profiles/per-user/${{USER:-}}/bin/herdr" \
+    /nix/var/nix/profiles/default/bin/herdr \
+    /run/current-system/sw/bin/herdr
+do
+    if [ -x "$herdr_path" ]; then
+        exec "$herdr_path"{arguments}
+    fi
+done
+for herdr_path in \
+    "$HOME"/.local/share/mise/installs/herdr/*/bin/herdr \
+    "$HOME"/.local/share/mise/installs/herdr/*/herdr \
+    "$HOME"/.local/share/mise/installs/github-ogulcancelik-herdr/*/herdr
+do
+    if [ -x "$herdr_path" ]; then
+        exec "$herdr_path"{arguments}
+    fi
+done
+printf '%s\n' 'OcHerdr: remote Herdr executable was not found in PATH or common install locations' >&2
+exit 127"#
+    )
+}
+
+fn remote_configured_executable(configured: &str) -> String {
+    configured
+        .strip_prefix("~/")
+        .map(|path| format!("\"$HOME\"/{}", posix_quote(path)))
+        .unwrap_or_else(|| posix_quote(configured))
 }
 
 fn resolve_local_herdr(configured: &str) -> PathBuf {
@@ -482,7 +542,7 @@ pub struct TerminalFrame {
 #[serde(tag = "type")]
 pub enum TerminalControlCommand<'a> {
     #[serde(rename = "terminal.input")]
-    Input { text: &'a str },
+    Input { bytes: &'a str },
     #[serde(rename = "terminal.resize")]
     Resize {
         cols: u16,
@@ -505,7 +565,7 @@ pub enum TerminalControlCommand<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalCommand {
-    Input(String),
+    Input(Vec<u8>),
     Resize {
         cols: u16,
         rows: u16,
@@ -522,8 +582,12 @@ pub enum TerminalCommand {
 impl TerminalCommand {
     fn write_to(&self, stdin: &mut ChildStdin) -> Result<()> {
         match self {
-            Self::Input(text) => {
-                serde_json::to_writer(&mut *stdin, &TerminalControlCommand::Input { text })?
+            Self::Input(bytes) => {
+                let bytes = base64::engine::general_purpose::STANDARD.encode(bytes);
+                serde_json::to_writer(
+                    &mut *stdin,
+                    &TerminalControlCommand::Input { bytes: &bytes },
+                )?
             }
             Self::Resize {
                 cols,
@@ -820,14 +884,18 @@ pub fn parse_ssh_hosts(contents: &str) -> Vec<String> {
 }
 
 pub fn attach_command(profile: &ConnectionProfile, session_name: &str) -> String {
-    let attach = format!(
-        "{} session attach {}",
-        posix_quote(profile.herdr_path()),
-        posix_quote(session_name)
-    );
     match profile {
-        ConnectionProfile::Local { .. } => attach,
-        ConnectionProfile::Ssh { destination, .. } => {
+        ConnectionProfile::Local { herdr_path } => format!(
+            "{} session attach {}",
+            posix_quote(herdr_path),
+            posix_quote(session_name)
+        ),
+        ConnectionProfile::Ssh {
+            destination,
+            herdr_path,
+            ..
+        } => {
+            let attach = remote_herdr_command(herdr_path, &["session", "attach", session_name]);
             format!(
                 "ssh -t {} {}",
                 posix_quote(destination),
@@ -881,6 +949,30 @@ mod tests {
     }
 
     #[test]
+    fn default_remote_command_discovers_common_install_locations() {
+        let command = remote_herdr_command("herdr", &["session", "list", "--json"]);
+
+        assert!(command.contains("herdr_path=$(command -v herdr"));
+        assert!(command.contains("\"$HOME/.local/bin/herdr\""));
+        assert!(command.contains("/opt/homebrew/bin/herdr"));
+        assert!(command.contains("/home/linuxbrew/.linuxbrew/bin/herdr"));
+        assert!(command.contains(".local/share/mise/installs/herdr/*/bin/herdr"));
+        assert!(command.contains("exec \"$herdr_path\" session list --json"));
+    }
+
+    #[test]
+    fn remote_command_quotes_arguments_and_honors_a_custom_path() {
+        assert_eq!(
+            remote_herdr_command("/opt/Herdr bin/herdr", &["$(touch nope)"]),
+            "exec '/opt/Herdr bin/herdr' '$(touch nope)'"
+        );
+        assert_eq!(
+            remote_herdr_command("~/.local/bin/herdr", &["--version"]),
+            "exec \"$HOME\"/.local/bin/herdr --version"
+        );
+    }
+
+    #[test]
     fn parses_only_concrete_ssh_hosts() {
         let hosts = parse_ssh_hosts(
             "Host *\n  ServerAliveInterval 15\nHost work work-alt\nHost build-?\nHost work\n",
@@ -896,11 +988,22 @@ mod tests {
             destination: "deploy@example.com".into(),
             port: None,
             identity_file: None,
-            herdr_path: "herdr".into(),
+            herdr_path: "/opt/herdr".into(),
         };
         assert_eq!(
             attach_command(&profile, "work one"),
-            "ssh -t deploy@example.com 'herdr session attach '\"'\"'work one'\"'\"''"
+            "ssh -t deploy@example.com 'exec /opt/herdr session attach '\"'\"'work one'\"'\"''"
         );
+    }
+
+    #[test]
+    fn terminal_input_serializes_lossless_bytes() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0, 0x1b, 0x80, 0xff]);
+        let value =
+            serde_json::to_value(TerminalControlCommand::Input { bytes: &encoded }).unwrap();
+
+        assert_eq!(value["type"], "terminal.input");
+        assert_eq!(value["bytes"], "ABuA/w==");
+        assert!(value.get("text").is_none());
     }
 }

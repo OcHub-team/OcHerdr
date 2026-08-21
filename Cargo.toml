@@ -32,6 +32,11 @@ thiserror = "2"
 [patch.crates-io]
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 
+[patch."https://github.com/zed-industries/zed"]
+gpui = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6bc21b82e78f9d0cbbbe5", version = "=0.2.2" }
+gpui_macos = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6bc21b82e78f9d0cbbbe5", version = "=0.1.0" }
+gpui_platform = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6bc21b82e78f9d0cbbbe5", version = "=0.1.0" }
+
 [profile.release]
 lto = "thin"
 strip = "symbols"

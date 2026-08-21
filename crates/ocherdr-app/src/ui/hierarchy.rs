@@ -619,13 +619,12 @@ impl OcHerdrView {
                 id: pane.pane_id.clone(),
                 label: pane.display_name().to_owned(),
             };
-            let text = self
+            let frame = self
                 .panes
                 .get(&pane.pane_id)
-                .map(|runtime| runtime.text.clone())
-                .unwrap_or_else(|| i18n.text("Connecting…").into());
+                .and_then(|runtime| runtime.frame.clone());
             elements.push(
-                render_pane(pane, text, geometry, selected)
+                render_pane(pane, frame, geometry, selected, i18n)
                     .on_click(cx.listener(
                         move |this, _event: &ochub_ui::gpui::ClickEvent, window, cx| {
                             this.select_pane(pane_id.clone(), window, cx);
@@ -717,12 +716,14 @@ fn tree_row(
 
 fn render_pane(
     pane: PaneInfo,
-    text: SharedString,
+    frame: Option<RenderedFrame>,
     geometry: (f32, f32, f32, f32),
     selected: bool,
+    i18n: I18n,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
     let (left, top, width, height) = geometry;
     let pane_name = pane.display_name().to_owned();
+    let waiting_for_frame = frame.is_none();
     div()
         .id(ochub_ui::gpui::ElementId::Name(
             format!("terminal-pane-{}", pane.pane_id).into(),
@@ -732,6 +733,8 @@ fn render_pane(
         .top(px(top + 2.))
         .w(px((width - 4.).max(40.)))
         .h(px((height - 4.).max(40.)))
+        .flex()
+        .flex_col()
         .overflow_hidden()
         .border_1()
         .border_color(if selected {
@@ -743,6 +746,7 @@ fn render_pane(
         .cursor_text()
         .child(
             div()
+                .flex_none()
                 .flex()
                 .items_center()
                 .h(px(PANE_HEADER_HEIGHT))
@@ -762,16 +766,31 @@ fn render_pane(
         )
         .child(
             div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_1()
+                .min_h_0()
                 .w_full()
-                .h(px((height - PANE_HEADER_HEIGHT - 4.).max(20.)))
                 .overflow_hidden()
-                .px_2()
-                .py_1()
-                .font_family("Menlo")
-                .text_size(px(12.5))
-                .line_height(px(CELL_HEIGHT))
-                .text_color(theme::text())
-                .child(text),
+                .bg(ochub_ui::gpui::rgb(0x1e1e1e))
+                .when_some(frame, |container, frame| {
+                    container.child(
+                        surface(frame.pixel_buffer)
+                            .with_frame_lifetime(frame.lifetime)
+                            .object_fit(ObjectFit::Contain)
+                            .w_full()
+                            .h_full(),
+                    )
+                })
+                .when(waiting_for_frame, |container| {
+                    container.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(i18n.text("Waiting for terminal frame…")),
+                    )
+                }),
         )
 }
 

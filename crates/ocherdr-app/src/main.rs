@@ -15,7 +15,7 @@ use ocherdr_herdr::{
     TerminalSession, attach_command, discover_sessions, open_system_terminal, request_socket,
     ssh_host_aliases,
 };
-use ocherdr_terminal::Terminal;
+use ocherdr_terminal::{KeyModifiers, RenderedFrame, Terminal};
 use ochub_ui::components::{
     ButtonSize, ButtonTone, button, context_menu, context_menu_item, empty_state, field,
     icon_button_tone, icon_only_button_tone, modal_body, modal_card, modal_footer, modal_header,
@@ -23,8 +23,9 @@ use ochub_ui::components::{
 };
 use ochub_ui::gpui::{
     App, AppContext, AssetSource, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Render, SharedString, TitlebarOptions,
-    Window, WindowAppearance, WindowBounds, WindowOptions, div, point, prelude::*, px, size,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Render, SharedString,
+    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions, div, point, prelude::*,
+    px, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::text_input::{TextInput, TextInputEvent};
@@ -42,8 +43,6 @@ const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;
 const STATUS_BAR_HEIGHT: f32 = 28.;
 const PANE_HEADER_HEIGHT: f32 = 26.;
-const CELL_WIDTH: f32 = 8.4;
-const CELL_HEIGHT: f32 = 17.;
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -82,9 +81,12 @@ struct LoadedSession {
 struct PaneRuntime {
     session: TerminalSession,
     terminal: Terminal,
-    text: SharedString,
+    frame: Option<RenderedFrame>,
     mode: TerminalMode,
     size: (u16, u16),
+    pixel_size: (u32, u32),
+    frame_context: u64,
+    color_scheme_dark: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -388,6 +390,12 @@ fn main() {
             ochub_ui::install(cx);
             settings.appearance.theme_family =
                 install_appearance(&settings.appearance, cx.window_appearance());
+            cx.on_window_closed(|cx, _window_id| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

@@ -20,8 +20,14 @@ bincode protocol.
 5. Use public API methods for Workspace, Tab, Pane, and layout mutations.
 6. Open `terminal session control --takeover` for the focused pane and `observe` for
    sibling panes. Release and terminate every bridge when focus or connection changes.
-7. Decode base64 ANSI frames into native libghostty-vt instances. GPUI paints the
-   resulting viewport and application chrome.
+7. Feed decoded ANSI bytes into Ghostty's `manualMirror` surface. Ghostty owns VT
+   state, shaping, glyph/image rendering, and produces a leased BGRA IOSurface.
+8. Wrap that IOSurface as a CoreVideo pixel buffer without copying it. GPUI samples
+   the native frame in its Metal pass and releases the Ghostty frame token only after
+   the command buffer completes.
+9. Carry Ghostty's Display-P3 metadata with the frame. GPUI converts P3 to sRGB in
+   the fragment shader while preserving premultiplied alpha, and Ghostty follows the
+   application's effective light/dark appearance.
 
 ## SSH policy
 
@@ -38,5 +44,11 @@ forwarded public socket instead of through a shell.
 
 Only one controller may own a terminal. OcHerdr always requests takeover for the pane
 selected by the user. All other visible panes are observers. A sequence gap in a delta
-frame invalidates the local terminal state and requires a fresh bridge; full frames reset
-the libghostty-vt state before replay.
+frame invalidates the local terminal state and requires a fresh bridge. A full frame is
+an ANSI redraw and is applied to the existing Ghostty surface; it does not destroy or
+recreate renderer state.
+
+Terminal input follows the reverse path: GPUI key or committed-text events enter
+Ghostty's native input encoder, and its exact output bytes are base64-encoded into
+Herdr's public `terminal.input` command. This preserves application-cursor mode,
+bracketed paste, modifier protocols, and other terminal modes.

@@ -6,15 +6,15 @@ This project is available under the MIT License or Apache License 2.0, at your o
 Third-party components
 ----------------------
 
-ochub-ui 0.4.0
+ochub-ui 0.6.0
 Copyright OcHub contributors
 MIT OR Apache-2.0
 https://github.com/OcHub-team/ochub-ui
 
-libghostty-vt (Ghostty commit c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3)
+GhosttyKit (manaflow-ai/ghostty commit 3da10da73ae848c0310e3e0f0cb29e509c2f6963)
 Copyright Ghostty contributors
 MIT
-https://github.com/ghostty-org/ghostty
+https://github.com/OcHub-team/ghostty/tree/ocherdr/ghosttykit
 
 Herdr is not linked into OcHerdr. OcHerdr interoperates with a separately installed
 Herdr executable through its public CLI and socket APIs. Herdr is Apache-2.0 licensed.

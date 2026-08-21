@@ -359,6 +359,7 @@ fn zh_hans(english: &'static str) -> &'static str {
         "SSH port must be a number from 1 to 65535." => "SSH 端口必须是 1 到 65535 之间的数字。",
         "No Herdr session is selected." => "尚未选择 Herdr 会话。",
         "Waiting for terminal frame…" => "正在等待终端画面…",
+        "The terminal input stream is no longer available." => "终端输入流已不可用。",
         _ => english,
     }
 }

@@ -16,8 +16,13 @@ default:
 doctor:
     @command -v cargo >/dev/null || { echo "error: cargo is not installed" >&2; exit 1; }
     @command -v rustc >/dev/null || { echo "error: rustc is not installed" >&2; exit 1; }
-    @if [[ -n "${ZIG:-}" ]]; then zig_bin="$ZIG"; elif [[ -x /opt/homebrew/opt/zig@0.15/bin/zig ]]; then zig_bin=/opt/homebrew/opt/zig@0.15/bin/zig; elif [[ -x /usr/local/opt/zig@0.15/bin/zig ]]; then zig_bin=/usr/local/opt/zig@0.15/bin/zig; else zig_bin="$(command -v zig || true)"; fi; [[ -n "$zig_bin" ]] || { echo "error: Zig 0.15.2 is required (brew install zig@0.15)" >&2; exit 1; }; version="$($zig_bin version)"; [[ "$version" == 0.15.2* ]] || { echo "error: Zig 0.15.2 is required, found $version at $zig_bin" >&2; exit 1; }; echo "Rust $(rustc --version | awk '{print $2}') · Zig $version · macOS $(sw_vers -productVersion)"
+    @test -f vendor/ghosttykit/GhosttyKit.xcframework/macos-arm64_x86_64/ghostty-internal.a || { echo "error: run 'just bootstrap-ghosttykit' first" >&2; exit 1; }
+    @echo "Rust $(rustc --version | awk '{print $2}') · GhosttyKit 3da10da · macOS $(sw_vers -productVersion)"
     @if command -v herdr >/dev/null; then echo "Herdr $(herdr --version 2>/dev/null || echo installed)"; else echo "warning: herdr is not on PATH; the GUI will open without a local session"; fi
+
+# Download and verify the pinned GhosttyKit XCFramework.
+bootstrap-ghosttykit:
+    ./scripts/bootstrap-ghosttykit.sh
 
 # Start the debug build for day-to-day development.
 run: doctor

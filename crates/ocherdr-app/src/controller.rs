@@ -387,6 +387,11 @@ impl OcHerdrView {
         self.appearance.background_opacity = self.appearance.background_opacity.clamp(40, 100);
         self.appearance.theme_family = install_appearance(&self.appearance, window.appearance());
         theme::apply_window_background(window);
+        let dark = theme::is_dark();
+        for runtime in self.panes.values_mut() {
+            runtime.terminal.set_color_scheme(dark);
+            runtime.color_scheme_dark = dark;
+        }
         if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
         {
             self.error = Some(error.into());
@@ -823,17 +828,25 @@ impl OcHerdrView {
                 cols,
                 rows,
             );
-            if let Ok(terminal) = Terminal::new(cols, rows, 10_000) {
-                self.panes.insert(
-                    pane.pane_id.clone(),
-                    PaneRuntime {
-                        session,
-                        terminal,
-                        text: self.i18n.text("Waiting for terminal frame…").into(),
-                        mode,
-                        size: (cols, rows),
-                    },
-                );
+            let color_scheme_dark = theme::is_dark();
+            match Terminal::new(cols, rows, 10_000, color_scheme_dark) {
+                Ok(terminal) => {
+                    terminal.set_focus(mode == TerminalMode::ControlTakeover);
+                    self.panes.insert(
+                        pane.pane_id.clone(),
+                        PaneRuntime {
+                            session,
+                            terminal,
+                            frame: None,
+                            mode,
+                            size: (cols, rows),
+                            pixel_size: (0, 0),
+                            frame_context: 0,
+                            color_scheme_dark,
+                        },
+                    );
+                }
+                Err(error) => self.error = Some(error.to_string().into()),
             }
         }
         self.schedule_terminal_poll(epoch, cx);
@@ -850,20 +863,28 @@ impl OcHerdrView {
                 }
                 let mut changed = false;
                 let mut error = None;
+                if let Err(runtime_error) = Terminal::tick_runtime() {
+                    error = Some(runtime_error.to_string().into());
+                }
                 for runtime in this.panes.values_mut() {
                     for _ in 0..64 {
                         match runtime.session.try_frame() {
                             Ok(Some(frame)) => {
-                                let _ = runtime.terminal.resize(
-                                    frame.width,
-                                    frame.height,
-                                    CELL_WIDTH as u32,
-                                    CELL_HEIGHT as u32,
-                                );
+                                if runtime.size != (frame.width, frame.height) {
+                                    match runtime.terminal.set_grid_size(frame.width, frame.height)
+                                    {
+                                        Ok(resolved) => {
+                                            runtime.size = (resolved.columns, resolved.rows);
+                                            if runtime.mode == TerminalMode::ControlTakeover {
+                                                runtime.pixel_size = (0, 0);
+                                            }
+                                        }
+                                        Err(resize_error) => {
+                                            error = Some(resize_error.to_string().into())
+                                        }
+                                    }
+                                }
                                 runtime.terminal.apply_frame(&frame.bytes, frame.full);
-                                runtime.text = runtime.terminal.text().into();
-                                runtime.size = (frame.width, frame.height);
-                                changed = true;
                             }
                             Ok(None) => break,
                             Err(stream_error) => {
@@ -871,6 +892,25 @@ impl OcHerdrView {
                                 break;
                             }
                         }
+                    }
+                    while let Some(bytes) = runtime.terminal.try_input() {
+                        if runtime.mode == TerminalMode::ControlTakeover
+                            && runtime.session.send(TerminalCommand::Input(bytes)).is_err()
+                        {
+                            error = Some(
+                                this.i18n
+                                    .text("The terminal input stream is no longer available.")
+                                    .into(),
+                            );
+                        }
+                    }
+                    match runtime.terminal.try_frame() {
+                        Ok(Some(frame)) if frame.host_context == runtime.frame_context => {
+                            runtime.frame = Some(frame);
+                            changed = true;
+                        }
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(frame_error) => error = Some(frame_error.to_string().into()),
                     }
                 }
                 if let Some(error) = error {
@@ -891,6 +931,8 @@ impl OcHerdrView {
         let available_width = (f32::from(viewport.width) - SIDEBAR_WIDTH).max(320.);
         let available_height =
             (f32::from(viewport.height) - HEADER_HEIGHT - STATUS_BAR_HEIGHT).max(180.);
+        let scale_factor = f64::from(window.scale_factor());
+        let color_scheme_dark = theme::is_dark();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -899,6 +941,13 @@ impl OcHerdrView {
         };
         let layout = snapshot.layout_for(tab_id);
         for (pane_id, runtime) in &mut self.panes {
+            if runtime.color_scheme_dark != color_scheme_dark {
+                runtime.terminal.set_color_scheme(color_scheme_dark);
+                runtime.color_scheme_dark = color_scheme_dark;
+            }
+            if runtime.mode != TerminalMode::ControlTakeover {
+                continue;
+            }
             let ratio = layout
                 .and_then(|layout| {
                     layout
@@ -914,25 +963,30 @@ impl OcHerdrView {
                         })
                 })
                 .unwrap_or((1., 1.));
-            let cols = ((available_width * ratio.0 - 18.) / CELL_WIDTH)
-                .floor()
-                .max(1.) as u16;
-            let rows = ((available_height * ratio.1 - PANE_HEADER_HEIGHT - 12.) / CELL_HEIGHT)
-                .floor()
-                .max(1.) as u16;
-            if runtime.size != (cols, rows) {
-                let _ = runtime
-                    .terminal
-                    .resize(cols, rows, CELL_WIDTH as u32, CELL_HEIGHT as u32);
+            let width_px =
+                ((available_width * ratio.0 - 6.).max(1.) * window.scale_factor()).round() as u32;
+            let height_px = ((available_height * ratio.1 - PANE_HEADER_HEIGHT - 6.).max(1.)
+                * window.scale_factor())
+            .round() as u32;
+            if runtime.pixel_size != (width_px, height_px) {
+                runtime.frame_context = runtime.frame_context.wrapping_add(1);
+                let resolved = runtime.terminal.resize_pixels(
+                    width_px,
+                    height_px,
+                    scale_factor,
+                    runtime.frame_context,
+                );
+                let size = (resolved.columns, resolved.rows);
                 if runtime.mode == TerminalMode::ControlTakeover {
                     let _ = runtime.session.send(TerminalCommand::Resize {
-                        cols,
-                        rows,
-                        cell_width_px: CELL_WIDTH as u32,
-                        cell_height_px: CELL_HEIGHT as u32,
+                        cols: resolved.columns,
+                        rows: resolved.rows,
+                        cell_width_px: resolved.cell_width_px,
+                        cell_height_px: resolved.cell_height_px,
                     });
                 }
-                runtime.size = (cols, rows);
+                runtime.size = size;
+                runtime.pixel_size = (width_px, height_px);
             }
         }
     }
@@ -1215,9 +1269,7 @@ impl OcHerdrView {
         let key = &event.keystroke;
         if key.modifiers.platform && key.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                let _ = runtime
-                    .session
-                    .send(TerminalCommand::Input(text.to_string()));
+                runtime.terminal.paste(&text);
                 cx.stop_propagation();
             }
             return;
@@ -1225,38 +1277,16 @@ impl OcHerdrView {
         if key.modifiers.platform {
             return;
         }
-        let mut text = if key.modifiers.control && key.key.len() == 1 {
-            let byte = key.key.as_bytes()[0].to_ascii_lowercase();
-            if byte.is_ascii_lowercase() {
-                String::from_utf8(vec![byte - b'a' + 1]).unwrap_or_default()
-            } else {
-                String::new()
-            }
-        } else if let Some(character) = &key.key_char {
-            character.clone()
-        } else {
-            match key.key.as_str() {
-                "enter" => "\r".into(),
-                "tab" => "\t".into(),
-                "backspace" => "\x7f".into(),
-                "escape" => "\x1b".into(),
-                "up" => "\x1b[A".into(),
-                "down" => "\x1b[B".into(),
-                "right" => "\x1b[C".into(),
-                "left" => "\x1b[D".into(),
-                "home" => "\x1b[H".into(),
-                "end" => "\x1b[F".into(),
-                "pageup" => "\x1b[5~".into(),
-                "pagedown" => "\x1b[6~".into(),
-                "delete" => "\x1b[3~".into(),
-                _ => String::new(),
-            }
-        };
-        if key.modifiers.alt && !text.is_empty() {
-            text.insert(0, '\x1b');
-        }
-        if !text.is_empty() {
-            let _ = runtime.session.send(TerminalCommand::Input(text));
+        if runtime.terminal.send_key(
+            &key.key,
+            key.key_char.as_deref(),
+            KeyModifiers {
+                control: key.modifiers.control,
+                alt: key.modifiers.alt,
+                shift: key.modifiers.shift,
+                platform: key.modifiers.platform,
+            },
+        ) {
             cx.stop_propagation();
         }
     }
