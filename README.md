@@ -22,7 +22,11 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - live workspace, tab, pane, layout, and agent status rendering;
 - interactive `--takeover` control for the focused pane;
 - read-only observation of the other panes in the selected tab;
-- workspace/tab creation and pane splitting through the public API;
+- workspace/tab creation, rename, close, and pane operations through the public API;
+- native context menus for workspace, tab, and pane actions;
+- macOS shortcuts plus Herdr's `Ctrl+B` prefix workflow;
+- theme families, native blur/clear backdrops, and adjustable shell opacity;
+- a read-only mirror of the native TUI settings sections with an Open TUI handoff;
 - stopped-session guidance through the system Terminal.
 
 OcHerdr never reads Herdr's private `herdr-client.sock` protocol and never stores SSH
@@ -68,6 +72,17 @@ herdr
 
 SSH hosts are read from `~/.ssh/config`. Authentication and host-key enrollment stay
 with OpenSSH; establish them in Terminal before using a host in OcHerdr.
+
+## Keyboard
+
+OcHerdr supports `Cmd+T` (new tab), `Cmd+W` (close tab), `Cmd+Shift+W` (close
+workspace), `Cmd+Shift+N` (new workspace), `Cmd+1…9` (switch tab), `Ctrl+Tab`
+(cycle tabs), `F2` (rename), and `Cmd+,` (Herdr settings).
+
+The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
+`Shift+N` for a workspace, `N/P` to cycle tabs, `Shift+T/W/P` to rename,
+`Shift+X/D` to close, `H/J/K/L` to focus panes, `1…9` to switch tabs, or `S`
+to open Herdr settings.
 
 ## Architecture
 

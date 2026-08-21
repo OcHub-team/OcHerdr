@@ -127,9 +127,17 @@ fn resolve_local_herdr(configured: &str) -> PathBuf {
     if configured != "herdr" || Path::new(configured).is_absolute() {
         return configured.into();
     }
-    for candidate in ["/opt/homebrew/bin/herdr", "/usr/local/bin/herdr"] {
-        if Path::new(candidate).is_file() {
-            return candidate.into();
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/herdr"),
+        PathBuf::from("/usr/local/bin/herdr"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin/herdr"));
+        candidates.push(home.join(".cargo/bin/herdr"));
+    }
+    for candidate in candidates {
+        if candidate.is_file() {
+            return candidate;
         }
     }
     configured.into()
