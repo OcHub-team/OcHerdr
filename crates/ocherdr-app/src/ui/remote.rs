@@ -2,6 +2,7 @@ use super::super::*;
 
 impl OcHerdrView {
     pub(super) fn render_node_manager(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let query = self.remote_search.read(cx).content().trim().to_lowercase();
         let mut rows = Vec::new();
         for source in [
@@ -15,16 +16,22 @@ impl OcHerdrView {
                 .cloned()
                 .enumerate()
                 .filter(|(_, profile)| {
-                    connection_source(profile) == source && profile_matches_search(profile, &query)
+                    connection_source(profile) == source
+                        && profile_matches_search(profile, &query, i18n)
                 })
                 .collect::<Vec<_>>();
             if matches.is_empty() {
                 continue;
             }
-            rows.push(remote_group_label(source.label(), matches.len()).into_any_element());
+            rows.push(remote_group_label(source.label(i18n), matches.len()).into_any_element());
             for (index, profile) in matches {
                 let selected = index == self.managed_profile_index;
                 let active = index == self.profile_index;
+                let display_label = if matches!(profile, ConnectionProfile::Local { .. }) {
+                    i18n.text("Local").to_owned()
+                } else {
+                    profile.label().to_owned()
+                };
                 let node_icon = if matches!(profile, ConnectionProfile::Local { .. }) {
                     IconName::Desktop
                 } else {
@@ -36,7 +43,7 @@ impl OcHerdrView {
                         .role(ochub_ui::gpui::Role::Button)
                         .aria_label(format!(
                             "{} · {}",
-                            profile.label(),
+                            display_label,
                             profile_endpoint(&profile)
                         ))
                         .flex()
@@ -92,7 +99,7 @@ impl OcHerdrView {
                                         .text_sm()
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(theme::text())
-                                        .child(profile.label().to_owned()),
+                                        .child(display_label.clone()),
                                 )
                                 .child(
                                     div()
@@ -119,8 +126,8 @@ impl OcHerdrView {
             rows.push(
                 empty_state(
                     IconName::Search,
-                    "No matching hosts",
-                    "Try a host name, SSH alias, or address.",
+                    i18n.text("No matching hosts"),
+                    i18n.text("Try a host name, SSH alias, or address."),
                     None,
                 )
                 .into_any_element(),
@@ -136,7 +143,7 @@ impl OcHerdrView {
             .h(px(580.))
             .rounded(px(CORNER_MODAL))
             .child(
-                modal_header("Remote connections").child(
+                modal_header(i18n.text("Remote connections")).child(
                     div()
                         .flex()
                         .items_center()
@@ -144,7 +151,7 @@ impl OcHerdrView {
                         .child(
                             icon_button_tone(
                                 "add-managed-node",
-                                "New SSH",
+                                i18n.text("New SSH"),
                                 IconName::Add,
                                 if self.add_remote_open {
                                     ButtonTone::Primary
@@ -158,7 +165,7 @@ impl OcHerdrView {
                         .child(
                             icon_only_button_tone(
                                 "close-node-manager",
-                                "Close",
+                                i18n.text("Close"),
                                 IconName::Close,
                                 ButtonTone::Ghost,
                                 ButtonSize::Sm,
@@ -212,6 +219,7 @@ impl OcHerdrView {
     }
 
     fn render_remote_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let Some(profile) = self.profiles.get(self.managed_profile_index).cloned() else {
             return div()
                 .flex()
@@ -219,15 +227,20 @@ impl OcHerdrView {
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .child("Select a connection");
+                .child(i18n.text("Select a connection"));
         };
         let index = self.managed_profile_index;
         let active = index == self.profile_index;
         let saved = connection_source(&profile) == ConnectionSource::Saved;
-        let source = connection_source(&profile).description();
+        let display_label = if matches!(profile, ConnectionProfile::Local { .. }) {
+            i18n.text("Local").to_owned()
+        } else {
+            profile.label().to_owned()
+        };
+        let source = connection_source(&profile).description(i18n);
         let (identity, herdr_path) = match &profile {
             ConnectionProfile::Local { herdr_path } => {
-                ("System default".to_owned(), herdr_path.clone())
+                (i18n.text("System default").to_owned(), herdr_path.clone())
             }
             ConnectionProfile::Ssh {
                 identity_file,
@@ -237,7 +250,7 @@ impl OcHerdrView {
                 identity_file
                     .as_ref()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "SSH config or agent".into()),
+                    .unwrap_or_else(|| i18n.text("SSH config or agent").into()),
                 herdr_path.clone(),
             ),
         };
@@ -285,7 +298,7 @@ impl OcHerdrView {
                                     .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::text())
-                                    .child(profile.label().to_owned()),
+                                    .child(display_label),
                             )
                             .child(
                                 div()
@@ -308,7 +321,7 @@ impl OcHerdrView {
                                 .text_xs()
                                 .text_color(theme::green())
                                 .child(status_dot(theme::green()))
-                                .child("Connected"),
+                                .child(i18n.text("Connected")),
                         )
                     }),
             )
@@ -319,9 +332,17 @@ impl OcHerdrView {
                     .border_1()
                     .border_color(theme::border())
                     .bg(theme::surface())
-                    .child(remote_detail_row("Source", source.to_owned(), true))
-                    .child(remote_detail_row("Identity", identity, true))
-                    .child(remote_detail_row("Herdr command", herdr_path, false)),
+                    .child(remote_detail_row(
+                        i18n.text("Source"),
+                        source.to_owned(),
+                        true,
+                    ))
+                    .child(remote_detail_row(i18n.text("Identity"), identity, true))
+                    .child(remote_detail_row(
+                        i18n.text("Herdr command"),
+                        herdr_path,
+                        false,
+                    )),
             )
             .child(div().flex_1())
             .child(
@@ -338,13 +359,13 @@ impl OcHerdrView {
                             .flex_1()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child("Uses OpenSSH config, keys, agent, and known_hosts."),
+                            .child(i18n.text("Uses OpenSSH config, keys, agent, and known_hosts.")),
                     )
                     .when(saved, |footer| {
                         footer.child(
                             icon_only_button_tone(
                                 "remove-managed-node-detail",
-                                "Remove saved host",
+                                i18n.text("Remove saved host"),
                                 IconName::Trash,
                                 ButtonTone::Ghost,
                                 ButtonSize::Sm,
@@ -357,7 +378,11 @@ impl OcHerdrView {
                     .child(
                         button(
                             "connect-managed-node",
-                            if active { "Reconnect" } else { "Connect" },
+                            if active {
+                                i18n.text("Reconnect")
+                            } else {
+                                i18n.text("Connect")
+                            },
                             ButtonTone::Primary,
                             ButtonSize::Md,
                         )
@@ -369,9 +394,10 @@ impl OcHerdrView {
     }
 
     fn render_add_remote(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let cancel = button(
             "cancel-add-remote",
-            "Cancel",
+            i18n.text("Cancel"),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
@@ -379,7 +405,7 @@ impl OcHerdrView {
         .into_any_element();
         let connect = button(
             "save-add-remote",
-            "Save & connect",
+            i18n.text("Save & connect"),
             ButtonTone::Primary,
             ButtonSize::Sm,
         )
@@ -418,14 +444,11 @@ impl OcHerdrView {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("New SSH connection"),
+                                    .child(i18n.text("New SSH connection")),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::muted())
-                                    .child("Save a host, then discover its Herdr sessions."),
-                            ),
+                            .child(div().text_xs().text_color(theme::muted()).child(
+                                i18n.text("Save a host, then discover its Herdr sessions."),
+                            )),
                     ),
             )
             .child(
@@ -445,22 +468,25 @@ impl OcHerdrView {
                             .items_start()
                             .gap_3()
                             .child(div().flex_1().min_w_0().child(field(
-                                "Label",
+                                i18n.text("Label"),
                                 false,
-                                Some("Name shown in OcHerdr.".into()),
+                                Some(i18n.text("Name shown in OcHerdr.").into()),
                                 self.remote_label.clone(),
                             )))
                             .child(div().w(px(132.)).flex_none().child(field(
-                                "Port",
+                                i18n.text("Port"),
                                 false,
-                                Some("Uses SSH config when empty.".into()),
+                                Some(i18n.text("Uses SSH config when empty.").into()),
                                 self.remote_port.clone(),
                             ))),
                     )
                     .child(field(
-                        "Destination",
+                        i18n.text("Destination"),
                         true,
-                        Some("SSH alias or user@host from ~/.ssh/config.".into()),
+                        Some(
+                            i18n.text("SSH alias or user@host from ~/.ssh/config.")
+                                .into(),
+                        ),
                         self.remote_destination.clone(),
                     ))
                     .child(
@@ -468,16 +494,21 @@ impl OcHerdrView {
                             .flex()
                             .items_start()
                             .gap_3()
-                            .child(div().flex_1().min_w_0().child(field(
-                                "Identity file",
-                                false,
-                                Some("Optional key path; SSH agent still works.".into()),
-                                self.remote_identity_file.clone(),
-                            )))
+                            .child(
+                                div().flex_1().min_w_0().child(field(
+                                    i18n.text("Identity file"),
+                                    false,
+                                    Some(
+                                        i18n.text("Optional key path; SSH agent still works.")
+                                            .into(),
+                                    ),
+                                    self.remote_identity_file.clone(),
+                                )),
+                            )
                             .child(div().w(px(150.)).flex_none().child(field(
-                                "Herdr command",
+                                i18n.text("Herdr command"),
                                 false,
-                                Some("Remote command or path.".into()),
+                                Some(i18n.text("Remote command or path.").into()),
                                 self.remote_herdr_path.clone(),
                             ))),
                     ),

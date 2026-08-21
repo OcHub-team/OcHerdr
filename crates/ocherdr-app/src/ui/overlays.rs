@@ -2,15 +2,16 @@ use super::super::*;
 
 impl OcHerdrView {
     pub(super) fn render_remove_node(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let node_name = self
             .pending_remove_profile
             .and_then(|index| self.profiles.get(index))
             .map(ConnectionProfile::label)
-            .unwrap_or("this node")
+            .unwrap_or(i18n.text("this node"))
             .to_owned();
         let cancel = button(
             "cancel-remove-node",
-            "Cancel",
+            i18n.text("Cancel"),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
@@ -18,7 +19,7 @@ impl OcHerdrView {
         .into_any_element();
         let remove = button(
             "confirm-remove-node",
-            "Remove node",
+            i18n.text("Remove node"),
             ButtonTone::Danger,
             ButtonSize::Sm,
         )
@@ -26,21 +27,21 @@ impl OcHerdrView {
         .into_any_element();
         modal_overlay(
             modal_card()
-                .child(modal_header("Remove SSH node?"))
+                .child(modal_header(i18n.text("Remove SSH node?")))
                 .child(
                     modal_body()
                         .child(
                             div()
                                 .text_sm()
                                 .text_color(theme::text())
-                                .child(format!("Remove {node_name} from OcHerdr?")),
+                                .child(i18n.remove_node_prompt(&node_name)),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme::muted())
                                 .child(
-                                    "This only removes the saved node profile. SSH keys and ~/.ssh/config are not changed.",
+                                    i18n.text("This only removes the saved node profile. SSH keys and ~/.ssh/config are not changed."),
                                 ),
                         ),
                 )
@@ -51,15 +52,16 @@ impl OcHerdrView {
     }
 
     pub(super) fn render_close_target(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let target = self.pending_close.as_ref();
         let kind = target.map(HierarchyTarget::kind_label).unwrap_or("item");
         let label = target
             .map(HierarchyTarget::label)
-            .unwrap_or("this item")
+            .unwrap_or(i18n.text("this item"))
             .to_owned();
         let cancel = button(
             "cancel-close-target",
-            "Cancel",
+            i18n.text("Cancel"),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
@@ -67,7 +69,7 @@ impl OcHerdrView {
         .into_any_element();
         let close = button(
             "confirm-close-target",
-            format!("Close {kind}"),
+            i18n.close_action(kind),
             ButtonTone::Danger,
             ButtonSize::Sm,
         )
@@ -75,17 +77,17 @@ impl OcHerdrView {
         .into_any_element();
         modal_overlay(
             modal_card()
-                .child(modal_header(format!("Close {kind}?")))
+                .child(modal_header(i18n.close_title(kind)))
                 .child(
                     modal_body()
                         .child(
                             div()
                                 .text_sm()
                                 .text_color(theme::text())
-                                .child(format!("Close {label}?")),
+                                .child(i18n.close_prompt(&label)),
                         )
                         .child(div().text_xs().text_color(theme::muted()).child(
-                            "Processes owned by this Herdr hierarchy item may be terminated. Closing a final tab also closes its workspace.",
+                            i18n.text("Processes owned by this Herdr hierarchy item may be terminated. Closing a final tab also closes its workspace."),
                         )),
                 )
                 .child(modal_footer(vec![cancel, close])),
@@ -95,6 +97,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn render_rename(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let kind = self
             .rename_target
             .as_ref()
@@ -102,29 +105,34 @@ impl OcHerdrView {
             .unwrap_or("item");
         let cancel = button(
             "cancel-rename",
-            "Cancel",
+            i18n.text("Cancel"),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
         .on_click(cx.listener(|this, _, window, cx| this.cancel_rename(window, cx)))
         .into_any_element();
-        let save = button("save-rename", "Rename", ButtonTone::Primary, ButtonSize::Sm)
-            .on_click(cx.listener(|this, _, window, cx| this.submit_rename(window, cx)))
-            .into_any_element();
+        let save = button(
+            "save-rename",
+            i18n.text("Rename"),
+            ButtonTone::Primary,
+            ButtonSize::Sm,
+        )
+        .on_click(cx.listener(|this, _, window, cx| this.submit_rename(window, cx)))
+        .into_any_element();
         modal_overlay(
             modal_card()
                 .w(px(440.))
                 .rounded(px(CORNER_MODAL))
-                .child(modal_header(format!("Rename {kind}")))
+                .child(modal_header(i18n.rename_title(kind)))
                 .child(
                     modal_body().child(field(
-                        "Name",
+                        i18n.text("Name"),
                         !matches!(self.rename_target, Some(HierarchyTarget::Pane { .. })),
                         Some(
                             if matches!(self.rename_target, Some(HierarchyTarget::Pane { .. })) {
-                                "Leave empty to clear the custom pane name."
+                                i18n.text("Leave empty to clear the custom pane name.")
                             } else {
-                                "Saved directly to the active Herdr session."
+                                i18n.text("Saved directly to the active Herdr session.")
                             }
                             .into(),
                         ),
@@ -151,6 +159,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn render_context_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let menu = self.context_menu.clone().expect("context menu state");
         let mut items = Vec::new();
         match menu.target.clone() {
@@ -159,7 +168,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "workspace-menu-rename",
-                        "Rename",
+                        i18n.text("Rename"),
                         Some("⌃B ⇧W"),
                         Some(IconName::Pencil),
                         false,
@@ -173,7 +182,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "workspace-menu-close",
-                        "Close",
+                        i18n.text("Close"),
                         Some("⌃B ⇧D"),
                         Some(IconName::Close),
                         true,
@@ -188,7 +197,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "tab-menu-new",
-                        "New tab",
+                        i18n.text("New tab"),
                         Some("⌘T"),
                         Some(IconName::Add),
                         false,
@@ -203,7 +212,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "tab-menu-rename",
-                        "Rename",
+                        i18n.text("Rename"),
                         Some("⌃B ⇧T"),
                         Some(IconName::Pencil),
                         false,
@@ -217,7 +226,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "tab-menu-close",
-                        "Close",
+                        i18n.text("Close"),
                         Some("⌘W"),
                         Some(IconName::Close),
                         true,
@@ -233,7 +242,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "pane-menu-rename",
-                        "Rename pane",
+                        i18n.text("Rename pane"),
                         Some("⌃B ⇧P"),
                         Some(IconName::Pencil),
                         false,
@@ -244,8 +253,8 @@ impl OcHerdrView {
                     .into_any_element(),
                 );
                 for (suffix, label, direction) in [
-                    ("right", "Split right", SplitDirection::Right),
-                    ("down", "Split down", SplitDirection::Down),
+                    ("right", i18n.text("Split right"), SplitDirection::Right),
+                    ("down", i18n.text("Split down"), SplitDirection::Down),
                 ] {
                     let pane_id = id.clone();
                     items.push(
@@ -273,7 +282,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "pane-menu-zoom",
-                        "Zoom",
+                        i18n.text("Zoom"),
                         None::<&str>,
                         Some(IconName::Eye),
                         false,
@@ -292,7 +301,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "pane-menu-close",
-                        "Close pane",
+                        i18n.text("Close pane"),
                         None::<&str>,
                         Some(IconName::Close),
                         true,
@@ -327,14 +336,16 @@ impl OcHerdrView {
     }
 
     pub(super) fn render_herdr_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let mut tabs = Vec::new();
         for (index, label) in HERDR_SETTINGS_SECTIONS.iter().enumerate() {
             let selected = self.herdr_settings_section == index;
+            let localized_label = i18n.text(label);
             tabs.push(
                 div()
                     .id(("herdr-settings-section", index))
                     .role(ochub_ui::gpui::Role::Tab)
-                    .aria_label(*label)
+                    .aria_label(localized_label)
                     .px_3()
                     .py_1()
                     .rounded(px(CORNER_COMPACT))
@@ -353,72 +364,84 @@ impl OcHerdrView {
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.select_herdr_settings_section(index, cx)
                     }))
-                    .child(*label)
+                    .child(localized_label)
                     .into_any_element(),
             );
         }
         let (title, description, options): (&str, &str, Vec<(&str, &str)>) =
             match self.herdr_settings_section {
                 0 => (
-                    "theme",
-                    "Themes exposed by Herdr's native TUI settings.",
+                    i18n.text("theme"),
+                    i18n.text("Themes exposed by Herdr's native TUI settings."),
                     vec![
-                        ("catppuccin", "dark"),
-                        ("catppuccin-latte", "light"),
-                        ("terminal", "inherit host colors"),
-                        ("tokyo-night", "dark"),
-                        ("tokyo-night-day", "light"),
-                        ("dracula", "dark"),
-                        ("nord", "dark"),
-                        ("gruvbox", "dark"),
-                        ("gruvbox-light", "light"),
-                        ("one-dark", "dark"),
-                        ("one-light", "light"),
-                        ("solarized", "dark"),
-                        ("solarized-light", "light"),
-                        ("kanagawa", "dark"),
-                        ("kanagawa-lotus", "light"),
-                        ("rose-pine", "dark"),
-                        ("rose-pine-dawn", "light"),
-                        ("vesper", "dark"),
+                        ("catppuccin", i18n.text("dark")),
+                        ("catppuccin-latte", i18n.text("light")),
+                        ("terminal", i18n.text("inherit host colors")),
+                        ("tokyo-night", i18n.text("dark")),
+                        ("tokyo-night-day", i18n.text("light")),
+                        ("dracula", i18n.text("dark")),
+                        ("nord", i18n.text("dark")),
+                        ("gruvbox", i18n.text("dark")),
+                        ("gruvbox-light", i18n.text("light")),
+                        ("one-dark", i18n.text("dark")),
+                        ("one-light", i18n.text("light")),
+                        ("solarized", i18n.text("dark")),
+                        ("solarized-light", i18n.text("light")),
+                        ("kanagawa", i18n.text("dark")),
+                        ("kanagawa-lotus", i18n.text("light")),
+                        ("rose-pine", i18n.text("dark")),
+                        ("rose-pine-dawn", i18n.text("light")),
+                        ("vesper", i18n.text("dark")),
                     ],
                 ),
                 1 => (
-                    "agent status indicators",
-                    "Choose the symbols used for agent state in the TUI.",
+                    i18n.text("agent status indicators"),
+                    i18n.text("Choose the symbols used for agent state in the TUI."),
                     vec![
-                        ("color dots  ● ● ● ○ ·", "compact color status"),
-                        ("distinct symbols  × ◐ ✓ ○ ·", "shape and color status"),
+                        ("color dots  ● ● ● ○ ·", i18n.text("compact color status")),
+                        (
+                            "distinct symbols  × ◐ ✓ ○ ·",
+                            i18n.text("shape and color status"),
+                        ),
                     ],
                 ),
                 2 => (
-                    "sound alerts",
-                    "Play sounds when agents change state in the background.",
-                    vec![("on", "enable alerts"), ("off", "silence alerts")],
+                    i18n.text("sound alerts"),
+                    i18n.text("Play sounds when agents change state in the background."),
+                    vec![
+                        (i18n.text("on"), i18n.text("enable alerts")),
+                        (i18n.text("off"), i18n.text("silence alerts")),
+                    ],
                 ),
                 3 => (
-                    "notification popups",
-                    "Choose where background notifications are delivered.",
+                    i18n.text("notification popups"),
+                    i18n.text("Choose where background notifications are delivered."),
                     vec![
-                        ("off", "disabled"),
-                        ("inside herdr", "TUI popup"),
-                        ("via terminal", "terminal notification"),
-                        ("via system", "macOS notification"),
+                        (i18n.text("off"), i18n.text("disabled")),
+                        (i18n.text("inside herdr"), i18n.text("TUI popup")),
+                        (
+                            i18n.text("via terminal"),
+                            i18n.text("terminal notification"),
+                        ),
+                        (i18n.text("via system"), i18n.text("macOS notification")),
                     ],
                 ),
                 4 => (
-                    "agent border labels",
-                    "Show detected agent names in split-pane borders.",
-                    vec![("on", "show labels"), ("off", "hide labels")],
+                    i18n.text("agent border labels"),
+                    i18n.text("Show detected agent names in split-pane borders."),
+                    vec![
+                        (i18n.text("on"), i18n.text("show labels")),
+                        (i18n.text("off"), i18n.text("hide labels")),
+                    ],
                 ),
                 _ => (
-                    "agent integrations",
-                    "Let supported agents report state directly to Herdr.",
+                    i18n.text("agent integrations"),
+                    i18n.text("Let supported agents report state directly to Herdr."),
                     vec![
-                        ("Claude Code", "integration target"),
-                        ("Codex", "integration target"),
-                        ("Gemini", "integration target"),
-                        ("OpenCode", "integration target"),
+                        ("Claude Code", i18n.text("integration target")),
+                        ("Codex", i18n.text("integration target")),
+                        ("Gemini", i18n.text("integration target")),
+                        ("OpenCode", i18n.text("integration target")),
                     ],
                 ),
             };
@@ -428,7 +451,7 @@ impl OcHerdrView {
             .collect::<Vec<_>>();
         let open_tui = button(
             "open-native-tui-settings",
-            "Open native TUI",
+            i18n.text("Open native TUI"),
             ButtonTone::Neutral,
             ButtonSize::Md,
         )
@@ -436,7 +459,7 @@ impl OcHerdrView {
         .into_any_element();
         let done = button(
             "close-herdr-settings",
-            "Done",
+            i18n.text("Done"),
             ButtonTone::Primary,
             ButtonSize::Md,
         )
@@ -448,10 +471,10 @@ impl OcHerdrView {
                 .h(px(560.))
                 .rounded(px(CORNER_MODAL))
                 .child(
-                    modal_header("Herdr settings").child(
+                    modal_header(i18n.text("Herdr settings")).child(
                         icon_only_button_tone(
                             "close-herdr-settings-header",
-                            "Close",
+                            i18n.text("Close"),
                             IconName::Close,
                             ButtonTone::Ghost,
                             ButtonSize::Sm,
@@ -499,7 +522,7 @@ impl OcHerdrView {
                                 .text_xs()
                                 .text_color(theme::subtext())
                                 .child(
-                                    "This mirrors Herdr's TUI settings surface. Protocol 20 does not expose live setting values; open the native TUI and press Ctrl+B, then S to inspect or apply the selected session.",
+                                    i18n.text("This mirrors Herdr's TUI settings surface. Protocol 20 does not expose live setting values; open the native TUI and press Ctrl+B, then S to inspect or apply the selected session."),
                                 ),
                         )
                         .child(

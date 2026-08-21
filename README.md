@@ -26,6 +26,7 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - native context menus for workspace, tab, and pane actions;
 - macOS shortcuts plus Herdr's `Ctrl+B` prefix workflow;
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
+- runtime internationalization with system-language detection, English, and Simplified Chinese;
 - a read-only mirror of the native TUI settings sections with an Open TUI handoff;
 - stopped-session guidance through the system Terminal.
 
@@ -63,6 +64,10 @@ just accept
 This checks the toolchain, runs the same format/Clippy/test gate as CI, creates an
 ad-hoc signed `target/qa/OcHerdr.app`, and opens a fresh instance. Use `just --list`
 for the shorter development commands.
+
+The left sidebar names its top-level Herdr endpoints **Connections**. Interface
+language can be changed without restarting under Appearance → Language; the choice
+is stored alongside the existing connection and appearance settings.
 
 Start Herdr first if no running session appears:
 

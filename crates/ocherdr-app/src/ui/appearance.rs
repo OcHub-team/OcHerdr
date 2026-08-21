@@ -2,6 +2,7 @@ use super::super::*;
 
 impl OcHerdrView {
     pub(super) fn render_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let mut family_rows = Vec::new();
         for record in &theme::load_registry().themes {
             let family = record.family.clone();
@@ -12,13 +13,18 @@ impl OcHerdrView {
             } else {
                 family.light
             };
+            let description = if family.description.is_empty() {
+                i18n.text("Light and dark variants").to_owned()
+            } else {
+                family.description.clone()
+            };
             family_rows.push(
                 div()
                     .id(ochub_ui::gpui::ElementId::Name(
                         format!("appearance-family-{family_id}").into(),
                     ))
                     .role(ochub_ui::gpui::Role::Button)
-                    .aria_label(format!("Use {} theme", family.name))
+                    .aria_label(i18n.use_theme_label(&family.name))
                     .flex()
                     .items_center()
                     .gap_3()
@@ -79,18 +85,32 @@ impl OcHerdrView {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(family.name),
                             )
-                            .child(div().truncate().text_xs().text_color(theme::muted()).child(
-                                if family.description.is_empty() {
-                                    "Light and dark variants".to_owned()
-                                } else {
-                                    family.description
-                                },
-                            )),
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(description),
+                            ),
                     )
                     .when(selected, |row| row.child(status_dot(theme::accent())))
                     .into_any_element(),
             );
         }
+        let language_listener = cx.listener(|this, index: &usize, _window, cx| {
+            this.set_language(Language::from_index(*index), cx);
+        });
+        let language_options = [
+            i18n.text("System"),
+            i18n.text("English"),
+            i18n.text("Simplified Chinese"),
+        ];
+        let language = segmented(
+            "language-control",
+            &language_options,
+            self.i18n.preference().index(),
+            move |index, window, cx| language_listener(&index, window, cx),
+        );
         let mode_listener = cx.listener(|this, index: &usize, window, cx| {
             let mode = match *index {
                 1 => AppearanceMode::Light,
@@ -101,7 +121,7 @@ impl OcHerdrView {
         });
         let mode = segmented(
             "appearance-mode-control",
-            &["System", "Light", "Dark"],
+            &[i18n.text("System"), i18n.text("Light"), i18n.text("Dark")],
             self.appearance.mode.index(),
             move |index, window, cx| mode_listener(&index, window, cx),
         );
@@ -115,7 +135,7 @@ impl OcHerdrView {
         });
         let backdrop = segmented(
             "appearance-backdrop-control",
-            &["Opaque", "Clear", "Blur"],
+            &[i18n.text("Opaque"), i18n.text("Clear"), i18n.text("Blur")],
             self.appearance.backdrop.index(),
             move |index, window, cx| backdrop_listener(&index, window, cx),
         );
@@ -136,21 +156,21 @@ impl OcHerdrView {
         );
         let done = button(
             "close-appearance-footer",
-            "Done",
+            i18n.text("Done"),
             ButtonTone::Primary,
             ButtonSize::Md,
         )
         .on_click(cx.listener(|this, _, window, cx| this.close_appearance(window, cx)))
         .into_any_element();
         let card = modal_card()
-            .w(px(680.))
-            .h(px(560.))
+            .w(px(720.))
+            .h(px(600.))
             .rounded(px(CORNER_MODAL))
             .child(
-                modal_header("Appearance").child(
+                modal_header(i18n.text("Appearance")).child(
                     icon_only_button_tone(
                         "close-appearance",
-                        "Close",
+                        i18n.text("Close"),
                         IconName::Close,
                         ButtonTone::Ghost,
                         ButtonSize::Sm,
@@ -169,24 +189,35 @@ impl OcHerdrView {
                     .gap_5()
                     .px_5()
                     .py_5()
+                    .child(appearance_setting_row(
+                        i18n.text("Language"),
+                        i18n.text("Choose the language used by OcHerdr."),
+                        language,
+                    ))
                     .child(appearance_section(
-                        "Theme",
-                        "Choose a color family. Each family includes light and dark variants.",
+                        i18n.text("Theme"),
+                        i18n.text(
+                            "Choose a color family. Each family includes light and dark variants.",
+                        ),
                         div().grid().grid_cols(2).gap_2().children(family_rows),
                     ))
                     .child(appearance_setting_row(
-                        "Appearance",
-                        "Follow macOS or pin a variant.",
+                        i18n.text("Appearance"),
+                        i18n.text("Follow macOS or pin a variant."),
                         mode,
                     ))
                     .child(appearance_setting_row(
-                        "Window background",
-                        "Clear keeps true transparency; Blur uses the native macOS backdrop.",
+                        i18n.text("Window background"),
+                        i18n.text(
+                            "Clear keeps true transparency; Blur uses the native macOS backdrop.",
+                        ),
                         backdrop,
                     ))
                     .child(appearance_setting_row(
-                        "Background opacity",
-                        "Applied to terminal and shell surfaces when transparency is enabled.",
+                        i18n.text("Background opacity"),
+                        i18n.text(
+                            "Applied to terminal and shell surfaces when transparency is enabled.",
+                        ),
                         opacity,
                     )),
             )
@@ -253,5 +284,5 @@ fn appearance_setting_row(
                 )
                 .child(div().text_xs().text_color(theme::muted()).child(hint)),
         )
-        .child(div().w(px(250.)).flex_none().child(control))
+        .child(div().w(px(300.)).flex_none().child(control))
 }

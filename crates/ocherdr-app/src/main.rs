@@ -33,7 +33,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod controller;
+mod i18n;
 mod ui;
+
+use i18n::{I18n, Language};
 
 const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;
@@ -207,6 +210,8 @@ struct Settings {
     connections: Vec<ConnectionProfile>,
     #[serde(default)]
     appearance: AppearanceSettings,
+    #[serde(default)]
+    language: Language,
 }
 
 struct OcHerdrView {
@@ -245,6 +250,7 @@ struct OcHerdrView {
     remote_search: Entity<TextInput>,
     rename_input: Entity<TextInput>,
     appearance: AppearanceSettings,
+    i18n: I18n,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -255,20 +261,20 @@ enum ConnectionSource {
 }
 
 impl ConnectionSource {
-    fn label(self) -> &'static str {
-        match self {
+    fn label(self, i18n: I18n) -> &'static str {
+        i18n.text(match self {
             Self::Current => "CURRENT",
             Self::Saved => "SAVED",
             Self::SshConfig => "SSH CONFIG",
-        }
+        })
     }
 
-    fn description(self) -> &'static str {
-        match self {
+    fn description(self, i18n: I18n) -> &'static str {
+        i18n.text(match self {
             Self::Current => "This Mac",
             Self::Saved => "Saved in OcHerdr",
             Self::SshConfig => "Imported from ~/.ssh/config",
-        }
+        })
     }
 }
 
@@ -294,18 +300,18 @@ fn profile_endpoint(profile: &ConnectionProfile) -> String {
     }
 }
 
-fn profile_matches_search(profile: &ConnectionProfile, query: &str) -> bool {
+fn profile_matches_search(profile: &ConnectionProfile, query: &str, i18n: I18n) -> bool {
     if query.is_empty() {
         return true;
     }
     profile.label().to_lowercase().contains(query)
         || profile_endpoint(profile).to_lowercase().contains(query)
         || connection_source(profile)
-            .label()
+            .label(i18n)
             .to_lowercase()
             .contains(query)
         || connection_source(profile)
-            .description()
+            .description(i18n)
             .to_lowercase()
             .contains(query)
 }
@@ -351,6 +357,7 @@ fn load_settings() -> Settings {
 fn save_settings(
     profiles: &[ConnectionProfile],
     appearance: &AppearanceSettings,
+    language: Language,
 ) -> std::result::Result<(), String> {
     let connections = profiles
         .iter()
@@ -360,6 +367,7 @@ fn save_settings(
     let settings = Settings {
         connections,
         appearance: appearance.clone(),
+        language,
     };
     let path =
         settings_path().ok_or_else(|| "Application Support directory is unavailable".to_owned())?;
@@ -375,8 +383,9 @@ fn main() {
     application()
         .with_assets(OcHerdrAssets)
         .run(|cx: &mut App| {
-            ochub_ui::install(cx);
             let mut settings = load_settings();
+            let _ = I18n::new(settings.language);
+            ochub_ui::install(cx);
             settings.appearance.theme_family =
                 install_appearance(&settings.appearance, cx.window_appearance());
             cx.open_window(
@@ -433,6 +442,7 @@ mod tests {
         assert_eq!(settings.appearance.mode, AppearanceMode::Dark);
         assert_eq!(settings.appearance.backdrop, BackdropMode::Blurred);
         assert_eq!(settings.appearance.background_opacity, 92);
+        assert_eq!(settings.language, Language::System);
     }
 
     #[test]
@@ -446,9 +456,10 @@ mod tests {
             herdr_path: "herdr".into(),
         };
 
-        assert!(profile_matches_search(&profile, "build"));
-        assert!(profile_matches_search(&profile, "2222"));
-        assert!(profile_matches_search(&profile, "ssh config"));
-        assert!(!profile_matches_search(&profile, "production"));
+        let i18n = I18n::new(Language::English);
+        assert!(profile_matches_search(&profile, "build", i18n));
+        assert!(profile_matches_search(&profile, "2222", i18n));
+        assert!(profile_matches_search(&profile, "ssh config", i18n));
+        assert!(!profile_matches_search(&profile, "production", i18n));
     }
 }

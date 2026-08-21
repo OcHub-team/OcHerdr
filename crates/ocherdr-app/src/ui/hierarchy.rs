@@ -2,6 +2,7 @@ use super::super::*;
 
 impl OcHerdrView {
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let session_rows = self
             .sessions
             .iter()
@@ -9,10 +10,15 @@ impl OcHerdrView {
             .map(|(index, session)| {
                 let selected = self.session_index == Some(index);
                 let running = session.running;
+                let display_name = if session.default {
+                    i18n.text("Default").to_owned()
+                } else {
+                    session.display_name().to_owned()
+                };
                 div()
                     .id(("session", index))
                     .role(ochub_ui::gpui::Role::Button)
-                    .aria_label(session.display_name().to_owned())
+                    .aria_label(display_name.clone())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -34,13 +40,7 @@ impl OcHerdrView {
                     } else {
                         theme::muted()
                     }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .truncate()
-                            .text_sm()
-                            .child(session.display_name().to_owned()),
-                    )
+                    .child(div().flex_1().truncate().text_sm().child(display_name))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -117,7 +117,7 @@ impl OcHerdrView {
                             div()
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(status.label()),
+                                .child(i18n.text(status.label())),
                         )
                         .into_any_element(),
                 );
@@ -146,7 +146,7 @@ impl OcHerdrView {
                         div()
                             .text_base()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Spaces"),
+                            .child(i18n.text("Spaces")),
                     ),
             )
             .child(
@@ -159,15 +159,15 @@ impl OcHerdrView {
                     .overflow_scroll()
                     .px_2()
                     .pb_3()
-                    .child(section_label("SESSIONS"))
+                    .child(section_label(i18n.text("CONNECTIONS")))
                     .children(session_rows)
-                    .child(section_label("WORKSPACES"))
+                    .child(section_label(i18n.text("WORKSPACES")))
                     .children(hierarchy)
                     .child(
                         div()
                             .id("new-workspace")
                             .role(ochub_ui::gpui::Role::Button)
-                            .aria_label("New workspace")
+                            .aria_label(i18n.text("New workspace"))
                             .flex()
                             .items_center()
                             .gap_2()
@@ -183,7 +183,7 @@ impl OcHerdrView {
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _window, cx| this.create_workspace(cx)))
                             .child(icon(IconName::Add, theme::muted(), 12.))
-                            .child("new"),
+                            .child(i18n.text("new")),
                     ),
             )
             .child(
@@ -206,8 +206,8 @@ impl OcHerdrView {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::muted())
-                            .child("AGENTS")
-                            .child("STATUS"),
+                            .child(i18n.text("AGENTS"))
+                            .child(i18n.text("STATUS")),
                     )
                     .child(
                         div()
@@ -222,6 +222,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
         let mut tabs = Vec::new();
         if let (Some(snapshot), Some(workspace_id)) =
             (&self.snapshot, self.selection.workspace_id.as_deref())
@@ -279,7 +280,7 @@ impl OcHerdrView {
                             row.child(
                                 icon_only_button_tone(
                                     ("close-tab", tab.number),
-                                    "Close tab",
+                                    i18n.text("Close tab"),
                                     IconName::Close,
                                     ButtonTone::Ghost,
                                     ButtonSize::Sm,
@@ -321,7 +322,7 @@ impl OcHerdrView {
             .child(
                 icon_only_button_tone(
                     "new-tab",
-                    "New tab",
+                    i18n.text("New tab"),
                     IconName::Add,
                     ButtonTone::Ghost,
                     ButtonSize::Sm,
@@ -333,7 +334,7 @@ impl OcHerdrView {
             .child(
                 icon_only_button_tone(
                     "split-right",
-                    "Split pane right",
+                    i18n.text("Split pane right"),
                     IconName::Blocks,
                     ButtonTone::Primary,
                     ButtonSize::Sm,
@@ -351,7 +352,7 @@ impl OcHerdrView {
             .child(
                 icon_only_button_tone(
                     "split-down",
-                    "Split pane down",
+                    i18n.text("Split pane down"),
                     IconName::ChevronDown,
                     ButtonTone::Ghost,
                     ButtonSize::Sm,
@@ -369,7 +370,7 @@ impl OcHerdrView {
             .child(
                 icon_only_button_tone(
                     "zoom-pane",
-                    "Zoom pane",
+                    i18n.text("Zoom pane"),
                     IconName::Eye,
                     ButtonTone::Ghost,
                     ButtonSize::Sm,
@@ -387,7 +388,7 @@ impl OcHerdrView {
             .child(
                 icon_only_button_tone(
                     "close-pane",
-                    "Close pane",
+                    i18n.text("Close pane"),
                     IconName::Close,
                     ButtonTone::Ghost,
                     ButtonSize::Sm,
@@ -410,7 +411,7 @@ impl OcHerdrView {
             .child(
                 icon_only_button_tone(
                     "open-appearance",
-                    "Appearance",
+                    i18n.text("Appearance"),
                     IconName::Palette,
                     if self.appearance_open {
                         ButtonTone::Primary
@@ -424,7 +425,7 @@ impl OcHerdrView {
             .child(
                 icon_only_button_tone(
                     "open-herdr-settings",
-                    "Herdr settings",
+                    i18n.text("Herdr settings"),
                     IconName::Settings,
                     if herdr_settings_open {
                         ButtonTone::Primary
@@ -437,7 +438,7 @@ impl OcHerdrView {
             )
             .child(icon_button_tone(
                 "manage-nodes",
-                "Remote",
+                i18n.text("Remote"),
                 IconName::Globe,
                 if node_manager_open { ButtonTone::Primary } else { ButtonTone::Neutral },
                 ButtonSize::Sm,
@@ -445,13 +446,18 @@ impl OcHerdrView {
     }
 
     pub(super) fn render_status_bar(&self) -> impl IntoElement {
+        let i18n = self.i18n;
         let profile = self.current_profile();
         let profile_icon = if matches!(profile, ConnectionProfile::Local { .. }) {
             IconName::Desktop
         } else {
             IconName::Cloud
         };
-        let profile_label = profile.label().to_owned();
+        let profile_label = if matches!(profile, ConnectionProfile::Local { .. }) {
+            i18n.text("Local").to_owned()
+        } else {
+            profile.label().to_owned()
+        };
         let status = if self.prefix_pending {
             div()
                 .flex()
@@ -465,9 +471,9 @@ impl OcHerdrView {
                         .bg(theme::accent_fill())
                         .text_color(theme::accent_text())
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("PREFIX"),
+                        .child(i18n.text("PREFIX")),
                 )
-                .child("C new tab · ⇧N new workspace · S settings · 1–9 switch tab")
+                .child(i18n.text("C new tab · ⇧N new workspace · S settings · 1–9 switch tab"))
                 .into_any_element()
         } else if let Some(operation) = &self.operation {
             div()
@@ -483,30 +489,19 @@ impl OcHerdrView {
                 .items_center()
                 .gap_2()
                 .child(status_dot(theme::red()))
-                .child("Connection unavailable")
+                .child(i18n.text("Connection unavailable"))
                 .into_any_element()
         } else if let Some(snapshot) = &self.snapshot {
-            let subscription = if self.events.is_some() {
-                "subscription active"
-            } else {
-                "snapshot"
-            };
             div()
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(status_dot(theme::green()))
-                .child(format!(
-                    "Herdr {} · protocol {} · connected · {} · {} workspace{}",
-                    snapshot.version,
+                .child(i18n.herdr_status(
+                    &snapshot.version,
                     snapshot.protocol,
-                    subscription,
+                    self.events.is_some(),
                     snapshot.workspaces.len(),
-                    if snapshot.workspaces.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
                 ))
                 .into_any_element()
         } else {
@@ -515,7 +510,7 @@ impl OcHerdrView {
                 .items_center()
                 .gap_2()
                 .child(status_dot(theme::muted()))
-                .child("No Herdr session")
+                .child(i18n.text("No Herdr session"))
                 .into_any_element()
         };
         div()
@@ -549,11 +544,12 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> ochub_ui::gpui::AnyElement {
+        let i18n = self.i18n;
         self.resize_visible_terminals(window);
         let Some(snapshot) = self.snapshot.clone() else {
             let cta = button(
                 "retry-empty",
-                "Refresh",
+                i18n.text("Refresh"),
                 ButtonTone::Primary,
                 ButtonSize::Sm,
             )
@@ -567,8 +563,8 @@ impl OcHerdrView {
                 .bg(theme::content_background())
                 .child(empty_state(
                     IconName::Terminal,
-                    "No running Herdr session",
-                    "Start Herdr locally or open Remote in the top-right.",
+                    i18n.text("No running Herdr session"),
+                    i18n.text("Start Herdr locally or open Remote in the top-right."),
                     Some(cta),
                 ))
                 .into_any_element();
@@ -581,8 +577,8 @@ impl OcHerdrView {
                 .justify_center()
                 .child(empty_state(
                     IconName::Layers,
-                    "This session has no tabs",
-                    "Create a workspace to open the first terminal.",
+                    i18n.text("This session has no tabs"),
+                    i18n.text("Create a workspace to open the first terminal."),
                     None,
                 ))
                 .into_any_element();
@@ -627,7 +623,7 @@ impl OcHerdrView {
                 .panes
                 .get(&pane.pane_id)
                 .map(|runtime| runtime.text.clone())
-                .unwrap_or_else(|| "Connecting…".into());
+                .unwrap_or_else(|| i18n.text("Connecting…").into());
             elements.push(
                 render_pane(pane, text, geometry, selected)
                     .on_click(cx.listener(

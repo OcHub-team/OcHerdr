@@ -2,6 +2,7 @@ use super::*;
 
 impl OcHerdrView {
     pub(super) fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
+        let i18n = I18n::new(settings.language);
         let mut profiles = vec![ConnectionProfile::default()];
         profiles.extend(settings.connections);
         let saved_destinations = profiles
@@ -25,8 +26,11 @@ impl OcHerdrView {
                     herdr_path: "herdr".into(),
                 }),
         );
-        let remote_search =
-            cx.new(|cx| TextInput::new(cx, "Search hosts").search_field().compact());
+        let remote_search = cx.new(|cx| {
+            TextInput::new(cx, i18n.text("Search hosts"))
+                .search_field()
+                .compact()
+        });
         cx.subscribe(&remote_search, |this, _input, _: &TextInputEvent, cx| {
             this.ensure_managed_profile_visible(cx);
         })
@@ -62,14 +66,17 @@ impl OcHerdrView {
             rename_target: None,
             context_menu: None,
             prefix_pending: false,
-            remote_label: cx.new(|cx| TextInput::new(cx, "Production")),
-            remote_destination: cx.new(|cx| TextInput::new(cx, "user@example.com or SSH alias")),
-            remote_port: cx.new(|cx| TextInput::new(cx, "22 (optional)")),
-            remote_identity_file: cx.new(|cx| TextInput::new(cx, "~/.ssh/id_ed25519 (optional)")),
+            remote_label: cx.new(|cx| TextInput::new(cx, i18n.text("Production"))),
+            remote_destination: cx
+                .new(|cx| TextInput::new(cx, i18n.text("user@example.com or SSH alias"))),
+            remote_port: cx.new(|cx| TextInput::new(cx, i18n.text("22 (optional)"))),
+            remote_identity_file: cx
+                .new(|cx| TextInput::new(cx, i18n.text("~/.ssh/id_ed25519 (optional)"))),
             remote_herdr_path: cx.new(|cx| TextInput::new(cx, "herdr").with_content("herdr")),
             remote_search,
-            rename_input: cx.new(|cx| TextInput::new(cx, "Name")),
+            rename_input: cx.new(|cx| TextInput::new(cx, i18n.text("Name"))),
             appearance: settings.appearance,
+            i18n,
         };
         view.reload(None, cx);
         view
@@ -92,7 +99,7 @@ impl OcHerdrView {
         let epoch = self.load_epoch;
         let profile = self.current_profile();
         self.error = None;
-        self.operation = Some("Discovering Herdr sessions…".into());
+        self.operation = Some(self.i18n.text("Discovering Herdr sessions…").into());
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
@@ -352,7 +359,7 @@ impl OcHerdrView {
         if self
             .profiles
             .get(self.managed_profile_index)
-            .is_some_and(|profile| profile_matches_search(profile, &query))
+            .is_some_and(|profile| profile_matches_search(profile, &query, self.i18n))
         {
             cx.notify();
             return;
@@ -360,7 +367,7 @@ impl OcHerdrView {
         if let Some(index) = self
             .profiles
             .iter()
-            .position(|profile| profile_matches_search(profile, &query))
+            .position(|profile| profile_matches_search(profile, &query, self.i18n))
         {
             self.managed_profile_index = index;
         }
@@ -380,7 +387,8 @@ impl OcHerdrView {
         self.appearance.background_opacity = self.appearance.background_opacity.clamp(40, 100);
         self.appearance.theme_family = install_appearance(&self.appearance, window.appearance());
         theme::apply_window_background(window);
-        if let Err(error) = save_settings(&self.profiles, &self.appearance) {
+        if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
+        {
             self.error = Some(error.into());
         }
         cx.refresh_windows();
@@ -427,6 +435,34 @@ impl OcHerdrView {
         self.apply_appearance(window, cx);
     }
 
+    pub(super) fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        self.i18n.set_preference(language);
+        theme::reload_registry();
+        self.remote_search.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text("Search hosts"), cx)
+        });
+        self.remote_label.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text("Production"), cx)
+        });
+        self.remote_destination.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text("user@example.com or SSH alias"), cx)
+        });
+        self.remote_port.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text("22 (optional)"), cx)
+        });
+        self.remote_identity_file.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text("~/.ssh/id_ed25519 (optional)"), cx)
+        });
+        self.rename_input.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text("Name"), cx)
+        });
+        if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
+        {
+            self.error = Some(error.into());
+        }
+        cx.notify();
+    }
+
     pub(super) fn request_remove_node(&mut self, index: usize, cx: &mut Context<Self>) {
         if self
             .profiles
@@ -451,7 +487,8 @@ impl OcHerdrView {
             return;
         }
         let removed = self.profiles.remove(index);
-        if let Err(error) = save_settings(&self.profiles, &self.appearance) {
+        if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
+        {
             self.profiles.insert(index, removed);
             self.error = Some(error.into());
             cx.notify();
@@ -557,7 +594,11 @@ impl OcHerdrView {
         };
         let label = self.rename_input.read(cx).content().trim().to_owned();
         if label.is_empty() && !matches!(target, HierarchyTarget::Pane { .. }) {
-            self.error = Some("Workspace and tab names cannot be empty.".into());
+            self.error = Some(
+                self.i18n
+                    .text("Workspace and tab names cannot be empty.")
+                    .into(),
+            );
             self.rename_target = Some(target);
             cx.notify();
             return;
@@ -587,7 +628,7 @@ impl OcHerdrView {
     pub(super) fn save_remote(&mut self, cx: &mut Context<Self>) {
         let destination = self.remote_destination.read(cx).content().trim().to_owned();
         if destination.is_empty() {
-            self.error = Some("SSH destination is required.".into());
+            self.error = Some(self.i18n.text("SSH destination is required.").into());
             return;
         }
         let label = self.remote_label.read(cx).content().trim().to_owned();
@@ -605,7 +646,11 @@ impl OcHerdrView {
             match port_text.parse::<u16>() {
                 Ok(port) if port > 0 => Some(port),
                 _ => {
-                    self.error = Some("SSH port must be a number from 1 to 65535.".into());
+                    self.error = Some(
+                        self.i18n
+                            .text("SSH port must be a number from 1 to 65535.")
+                            .into(),
+                    );
                     return;
                 }
             }
@@ -635,7 +680,8 @@ impl OcHerdrView {
             },
         };
         self.profiles.push(profile);
-        if let Err(error) = save_settings(&self.profiles, &self.appearance) {
+        if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
+        {
             self.profiles.pop();
             self.error = Some(error.into());
             return;
@@ -673,7 +719,7 @@ impl OcHerdrView {
 
     pub(super) fn open_native_tui(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.current_session() else {
-            self.error = Some("No Herdr session is selected.".into());
+            self.error = Some(self.i18n.text("No Herdr session is selected.").into());
             cx.notify();
             return;
         };
@@ -783,7 +829,7 @@ impl OcHerdrView {
                     PaneRuntime {
                         session,
                         terminal,
-                        text: "Waiting for terminal frame…".into(),
+                        text: self.i18n.text("Waiting for terminal frame…").into(),
                         mode,
                         size: (cols, rows),
                     },
@@ -1220,7 +1266,7 @@ impl OcHerdrView {
             return;
         };
         let socket = connection.socket_path().to_owned();
-        self.operation = Some(format!("Running {method}…").into());
+        self.operation = Some(self.i18n.running_operation(method).into());
         self.error = None;
         cx.spawn(async move |this, cx| {
             let result = cx

@@ -18,6 +18,7 @@ ocherdr-terminal = { path = "../ocherdr-terminal" }
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sys-locale.workspace = true
 
 [[bin]]
 name = "ocherdr"
