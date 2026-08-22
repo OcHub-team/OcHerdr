@@ -47,7 +47,7 @@ impl Render for OcHerdrView {
             .child(self.render_sidebar(cx))
             .child(main)
             .into_any_element();
-        let body = if self.node_manager_open {
+        let body = if self.overlay.host_center() {
             self.render_node_manager(cx).into_any_element()
         } else {
             workspace_body
@@ -63,48 +63,44 @@ impl Render for OcHerdrView {
                 if this.handle_overlay_key(event, window, cx) {
                     return;
                 }
-                if this.rename_target.is_some()
-                    || this.remote_form != RemoteForm::Closed
-                    || this.appearance_open
-                    || this.herdr_settings_open
-                    || this.node_manager_open
-                    || this.host_switcher_open
-                    || this.pending_close.is_some()
-                    || this.pending_remove_profile.is_some()
-                    || this.pending_bulk_remove
-                    || this.pending_switch_profile.is_some()
-                    || this.context_menu.is_some()
-                {
+                if !key_goes_to_terminal(&this.overlay) {
                     return;
                 }
                 this.send_key(event, window, cx);
             }))
             .child(body);
-        if !self.node_manager_open {
+        if !self.overlay.host_center() {
             root = root.child(self.render_status_bar(cx));
         }
-        if self.host_switcher_open {
-            root = root.child(self.render_host_switcher(cx));
-        }
-        if self.appearance_open {
-            root = root.child(self.render_appearance(cx));
-        }
-        if self.herdr_settings_open {
-            root = root.child(self.render_herdr_settings(cx));
-        }
-        if self.context_menu.is_some() {
-            root = root.child(self.render_context_menu(cx));
-        }
-        if self.pending_switch_profile.is_some() {
-            root = root.child(self.render_switch_host(cx));
-        } else if self.pending_bulk_remove {
-            root = root.child(self.render_bulk_remove(cx));
-        } else if self.pending_remove_profile.is_some() {
-            root = root.child(self.render_remove_node(cx));
-        } else if self.pending_close.is_some() {
-            root = root.child(self.render_close_target(cx));
-        } else if self.rename_target.is_some() {
-            root = root.child(self.render_rename(cx));
+        match self.overlay.clone() {
+            Overlay::None | Overlay::NodeManager | Overlay::RemoteForm(_) => {}
+            Overlay::HostSwitcher => {
+                root = root.child(self.render_host_switcher(cx));
+            }
+            Overlay::Appearance => {
+                root = root.child(self.render_appearance(cx));
+            }
+            Overlay::HerdrSettings => {
+                root = root.child(self.render_herdr_settings(cx));
+            }
+            Overlay::ContextMenu(menu) => {
+                root = root.child(self.render_context_menu(menu, cx));
+            }
+            Overlay::ConfirmSwitchProfile { index, .. } => {
+                root = root.child(self.render_switch_host(index, cx));
+            }
+            Overlay::ConfirmBulkRemove => {
+                root = root.child(self.render_bulk_remove(cx));
+            }
+            Overlay::ConfirmRemoveProfile(index) => {
+                root = root.child(self.render_remove_node(index, cx));
+            }
+            Overlay::ConfirmClose(target) => {
+                root = root.child(self.render_close_target(&target, cx));
+            }
+            Overlay::Rename(target) => {
+                root = root.child(self.render_rename(&target, cx));
+            }
         }
         root
     }

@@ -411,15 +411,9 @@ struct OcHerdrView {
     snapshot_refreshing: bool,
     snapshot_refresh_pending: bool,
     session_panes: Option<SessionPanes>,
-    node_manager_open: bool,
-    remote_form: RemoteForm,
-    appearance_open: bool,
-    herdr_settings_open: bool,
+    overlay: Overlay,
     herdr_settings_section: usize,
     managed_profile_index: usize,
-    pending_remove_profile: Option<usize>,
-    pending_switch_profile: Option<usize>,
-    host_switcher_open: bool,
     remote_advanced_open: bool,
     recent_connection_ids: Vec<String>,
     host_metadata: HashMap<String, HostMetadata>,
@@ -431,11 +425,7 @@ struct OcHerdrView {
     host_checks_running: usize,
     host_bulk_mode: bool,
     host_bulk_selection: HashSet<String>,
-    pending_bulk_remove: bool,
     orphaned_ssh_hosts: HashSet<String>,
-    pending_close: Option<HierarchyTarget>,
-    rename_target: Option<HierarchyTarget>,
-    context_menu: Option<HierarchyContextMenu>,
     prefix_pending: bool,
     text_drag_pane: Option<String>,
     ime_marked: Option<String>,
@@ -452,9 +442,44 @@ struct OcHerdrView {
     i18n: I18n,
 }
 
+#[derive(Clone, Debug)]
+enum Overlay {
+    None,
+    NodeManager,
+    RemoteForm(RemoteForm),
+    Appearance,
+    HerdrSettings,
+    HostSwitcher,
+    ContextMenu(HierarchyContextMenu),
+    Rename(HierarchyTarget),
+    ConfirmClose(HierarchyTarget),
+    ConfirmRemoveProfile(usize),
+    ConfirmSwitchProfile { index: usize, from_hosts: bool },
+    ConfirmBulkRemove,
+}
+
+impl Overlay {
+    fn host_center(&self) -> bool {
+        matches!(
+            self,
+            Self::NodeManager
+                | Self::RemoteForm(_)
+                | Self::ConfirmRemoveProfile(_)
+                | Self::ConfirmBulkRemove
+                | Self::ConfirmSwitchProfile {
+                    from_hosts: true,
+                    ..
+                }
+        )
+    }
+}
+
+fn key_goes_to_terminal(overlay: &Overlay) -> bool {
+    matches!(overlay, Overlay::None)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteForm {
-    Closed,
     Create,
     Edit(usize),
 }
@@ -821,6 +846,47 @@ mod tests {
         assert!(!switch_requires_confirm(0, 0, true));
         assert!(!switch_requires_confirm(1, 2, false));
         assert!(switch_requires_confirm(1, 2, true));
+    }
+
+    #[test]
+    fn keys_go_to_the_terminal_only_when_no_overlay_is_open() {
+        let target = HierarchyTarget::Pane {
+            id: "p".into(),
+            label: "p".into(),
+        };
+        let overlays = [
+            Overlay::None,
+            Overlay::NodeManager,
+            Overlay::RemoteForm(RemoteForm::Create),
+            Overlay::RemoteForm(RemoteForm::Edit(0)),
+            Overlay::Appearance,
+            Overlay::HerdrSettings,
+            Overlay::HostSwitcher,
+            Overlay::ContextMenu(HierarchyContextMenu {
+                target: target.clone(),
+                x: 0.,
+                y: 0.,
+            }),
+            Overlay::Rename(target.clone()),
+            Overlay::ConfirmClose(target),
+            Overlay::ConfirmRemoveProfile(0),
+            Overlay::ConfirmSwitchProfile {
+                index: 0,
+                from_hosts: false,
+            },
+            Overlay::ConfirmSwitchProfile {
+                index: 1,
+                from_hosts: true,
+            },
+            Overlay::ConfirmBulkRemove,
+        ];
+        for overlay in overlays {
+            assert_eq!(
+                key_goes_to_terminal(&overlay),
+                matches!(overlay, Overlay::None),
+                "{overlay:?}"
+            );
+        }
     }
 
     #[test]

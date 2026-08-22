@@ -8,6 +8,7 @@ use ochub_ui::gpui::{Div, Role, Stateful, Toggled, prelude::*};
 
 use super::EventStreamState;
 use super::OcHerdrView;
+use super::Overlay;
 use super::i18n::I18n;
 use super::profile_display_label;
 
@@ -408,9 +409,9 @@ impl OcHerdrView {
             snapshot: self.snapshot.as_ref(),
             selection: &self.selection,
             i18n: self.i18n,
-            appearance_open: self.appearance_open,
-            herdr_settings_open: self.herdr_settings_open,
-            node_manager_open: self.node_manager_open,
+            appearance_open: matches!(self.overlay, Overlay::Appearance),
+            herdr_settings_open: matches!(self.overlay, Overlay::HerdrSettings),
+            node_manager_open: self.overlay.host_center(),
             prefix_pending: self.prefix_pending,
             operation: self.operation.as_deref(),
             has_error: self.error.is_some(),

@@ -394,8 +394,8 @@ impl OcHerdrView {
         let pane_id_down = self.selection.pane_id.clone();
         let pane_id_zoom = self.selection.pane_id.clone();
         let pane_id_close = self.selection.pane_id.clone();
-        let node_manager_open = self.node_manager_open;
-        let herdr_settings_open = self.herdr_settings_open;
+        let node_manager_open = self.overlay.host_center();
+        let herdr_settings_open = matches!(self.overlay, Overlay::HerdrSettings);
         div()
             .flex()
             .items_center()
@@ -527,7 +527,7 @@ impl OcHerdrView {
                         "open-appearance",
                         chrome.toolbar.appearance.name.clone(),
                         IconName::Palette,
-                        if self.appearance_open {
+                        if matches!(self.overlay, Overlay::Appearance) {
                             ButtonTone::Primary
                         } else {
                             ButtonTone::Ghost
@@ -577,7 +577,7 @@ impl OcHerdrView {
             IconName::Globe
         };
         let profile_label = profile_display_label(&profile, i18n);
-        let switcher_open = self.host_switcher_open;
+        let switcher_open = matches!(self.overlay, Overlay::HostSwitcher);
         let status = if self.prefix_pending {
             div()
                 .flex()

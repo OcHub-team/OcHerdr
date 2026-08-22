@@ -121,15 +121,9 @@ impl OcHerdrView {
             snapshot_refreshing: false,
             snapshot_refresh_pending: false,
             session_panes: None,
-            node_manager_open: false,
-            remote_form: RemoteForm::Closed,
-            appearance_open: false,
-            herdr_settings_open: false,
+            overlay: Overlay::None,
             herdr_settings_section: 0,
             managed_profile_index: 0,
-            pending_remove_profile: None,
-            pending_switch_profile: None,
-            host_switcher_open: false,
             remote_advanced_open: false,
             recent_connection_ids,
             host_metadata,
@@ -141,11 +135,7 @@ impl OcHerdrView {
             host_checks_running: 0,
             host_bulk_mode: false,
             host_bulk_selection: HashSet::new(),
-            pending_bulk_remove: false,
             orphaned_ssh_hosts,
-            pending_close: None,
-            rename_target: None,
-            context_menu: None,
             prefix_pending: false,
             text_drag_pane: None,
             ime_marked: None,
@@ -490,7 +480,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn open_add_remote(&mut self, cx: &mut Context<Self>) {
-        self.remote_form = RemoteForm::Create;
+        self.overlay = Overlay::RemoteForm(RemoteForm::Create);
         self.remote_advanced_open = false;
         self.error = None;
         self.clear_remote_form(cx);
@@ -498,57 +488,42 @@ impl OcHerdrView {
     }
 
     pub(super) fn open_node_manager(&mut self, cx: &mut Context<Self>) {
-        self.node_manager_open = true;
-        self.host_switcher_open = false;
-        self.appearance_open = false;
-        self.herdr_settings_open = false;
-        self.context_menu = None;
-        self.remote_form = RemoteForm::Closed;
+        self.overlay = Overlay::NodeManager;
         self.managed_profile_index = self.profile_index;
         self.host_filter = HostFilter::All;
         self.host_bulk_mode = false;
         self.host_bulk_selection.clear();
-        self.pending_bulk_remove = false;
         self.error = None;
         self.refresh_common_host_health(cx);
         cx.notify();
     }
 
     pub(super) fn close_node_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.node_manager_open = false;
-        self.remote_form = RemoteForm::Closed;
-        self.pending_remove_profile = None;
+        self.overlay = Overlay::None;
         self.host_bulk_mode = false;
         self.host_bulk_selection.clear();
-        self.pending_bulk_remove = false;
         self.focus.focus(window, cx);
         cx.notify();
     }
 
     pub(super) fn open_appearance(&mut self, cx: &mut Context<Self>) {
-        self.appearance_open = true;
-        self.node_manager_open = false;
-        self.herdr_settings_open = false;
-        self.context_menu = None;
+        self.overlay = Overlay::Appearance;
         cx.notify();
     }
 
     pub(super) fn close_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.appearance_open = false;
+        self.overlay = Overlay::None;
         self.focus.focus(window, cx);
         cx.notify();
     }
 
     pub(super) fn open_herdr_settings(&mut self, cx: &mut Context<Self>) {
-        self.herdr_settings_open = true;
-        self.node_manager_open = false;
-        self.appearance_open = false;
-        self.context_menu = None;
+        self.overlay = Overlay::HerdrSettings;
         cx.notify();
     }
 
     pub(super) fn close_herdr_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.herdr_settings_open = false;
+        self.overlay = Overlay::None;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -569,7 +544,9 @@ impl OcHerdrView {
                 return;
             }
             self.managed_profile_index = index;
-            self.remote_form = RemoteForm::Closed;
+            if matches!(self.overlay, Overlay::RemoteForm(_)) {
+                self.overlay = Overlay::NodeManager;
+            }
             cx.notify();
         }
     }
@@ -584,14 +561,16 @@ impl OcHerdrView {
             return;
         }
         self.managed_profile_index = index;
-        self.remote_form = RemoteForm::Edit(index);
+        self.overlay = Overlay::RemoteForm(RemoteForm::Edit(index));
         self.fill_remote_form(&profile, cx);
         cx.notify();
     }
 
     pub(super) fn set_host_filter(&mut self, filter: HostFilter, cx: &mut Context<Self>) {
         self.host_filter = filter;
-        self.remote_form = RemoteForm::Closed;
+        if matches!(self.overlay, Overlay::RemoteForm(_)) {
+            self.overlay = Overlay::NodeManager;
+        }
         if let Some(index) = self.filtered_profile_indexes(cx).first().copied() {
             self.managed_profile_index = index;
         }
@@ -618,7 +597,9 @@ impl OcHerdrView {
     pub(super) fn toggle_host_bulk_mode(&mut self, cx: &mut Context<Self>) {
         self.host_bulk_mode = !self.host_bulk_mode;
         self.host_bulk_selection.clear();
-        self.remote_form = RemoteForm::Closed;
+        if matches!(self.overlay, Overlay::RemoteForm(_)) {
+            self.overlay = Overlay::NodeManager;
+        }
         if self.host_bulk_mode {
             self.remote_group
                 .update(cx, |input, cx| input.set_content("", cx));
@@ -703,20 +684,22 @@ impl OcHerdrView {
             cx.notify();
             return;
         }
-        self.pending_bulk_remove = true;
+        self.overlay = Overlay::ConfirmBulkRemove;
         cx.notify();
     }
 
     pub(super) fn cancel_bulk_remove(&mut self, cx: &mut Context<Self>) {
-        self.pending_bulk_remove = false;
+        if matches!(self.overlay, Overlay::ConfirmBulkRemove) {
+            self.overlay = Overlay::NodeManager;
+        }
         cx.notify();
     }
 
     pub(super) fn confirm_bulk_remove(&mut self, cx: &mut Context<Self>) {
-        if !self.pending_bulk_remove {
+        if !matches!(self.overlay, Overlay::ConfirmBulkRemove) {
             return;
         }
-        self.pending_bulk_remove = false;
+        self.overlay = Overlay::NodeManager;
         let selected = self.host_bulk_selection.clone();
         let original_profiles = self.profiles.clone();
         let original_recents = self.recent_connection_ids.clone();
@@ -1088,8 +1071,10 @@ impl OcHerdrView {
             return;
         }
         if switch_requires_confirm(self.profile_index, index, self.live_herdr_session()) {
-            self.pending_switch_profile = Some(index);
-            self.host_switcher_open = false;
+            self.overlay = Overlay::ConfirmSwitchProfile {
+                index,
+                from_hosts: self.overlay.host_center(),
+            };
             cx.notify();
             return;
         }
@@ -1097,29 +1082,39 @@ impl OcHerdrView {
     }
 
     pub(super) fn cancel_switch_profile(&mut self, cx: &mut Context<Self>) {
-        self.pending_switch_profile = None;
+        let from_hosts = match &self.overlay {
+            Overlay::ConfirmSwitchProfile { from_hosts, .. } => Some(*from_hosts),
+            _ => None,
+        };
+        if let Some(from_hosts) = from_hosts {
+            self.overlay = if from_hosts {
+                Overlay::NodeManager
+            } else {
+                Overlay::None
+            };
+        }
         cx.notify();
     }
 
     pub(super) fn confirm_switch_profile(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.pending_switch_profile.take() else {
+        let &Overlay::ConfirmSwitchProfile { index, .. } = &self.overlay else {
             return;
         };
         self.apply_profile(index, cx);
     }
 
     pub(super) fn toggle_host_switcher(&mut self, cx: &mut Context<Self>) {
-        self.host_switcher_open = !self.host_switcher_open;
-        if self.host_switcher_open {
-            self.node_manager_open = false;
-            self.context_menu = None;
-        }
+        self.overlay = if matches!(self.overlay, Overlay::HostSwitcher) {
+            Overlay::None
+        } else {
+            Overlay::HostSwitcher
+        };
         cx.notify();
     }
 
     pub(super) fn close_host_switcher(&mut self, cx: &mut Context<Self>) {
-        if self.host_switcher_open {
-            self.host_switcher_open = false;
+        if matches!(self.overlay, Overlay::HostSwitcher) {
+            self.overlay = Overlay::None;
             cx.notify();
         }
     }
@@ -1130,10 +1125,7 @@ impl OcHerdrView {
     }
 
     fn apply_profile(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.node_manager_open = false;
-        self.host_switcher_open = false;
-        self.pending_switch_profile = None;
-        self.remote_form = RemoteForm::Closed;
+        self.overlay = Overlay::None;
         if index == self.profile_index {
             self.remember_current_host();
             self.reload(None, cx);
@@ -1310,20 +1302,23 @@ impl OcHerdrView {
             return;
         }
         if self.profiles.get(index).is_some_and(is_saved_profile) {
-            self.pending_remove_profile = Some(index);
+            self.overlay = Overlay::ConfirmRemoveProfile(index);
             cx.notify();
         }
     }
 
     pub(super) fn cancel_remove_node(&mut self, cx: &mut Context<Self>) {
-        self.pending_remove_profile = None;
+        if matches!(self.overlay, Overlay::ConfirmRemoveProfile(_)) {
+            self.overlay = Overlay::NodeManager;
+        }
         cx.notify();
     }
 
     pub(super) fn confirm_remove_node(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.pending_remove_profile.take() else {
+        let &Overlay::ConfirmRemoveProfile(index) = &self.overlay else {
             return;
         };
+        self.overlay = Overlay::NodeManager;
         if index == 0 || index >= self.profiles.len() {
             return;
         }
@@ -1357,19 +1352,19 @@ impl OcHerdrView {
     }
 
     pub(super) fn close_add_remote(&mut self, cx: &mut Context<Self>) {
-        self.remote_form = RemoteForm::Closed;
-        self.sync_remote_form_with_selection(cx);
+        self.overlay = Overlay::NodeManager;
         cx.notify();
     }
 
     pub(super) fn request_close(&mut self, target: HierarchyTarget, cx: &mut Context<Self>) {
-        self.pending_close = Some(target);
-        self.context_menu = None;
+        self.overlay = Overlay::ConfirmClose(target);
         cx.notify();
     }
 
     pub(super) fn cancel_close(&mut self, cx: &mut Context<Self>) {
-        self.pending_close = None;
+        if matches!(self.overlay, Overlay::ConfirmClose(_)) {
+            self.overlay = Overlay::None;
+        }
         cx.notify();
     }
 
@@ -1382,94 +1377,51 @@ impl OcHerdrView {
         let Some(confirm) = overlay_confirm_or_cancel(event) else {
             return false;
         };
-        let enter = confirm;
-        let escape = !confirm;
-        if self.pending_close.is_some() {
-            if enter {
-                self.confirm_close(cx);
-            } else {
-                self.cancel_close(cx);
+        match (self.overlay.clone(), confirm) {
+            (Overlay::ConfirmClose(_), true) => self.confirm_close(cx),
+            (Overlay::ConfirmClose(_), false) => self.cancel_close(cx),
+            (Overlay::ConfirmRemoveProfile(_), true) => self.confirm_remove_node(cx),
+            (Overlay::ConfirmRemoveProfile(_), false) => self.cancel_remove_node(cx),
+            (Overlay::ConfirmBulkRemove, true) => self.confirm_bulk_remove(cx),
+            (Overlay::ConfirmBulkRemove, false) => self.cancel_bulk_remove(cx),
+            (Overlay::Rename(_), true) => self.submit_rename(window, cx),
+            (Overlay::Rename(_), false) => self.cancel_rename(window, cx),
+            (Overlay::ConfirmSwitchProfile { .. }, true) => self.confirm_switch_profile(cx),
+            (Overlay::ConfirmSwitchProfile { .. }, false) => self.cancel_switch_profile(cx),
+            (Overlay::RemoteForm(_), false) => self.close_add_remote(cx),
+            (Overlay::HostSwitcher, false) => self.close_host_switcher(cx),
+            (
+                Overlay::ContextMenu(_)
+                | Overlay::NodeManager
+                | Overlay::Appearance
+                | Overlay::HerdrSettings,
+                false,
+            ) => {
+                self.overlay = Overlay::None;
+                self.focus.focus(window, cx);
+                cx.notify();
             }
-            cx.stop_propagation();
-            return true;
+            _ => return false,
         }
-        if self.pending_remove_profile.is_some() {
-            if enter {
-                self.confirm_remove_node(cx);
-            } else {
-                self.cancel_remove_node(cx);
-            }
-            cx.stop_propagation();
-            return true;
-        }
-        if self.pending_bulk_remove {
-            if enter {
-                self.confirm_bulk_remove(cx);
-            } else {
-                self.cancel_bulk_remove(cx);
-            }
-            cx.stop_propagation();
-            return true;
-        }
-        if self.rename_target.is_some() {
-            if enter {
-                self.submit_rename(window, cx);
-            } else {
-                self.cancel_rename(window, cx);
-            }
-            cx.stop_propagation();
-            return true;
-        }
-        if self.pending_switch_profile.is_some() {
-            if enter {
-                self.confirm_switch_profile(cx);
-            } else {
-                self.cancel_switch_profile(cx);
-            }
-            cx.stop_propagation();
-            return true;
-        }
-        if self.remote_form != RemoteForm::Closed && escape {
-            self.close_add_remote(cx);
-            cx.stop_propagation();
-            return true;
-        }
-        if escape && self.host_switcher_open {
-            self.close_host_switcher(cx);
-            cx.stop_propagation();
-            return true;
-        }
-        if escape
-            && (self.context_menu.take().is_some()
-                || self.node_manager_open
-                || self.appearance_open
-                || self.herdr_settings_open)
-        {
-            self.node_manager_open = false;
-            self.remote_form = RemoteForm::Closed;
-            self.host_switcher_open = false;
-            self.appearance_open = false;
-            self.herdr_settings_open = false;
-            self.focus.focus(window, cx);
-            cx.stop_propagation();
-            cx.notify();
-            return true;
-        }
-        false
+        cx.stop_propagation();
+        true
     }
 
     pub(super) fn confirm_close(&mut self, cx: &mut Context<Self>) {
-        if let Some(target) = self.pending_close.take() {
-            match target {
-                HierarchyTarget::Workspace { id, .. } => {
-                    self.invoke("workspace.close", json!({ "workspace_id": id }), cx)
-                }
-                HierarchyTarget::Tab { id, .. } => {
-                    self.invoke("tab.close", json!({ "tab_id": id }), cx)
-                }
-                HierarchyTarget::Pane { id, .. } => {
-                    self.invoke("pane.close", json!({ "pane_id": id }), cx)
-                }
+        let Overlay::ConfirmClose(target) = &self.overlay else {
+            return;
+        };
+        let target = target.clone();
+        self.overlay = Overlay::None;
+        match target {
+            HierarchyTarget::Workspace { id, .. } => {
+                self.invoke("workspace.close", json!({ "workspace_id": id }), cx)
+            }
+            HierarchyTarget::Tab { id, .. } => {
+                self.invoke("tab.close", json!({ "tab_id": id }), cx)
+            }
+            HierarchyTarget::Pane { id, .. } => {
+                self.invoke("pane.close", json!({ "pane_id": id }), cx)
             }
         }
     }
@@ -1482,7 +1434,7 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) {
         let viewport = window.viewport_size();
-        self.context_menu = Some(HierarchyContextMenu {
+        self.overlay = Overlay::ContextMenu(HierarchyContextMenu {
             target,
             x: f32::from(event.position.x)
                 .min((f32::from(viewport.width) - 220.).max(8.))
@@ -1496,7 +1448,9 @@ impl OcHerdrView {
     }
 
     pub(super) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
-        self.context_menu = None;
+        if matches!(self.overlay, Overlay::ContextMenu(_)) {
+            self.overlay = Overlay::None;
+        }
         cx.notify();
     }
 
@@ -1509,8 +1463,7 @@ impl OcHerdrView {
         let label = target.label().to_owned();
         self.rename_input
             .update(cx, |input, cx| input.set_content(label, cx));
-        self.rename_target = Some(target);
-        self.context_menu = None;
+        self.overlay = Overlay::Rename(target);
         self.rename_input
             .read(cx)
             .focus_handle(cx)
@@ -1519,15 +1472,18 @@ impl OcHerdrView {
     }
 
     pub(super) fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.rename_target = None;
+        if matches!(self.overlay, Overlay::Rename(_)) {
+            self.overlay = Overlay::None;
+        }
         self.focus.focus(window, cx);
         cx.notify();
     }
 
     pub(super) fn submit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.rename_target.take() else {
+        let Overlay::Rename(target) = &self.overlay else {
             return;
         };
+        let target = target.clone();
         let label = self.rename_input.read(cx).content().trim().to_owned();
         if label.is_empty() && !matches!(target, HierarchyTarget::Pane { .. }) {
             self.error = Some(
@@ -1535,10 +1491,10 @@ impl OcHerdrView {
                     .text("Workspace and tab names cannot be empty.")
                     .into(),
             );
-            self.rename_target = Some(target);
             cx.notify();
             return;
         }
+        self.overlay = Overlay::None;
         match target {
             HierarchyTarget::Workspace { id, .. } => {
                 self.invoke(
@@ -1571,7 +1527,11 @@ impl OcHerdrView {
         let original_profiles = self.profiles.clone();
         let original_metadata = self.host_metadata.clone();
         let original_groups = self.host_groups.clone();
-        let index = match self.remote_form {
+        let form = match &self.overlay {
+            Overlay::RemoteForm(form) => *form,
+            _ => return,
+        };
+        let index = match form {
             RemoteForm::Create => {
                 self.profiles.push(draft);
                 let index = self.profiles.len() - 1;
@@ -1633,7 +1593,7 @@ impl OcHerdrView {
                 }
                 index
             }
-            RemoteForm::Closed | RemoteForm::Edit(_) => return,
+            RemoteForm::Edit(_) => return,
         };
         if let Some(group) = &group
             && !self
@@ -1653,7 +1613,7 @@ impl OcHerdrView {
             return;
         }
         self.managed_profile_index = index;
-        self.remote_form = RemoteForm::Closed;
+        self.overlay = Overlay::NodeManager;
         self.error = None;
         if connect {
             self.request_choose_node(index, cx);
@@ -1694,10 +1654,10 @@ impl OcHerdrView {
                 }
             }
         };
-        let id = match self.remote_form {
-            RemoteForm::Edit(index) => self
+        let id = match &self.overlay {
+            Overlay::RemoteForm(RemoteForm::Edit(index)) => self
                 .profiles
-                .get(index)
+                .get(*index)
                 .map(|profile| profile.id().to_owned())
                 .unwrap_or_else(|| format!("manual-{}", next_manual_profile_id(&self.profiles))),
             _ => format!("manual-{}", next_manual_profile_id(&self.profiles)),
@@ -1794,11 +1754,6 @@ impl OcHerdrView {
                     port.is_some() || identity_file.is_some() || herdr_path != "herdr";
             }
         }
-    }
-
-    fn sync_remote_form_with_selection(&mut self, cx: &mut Context<Self>) {
-        self.remote_form = RemoteForm::Closed;
-        cx.notify();
     }
 
     pub(super) fn host_switcher_entries(&self) -> Vec<usize> {
@@ -2474,7 +2429,9 @@ impl OcHerdrView {
         let modifiers = event.keystroke.modifiers;
         if modifiers.control && !modifiers.platform && !modifiers.alt && key == "b" {
             self.prefix_pending = true;
-            self.context_menu = None;
+            if matches!(self.overlay, Overlay::ContextMenu(_)) {
+                self.overlay = Overlay::None;
+            }
             cx.notify();
             return true;
         }
@@ -2483,22 +2440,21 @@ impl OcHerdrView {
             return true;
         }
         if key == "escape" {
-            if self.context_menu.take().is_some()
-                || self.node_manager_open
-                || self.appearance_open
-                || self.herdr_settings_open
-                || self.host_switcher_open
-            {
-                self.node_manager_open = false;
-                self.remote_form = RemoteForm::Closed;
-                self.host_switcher_open = false;
-                self.appearance_open = false;
-                self.herdr_settings_open = false;
+            if matches!(
+                self.overlay,
+                Overlay::ContextMenu(_)
+                    | Overlay::NodeManager
+                    | Overlay::Appearance
+                    | Overlay::HerdrSettings
+                    | Overlay::HostSwitcher
+            ) {
+                self.overlay = Overlay::None;
                 self.focus.focus(window, cx);
                 cx.notify();
                 return true;
             }
-            if self.pending_close.take().is_some() {
+            if matches!(self.overlay, Overlay::ConfirmClose(_)) {
+                self.overlay = Overlay::None;
                 cx.notify();
                 return true;
             }
@@ -2845,16 +2801,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn accepts_ime(&self) -> bool {
-        self.rename_target.is_none()
-            && self.remote_form == RemoteForm::Closed
-            && !self.appearance_open
-            && !self.herdr_settings_open
-            && !self.node_manager_open
-            && !self.host_switcher_open
-            && self.pending_close.is_none()
-            && self.pending_remove_profile.is_none()
-            && self.pending_switch_profile.is_none()
-            && self.selection.pane_id.is_some()
+        key_goes_to_terminal(&self.overlay) && self.selection.pane_id.is_some()
     }
 
     pub(super) fn commit_ime_text(

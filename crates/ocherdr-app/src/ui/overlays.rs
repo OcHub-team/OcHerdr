@@ -2,12 +2,16 @@ use super::super::*;
 use crate::a11y::apply_dialog;
 
 impl OcHerdrView {
-    pub(super) fn render_switch_host(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_switch_host(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let i18n = self.i18n;
         let current = profile_display_label(&self.current_profile(), i18n);
         let next = self
-            .pending_switch_profile
-            .and_then(|index| self.profiles.get(index))
+            .profiles
+            .get(index)
             .map(|profile| profile_display_label(profile, i18n))
             .unwrap_or_else(|| i18n.text("this host").to_owned());
         let cancel = button(
@@ -59,11 +63,15 @@ impl OcHerdrView {
         }))
     }
 
-    pub(super) fn render_remove_node(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_remove_node(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let i18n = self.i18n;
         let node_name = self
-            .pending_remove_profile
-            .and_then(|index| self.profiles.get(index))
+            .profiles
+            .get(index)
             .map(ConnectionProfile::label)
             .unwrap_or(i18n.text("this node"))
             .to_owned();
@@ -168,14 +176,14 @@ impl OcHerdrView {
         }))
     }
 
-    pub(super) fn render_close_target(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_close_target(
+        &mut self,
+        target: &HierarchyTarget,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let i18n = self.i18n;
-        let target = self.pending_close.as_ref();
-        let kind = target.map(HierarchyTarget::kind_label).unwrap_or("item");
-        let label = target
-            .map(HierarchyTarget::label)
-            .unwrap_or(i18n.text("this item"))
-            .to_owned();
+        let kind = target.kind_label();
+        let label = target.label().to_owned();
         let cancel = button(
             "cancel-close-target",
             i18n.text("Cancel"),
@@ -216,13 +224,14 @@ impl OcHerdrView {
         }))
     }
 
-    pub(super) fn render_rename(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_rename(
+        &mut self,
+        target: &HierarchyTarget,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let i18n = self.i18n;
-        let kind = self
-            .rename_target
-            .as_ref()
-            .map(HierarchyTarget::kind_label)
-            .unwrap_or("item");
+        let kind = target.kind_label();
+        let pane = matches!(target, HierarchyTarget::Pane { .. });
         let cancel = button(
             "cancel-rename",
             i18n.text("Cancel"),
@@ -247,9 +256,9 @@ impl OcHerdrView {
                 .child(
                     modal_body().child(field(
                         i18n.text("Name"),
-                        !matches!(self.rename_target, Some(HierarchyTarget::Pane { .. })),
+                        !pane,
                         Some(
-                            if matches!(self.rename_target, Some(HierarchyTarget::Pane { .. })) {
+                            if pane {
                                 i18n.text("Leave empty to clear the custom pane name.")
                             } else {
                                 i18n.text("Saved directly to the active Herdr session.")
@@ -268,9 +277,12 @@ impl OcHerdrView {
         }))
     }
 
-    pub(super) fn render_context_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_context_menu(
+        &mut self,
+        menu: HierarchyContextMenu,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let i18n = self.i18n;
-        let menu = self.context_menu.clone().expect("context menu state");
         let mut items = Vec::new();
         match menu.target.clone() {
             HierarchyTarget::Workspace { .. } => {
@@ -313,7 +325,7 @@ impl OcHerdrView {
                         false,
                     )
                     .on_click(cx.listener(|this, _, _window, cx| {
-                        this.context_menu = None;
+                        this.overlay = Overlay::None;
                         this.create_tab(cx)
                     }))
                     .into_any_element(),
@@ -357,7 +369,7 @@ impl OcHerdrView {
                         false,
                     )
                     .on_click(cx.listener(|this, _, _window, cx| {
-                        this.context_menu = None;
+                        this.overlay = Overlay::None;
                         this.copy_selection(cx);
                     }))
                     .into_any_element(),
@@ -392,7 +404,7 @@ impl OcHerdrView {
                             false,
                         )
                         .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.context_menu = None;
+                            this.overlay = Overlay::None;
                             this.invoke(
                                 "pane.split",
                                 json!({ "target_pane_id": pane_id, "direction": direction, "focus": true, "right_click": "herdr", "env": {} }),
@@ -412,7 +424,7 @@ impl OcHerdrView {
                         false,
                     )
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.context_menu = None;
+                        this.overlay = Overlay::None;
                         this.invoke(
                             "pane.zoom",
                             json!({ "pane_id": pane_id, "mode": "toggle" }),

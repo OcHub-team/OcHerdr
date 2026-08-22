@@ -20,9 +20,7 @@ impl OcHerdrView {
                 .into_any_element(),
             );
         }
-        let detail = if self.remote_form == RemoteForm::Create
-            || matches!(self.remote_form, RemoteForm::Edit(_))
-        {
+        let detail = if matches!(self.overlay, Overlay::RemoteForm(_)) {
             self.render_remote_form(cx).into_any_element()
         } else if self.host_bulk_mode {
             self.render_bulk_inspector(cx).into_any_element()
@@ -403,8 +401,8 @@ impl OcHerdrView {
             return div().into_any_element();
         };
         let i18n = self.i18n;
-        let selected =
-            index == self.managed_profile_index && self.remote_form != RemoteForm::Create;
+        let selected = index == self.managed_profile_index
+            && !matches!(self.overlay, Overlay::RemoteForm(RemoteForm::Create));
         let active = index == self.profile_index;
         let metadata = self
             .host_metadata
@@ -864,9 +862,9 @@ impl OcHerdrView {
 
     fn render_remote_form(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
-        let creating = self.remote_form == RemoteForm::Create;
-        let index = match self.remote_form {
-            RemoteForm::Edit(index) => Some(index),
+        let creating = matches!(self.overlay, Overlay::RemoteForm(RemoteForm::Create));
+        let index = match &self.overlay {
+            Overlay::RemoteForm(RemoteForm::Edit(index)) => Some(*index),
             _ => None,
         };
         let source = index
