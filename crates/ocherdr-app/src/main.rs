@@ -19,14 +19,15 @@ use ocherdr_terminal::{KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
 use ochub_ui::components::{
     ButtonSize, ButtonTone, button, context_menu, context_menu_item, empty_state, field,
     icon_button_tone, icon_only_button_tone, modal_body, modal_card, modal_footer, modal_header,
-    modal_overlay, segmented, spinner, status_dot,
+    modal_overlay, spinner, status_dot,
 };
 use ochub_ui::gpui::{
     App, AppContext, AssetSource, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, Task, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
-    WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, size, surface,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Task, TitlebarOptions, UTF16Selection, WeakEntity, Window,
+    WindowAppearance, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, size,
+    surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::text_input::{TextInput, TextInputEvent};
@@ -404,6 +405,8 @@ struct OcHerdrView {
     snapshot_refresh_pending: bool,
     session_panes: Option<SessionPanes>,
     overlay: Overlay,
+    open_select: Option<SharedString>,
+    appearance_scroll: ScrollHandle,
     managed_profile_index: usize,
     remote_advanced_open: bool,
     recent_connection_ids: Vec<String>,

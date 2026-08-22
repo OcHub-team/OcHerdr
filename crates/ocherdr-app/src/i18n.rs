@@ -414,8 +414,6 @@ fn zh_hans(english: &'static str) -> &'static str {
         "Point size used by the terminal grid." => "终端网格使用的点数大小。",
         "Ligatures" => "连字",
         "Programming ligatures such as => and !=." => "编程连字，例如 => 和 !=。",
-        "On" => "开",
-        "Off" => "关",
         "Thicken" => "加粗描边",
         "Draw a heavier stroke. macOS only." => "加粗笔画，仅 macOS 有效。",
         "Cell width" => "字宽",

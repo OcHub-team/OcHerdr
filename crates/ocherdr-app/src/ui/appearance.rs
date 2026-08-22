@@ -1,5 +1,9 @@
 use super::super::*;
 use crate::a11y::apply_dialog;
+use ochub_ui::layout::{
+    SelectRowEvent, SelectRowState, group, section_header, select_row, switch_row,
+};
+use ochub_ui::scrollbar::{VerticalScrollbar, contain_vertical_scroll};
 
 impl OcHerdrView {
     pub(super) fn render_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -100,62 +104,76 @@ impl OcHerdrView {
                     .into_any_element(),
             );
         }
-        let language_listener = cx.listener(|this, index: &usize, _window, cx| {
-            this.set_language(Language::from_index(*index), cx);
-        });
-        let language_options = [
-            i18n.text("System"),
-            i18n.text("English"),
-            i18n.text("Simplified Chinese"),
-        ];
-        let language = segmented(
-            "language-control",
-            &language_options,
+
+        let language = select_row(
+            "language",
+            i18n.text("Language"),
+            Some(i18n.text("Choose the language used by OcHerdr.").into()),
+            &[
+                i18n.text("System"),
+                i18n.text("English"),
+                i18n.text("Simplified Chinese"),
+            ],
             self.i18n.preference().index(),
-            move |index, window, cx| language_listener(&index, window, cx),
+            self.select_row_state("language"),
+            appearance_select(cx, "language", |this, index, _window, cx| {
+                this.set_language(Language::from_index(index), cx);
+            }),
         );
-        let mode_listener = cx.listener(|this, index: &usize, window, cx| {
-            let mode = match *index {
-                1 => AppearanceMode::Light,
-                2 => AppearanceMode::Dark,
-                _ => AppearanceMode::System,
-            };
-            this.set_appearance_mode(mode, window, cx);
-        });
-        let mode = segmented(
-            "appearance-mode-control",
+        let mode = select_row(
+            "appearance-mode",
+            i18n.text("Appearance"),
+            Some(i18n.text("Follow macOS or pin a variant.").into()),
             &[i18n.text("System"), i18n.text("Light"), i18n.text("Dark")],
             self.appearance.mode.index(),
-            move |index, window, cx| mode_listener(&index, window, cx),
+            self.select_row_state("appearance-mode"),
+            appearance_select(cx, "appearance-mode", |this, index, window, cx| {
+                let mode = match index {
+                    1 => AppearanceMode::Light,
+                    2 => AppearanceMode::Dark,
+                    _ => AppearanceMode::System,
+                };
+                this.set_appearance_mode(mode, window, cx);
+            }),
         );
-        let backdrop_listener = cx.listener(|this, index: &usize, window, cx| {
-            let backdrop = match *index {
-                1 => BackdropMode::Transparent,
-                2 => BackdropMode::Blurred,
-                _ => BackdropMode::Opaque,
-            };
-            this.set_backdrop_mode(backdrop, window, cx);
-        });
-        let backdrop = segmented(
-            "appearance-backdrop-control",
+        let backdrop = select_row(
+            "appearance-backdrop",
+            i18n.text("Window background"),
+            Some(
+                i18n.text("Clear keeps true transparency; Blur uses the native macOS backdrop.")
+                    .into(),
+            ),
             &[i18n.text("Opaque"), i18n.text("Clear"), i18n.text("Blur")],
             self.appearance.backdrop.index(),
-            move |index, window, cx| backdrop_listener(&index, window, cx),
+            self.select_row_state("appearance-backdrop"),
+            appearance_select(cx, "appearance-backdrop", |this, index, window, cx| {
+                let backdrop = match index {
+                    1 => BackdropMode::Transparent,
+                    2 => BackdropMode::Blurred,
+                    _ => BackdropMode::Opaque,
+                };
+                this.set_backdrop_mode(backdrop, window, cx);
+            }),
         );
         let opacity_values = [100_u8, 92, 84, 72];
         let opacity_index = opacity_values
             .iter()
             .position(|value| *value == self.appearance.background_opacity)
             .unwrap_or(1);
-        let opacity_listener = cx.listener(|this, index: &usize, window, cx| {
-            let opacity = [100_u8, 92, 84, 72].get(*index).copied().unwrap_or(92);
-            this.set_background_opacity(opacity, window, cx);
-        });
-        let opacity = segmented(
-            "appearance-opacity-control",
+        let opacity = select_row(
+            "appearance-opacity",
+            i18n.text("Background opacity"),
+            Some(
+                i18n.text("Applied to terminal and shell surfaces when transparency is enabled.")
+                    .into(),
+            ),
             &["100%", "92%", "84%", "72%"],
             opacity_index,
-            move |index, window, cx| opacity_listener(&index, window, cx),
+            self.select_row_state("appearance-opacity"),
+            appearance_select(cx, "appearance-opacity", |this, index, window, cx| {
+                let opacity = [100_u8, 92, 84, 72].get(index).copied().unwrap_or(92);
+                this.set_background_opacity(opacity, window, cx);
+            }),
         );
         let size_labels = FONT_SIZES.map(|size| size.to_string());
         let size_refs = size_labels.each_ref().map(String::as_str);
@@ -163,58 +181,70 @@ impl OcHerdrView {
             .iter()
             .position(|size| *size == self.appearance.font.size)
             .unwrap_or(2);
-        let size_listener = cx.listener(|this, index: &usize, window, cx| {
-            let size = FONT_SIZES.get(*index).copied().unwrap_or(13);
-            this.set_font_size(size, window, cx);
-        });
-        let font_size = segmented(
-            "appearance-font-size-control",
+        let font_size = select_row(
+            "appearance-font-size",
+            i18n.text("Size"),
+            Some(i18n.text("Point size used by the terminal grid.").into()),
             &size_refs,
             size_index,
-            move |index, window, cx| size_listener(&index, window, cx),
+            self.select_row_state("appearance-font-size"),
+            appearance_select(cx, "appearance-font-size", |this, index, window, cx| {
+                let size = FONT_SIZES.get(index).copied().unwrap_or(13);
+                this.set_font_size(size, window, cx);
+            }),
         );
-        let ligatures_listener = cx.listener(|this, index: &usize, window, cx| {
-            this.set_font_ligatures(*index == 0, window, cx);
+        let ligatures_listener = cx.listener(|this, _: &(), window, cx| {
+            this.set_font_ligatures(!this.appearance.font.ligatures, window, cx);
         });
-        let ligatures = segmented(
-            "appearance-ligatures-control",
-            &[i18n.text("On"), i18n.text("Off")],
-            if self.appearance.font.ligatures { 0 } else { 1 },
-            move |index, window, cx| ligatures_listener(&index, window, cx),
+        let ligatures = switch_row(
+            "appearance-ligatures",
+            i18n.text("Ligatures"),
+            Some(i18n.text("Programming ligatures such as => and !=.").into()),
+            self.appearance.font.ligatures,
+            false,
+            move |window, cx| ligatures_listener(&(), window, cx),
         );
-        let thicken_listener = cx.listener(|this, index: &usize, window, cx| {
-            this.set_font_thicken(*index == 1, window, cx);
+        let thicken_listener = cx.listener(|this, _: &(), window, cx| {
+            this.set_font_thicken(!this.appearance.font.thicken, window, cx);
         });
-        let thicken = segmented(
-            "appearance-thicken-control",
-            &[i18n.text("Off"), i18n.text("On")],
-            if self.appearance.font.thicken { 1 } else { 0 },
-            move |index, window, cx| thicken_listener(&index, window, cx),
+        let thicken = switch_row(
+            "appearance-thicken",
+            i18n.text("Thicken"),
+            Some(i18n.text("Draw a heavier stroke. macOS only.").into()),
+            self.appearance.font.thicken,
+            false,
+            move |window, cx| thicken_listener(&(), window, cx),
         );
         let width_index = CELL_WIDTHS
             .iter()
             .position(|value| *value == self.appearance.font.cell_width_percent)
             .unwrap_or(1);
-        let width_listener = cx.listener(|this, index: &usize, window, cx| {
-            let percent = CELL_WIDTHS.get(*index).copied().unwrap_or(0);
-            this.set_cell_width(percent, window, cx);
-        });
-        let cell_width = segmented(
-            "appearance-cell-width-control",
+        let cell_width = select_row(
+            "appearance-cell-width",
+            i18n.text("Cell width"),
+            Some(
+                i18n.text("Tighten or loosen the terminal cell width.")
+                    .into(),
+            ),
             &[i18n.text("Tight"), i18n.text("Default"), i18n.text("Wide")],
             width_index,
-            move |index, window, cx| width_listener(&index, window, cx),
+            self.select_row_state("appearance-cell-width"),
+            appearance_select(cx, "appearance-cell-width", |this, index, window, cx| {
+                let percent = CELL_WIDTHS.get(index).copied().unwrap_or(0);
+                this.set_cell_width(percent, window, cx);
+            }),
         );
         let height_index = CELL_HEIGHTS
             .iter()
             .position(|value| *value == self.appearance.font.cell_height_percent)
             .unwrap_or(1);
-        let height_listener = cx.listener(|this, index: &usize, window, cx| {
-            let percent = CELL_HEIGHTS.get(*index).copied().unwrap_or(0);
-            this.set_cell_height(percent, window, cx);
-        });
-        let cell_height = segmented(
-            "appearance-cell-height-control",
+        let cell_height = select_row(
+            "appearance-cell-height",
+            i18n.text("Cell height"),
+            Some(
+                i18n.text("Change the vertical space of each terminal row.")
+                    .into(),
+            ),
             &[
                 i18n.text("Compact"),
                 i18n.text("Default"),
@@ -222,8 +252,13 @@ impl OcHerdrView {
                 i18n.text("Loose"),
             ],
             height_index,
-            move |index, window, cx| height_listener(&index, window, cx),
+            self.select_row_state("appearance-cell-height"),
+            appearance_select(cx, "appearance-cell-height", |this, index, window, cx| {
+                let percent = CELL_HEIGHTS.get(index).copied().unwrap_or(0);
+                this.set_cell_height(percent, window, cx);
+            }),
         );
+
         let done = button(
             "close-appearance-footer",
             i18n.text("Done"),
@@ -232,6 +267,7 @@ impl OcHerdrView {
         )
         .on_click(cx.listener(|this, _, window, cx| this.close_appearance(window, cx)))
         .into_any_element();
+        let appearance_scroll = self.appearance_scroll.clone();
         let card = apply_dialog(modal_card(), "appearance-dialog", i18n.text("Appearance"))
             .w(px(720.))
             .h(px(640.))
@@ -250,88 +286,93 @@ impl OcHerdrView {
             )
             .child(
                 div()
-                    .id("appearance-scroll")
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_scroll()
-                    .gap_5()
-                    .px_5()
-                    .py_5()
-                    .child(appearance_setting_row(
-                        i18n.text("Language"),
-                        i18n.text("Choose the language used by OcHerdr."),
-                        language,
-                    ))
-                    .child(appearance_section(
-                        i18n.text("Theme"),
-                        i18n.text(
-                            "Choose a color family. Each family includes light and dark variants.",
-                        ),
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
                         div()
-                            .id("appearance-theme-list")
-                            .role(ochub_ui::gpui::Role::List)
-                            .aria_label(i18n.text("Theme"))
-                            .grid()
-                            .grid_cols(2)
-                            .gap_2()
-                            .children(family_rows),
-                    ))
-                    .child(appearance_setting_row(
-                        i18n.text("Appearance"),
-                        i18n.text("Follow macOS or pin a variant."),
-                        mode,
-                    ))
-                    .child(appearance_setting_row(
-                        i18n.text("Window background"),
-                        i18n.text(
-                            "Clear keeps true transparency; Blur uses the native macOS backdrop.",
-                        ),
-                        backdrop,
-                    ))
-                    .child(appearance_setting_row(
-                        i18n.text("Background opacity"),
-                        i18n.text(
-                            "Applied to terminal and shell surfaces when transparency is enabled.",
-                        ),
-                        opacity,
-                    ))
-                    .child(appearance_section(
-                        i18n.text("Terminal type"),
-                        i18n.text(
-                            "Choose the font used by embedded terminals. Ghostty default is JetBrains Mono.",
-                        ),
-                        self.render_font_family_list(cx),
-                    ))
-                    .child(appearance_setting_row(
-                        i18n.text("Size"),
-                        i18n.text("Point size used by the terminal grid."),
-                        font_size,
-                    ))
-                    .child(appearance_setting_row(
-                        i18n.text("Ligatures"),
-                        i18n.text("Programming ligatures such as => and !=."),
-                        ligatures,
-                    ))
-                    .child(appearance_setting_row(
-                        i18n.text("Thicken"),
-                        i18n.text("Draw a heavier stroke. macOS only."),
-                        thicken,
-                    ))
-                    .child(appearance_setting_row(
-                        i18n.text("Cell width"),
-                        i18n.text("Tighten or loosen the terminal cell width."),
-                        cell_width,
-                    ))
-                    .child(appearance_setting_row(
-                        i18n.text("Cell height"),
-                        i18n.text("Change the vertical space of each terminal row."),
-                        cell_height,
+                            .id("appearance-scroll")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&appearance_scroll)
+                            .on_scroll_wheel(contain_vertical_scroll(appearance_scroll.clone()))
+                            .gap_5()
+                            .px_5()
+                            .py_5()
+                            .child(group(vec![language.into_any_element()]))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .child(section_header(
+                                        i18n.text("Theme"),
+                                        Some(
+                                            i18n.text(
+                                                "Choose a color family. Each family includes light and dark variants.",
+                                            )
+                                            .into(),
+                                        ),
+                                    ))
+                                    .child(
+                                        div()
+                                            .id("appearance-theme-list")
+                                            .role(ochub_ui::gpui::Role::List)
+                                            .aria_label(i18n.text("Theme"))
+                                            .grid()
+                                            .grid_cols(2)
+                                            .gap_2()
+                                            .children(family_rows),
+                                    ),
+                            )
+                            .child(group(vec![
+                                mode.into_any_element(),
+                                backdrop.into_any_element(),
+                                opacity.into_any_element(),
+                            ]))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .child(section_header(
+                                        i18n.text("Terminal type"),
+                                        Some(
+                                            i18n.text(
+                                                "Choose the font used by embedded terminals. Ghostty default is JetBrains Mono.",
+                                            )
+                                            .into(),
+                                        ),
+                                    ))
+                                    .child(self.render_font_family_list(cx)),
+                            )
+                            .child(group(vec![
+                                font_size.into_any_element(),
+                                ligatures.into_any_element(),
+                                thicken.into_any_element(),
+                                cell_width.into_any_element(),
+                                cell_height.into_any_element(),
+                            ])),
+                    )
+                    .child(VerticalScrollbar::new(
+                        ochub_ui::gpui::ElementId::Name("appearance-scroll-scrollbar".into()),
+                        appearance_scroll,
                     )),
             )
             .child(modal_footer(vec![done]));
         modal_overlay(card).top_0().left_0()
+    }
+
+    fn select_row_state(&self, id: &str) -> SelectRowState {
+        SelectRowState::new(false, self.open_select.as_deref() == Some(id))
     }
 
     fn render_font_family_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -422,63 +463,52 @@ impl OcHerdrView {
     }
 }
 
-fn appearance_section(
-    title: &'static str,
-    hint: &'static str,
-    content: impl IntoElement,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text())
-                        .child(title),
-                )
-                .child(div().text_xs().text_color(theme::muted()).child(hint)),
-        )
-        .child(content)
+fn appearance_select(
+    cx: &mut Context<OcHerdrView>,
+    id: &'static str,
+    on_select: impl Fn(&mut OcHerdrView, usize, &mut Window, &mut Context<OcHerdrView>) + 'static,
+) -> impl Fn(SelectRowEvent, &mut Window, &mut App) + 'static {
+    let listener = cx.listener(move |this, event: &SelectRowEvent, window, cx| {
+        if let Some(index) = apply_select_event(&mut this.open_select, id, *event) {
+            on_select(this, index, window, cx);
+        } else {
+            cx.notify();
+        }
+    });
+    move |event, window, cx| listener(&event, window, cx)
 }
 
-fn appearance_setting_row(
-    label: &'static str,
-    hint: &'static str,
-    control: impl IntoElement,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_5()
-        .min_h(px(66.))
-        .px_4()
-        .py_3()
-        .rounded(px(CORNER_PANEL))
-        .border_1()
-        .border_color(theme::border())
-        .bg(theme::surface())
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::text())
-                        .child(label),
-                )
-                .child(div().text_xs().text_color(theme::muted()).child(hint)),
-        )
-        .child(div().w(px(300.)).flex_none().child(control))
+fn apply_select_event(
+    open_select: &mut Option<SharedString>,
+    id: &str,
+    event: SelectRowEvent,
+) -> Option<usize> {
+    match event {
+        SelectRowEvent::Open(true) => {
+            *open_select = Some(id.into());
+            None
+        }
+        SelectRowEvent::Open(false) => {
+            *open_select = None;
+            None
+        }
+        SelectRowEvent::Select(index) => {
+            *open_select = None;
+            Some(index)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_a_select_closes_the_one_that_was_already_open() {
+        let mut open_select = None;
+        apply_select_event(&mut open_select, "a", SelectRowEvent::Open(true));
+        assert_eq!(open_select.as_deref(), Some("a"));
+        apply_select_event(&mut open_select, "b", SelectRowEvent::Open(true));
+        assert_eq!(open_select.as_deref(), Some("b"));
+    }
 }

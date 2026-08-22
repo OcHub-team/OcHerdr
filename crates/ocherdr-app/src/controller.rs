@@ -122,6 +122,8 @@ impl OcHerdrView {
             snapshot_refresh_pending: false,
             session_panes: None,
             overlay: Overlay::None,
+            open_select: None,
+            appearance_scroll: ScrollHandle::new(),
             managed_profile_index: 0,
             remote_advanced_open: false,
             recent_connection_ids,
@@ -506,11 +508,13 @@ impl OcHerdrView {
     }
 
     pub(super) fn open_appearance(&mut self, cx: &mut Context<Self>) {
+        self.open_select = None;
         self.overlay = Overlay::Appearance;
         cx.notify();
     }
 
     pub(super) fn close_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_select = None;
         self.overlay = Overlay::None;
         self.focus.focus(window, cx);
         cx.notify();
@@ -1373,7 +1377,8 @@ impl OcHerdrView {
             (Overlay::ConfirmSwitchProfile { .. }, false) => self.cancel_switch_profile(cx),
             (Overlay::RemoteForm(_), false) => self.close_add_remote(cx),
             (Overlay::HostSwitcher, false) => self.close_host_switcher(cx),
-            (Overlay::ContextMenu(_) | Overlay::NodeManager | Overlay::Appearance, false) => {
+            (Overlay::Appearance, false) => self.close_appearance(window, cx),
+            (Overlay::ContextMenu(_) | Overlay::NodeManager, false) => {
                 self.overlay = Overlay::None;
                 self.focus.focus(window, cx);
                 cx.notify();
@@ -2417,12 +2422,13 @@ impl OcHerdrView {
             return true;
         }
         if key == "escape" {
+            if matches!(self.overlay, Overlay::Appearance) {
+                self.close_appearance(window, cx);
+                return true;
+            }
             if matches!(
                 self.overlay,
-                Overlay::ContextMenu(_)
-                    | Overlay::NodeManager
-                    | Overlay::Appearance
-                    | Overlay::HostSwitcher
+                Overlay::ContextMenu(_) | Overlay::NodeManager | Overlay::HostSwitcher
             ) {
                 self.overlay = Overlay::None;
                 self.focus.focus(window, cx);
