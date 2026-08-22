@@ -98,7 +98,6 @@ pub struct ChromeA11yInput<'a> {
     pub selection: &'a Selection,
     pub i18n: I18n,
     pub appearance_open: bool,
-    pub herdr_settings_open: bool,
     pub node_manager_open: bool,
     pub prefix_pending: bool,
     pub operation: Option<&'a str>,
@@ -236,10 +235,9 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
                 i18n.text("Appearance"),
                 input.appearance_open,
             ),
-            herdr_settings: toolbar_toggle(
+            herdr_settings: toolbar_button(
                 "open-herdr-settings",
-                i18n.text("Herdr settings"),
-                input.herdr_settings_open,
+                i18n.text("Open Herdr settings in Terminal"),
             ),
             remote: toolbar_toggle("manage-nodes", i18n.text("Hosts"), input.node_manager_open),
         },
@@ -359,7 +357,7 @@ fn status_value(input: &ChromeA11yInput<'_>) -> String {
         format!(
             "{} · {}",
             i18n.text("PREFIX"),
-            i18n.text("C new tab · ⇧N new workspace · S settings · 1–9 switch tab")
+            i18n.text("C new tab · ⇧N new workspace · S settings in Terminal · 1–9 switch tab")
         )
     } else if let Some(operation) = input.operation {
         operation.to_owned()
@@ -410,7 +408,6 @@ impl OcHerdrView {
             selection: &self.selection,
             i18n: self.i18n,
             appearance_open: matches!(self.overlay, Overlay::Appearance),
-            herdr_settings_open: matches!(self.overlay, Overlay::HerdrSettings),
             node_manager_open: self.overlay.host_center(),
             prefix_pending: self.prefix_pending,
             operation: self.operation.as_deref(),
@@ -564,7 +561,6 @@ mod tests {
             selection,
             i18n: I18n::new(Language::English),
             appearance_open: false,
-            herdr_settings_open: false,
             node_manager_open: true,
             prefix_pending: false,
             operation: None,
@@ -707,7 +703,10 @@ mod tests {
         assert_eq!(chrome.toolbar.zoom.name, "Zoom pane");
         assert_eq!(chrome.toolbar.close_pane.name, "Close pane");
         assert_eq!(chrome.toolbar.appearance.name, "Appearance");
-        assert_eq!(chrome.toolbar.herdr_settings.name, "Herdr settings");
+        assert_eq!(
+            chrome.toolbar.herdr_settings.name,
+            "Open Herdr settings in Terminal"
+        );
         assert_eq!(chrome.toolbar.remote.name, "Hosts");
         assert_eq!(chrome.toolbar.remote.selected, Some(true));
         assert_eq!(chrome.toolbar.remote.toggled, Some(true));
@@ -745,7 +744,6 @@ mod tests {
             selection: &selection,
             i18n,
             appearance_open: false,
-            herdr_settings_open: false,
             node_manager_open: false,
             prefix_pending: false,
             operation: None,

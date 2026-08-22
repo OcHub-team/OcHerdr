@@ -54,14 +54,6 @@ const CORNER_MODAL: f32 = 14.;
 const CORNER_PANEL: f32 = 10.;
 const CORNER_CONTROL: f32 = 7.;
 const CORNER_COMPACT: f32 = 5.;
-const HERDR_SETTINGS_SECTIONS: [&str; 6] = [
-    "Theme",
-    "Indicators",
-    "Sound",
-    "Toast",
-    "Pane labels",
-    "Integrations",
-];
 
 struct OcHerdrAssets;
 
@@ -412,7 +404,6 @@ struct OcHerdrView {
     snapshot_refresh_pending: bool,
     session_panes: Option<SessionPanes>,
     overlay: Overlay,
-    herdr_settings_section: usize,
     managed_profile_index: usize,
     remote_advanced_open: bool,
     recent_connection_ids: Vec<String>,
@@ -448,7 +439,6 @@ enum Overlay {
     NodeManager,
     RemoteForm(RemoteForm),
     Appearance,
-    HerdrSettings,
     HostSwitcher,
     ContextMenu(HierarchyContextMenu),
     Rename(HierarchyTarget),
@@ -860,7 +850,6 @@ mod tests {
             Overlay::RemoteForm(RemoteForm::Create),
             Overlay::RemoteForm(RemoteForm::Edit(0)),
             Overlay::Appearance,
-            Overlay::HerdrSettings,
             Overlay::HostSwitcher,
             Overlay::ContextMenu(HierarchyContextMenu {
                 target: target.clone(),

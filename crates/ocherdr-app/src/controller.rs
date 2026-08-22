@@ -122,7 +122,6 @@ impl OcHerdrView {
             snapshot_refresh_pending: false,
             session_panes: None,
             overlay: Overlay::None,
-            herdr_settings_section: 0,
             managed_profile_index: 0,
             remote_advanced_open: false,
             recent_connection_ids,
@@ -514,22 +513,6 @@ impl OcHerdrView {
     pub(super) fn close_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
         self.focus.focus(window, cx);
-        cx.notify();
-    }
-
-    pub(super) fn open_herdr_settings(&mut self, cx: &mut Context<Self>) {
-        self.overlay = Overlay::HerdrSettings;
-        cx.notify();
-    }
-
-    pub(super) fn close_herdr_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.overlay = Overlay::None;
-        self.focus.focus(window, cx);
-        cx.notify();
-    }
-
-    pub(super) fn select_herdr_settings_section(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.herdr_settings_section = index.min(HERDR_SETTINGS_SECTIONS.len() - 1);
         cx.notify();
     }
 
@@ -1390,13 +1373,7 @@ impl OcHerdrView {
             (Overlay::ConfirmSwitchProfile { .. }, false) => self.cancel_switch_profile(cx),
             (Overlay::RemoteForm(_), false) => self.close_add_remote(cx),
             (Overlay::HostSwitcher, false) => self.close_host_switcher(cx),
-            (
-                Overlay::ContextMenu(_)
-                | Overlay::NodeManager
-                | Overlay::Appearance
-                | Overlay::HerdrSettings,
-                false,
-            ) => {
+            (Overlay::ContextMenu(_) | Overlay::NodeManager | Overlay::Appearance, false) => {
                 self.overlay = Overlay::None;
                 self.focus.focus(window, cx);
                 cx.notify();
@@ -2373,7 +2350,7 @@ impl OcHerdrView {
         let shift = event.keystroke.modifiers.shift;
         match (key, shift) {
             ("escape", _) => {}
-            ("s", false) => self.open_herdr_settings(cx),
+            ("s", false) => self.open_native_tui(cx),
             ("c", false) => self.create_tab(cx),
             ("n", true) => self.create_workspace(cx),
             ("n", false) => self.cycle_tab(1, cx),
@@ -2445,7 +2422,6 @@ impl OcHerdrView {
                 Overlay::ContextMenu(_)
                     | Overlay::NodeManager
                     | Overlay::Appearance
-                    | Overlay::HerdrSettings
                     | Overlay::HostSwitcher
             ) {
                 self.overlay = Overlay::None;
@@ -2487,7 +2463,7 @@ impl OcHerdrView {
                     true
                 }
                 (",", false) => {
-                    self.open_herdr_settings(cx);
+                    self.open_native_tui(cx);
                     true
                 }
                 ("c", false) => {

@@ -80,9 +80,6 @@ impl Render for OcHerdrView {
             Overlay::Appearance => {
                 root = root.child(self.render_appearance(cx));
             }
-            Overlay::HerdrSettings => {
-                root = root.child(self.render_herdr_settings(cx));
-            }
             Overlay::ContextMenu(menu) => {
                 root = root.child(self.render_context_menu(menu, cx));
             }

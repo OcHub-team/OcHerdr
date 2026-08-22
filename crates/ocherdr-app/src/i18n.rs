@@ -250,7 +250,7 @@ fn zh_hans(english: &'static str) -> &'static str {
         "Zoom pane" => "缩放窗格",
         "Close pane" => "关闭窗格",
         "Appearance" => "外观",
-        "Herdr settings" => "Herdr 设置",
+        "Open Herdr settings in Terminal" => "在终端中打开 Herdr 设置",
         "Remote" => "主机",
         "Hosts" => "主机",
         "Host center" => "主机中心",
@@ -365,8 +365,8 @@ fn zh_hans(english: &'static str) -> &'static str {
             "OcHerdr 会离开当前 Herdr 会话，并连接到另一台机器。"
         }
         "PREFIX" => "前缀键",
-        "C new tab · ⇧N new workspace · S settings · 1–9 switch tab" => {
-            "C 新建标签页 · ⇧N 新建工作区 · S 设置 · 1–9 切换标签页"
+        "C new tab · ⇧N new workspace · S settings in Terminal · 1–9 switch tab" => {
+            "C 新建标签页 · ⇧N 新建工作区 · S 在终端中打开设置 · 1–9 切换标签页"
         }
         "Connection unavailable" => "连接不可用",
         "Live updates disconnected — click to reconnect" => "实时更新已断开 · 点击重新连接",
@@ -491,54 +491,6 @@ fn zh_hans(english: &'static str) -> &'static str {
         "Split right" => "向右拆分",
         "Split down" => "向下拆分",
         "Zoom" => "缩放",
-        "Indicators" => "状态标记",
-        "Sound" => "声音",
-        "Toast" => "通知弹窗",
-        "Pane labels" => "窗格标签",
-        "Integrations" => "集成",
-        "theme" => "主题",
-        "Themes exposed by Herdr's native TUI settings." => "Herdr 原生 TUI 设置提供的主题。",
-        "agent status indicators" => "智能体状态标记",
-        "Choose the symbols used for agent state in the TUI." => {
-            "选择 TUI 中用于表示智能体状态的符号。"
-        }
-        "sound alerts" => "声音提醒",
-        "Play sounds when agents change state in the background." => {
-            "智能体在后台改变状态时播放提示音。"
-        }
-        "notification popups" => "通知弹窗",
-        "Choose where background notifications are delivered." => "选择后台通知的发送位置。",
-        "agent border labels" => "智能体边框标签",
-        "Show detected agent names in split-pane borders." => {
-            "在拆分窗格边框中显示检测到的智能体名称。"
-        }
-        "agent integrations" => "智能体集成",
-        "Let supported agents report state directly to Herdr." => {
-            "允许受支持的智能体直接向 Herdr 报告状态。"
-        }
-        "dark" => "深色",
-        "light" => "浅色",
-        "inherit host colors" => "继承宿主颜色",
-        "compact color status" => "紧凑彩色状态",
-        "shape and color status" => "形状和彩色状态",
-        "on" => "开启",
-        "off" => "关闭",
-        "enable alerts" => "启用提醒",
-        "silence alerts" => "关闭提醒",
-        "disabled" => "已禁用",
-        "inside herdr" => "Herdr 内",
-        "TUI popup" => "TUI 弹窗",
-        "via terminal" => "通过终端",
-        "terminal notification" => "终端通知",
-        "via system" => "通过系统",
-        "macOS notification" => "macOS 通知",
-        "show labels" => "显示标签",
-        "hide labels" => "隐藏标签",
-        "integration target" => "集成目标",
-        "Open native TUI" => "打开原生 TUI",
-        "This mirrors Herdr's TUI settings surface. Protocol 20 does not expose live setting values; open the native TUI and press Ctrl+B, then S to inspect or apply the selected session." => {
-            "此处映射 Herdr 的 TUI 设置界面。协议 20 不提供实时设置值；请打开原生 TUI，再按 Ctrl+B、S 查看或应用当前会话设置。"
-        }
         "Discovering Herdr sessions…" => "正在发现 Herdr 会话…",
         "Workspace and tab names cannot be empty." => "工作区和标签页名称不能为空。",
         "SSH destination is required." => "必须填写 SSH 目标地址。",

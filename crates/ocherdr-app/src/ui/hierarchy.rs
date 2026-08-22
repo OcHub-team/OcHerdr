@@ -395,7 +395,6 @@ impl OcHerdrView {
         let pane_id_zoom = self.selection.pane_id.clone();
         let pane_id_close = self.selection.pane_id.clone();
         let node_manager_open = self.overlay.host_center();
-        let herdr_settings_open = matches!(self.overlay, Overlay::HerdrSettings);
         div()
             .flex()
             .items_center()
@@ -544,16 +543,12 @@ impl OcHerdrView {
                         "open-herdr-settings",
                         chrome.toolbar.herdr_settings.name.clone(),
                         IconName::Settings,
-                        if herdr_settings_open {
-                            ButtonTone::Primary
-                        } else {
-                            ButtonTone::Ghost
-                        },
+                        ButtonTone::Ghost,
                         ButtonSize::Sm,
                     ),
                     &chrome.toolbar.herdr_settings,
                 )
-                .on_click(cx.listener(|this, _, _window, cx| this.open_herdr_settings(cx))),
+                .on_click(cx.listener(|this, _, _window, cx| this.open_native_tui(cx))),
             )
             .child(apply_control(
                 icon_button_tone(
@@ -578,42 +573,45 @@ impl OcHerdrView {
         };
         let profile_label = profile_display_label(&profile, i18n);
         let switcher_open = matches!(self.overlay, Overlay::HostSwitcher);
-        let status = if self.prefix_pending {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .rounded(px(CORNER_COMPACT))
-                        .bg(theme::accent_fill())
-                        .text_color(theme::accent_text())
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(i18n.text("PREFIX")),
-                )
-                .child(i18n.text("C new tab · ⇧N new workspace · S settings · 1–9 switch tab"))
-                .into_any_element()
-        } else if let Some(operation) = &self.operation {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(spinner(theme::muted(), 11.))
-                .child(operation.clone())
-                .into_any_element()
-        } else if self.error.is_some() {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(status_dot(theme::red()))
-                .child(i18n.text("Connection unavailable"))
-                .into_any_element()
-        } else if let EventStreamState::Lost(reason) = &self.event_stream {
-            let message = event_stream_lost_copy(i18n);
-            div()
+        let status =
+            if self.prefix_pending {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(CORNER_COMPACT))
+                            .bg(theme::accent_fill())
+                            .text_color(theme::accent_text())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(i18n.text("PREFIX")),
+                    )
+                    .child(i18n.text(
+                        "C new tab · ⇧N new workspace · S settings in Terminal · 1–9 switch tab",
+                    ))
+                    .into_any_element()
+            } else if let Some(operation) = &self.operation {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(spinner(theme::muted(), 11.))
+                    .child(operation.clone())
+                    .into_any_element()
+            } else if self.error.is_some() {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(status_dot(theme::red()))
+                    .child(i18n.text("Connection unavailable"))
+                    .into_any_element()
+            } else if let EventStreamState::Lost(reason) = &self.event_stream {
+                let message = event_stream_lost_copy(i18n);
+                div()
                 .id((
                     ochub_ui::gpui::ElementId::from("reconnect-live-updates"),
                     reason.clone(),
@@ -630,23 +628,23 @@ impl OcHerdrView {
                 .child(status_dot(theme::red()))
                 .child(message)
                 .into_any_element()
-        } else if let Some(snapshot) = &self.snapshot {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(status_dot(theme::green()))
-                .child(event_stream_status_copy(i18n, &self.event_stream, snapshot))
-                .into_any_element()
-        } else {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(status_dot(theme::muted()))
-                .child(i18n.text("No Herdr session"))
-                .into_any_element()
-        };
+            } else if let Some(snapshot) = &self.snapshot {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(status_dot(theme::green()))
+                    .child(event_stream_status_copy(i18n, &self.event_stream, snapshot))
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(status_dot(theme::muted()))
+                    .child(i18n.text("No Herdr session"))
+                    .into_any_element()
+            };
         apply_region(div().id(chrome.status.id), &chrome.status)
             .flex()
             .items_center()
