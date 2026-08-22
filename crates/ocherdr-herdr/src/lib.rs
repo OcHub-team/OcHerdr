@@ -16,7 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use ocherdr_core::{ConnectionProfile, HierarchySnapshot, MINIMUM_HERDR_VERSION, SessionSummary};
+use ocherdr_core::{
+    ConnectionProfile, HerdrEvent, HierarchySnapshot, MINIMUM_HERDR_VERSION, SessionSummary,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -49,6 +51,12 @@ pub enum HerdrError {
 }
 
 pub type Result<T> = std::result::Result<T, HerdrError>;
+
+impl HerdrError {
+    pub fn is_event_payload_error(&self) -> bool {
+        matches!(self, Self::Json(_) | Self::Protocol(_))
+    }
+}
 
 /// A user-facing summary of a host probe. The transport owns classification so
 /// the app never has to infer state from raw OpenSSH stderr.
@@ -481,24 +489,29 @@ fn request_socket_with_timeout(
         return Err(HerdrError::Protocol("empty API response".into()));
     }
     let value: Value = serde_json::from_str(&line)?;
-    if let Some(error) = value.get("error") {
-        return Err(HerdrError::Api {
-            code: error
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .into(),
-            message: error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown Herdr API error")
-                .into(),
-        });
+    if let Some(error) = api_error(&value) {
+        return Err(error);
     }
     value
         .get("result")
         .cloned()
         .ok_or_else(|| HerdrError::Protocol("API response is missing `result`".into()))
+}
+
+fn api_error(value: &Value) -> Option<HerdrError> {
+    let error = value.get("error")?;
+    Some(HerdrError::Api {
+        code: error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .into(),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Herdr API error")
+            .into(),
+    })
 }
 
 fn write_socket_json(stream: &mut UnixStream, value: &Value, timeout: Duration) -> Result<()> {
@@ -606,6 +619,30 @@ impl Drop for SshTunnel {
     }
 }
 
+pub(crate) const EVENT_SUBSCRIPTIONS: &[&str] = &[
+    "workspace.created",
+    "workspace.updated",
+    "workspace.metadata_updated",
+    "workspace.renamed",
+    "workspace.moved",
+    "workspace.reordered",
+    "workspace.closed",
+    "workspace.focused",
+    "tab.created",
+    "tab.closed",
+    "tab.focused",
+    "tab.renamed",
+    "tab.moved",
+    "pane.created",
+    "pane.closed",
+    "pane.updated",
+    "pane.focused",
+    "pane.moved",
+    "pane.exited",
+    "pane.agent_detected",
+    "layout.updated",
+];
+
 pub struct EventStream {
     reader: BufReader<UnixStream>,
 }
@@ -614,38 +651,13 @@ impl EventStream {
     fn connect(socket_path: &Path) -> Result<Self> {
         let mut stream = UnixStream::connect(socket_path)?;
         stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
-        // No read timeout: idle gaps are normal; SSH ServerAlive* closes a dead tunnel instead.
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
         let id = format!(
             "ocherdr-events-{}",
             REQUEST_ID.fetch_add(1, Ordering::Relaxed)
         );
-        let types = [
-            "workspace.created",
-            "workspace.updated",
-            "workspace.metadata_updated",
-            "workspace.renamed",
-            "workspace.moved",
-            "workspace.reordered",
-            "workspace.closed",
-            "workspace.focused",
-            "tab.created",
-            "tab.closed",
-            "tab.focused",
-            "tab.renamed",
-            "tab.moved",
-            "pane.created",
-            "pane.closed",
-            "pane.updated",
-            "pane.focused",
-            "pane.moved",
-            "pane.exited",
-            "pane.agent_detected",
-            "pane.agent_status_changed",
-            "pane.scroll_changed",
-            "layout.updated",
-        ];
-        let subscriptions = types
-            .into_iter()
+        let subscriptions = EVENT_SUBSCRIPTIONS
+            .iter()
             .map(|kind| json!({ "type": kind }))
             .collect::<Vec<_>>();
         write_socket_json(
@@ -657,27 +669,65 @@ impl EventStream {
             }),
             REQUEST_TIMEOUT,
         )?;
-        Ok(Self {
-            reader: BufReader::new(stream),
-        })
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| timeout_or_io(error, REQUEST_TIMEOUT))?;
+        parse_subscription_ack(&line)?;
+        // Idle gaps after subscribe are normal; SSH ServerAlive* closes a dead tunnel.
+        reader.get_mut().set_read_timeout(None)?;
+        Ok(Self { reader })
     }
 
-    pub fn next_event(&mut self) -> Result<Option<Value>> {
+    pub fn next_event(&mut self) -> Result<Option<HerdrEvent>> {
         let mut line = String::new();
         let count = self.reader.read_line(&mut line)?;
         if count == 0 {
             return Ok(None);
         }
-        Ok(Some(serde_json::from_str(&line)?))
+        Ok(Some(parse_event_line(&line)?))
     }
 }
 
+fn parse_subscription_ack(line: &str) -> Result<()> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Err(HerdrError::Protocol("empty subscription ack".into()));
+    }
+    let value: Value = serde_json::from_str(line)?;
+    if let Some(error) = api_error(&value) {
+        return Err(error);
+    }
+    match value
+        .get("result")
+        .and_then(|result| result.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("subscription_started") => Ok(()),
+        Some(other) => Err(HerdrError::Protocol(format!(
+            "unexpected subscription ack type `{other}`"
+        ))),
+        None => Err(HerdrError::Protocol(
+            "subscription ack is missing `result.type`".into(),
+        )),
+    }
+}
+
+fn parse_event_line(line: &str) -> Result<HerdrEvent> {
+    let value: Value = serde_json::from_str(line)?;
+    let Some(data) = value.get("data") else {
+        return Err(HerdrError::Protocol("event is missing `data`".into()));
+    };
+    Ok(serde_json::from_value(data.clone())?)
+}
+
 pub struct EventSubscription {
-    events: Receiver<Result<Value>>,
+    events: Receiver<Result<HerdrEvent>>,
 }
 
 impl EventSubscription {
-    pub fn new(events: Receiver<Result<Value>>) -> Self {
+    pub fn new(events: Receiver<Result<HerdrEvent>>) -> Self {
         Self { events }
     }
 
@@ -693,8 +743,13 @@ impl EventSubscription {
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = event_tx.send(Err(error));
-                        break;
+                        let fatal = !error.is_event_payload_error();
+                        if event_tx.send(Err(error)).is_err() {
+                            break;
+                        }
+                        if fatal {
+                            break;
+                        }
                     }
                 }
             }
@@ -702,12 +757,12 @@ impl EventSubscription {
         Self::new(event_rx)
     }
 
-    pub fn try_event(&self) -> Result<Option<Value>> {
+    pub fn try_event(&self) -> Result<Option<HerdrEvent>> {
         recv_event(&self.events)
     }
 }
 
-fn recv_event(events: &Receiver<Result<Value>>) -> Result<Option<Value>> {
+fn recv_event(events: &Receiver<Result<HerdrEvent>>) -> Result<Option<HerdrEvent>> {
     match events.try_recv() {
         Ok(event) => event.map(Some),
         Err(TryRecvError::Empty) => Ok(None),
@@ -1418,7 +1473,7 @@ mod tests {
 
     #[test]
     fn recv_event_treats_a_stopped_worker_as_closed() {
-        let (tx, rx) = mpsc::channel::<Result<Value>>();
+        let (tx, rx) = mpsc::channel::<Result<HerdrEvent>>();
         drop(tx);
         let error = recv_event(&rx).unwrap_err();
         assert!(
@@ -1428,8 +1483,98 @@ mod tests {
 
     #[test]
     fn recv_event_returns_none_while_the_sender_is_still_alive() {
-        let (_tx, rx) = mpsc::channel::<Result<Value>>();
+        let (_tx, rx) = mpsc::channel::<Result<HerdrEvent>>();
         assert_eq!(recv_event(&rx).unwrap(), None);
+    }
+
+    const PANE_ID_REQUIRED_SUBSCRIPTIONS: &[&str] = &[
+        "pane.agent_status_changed",
+        "pane.scroll_changed",
+        "pane.output_matched",
+    ];
+
+    #[test]
+    fn subscription_list_excludes_types_that_require_pane_id() {
+        assert_eq!(EVENT_SUBSCRIPTIONS.len(), 21);
+        for required in PANE_ID_REQUIRED_SUBSCRIPTIONS {
+            assert!(
+                !EVENT_SUBSCRIPTIONS.contains(required),
+                "{required} requires pane_id and must not be in the session-wide subscribe list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subscription_started_ack_succeeds() {
+        parse_subscription_ack(
+            r#"{"id":"ocherdr-events-1","result":{"type":"subscription_started"}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn event_lines_are_decoded_from_the_data_payload() {
+        let event = parse_event_line(
+            r#"{"data":{"type":"workspace_focused","workspace_id":"w1"},"event":"workspace_focused"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            HerdrEvent::WorkspaceFocused {
+                workspace_id: "w1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_event_types_are_unknown_and_broken_payloads_error() {
+        assert_eq!(
+            parse_event_line(
+                r#"{"data":{"type":"some_future_event","whatever":1},"event":"some_future_event"}"#
+            )
+            .unwrap(),
+            HerdrEvent::Unknown
+        );
+        let missing_data = parse_event_line(r#"{"event":"pane_updated"}"#).unwrap_err();
+        assert!(
+            matches!(missing_data, HerdrError::Protocol(message) if message.contains("`data`"))
+        );
+        let broken = parse_event_line(r#"{"data":{"type":"pane_updated"},"event":"pane_updated"}"#)
+            .unwrap_err();
+        assert!(matches!(broken, HerdrError::Json(_)));
+    }
+
+    #[test]
+    fn connect_returns_err_when_subscribe_is_rejected() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let socket_path = directory.path().join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let mut payload = serde_json::to_vec(&json!({
+                "id": "",
+                "error": {
+                    "code": "invalid_request",
+                    "message": "invalid request: missing field `pane_id`"
+                }
+            }))
+            .unwrap();
+            payload.push(b'\n');
+            stream.write_all(&payload).unwrap();
+            stream.flush().unwrap();
+        });
+        match EventStream::connect(&socket_path) {
+            Err(HerdrError::Api { code, message }) => {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("pane_id"));
+            }
+            Err(error) => panic!("expected invalid_request, got {error:?}"),
+            Ok(_) => panic!("rejected subscribe must return Err"),
+        }
     }
 
     #[test]

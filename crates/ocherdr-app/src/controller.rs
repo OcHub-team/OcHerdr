@@ -314,21 +314,56 @@ impl OcHerdrView {
                 if this.event_epoch != epoch {
                     return;
                 }
+                let old_tab = this.selection.tab_id.clone();
+                let old_selected = this.selection.pane_id.clone();
+                let old_panes = this
+                    .snapshot
+                    .as_ref()
+                    .map(snapshot_pane_ids)
+                    .unwrap_or_default();
                 let action = {
                     let EventStreamState::Live(events) = &this.event_stream else {
                         return;
                     };
-                    poll_event_stream(|| events.try_event())
+                    let Some(snapshot) = this.snapshot.as_mut() else {
+                        return;
+                    };
+                    poll_event_stream(snapshot, || events.try_event())
                 };
-                let reschedule = action.reschedules();
-                if let EventPollAction::Continue { refresh: true } = &action {
-                    this.refresh_snapshot_from_event(epoch, cx);
+                let effects = effects_for(&action);
+                if let Some(error) = effects.error {
+                    this.error = Some(error);
+                }
+                if effects.resync {
+                    this.resync_snapshot(epoch, cx);
+                }
+                if effects.apply_local
+                    && let Some(snapshot) = &this.snapshot
+                {
+                    this.selection.reconcile(snapshot);
+                    let closed_stream = this
+                        .panes
+                        .values()
+                        .any(|runtime| runtime.exit_seen || runtime.session.is_closed());
+                    if session_terminals_need_rebuild(
+                        old_tab.as_deref(),
+                        old_selected.as_deref(),
+                        &old_panes,
+                        &this.selection,
+                        snapshot,
+                        closed_stream,
+                    ) {
+                        this.ensure_session_terminals(cx);
+                    }
+                }
+                if effects.notify {
+                    cx.notify();
                 }
                 if let Some(stream) = action.event_stream() {
                     this.event_stream = stream;
                     cx.notify();
                 }
-                if reschedule {
+                if effects.reschedule {
                     this.schedule_event_poll(epoch, cx);
                 }
             })
@@ -337,7 +372,7 @@ impl OcHerdrView {
         .detach();
     }
 
-    pub(super) fn refresh_snapshot_from_event(&mut self, epoch: u64, cx: &mut Context<Self>) {
+    pub(super) fn resync_snapshot(&mut self, epoch: u64, cx: &mut Context<Self>) {
         if snapshot_refresh_should_queue(self.snapshot_refreshing) {
             self.snapshot_refresh_pending = true;
             return;
@@ -375,22 +410,20 @@ impl OcHerdrView {
                         this.snapshot = Some(snapshot);
                         if let Some(snapshot) = &this.snapshot {
                             this.selection.reconcile(snapshot);
-                        }
-                        let new_panes = this
-                            .snapshot
-                            .as_ref()
-                            .map(snapshot_pane_ids)
-                            .unwrap_or_default();
-                        let closed_stream = this
-                            .panes
-                            .values()
-                            .any(|runtime| runtime.exit_seen || runtime.session.is_closed());
-                        if old_tab != this.selection.tab_id
-                            || old_selected != this.selection.pane_id
-                            || old_panes != new_panes
-                            || closed_stream
-                        {
-                            this.ensure_session_terminals(cx);
+                            let closed_stream = this
+                                .panes
+                                .values()
+                                .any(|runtime| runtime.exit_seen || runtime.session.is_closed());
+                            if session_terminals_need_rebuild(
+                                old_tab.as_deref(),
+                                old_selected.as_deref(),
+                                &old_panes,
+                                &this.selection,
+                                snapshot,
+                                closed_stream,
+                            ) {
+                                this.ensure_session_terminals(cx);
+                            }
                         }
                         cx.notify();
                     }
@@ -400,7 +433,7 @@ impl OcHerdrView {
                     }
                 }
                 if this.snapshot_refresh_pending {
-                    this.refresh_snapshot_from_event(epoch, cx);
+                    this.resync_snapshot(epoch, cx);
                 }
             })
             .ok();
@@ -2045,7 +2078,7 @@ impl OcHerdrView {
                     this.error = Some(error);
                 }
                 if hierarchy_changed {
-                    this.refresh_snapshot_from_event(this.event_epoch, cx);
+                    this.resync_snapshot(this.event_epoch, cx);
                 }
                 if changed {
                     cx.notify();
@@ -2435,7 +2468,7 @@ impl OcHerdrView {
             }
         };
         if stream_closed {
-            self.refresh_snapshot_from_event(self.event_epoch, cx);
+            self.resync_snapshot(self.event_epoch, cx);
         }
     }
 
@@ -2695,7 +2728,7 @@ impl OcHerdrView {
         window.invalidate_character_coordinates();
         cx.notify();
         if stream_closed {
-            self.refresh_snapshot_from_event(self.event_epoch, cx);
+            self.resync_snapshot(self.event_epoch, cx);
         }
     }
 
@@ -2796,6 +2829,20 @@ fn snapshot_pane_ids(snapshot: &HierarchySnapshot) -> HashSet<String> {
         .collect()
 }
 
+fn session_terminals_need_rebuild(
+    old_tab: Option<&str>,
+    old_selected: Option<&str>,
+    old_panes: &HashSet<String>,
+    selection: &Selection,
+    snapshot: &HierarchySnapshot,
+    closed_stream: bool,
+) -> bool {
+    old_tab != selection.tab_id.as_deref()
+        || old_selected != selection.pane_id.as_deref()
+        || *old_panes != snapshot_pane_ids(snapshot)
+        || closed_stream
+}
+
 fn snapshot_runtime_targets(
     snapshot: &HierarchySnapshot,
     selected_pane: Option<&str>,
@@ -2884,36 +2931,94 @@ fn snapshot_refresh_should_queue(refreshing: bool) -> bool {
 enum EventPollAction {
     /// Replace Live with Lost. A dead stream has nothing left to poll.
     Disconnect(SharedString),
-    Continue {
-        refresh: bool,
+    Idle,
+    Applied,
+    Resync {
+        error: Option<SharedString>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PollEffects {
+    resync: bool,
+    apply_local: bool,
+    notify: bool,
+    reschedule: bool,
+    error: Option<SharedString>,
+}
+
+fn effects_for(action: &EventPollAction) -> PollEffects {
+    match action {
+        EventPollAction::Disconnect(_) => PollEffects {
+            resync: false,
+            apply_local: false,
+            notify: true,
+            reschedule: false,
+            error: None,
+        },
+        EventPollAction::Idle => PollEffects {
+            resync: false,
+            apply_local: false,
+            notify: false,
+            reschedule: true,
+            error: None,
+        },
+        EventPollAction::Applied => PollEffects {
+            resync: false,
+            apply_local: true,
+            notify: true,
+            reschedule: true,
+            error: None,
+        },
+        EventPollAction::Resync { error } => PollEffects {
+            resync: true,
+            apply_local: false,
+            notify: false,
+            reschedule: true,
+            error: error.clone(),
+        },
+    }
 }
 
 impl EventPollAction {
     fn event_stream(&self) -> Option<EventStreamState> {
         match self {
             Self::Disconnect(detail) => Some(EventStreamState::Lost(detail.clone())),
-            Self::Continue { .. } => None,
+            Self::Idle | Self::Applied | Self::Resync { .. } => None,
         }
-    }
-
-    fn reschedules(&self) -> bool {
-        matches!(self, Self::Continue { .. })
     }
 }
 
 fn poll_event_stream(
-    mut next: impl FnMut() -> std::result::Result<Option<Value>, HerdrError>,
+    snapshot: &mut HierarchySnapshot,
+    mut next: impl FnMut() -> std::result::Result<Option<HerdrEvent>, HerdrError>,
 ) -> EventPollAction {
-    let mut refresh = false;
+    let mut seen = false;
+    let mut resync = false;
+    let mut error = None;
     for _ in 0..128 {
         match next() {
-            Ok(Some(_)) => refresh = true,
+            Ok(Some(event)) => {
+                seen = true;
+                if snapshot.apply(&event) == SnapshotUpdate::Resync {
+                    resync = true;
+                }
+            }
             Ok(None) => break,
-            Err(error) => return EventPollAction::Disconnect(error.to_string().into()),
+            Err(err) if err.is_event_payload_error() => {
+                resync = true;
+                error = Some(err.to_string().into());
+            }
+            Err(err) => return EventPollAction::Disconnect(err.to_string().into()),
         }
     }
-    EventPollAction::Continue { refresh }
+    if resync {
+        EventPollAction::Resync { error }
+    } else if seen {
+        EventPollAction::Applied
+    } else {
+        EventPollAction::Idle
+    }
 }
 
 fn mouse_point(position: ochub_ui::gpui::Point<ochub_ui::gpui::Pixels>) -> (f32, f32) {
@@ -3651,9 +3756,10 @@ mod tests {
 
     #[test]
     fn a_dead_event_stream_is_marked_lost_instead_of_idle() {
-        let next =
-            poll_event_stream(|| Err(HerdrError::EventStreamClosed("event worker stopped".into())))
-                .event_stream();
+        let next = poll_event_stream(&mut HierarchySnapshot::default(), || {
+            Err(HerdrError::EventStreamClosed("event worker stopped".into()))
+        })
+        .event_stream();
         assert!(
             matches!(next, Some(EventStreamState::Lost(_))),
             "a closed subscription must become Lost, not Idle"
@@ -3662,30 +3768,81 @@ mod tests {
 
     #[test]
     fn a_dead_event_stream_does_not_reschedule_the_poll() {
-        let action =
-            poll_event_stream(|| Err(HerdrError::EventStreamClosed("event worker stopped".into())));
+        let action = poll_event_stream(&mut HierarchySnapshot::default(), || {
+            Err(HerdrError::EventStreamClosed("event worker stopped".into()))
+        });
         assert!(
-            !action.reschedules(),
+            !effects_for(&action).reschedule,
             "polling a closed stream has nothing left to wait for"
         );
     }
 
     #[test]
     fn a_quiet_live_stream_keeps_polling_without_refreshing() {
-        assert_eq!(
-            poll_event_stream(|| Ok(None)),
-            EventPollAction::Continue { refresh: false }
-        );
-        assert!(poll_event_stream(|| Ok(None)).reschedules());
-        assert!(poll_event_stream(|| Ok(None)).event_stream().is_none());
+        let action = poll_event_stream(&mut HierarchySnapshot::default(), || Ok(None));
+        assert_eq!(action, EventPollAction::Idle);
+        assert!(effects_for(&action).reschedule);
+        assert!(action.event_stream().is_none());
     }
 
     #[test]
-    fn events_on_a_live_stream_refresh_and_keep_polling() {
-        let mut events = vec![Ok(Some(json!({ "type": "tab.focused" }))), Ok(None)].into_iter();
-        let action = poll_event_stream(|| events.next().unwrap());
-        assert_eq!(action, EventPollAction::Continue { refresh: true });
-        assert!(action.reschedules());
+    fn pane_updated_is_applied_without_resyncing_the_snapshot() {
+        let mut snapshot = two_tab_snapshot();
+        snapshot.panes[0].revision = 1;
+        let mut updated = snapshot.panes[0].clone();
+        updated.revision = 9;
+        updated.agent_status = AgentStatus::Working;
+        let mut events = vec![
+            Ok(Some(HerdrEvent::PaneUpdated {
+                pane: updated.clone(),
+            })),
+            Ok(None),
+        ]
+        .into_iter();
+        let action = poll_event_stream(&mut snapshot, || events.next().unwrap());
+        assert_eq!(action, EventPollAction::Applied);
+        assert!(!effects_for(&action).resync);
+        assert!(effects_for(&action).apply_local);
+        assert!(effects_for(&action).reschedule);
+        assert!(action.event_stream().is_none());
+        assert_eq!(snapshot.panes[0], updated);
+    }
+
+    #[test]
+    fn applied_poll_effects_do_not_resync() {
+        let applied = effects_for(&EventPollAction::Applied);
+        assert!(!applied.resync);
+        assert!(applied.apply_local);
+        assert!(applied.notify);
+        assert!(applied.reschedule);
+        assert!(applied.error.is_none());
+        let resync = effects_for(&EventPollAction::Resync { error: None });
+        assert!(resync.resync);
+        assert!(!resync.apply_local);
+        assert!(resync.reschedule);
+    }
+
+    #[test]
+    fn a_malformed_event_resyncs_without_dropping_the_stream() {
+        let mut events = vec![
+            Err(HerdrError::Protocol("event is missing `data`".into())),
+            Ok(None),
+        ]
+        .into_iter();
+        let action =
+            poll_event_stream(&mut HierarchySnapshot::default(), || events.next().unwrap());
+        let EventPollAction::Resync { error } = &action else {
+            panic!("payload errors must resync, got {action:?}");
+        };
+        assert!(
+            error
+                .as_ref()
+                .is_some_and(|detail| detail.contains("`data`"))
+        );
+        let effects = effects_for(&action);
+        assert!(effects.resync);
+        assert!(effects.error.is_some());
+        assert!(effects.reschedule);
         assert!(action.event_stream().is_none());
     }
 

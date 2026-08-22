@@ -8,6 +8,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod event;
+pub use event::{HerdrEvent, SnapshotUpdate};
+
 pub const MINIMUM_HERDR_VERSION: &str = "0.8.1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

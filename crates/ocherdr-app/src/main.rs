@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
-    AgentStatus, ConnectionProfile, HierarchySnapshot, PaneInfo, Selection, SessionSummary,
-    SplitDirection,
+    AgentStatus, ConnectionProfile, HerdrEvent, HierarchySnapshot, PaneInfo, Selection,
+    SessionSummary, SnapshotUpdate, SplitDirection,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthCheck, HostHealthStatus, SessionConnection,
