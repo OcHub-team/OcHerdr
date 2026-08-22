@@ -170,26 +170,41 @@ impl I18n {
         self,
         version: &str,
         protocol: u32,
-        subscription: bool,
         workspace_count: usize,
+    ) -> String {
+        self.format_herdr_status(
+            version,
+            protocol,
+            workspace_count,
+            "subscription active",
+            "实时订阅",
+        )
+    }
+
+    pub(crate) fn herdr_snapshot_status(
+        self,
+        version: &str,
+        protocol: u32,
+        workspace_count: usize,
+    ) -> String {
+        self.format_herdr_status(version, protocol, workspace_count, "snapshot", "状态快照")
+    }
+
+    fn format_herdr_status(
+        self,
+        version: &str,
+        protocol: u32,
+        workspace_count: usize,
+        link: &str,
+        link_zh: &str,
     ) -> String {
         match self.locale {
             Locale::English => format!(
-                "Herdr {version} · protocol {protocol} · connected · {} · {workspace_count} workspace{}",
-                if subscription {
-                    "subscription active"
-                } else {
-                    "snapshot"
-                },
+                "Herdr {version} · protocol {protocol} · connected · {link} · {workspace_count} workspace{}",
                 if workspace_count == 1 { "" } else { "s" },
             ),
             Locale::SimplifiedChinese => format!(
-                "Herdr {version} · 协议 {protocol} · 已连接 · {} · {workspace_count} 个工作区",
-                if subscription {
-                    "实时订阅"
-                } else {
-                    "状态快照"
-                },
+                "Herdr {version} · 协议 {protocol} · 已连接 · {link_zh} · {workspace_count} 个工作区",
             ),
         }
     }
@@ -354,6 +369,7 @@ fn zh_hans(english: &'static str) -> &'static str {
             "C 新建标签页 · ⇧N 新建工作区 · S 设置 · 1–9 切换标签页"
         }
         "Connection unavailable" => "连接不可用",
+        "Live updates disconnected — click to reconnect" => "实时更新已断开 · 点击重新连接",
         "No Herdr session" => "没有 Herdr 会话",
         "Refresh" => "刷新",
         "No running Herdr session" => "没有正在运行的 Herdr 会话",

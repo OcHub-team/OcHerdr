@@ -6,6 +6,7 @@
 use ocherdr_core::{HierarchySnapshot, PaneInfo, Selection, SessionSummary};
 use ochub_ui::gpui::{Div, Role, Stateful, Toggled, prelude::*};
 
+use super::EventStreamState;
 use super::OcHerdrView;
 use super::i18n::I18n;
 use super::profile_display_label;
@@ -101,7 +102,7 @@ pub struct ChromeA11yInput<'a> {
     pub prefix_pending: bool,
     pub operation: Option<&'a str>,
     pub has_error: bool,
-    pub subscription: bool,
+    pub event_stream: &'a EventStreamState,
     pub profile_label: &'a str,
 }
 
@@ -363,15 +364,37 @@ fn status_value(input: &ChromeA11yInput<'_>) -> String {
         operation.to_owned()
     } else if input.has_error {
         i18n.text("Connection unavailable").to_owned()
+    } else if matches!(input.event_stream, EventStreamState::Lost(_)) {
+        event_stream_lost_copy(i18n)
     } else if let Some(snapshot) = input.snapshot {
-        i18n.herdr_status(
-            &snapshot.version,
-            snapshot.protocol,
-            input.subscription,
-            snapshot.workspaces.len(),
-        )
+        event_stream_status_copy(i18n, input.event_stream, snapshot)
     } else {
         i18n.text("No Herdr session").to_owned()
+    }
+}
+
+pub(crate) fn event_stream_lost_copy(i18n: I18n) -> String {
+    i18n.text("Live updates disconnected — click to reconnect")
+        .to_owned()
+}
+
+pub(crate) fn event_stream_status_copy(
+    i18n: I18n,
+    stream: &EventStreamState,
+    snapshot: &HierarchySnapshot,
+) -> String {
+    match stream {
+        EventStreamState::Lost(_) => event_stream_lost_copy(i18n),
+        EventStreamState::Live(_) => i18n.herdr_status(
+            &snapshot.version,
+            snapshot.protocol,
+            snapshot.workspaces.len(),
+        ),
+        EventStreamState::Idle => i18n.herdr_snapshot_status(
+            &snapshot.version,
+            snapshot.protocol,
+            snapshot.workspaces.len(),
+        ),
     }
 }
 
@@ -391,7 +414,7 @@ impl OcHerdrView {
             prefix_pending: self.prefix_pending,
             operation: self.operation.as_deref(),
             has_error: self.error.is_some(),
-            subscription: self.events.is_some(),
+            event_stream: &self.event_stream,
             profile_label: &profile_label,
         })
     }
@@ -404,8 +427,15 @@ mod tests {
 
     use ocherdr_core::{AgentStatus, PaneInfo, TabInfo, WorkspaceInfo};
 
+    use ocherdr_herdr::EventSubscription;
+
     use super::*;
     use crate::i18n::Language;
+
+    fn live_event_stream() -> EventStreamState {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        EventStreamState::Live(EventSubscription::new(rx))
+    }
 
     fn sample_snapshot() -> HierarchySnapshot {
         HierarchySnapshot {
@@ -527,6 +557,7 @@ mod tests {
         sessions: &'a [SessionSummary],
         snapshot: &'a HierarchySnapshot,
         selection: &'a Selection,
+        event_stream: &'a EventStreamState,
     ) -> ChromeA11yInput<'a> {
         ChromeA11yInput {
             sessions,
@@ -540,7 +571,7 @@ mod tests {
             prefix_pending: false,
             operation: None,
             has_error: false,
-            subscription: true,
+            event_stream,
             profile_label: "This Mac",
         }
     }
@@ -553,11 +584,61 @@ mod tests {
     }
 
     #[test]
+    fn live_idle_and_lost_event_streams_map_to_distinct_status_copy() {
+        let snapshot = sample_snapshot();
+        let live = live_event_stream();
+        let lost = EventStreamState::Lost("event worker stopped".into());
+        let english = I18n::new(Language::English);
+        let chinese = I18n::new(Language::SimplifiedChinese);
+
+        assert_eq!(
+            event_stream_status_copy(english, &live, &snapshot),
+            "Herdr 0.8.2 · protocol 20 · connected · subscription active · 2 workspaces"
+        );
+        assert_eq!(
+            event_stream_status_copy(english, &EventStreamState::Idle, &snapshot),
+            "Herdr 0.8.2 · protocol 20 · connected · snapshot · 2 workspaces"
+        );
+        assert_eq!(
+            event_stream_status_copy(english, &lost, &snapshot),
+            "Live updates disconnected — click to reconnect"
+        );
+        assert_eq!(
+            event_stream_status_copy(chinese, &live, &snapshot),
+            "Herdr 0.8.2 · 协议 20 · 已连接 · 实时订阅 · 2 个工作区"
+        );
+        assert_eq!(
+            event_stream_status_copy(chinese, &EventStreamState::Idle, &snapshot),
+            "Herdr 0.8.2 · 协议 20 · 已连接 · 状态快照 · 2 个工作区"
+        );
+        assert_eq!(
+            event_stream_status_copy(chinese, &lost, &snapshot),
+            "实时更新已断开 · 点击重新连接"
+        );
+    }
+
+    #[test]
+    fn chrome_a11y_announces_a_lost_event_stream() {
+        let sessions = sample_sessions();
+        let snapshot = sample_snapshot();
+        let selection = sample_selection();
+        let stream = EventStreamState::Lost("event worker stopped".into());
+        let chrome = chrome_a11y(sample_input(&sessions, &snapshot, &selection, &stream));
+        assert_eq!(
+            chrome.status_value,
+            "Live updates disconnected — click to reconnect"
+        );
+        assert_eq!(chrome.status_message.name, chrome.status_value);
+        assert_eq!(chrome.status_message.role, Role::Button);
+    }
+
+    #[test]
     fn chrome_a11y_names_roles_selected_state_and_regions() {
         let sessions = sample_sessions();
         let snapshot = sample_snapshot();
         let selection = sample_selection();
-        let chrome = chrome_a11y(sample_input(&sessions, &snapshot, &selection));
+        let stream = live_event_stream();
+        let chrome = chrome_a11y(sample_input(&sessions, &snapshot, &selection, &stream));
 
         assert_eq!(chrome.sidebar.role, Role::Toolbar);
         assert_eq!(chrome.sidebar.name, "Spaces");
@@ -671,7 +752,7 @@ mod tests {
             prefix_pending: false,
             operation: None,
             has_error: false,
-            subscription: false,
+            event_stream: &EventStreamState::Idle,
             profile_label: "This Mac",
         });
         assert_eq!(chrome.sidebar.role, Role::Toolbar);

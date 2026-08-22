@@ -1,5 +1,8 @@
 use super::super::*;
-use crate::a11y::{apply_control, apply_list, apply_region, pane_a11y};
+use crate::a11y::{
+    apply_control, apply_list, apply_region, event_stream_lost_copy, event_stream_status_copy,
+    pane_a11y,
+};
 
 impl OcHerdrView {
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -608,18 +611,32 @@ impl OcHerdrView {
                 .child(status_dot(theme::red()))
                 .child(i18n.text("Connection unavailable"))
                 .into_any_element()
+        } else if let EventStreamState::Lost(reason) = &self.event_stream {
+            let message = event_stream_lost_copy(i18n);
+            div()
+                .id((
+                    ochub_ui::gpui::ElementId::from("reconnect-live-updates"),
+                    reason.clone(),
+                ))
+                // The enclosing `status-message` control already carries the button role
+                // and the localized name; a nested one would announce twice.
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.reload(this.selection.session_name.clone(), cx);
+                }))
+                .child(status_dot(theme::red()))
+                .child(message)
+                .into_any_element()
         } else if let Some(snapshot) = &self.snapshot {
             div()
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(status_dot(theme::green()))
-                .child(i18n.herdr_status(
-                    &snapshot.version,
-                    snapshot.protocol,
-                    self.events.is_some(),
-                    snapshot.workspaces.len(),
-                ))
+                .child(event_stream_status_copy(i18n, &self.event_stream, snapshot))
                 .into_any_element()
         } else {
             div()

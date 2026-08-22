@@ -99,7 +99,7 @@ impl OcHerdrView {
             sessions: Vec::new(),
             session_index: None,
             connection: None,
-            events: None,
+            event_stream: EventStreamState::Idle,
             snapshot: None,
             selection: Selection {
                 connection_id: "local".into(),
@@ -189,7 +189,7 @@ impl OcHerdrView {
     pub(super) fn reload(&mut self, preferred_session: Option<String>, cx: &mut Context<Self>) {
         self.load_epoch = self.load_epoch.wrapping_add(1);
         self.event_epoch = self.event_epoch.wrapping_add(1);
-        self.events = None;
+        self.event_stream = EventStreamState::Idle;
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
         let epoch = self.load_epoch;
@@ -209,13 +209,14 @@ impl OcHerdrView {
                             let connection =
                                 SessionConnection::connect(&profile, &sessions[index])?;
                             let snapshot = connection.snapshot()?;
-                            let events = connection.subscribe_background().ok();
+                            let events =
+                                EventStreamState::from_subscribe(connection.subscribe_background());
                             (Some(connection), events, Some(snapshot))
                         } else {
-                            (None, None, None)
+                            (None, EventStreamState::Idle, None)
                         }
                     } else {
-                        (None, None, None)
+                        (None, EventStreamState::Idle, None)
                     };
                     Ok::<_, HerdrError>(LoadedSession {
                         sessions,
@@ -236,7 +237,7 @@ impl OcHerdrView {
                         this.sessions = loaded.sessions;
                         this.session_index = loaded.selected;
                         this.connection = loaded.connection;
-                        this.events = loaded.events;
+                        this.event_stream = loaded.events;
                         this.snapshot = loaded.snapshot;
                         this.selection.connection_id = this.current_profile().id().into();
                         this.selection.session_name =
@@ -245,7 +246,7 @@ impl OcHerdrView {
                             this.selection.reconcile(snapshot);
                         }
                         this.ensure_session_terminals(cx);
-                        if this.events.is_some() {
+                        if matches!(this.event_stream, EventStreamState::Live(_)) {
                             this.schedule_event_poll(this.event_epoch, cx);
                         }
                     }
@@ -253,7 +254,7 @@ impl OcHerdrView {
                         this.sessions.clear();
                         this.session_index = None;
                         this.connection = None;
-                        this.events = None;
+                        this.event_stream = EventStreamState::Idle;
                         this.snapshot = None;
                         this.panes.clear();
                         this.error = Some(error.to_string().into());
@@ -275,7 +276,7 @@ impl OcHerdrView {
         self.sessions.clear();
         self.session_index = None;
         self.connection = None;
-        self.events = None;
+        self.event_stream = EventStreamState::Idle;
         self.snapshot = None;
         self.panes.clear();
         self.reload(None, cx);
@@ -310,30 +311,26 @@ impl OcHerdrView {
                 .timer(Duration::from_millis(100))
                 .await;
             this.update(cx, |this, cx| {
-                if this.event_epoch != epoch || this.events.is_none() {
+                if this.event_epoch != epoch {
                     return;
                 }
-                let mut changed = false;
-                let mut stream_error = None;
-                if let Some(events) = &this.events {
-                    for _ in 0..128 {
-                        match events.try_event() {
-                            Ok(Some(_)) => changed = true,
-                            Ok(None) => break,
-                            Err(error) => {
-                                stream_error = Some(error.to_string().into());
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some(error) = stream_error {
-                    this.error = Some(error);
-                }
-                if changed {
+                let action = {
+                    let EventStreamState::Live(events) = &this.event_stream else {
+                        return;
+                    };
+                    poll_event_stream(|| events.try_event())
+                };
+                let reschedule = action.reschedules();
+                if let EventPollAction::Continue { refresh: true } = &action {
                     this.refresh_snapshot_from_event(epoch, cx);
                 }
-                this.schedule_event_poll(epoch, cx);
+                if let Some(stream) = action.event_stream() {
+                    this.event_stream = stream;
+                    cx.notify();
+                }
+                if reschedule {
+                    this.schedule_event_poll(epoch, cx);
+                }
             })
             .ok();
         })
@@ -2883,6 +2880,42 @@ fn snapshot_refresh_should_queue(refreshing: bool) -> bool {
     refreshing
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EventPollAction {
+    /// Replace Live with Lost. A dead stream has nothing left to poll.
+    Disconnect(SharedString),
+    Continue {
+        refresh: bool,
+    },
+}
+
+impl EventPollAction {
+    fn event_stream(&self) -> Option<EventStreamState> {
+        match self {
+            Self::Disconnect(detail) => Some(EventStreamState::Lost(detail.clone())),
+            Self::Continue { .. } => None,
+        }
+    }
+
+    fn reschedules(&self) -> bool {
+        matches!(self, Self::Continue { .. })
+    }
+}
+
+fn poll_event_stream(
+    mut next: impl FnMut() -> std::result::Result<Option<Value>, HerdrError>,
+) -> EventPollAction {
+    let mut refresh = false;
+    for _ in 0..128 {
+        match next() {
+            Ok(Some(_)) => refresh = true,
+            Ok(None) => break,
+            Err(error) => return EventPollAction::Disconnect(error.to_string().into()),
+        }
+    }
+    EventPollAction::Continue { refresh }
+}
+
 fn mouse_point(position: ochub_ui::gpui::Point<ochub_ui::gpui::Pixels>) -> (f32, f32) {
     (f32::from(position.x), f32::from(position.y))
 }
@@ -3595,6 +3628,65 @@ mod tests {
     fn snapshot_refresh_queues_when_one_is_already_in_flight() {
         assert!(snapshot_refresh_should_queue(true));
         assert!(!snapshot_refresh_should_queue(false));
+    }
+
+    #[test]
+    fn a_rejected_subscription_is_lost_instead_of_idle() {
+        let stream = EventStreamState::from_subscribe(Err(HerdrError::Api {
+            code: "unknown_type".into(),
+            message: "events.subscribe rejected".into(),
+        }));
+        let EventStreamState::Lost(detail) = stream else {
+            panic!("a failed subscribe is Lost, not Idle");
+        };
+        assert!(detail.contains("events.subscribe rejected"));
+    }
+
+    #[test]
+    fn a_successful_subscription_is_live() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let stream = EventStreamState::from_subscribe(Ok(EventSubscription::new(rx)));
+        assert!(matches!(stream, EventStreamState::Live(_)));
+    }
+
+    #[test]
+    fn a_dead_event_stream_is_marked_lost_instead_of_idle() {
+        let next =
+            poll_event_stream(|| Err(HerdrError::EventStreamClosed("event worker stopped".into())))
+                .event_stream();
+        assert!(
+            matches!(next, Some(EventStreamState::Lost(_))),
+            "a closed subscription must become Lost, not Idle"
+        );
+    }
+
+    #[test]
+    fn a_dead_event_stream_does_not_reschedule_the_poll() {
+        let action =
+            poll_event_stream(|| Err(HerdrError::EventStreamClosed("event worker stopped".into())));
+        assert!(
+            !action.reschedules(),
+            "polling a closed stream has nothing left to wait for"
+        );
+    }
+
+    #[test]
+    fn a_quiet_live_stream_keeps_polling_without_refreshing() {
+        assert_eq!(
+            poll_event_stream(|| Ok(None)),
+            EventPollAction::Continue { refresh: false }
+        );
+        assert!(poll_event_stream(|| Ok(None)).reschedules());
+        assert!(poll_event_stream(|| Ok(None)).event_stream().is_none());
+    }
+
+    #[test]
+    fn events_on_a_live_stream_refresh_and_keep_polling() {
+        let mut events = vec![Ok(Some(json!({ "type": "tab.focused" }))), Ok(None)].into_iter();
+        let action = poll_event_stream(|| events.next().unwrap());
+        assert_eq!(action, EventPollAction::Continue { refresh: true });
+        assert!(action.reschedules());
+        assert!(action.event_stream().is_none());
     }
 
     #[test]

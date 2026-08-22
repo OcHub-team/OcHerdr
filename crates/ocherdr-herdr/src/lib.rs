@@ -38,6 +38,10 @@ pub enum HerdrError {
     Protocol(String),
     #[error("terminal stream closed: {0}")]
     TerminalClosed(String),
+    #[error("Herdr event stream closed: {0}")]
+    EventStreamClosed(String),
+    #[error("Herdr did not respond within {0:?}")]
+    Timeout(Duration),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -447,18 +451,32 @@ impl SessionConnection {
     }
 }
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub fn request_socket(socket_path: &Path, method: &str, params: Value) -> Result<Value> {
+    request_socket_with_timeout(socket_path, method, params, REQUEST_TIMEOUT)
+}
+
+fn request_socket_with_timeout(
+    socket_path: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let id = format!("ocherdr-{}", REQUEST_ID.fetch_add(1, Ordering::Relaxed));
-    serde_json::to_writer(
+    write_socket_json(
         &mut stream,
         &json!({ "id": id, "method": method, "params": params }),
+        timeout,
     )?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
 
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| timeout_or_io(error, timeout))?;
     if line.trim().is_empty() {
         return Err(HerdrError::Protocol("empty API response".into()));
     }
@@ -481,6 +499,25 @@ pub fn request_socket(socket_path: &Path, method: &str, params: Value) -> Result
         .get("result")
         .cloned()
         .ok_or_else(|| HerdrError::Protocol("API response is missing `result`".into()))
+}
+
+fn write_socket_json(stream: &mut UnixStream, value: &Value, timeout: Duration) -> Result<()> {
+    let mut payload = serde_json::to_vec(value)?;
+    payload.push(b'\n');
+    stream
+        .write_all(&payload)
+        .map_err(|error| timeout_or_io(error, timeout))?;
+    stream
+        .flush()
+        .map_err(|error| timeout_or_io(error, timeout))?;
+    Ok(())
+}
+
+fn timeout_or_io(error: io::Error, timeout: Duration) -> HerdrError {
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => HerdrError::Timeout(timeout),
+        _ => HerdrError::Io(error),
+    }
 }
 
 struct SshTunnel {
@@ -576,6 +613,8 @@ pub struct EventStream {
 impl EventStream {
     fn connect(socket_path: &Path) -> Result<Self> {
         let mut stream = UnixStream::connect(socket_path)?;
+        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+        // No read timeout: idle gaps are normal; SSH ServerAlive* closes a dead tunnel instead.
         let id = format!(
             "ocherdr-events-{}",
             REQUEST_ID.fetch_add(1, Ordering::Relaxed)
@@ -609,16 +648,15 @@ impl EventStream {
             .into_iter()
             .map(|kind| json!({ "type": kind }))
             .collect::<Vec<_>>();
-        serde_json::to_writer(
+        write_socket_json(
             &mut stream,
             &json!({
                 "id": id,
                 "method": "events.subscribe",
                 "params": { "subscriptions": subscriptions }
             }),
+            REQUEST_TIMEOUT,
         )?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
         Ok(Self {
             reader: BufReader::new(stream),
         })
@@ -639,6 +677,10 @@ pub struct EventSubscription {
 }
 
 impl EventSubscription {
+    pub fn new(events: Receiver<Result<Value>>) -> Self {
+        Self { events }
+    }
+
     fn spawn(mut stream: EventStream) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         thread::spawn(move || {
@@ -657,13 +699,20 @@ impl EventSubscription {
                 }
             }
         });
-        Self { events: event_rx }
+        Self::new(event_rx)
     }
 
     pub fn try_event(&self) -> Result<Option<Value>> {
-        match self.events.try_recv() {
-            Ok(event) => event.map(Some),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
+        recv_event(&self.events)
+    }
+}
+
+fn recv_event(events: &Receiver<Result<Value>>) -> Result<Option<Value>> {
+    match events.try_recv() {
+        Ok(event) => event.map(Some),
+        Err(TryRecvError::Empty) => Ok(None),
+        Err(TryRecvError::Disconnected) => {
+            Err(HerdrError::EventStreamClosed("event worker stopped".into()))
         }
     }
 }
@@ -1365,5 +1414,74 @@ mod tests {
         drop(tx);
         let error = recv_terminal_frame(&rx).unwrap_err();
         assert!(matches!(error, HerdrError::TerminalClosed(reason) if reason.contains("stopped")));
+    }
+
+    #[test]
+    fn recv_event_treats_a_stopped_worker_as_closed() {
+        let (tx, rx) = mpsc::channel::<Result<Value>>();
+        drop(tx);
+        let error = recv_event(&rx).unwrap_err();
+        assert!(
+            matches!(error, HerdrError::EventStreamClosed(reason) if reason.contains("stopped"))
+        );
+    }
+
+    #[test]
+    fn recv_event_returns_none_while_the_sender_is_still_alive() {
+        let (_tx, rx) = mpsc::channel::<Result<Value>>();
+        assert_eq!(recv_event(&rx).unwrap(), None);
+    }
+
+    #[test]
+    fn request_socket_times_out_when_the_server_never_replies() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let socket_path = directory.path().join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        thread::spawn(move || {
+            held_tx.send(listener.accept().unwrap().0).unwrap();
+        });
+        let error = request_socket_with_timeout(
+            &socket_path,
+            "session.snapshot",
+            json!({}),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, HerdrError::Timeout(timeout) if timeout == Duration::from_millis(100))
+        );
+        let _held = held_rx.recv().unwrap();
+    }
+
+    #[test]
+    fn request_socket_returns_the_result_when_the_server_replies() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let socket_path = directory.path().join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let mut payload = serde_json::to_vec(&json!({
+                "id": request["id"],
+                "result": { "ok": true }
+            }))
+            .unwrap();
+            payload.push(b'\n');
+            stream.write_all(&payload).unwrap();
+            stream.flush().unwrap();
+        });
+        let result = request_socket_with_timeout(
+            &socket_path,
+            "session.snapshot",
+            json!({}),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(result, json!({ "ok": true }));
     }
 }

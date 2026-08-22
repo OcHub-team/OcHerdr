@@ -79,8 +79,25 @@ struct LoadedSession {
     sessions: Vec<SessionSummary>,
     selected: Option<usize>,
     connection: Option<SessionConnection>,
-    events: Option<EventSubscription>,
+    events: EventStreamState,
     snapshot: Option<HierarchySnapshot>,
+}
+
+pub(crate) enum EventStreamState {
+    /// No live session, or the selected session is not running.
+    Idle,
+    Live(EventSubscription),
+    /// Subscribe failed, or a live stream later died. The snapshot is not live.
+    Lost(SharedString),
+}
+
+impl EventStreamState {
+    fn from_subscribe(result: std::result::Result<EventSubscription, HerdrError>) -> Self {
+        match result {
+            Ok(events) => Self::Live(events),
+            Err(error) => Self::Lost(error.to_string().into()),
+        }
+    }
 }
 
 struct PaneRuntime {
@@ -351,7 +368,7 @@ struct OcHerdrView {
     sessions: Vec<SessionSummary>,
     session_index: Option<usize>,
     connection: Option<SessionConnection>,
-    events: Option<EventSubscription>,
+    event_stream: EventStreamState,
     snapshot: Option<HierarchySnapshot>,
     selection: Selection,
     operation: Option<SharedString>,
