@@ -10,6 +10,7 @@ build = "build.rs"
 [dependencies]
 core-foundation = "0.10"
 core-video = "0.5.2"
+futures.workspace = true
 io-surface = "0.16"
 thiserror.workspace = true
 

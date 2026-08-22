@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui_platform::application;
@@ -25,7 +25,7 @@ use ochub_ui::gpui::{
     App, AppContext, AssetSource, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
+    SharedString, Task, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
     WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
@@ -79,23 +79,50 @@ struct LoadedSession {
     sessions: Vec<SessionSummary>,
     selected: Option<usize>,
     connection: Option<SessionConnection>,
-    events: EventStreamState,
+    events: LoadedEvents,
     snapshot: Option<HierarchySnapshot>,
+}
+
+enum LoadedEvents {
+    Idle,
+    Live(EventSubscription),
+    Lost(SharedString),
+}
+
+impl LoadedEvents {
+    fn from_subscribe(result: std::result::Result<EventSubscription, HerdrError>) -> Self {
+        match result {
+            Ok(events) => Self::Live(events),
+            Err(error) => Self::Lost(error.to_string().into()),
+        }
+    }
 }
 
 pub(crate) enum EventStreamState {
     /// No live session, or the selected session is not running.
     Idle,
-    Live(EventSubscription),
+    Live,
     /// Subscribe failed, or a live stream later died. The snapshot is not live.
     Lost(SharedString),
 }
 
-impl EventStreamState {
-    fn from_subscribe(result: std::result::Result<EventSubscription, HerdrError>) -> Self {
-        match result {
-            Ok(events) => Self::Live(events),
-            Err(error) => Self::Lost(error.to_string().into()),
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionKey {
+    profile_id: String,
+    session_name: String,
+}
+
+struct SessionPanes {
+    /// Dropping a mismatched owner drops every pane runtime and its listen task.
+    owner: SessionKey,
+    panes: HashMap<String, PaneRuntime>,
+}
+
+impl SessionPanes {
+    fn new(owner: SessionKey) -> Self {
+        Self {
+            owner,
+            panes: HashMap::new(),
         }
     }
 }
@@ -113,6 +140,8 @@ struct PaneRuntime {
     frame_context: u64,
     color_scheme_dark: bool,
     palette_signature: u64,
+    /// Dropping this cancels the pane's await loop.
+    listen: Option<Task<()>>,
     /// The Herdr stream ended; keep the last frame until the snapshot drops this pane.
     exit_seen: bool,
     /// Leftover pixel delta from trackpad wheel events, in the pane's Y axis.
@@ -369,17 +398,19 @@ struct OcHerdrView {
     session_index: Option<usize>,
     connection: Option<SessionConnection>,
     event_stream: EventStreamState,
+    /// Dropping this cancels the event await loop.
+    event_listen: Option<Task<()>>,
     snapshot: Option<HierarchySnapshot>,
     selection: Selection,
     operation: Option<SharedString>,
     error: Option<SharedString>,
     focus: FocusHandle,
     load_epoch: u64,
+    /// Invalidates in-flight snapshot refreshes when the live session is replaced.
     event_epoch: u64,
     snapshot_refreshing: bool,
     snapshot_refresh_pending: bool,
-    terminal_epoch: u64,
-    panes: HashMap<String, PaneRuntime>,
+    session_panes: Option<SessionPanes>,
     node_manager_open: bool,
     remote_form: RemoteForm,
     appearance_open: bool,

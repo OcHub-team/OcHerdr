@@ -778,13 +778,11 @@ impl OcHerdrView {
                 label: pane.display_name().to_owned(),
             };
             let frame = self
-                .panes
-                .get(&pane.pane_id)
+                .pane(&pane.pane_id)
                 .and_then(|runtime| runtime.frame.clone());
             let waiting = frame.is_none();
             let screen_text = if window.is_a11y_active() && !waiting {
-                self.panes
-                    .get(&pane.pane_id)
+                self.pane(&pane.pane_id)
                     .and_then(|runtime| runtime.terminal.read_visible_text())
             } else {
                 None

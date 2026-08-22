@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 base64.workspace = true
 dirs.workspace = true
+futures.workspace = true
 libc.workspace = true
 ocherdr-core = { path = "../ocherdr-core" }
 serde.workspace = true

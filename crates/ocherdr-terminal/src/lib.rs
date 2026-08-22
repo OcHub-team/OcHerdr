@@ -8,10 +8,15 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
+use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, OnceLock, Weak};
+use std::task::{Context, Poll};
+
+use futures::Stream;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use core_foundation::base::{CFRelease, TCFType as _};
 use core_foundation::data::CFData;
@@ -187,7 +192,7 @@ struct PendingFrame {
 
 struct CallbackState {
     surface: Weak<SurfaceCore>,
-    frames: SyncSender<PendingFrame>,
+    frames: UnboundedSender<PendingFrame>,
     input: mpsc::Sender<Vec<u8>>,
 }
 
@@ -487,12 +492,16 @@ unsafe extern "C" fn present_frame(
             token: AtomicU64::new(frame.frame_token),
         }),
     };
-    match callback.frames.try_send(pending) {
+    match callback.frames.unbounded_send(pending) {
         Ok(()) => {
             ffi::ghostty_metal_external_frame_disposition_e_GHOSTTY_METAL_EXTERNAL_FRAME_ACQUIRE
         }
-        Err(TrySendError::Full(pending) | TrySendError::Disconnected(pending)) => {
-            pending.lifetime.token.store(0, Ordering::Release);
+        Err(error) => {
+            error
+                .into_inner()
+                .lifetime
+                .token
+                .store(0, Ordering::Release);
             ffi::ghostty_metal_external_frame_disposition_e_GHOSTTY_METAL_EXTERNAL_FRAME_DROP
         }
     }
@@ -510,7 +519,7 @@ unsafe extern "C" fn write_input(userdata: *mut c_void, bytes: *const c_char, le
 
 pub struct Terminal {
     surface: Arc<SurfaceCore>,
-    frames: Receiver<PendingFrame>,
+    frames: UnboundedReceiver<PendingFrame>,
     input: Receiver<Vec<u8>>,
 }
 
@@ -524,7 +533,7 @@ impl Terminal {
         let runtime = GhosttyRuntime::shared()?;
         runtime.apply_palette(palette)?;
         runtime.set_color_scheme(palette.dark);
-        let (frame_sender, frames) = mpsc::sync_channel(3);
+        let (frame_sender, frames) = futures::channel::mpsc::unbounded();
         let (input_sender, input) = mpsc::channel();
         let surface = Arc::new(SurfaceCore {
             raw: AtomicPtr::new(std::ptr::null_mut()),
@@ -645,27 +654,44 @@ impl Terminal {
         unsafe { ffi::ghostty_surface_size(self.raw()).into() }
     }
 
-    pub fn try_frame(&self) -> Result<Option<RenderedFrame>, TerminalError> {
-        let mut newest = match self.frames.try_recv() {
+    pub fn try_frame(&mut self) -> Result<Option<RenderedFrame>, TerminalError> {
+        let newest = match self.frames.try_recv() {
             Ok(frame) => frame,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(None),
+            Err(_) => return Ok(None),
         };
+        self.rendered_newest(newest).map(Some)
+    }
+
+    pub fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RenderedFrame, TerminalError>>> {
+        match Pin::new(&mut self.frames).poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(first)) => Poll::Ready(Some(self.rendered_newest(first))),
+        }
+    }
+
+    fn rendered_newest(
+        &mut self,
+        mut newest: PendingFrame,
+    ) -> Result<RenderedFrame, TerminalError> {
         while let Ok(frame) = self.frames.try_recv() {
             newest = frame;
         }
-
         // SAFETY: an acquired frame keeps the borrowed IOSurface alive until the
         // lifetime guard is dropped. Both wrappers retain their underlying object.
         let iosurface = unsafe { IOSurface::wrap_under_get_rule(newest.iosurface as IOSurfaceRef) };
         let pixel_buffer = CVPixelBuffer::from_io_surface(&iosurface, None)
             .map_err(TerminalError::FrameConversion)?;
-        Ok(Some(RenderedFrame {
+        Ok(RenderedFrame {
             pixel_buffer,
             width_px: newest.width_px,
             height_px: newest.height_px,
             host_context: newest.host_context,
             lifetime: newest.lifetime,
-        }))
+        })
     }
 
     pub fn try_input(&self) -> Option<Vec<u8>> {

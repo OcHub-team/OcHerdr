@@ -3778,6 +3778,7 @@ dependencies = [
  "anyhow",
  "core-foundation 0.10.1",
  "dirs",
+ "futures",
  "gpui_platform",
  "ocherdr-core",
  "ocherdr-herdr",
@@ -3803,6 +3804,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "dirs",
+ "futures",
  "libc",
  "ocherdr-core",
  "serde",
@@ -3818,6 +3820,7 @@ dependencies = [
  "bindgen 0.72.1",
  "core-foundation 0.10.1",
  "core-video",
+ "futures",
  "io-surface",
  "thiserror 2.0.20",
 ]

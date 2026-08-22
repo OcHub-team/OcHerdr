@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use futures::channel::mpsc::{self as futures_mpsc, UnboundedReceiver};
 use ocherdr_core::{
     ConnectionProfile, HerdrEvent, HierarchySnapshot, MINIMUM_HERDR_VERSION, SessionSummary,
 };
@@ -723,28 +724,28 @@ fn parse_event_line(line: &str) -> Result<HerdrEvent> {
 }
 
 pub struct EventSubscription {
-    events: Receiver<Result<HerdrEvent>>,
+    events: UnboundedReceiver<Result<HerdrEvent>>,
 }
 
 impl EventSubscription {
-    pub fn new(events: Receiver<Result<HerdrEvent>>) -> Self {
+    pub fn new(events: UnboundedReceiver<Result<HerdrEvent>>) -> Self {
         Self { events }
     }
 
     fn spawn(mut stream: EventStream) -> Self {
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = futures_mpsc::unbounded();
         thread::spawn(move || {
             loop {
                 match stream.next_event() {
                     Ok(Some(event)) => {
-                        if event_tx.send(Ok(event)).is_err() {
+                        if event_tx.unbounded_send(Ok(event)).is_err() {
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(error) => {
                         let fatal = !error.is_event_payload_error();
-                        if event_tx.send(Err(error)).is_err() {
+                        if event_tx.unbounded_send(Err(error)).is_err() {
                             break;
                         }
                         if fatal {
@@ -757,19 +758,26 @@ impl EventSubscription {
         Self::new(event_rx)
     }
 
-    pub fn try_event(&self) -> Result<Option<HerdrEvent>> {
-        recv_event(&self.events)
+    pub async fn next_batch(&mut self) -> Option<Vec<Result<HerdrEvent>>> {
+        next_batch(&mut self.events).await
     }
 }
 
-fn recv_event(events: &Receiver<Result<HerdrEvent>>) -> Result<Option<HerdrEvent>> {
-    match events.try_recv() {
-        Ok(event) => event.map(Some),
-        Err(TryRecvError::Empty) => Ok(None),
-        Err(TryRecvError::Disconnected) => {
-            Err(HerdrError::EventStreamClosed("event worker stopped".into()))
+const STREAM_BATCH_LIMIT: usize = 128;
+
+/// Await the next item, then drain already-ready items.
+/// `None` means the stream has closed.
+pub async fn next_batch<T>(rx: &mut UnboundedReceiver<T>) -> Option<Vec<T>> {
+    use futures::StreamExt as _;
+    let first = rx.next().await?;
+    let mut batch = vec![first];
+    while batch.len() < STREAM_BATCH_LIMIT {
+        match rx.try_recv() {
+            Ok(item) => batch.push(item),
+            Err(_) => break,
         }
     }
+    Some(batch)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1027,7 +1035,6 @@ impl Drop for TerminalStream {
 
 pub struct TerminalSession {
     commands: Sender<TerminalCommand>,
-    frames: Receiver<Result<TerminalFrame>>,
     process_id: Arc<AtomicU32>,
     alive: Arc<AtomicBool>,
 }
@@ -1040,9 +1047,9 @@ impl TerminalSession {
         mode: TerminalMode,
         cols: u16,
         rows: u16,
-    ) -> Self {
+    ) -> (Self, UnboundedReceiver<Result<TerminalFrame>>) {
         let (command_tx, command_rx) = mpsc::channel::<TerminalCommand>();
-        let (frame_tx, frame_rx) = mpsc::channel::<Result<TerminalFrame>>();
+        let (frame_tx, frame_rx) = futures_mpsc::unbounded::<Result<TerminalFrame>>();
         let process_id = Arc::new(AtomicU32::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let worker_process_id = process_id.clone();
@@ -1053,7 +1060,7 @@ impl TerminalSession {
                 Ok(stream) => stream,
                 Err(error) => {
                     worker_alive.store(false, Ordering::Release);
-                    let _ = frame_tx.send(Err(error));
+                    let _ = frame_tx.unbounded_send(Err(error));
                     return;
                 }
             };
@@ -1073,13 +1080,13 @@ impl TerminalSession {
             loop {
                 match stream.read_frame() {
                     Ok(Some(frame)) => {
-                        if frame_tx.send(Ok(frame)).is_err() {
+                        if frame_tx.unbounded_send(Ok(frame)).is_err() {
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = frame_tx.send(Err(error));
+                        let _ = frame_tx.unbounded_send(Err(error));
                         break;
                     }
                 }
@@ -1089,12 +1096,14 @@ impl TerminalSession {
             worker_alive.store(false, Ordering::Release);
             let _ = writer.join();
         });
-        Self {
-            commands: command_tx,
-            frames: frame_rx,
-            process_id,
-            alive,
-        }
+        (
+            Self {
+                commands: command_tx,
+                process_id,
+                alive,
+            },
+            frame_rx,
+        )
     }
 
     pub fn send(&self, command: TerminalCommand) -> Result<()> {
@@ -1105,20 +1114,6 @@ impl TerminalSession {
 
     pub fn is_closed(&self) -> bool {
         !self.alive.load(Ordering::Acquire)
-    }
-
-    pub fn try_frame(&self) -> Result<Option<TerminalFrame>> {
-        recv_terminal_frame(&self.frames)
-    }
-}
-
-fn recv_terminal_frame(frames: &Receiver<Result<TerminalFrame>>) -> Result<Option<TerminalFrame>> {
-    match frames.try_recv() {
-        Ok(frame) => frame.map(Some),
-        Err(TryRecvError::Empty) => Ok(None),
-        Err(TryRecvError::Disconnected) => {
-            Err(HerdrError::TerminalClosed("terminal worker stopped".into()))
-        }
     }
 }
 
@@ -1464,27 +1459,34 @@ mod tests {
     }
 
     #[test]
-    fn try_frame_treats_a_stopped_worker_as_closed() {
-        let (tx, rx) = mpsc::channel::<Result<TerminalFrame>>();
-        drop(tx);
-        let error = recv_terminal_frame(&rx).unwrap_err();
-        assert!(matches!(error, HerdrError::TerminalClosed(reason) if reason.contains("stopped")));
-    }
-
-    #[test]
-    fn recv_event_treats_a_stopped_worker_as_closed() {
-        let (tx, rx) = mpsc::channel::<Result<HerdrEvent>>();
-        drop(tx);
-        let error = recv_event(&rx).unwrap_err();
+    fn an_empty_open_channel_does_not_wake_the_ui() {
+        use futures::FutureExt as _;
+        let (_tx, mut rx) = futures_mpsc::unbounded::<u8>();
         assert!(
-            matches!(error, HerdrError::EventStreamClosed(reason) if reason.contains("stopped"))
+            next_batch(&mut rx).now_or_never().is_none(),
+            "空通道不应该唤醒 UI"
         );
     }
 
     #[test]
-    fn recv_event_returns_none_while_the_sender_is_still_alive() {
-        let (_tx, rx) = mpsc::channel::<Result<HerdrEvent>>();
-        assert_eq!(recv_event(&rx).unwrap(), None);
+    fn a_ready_channel_drains_already_queued_items() {
+        use futures::FutureExt as _;
+        let (tx, mut rx) = futures_mpsc::unbounded();
+        tx.unbounded_send(1).unwrap();
+        tx.unbounded_send(2).unwrap();
+        tx.unbounded_send(3).unwrap();
+        assert_eq!(
+            next_batch(&mut rx).now_or_never(),
+            Some(Some(vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn a_closed_channel_ends_the_stream_instead_of_waiting() {
+        use futures::FutureExt as _;
+        let (tx, mut rx) = futures_mpsc::unbounded::<u8>();
+        drop(tx);
+        assert_eq!(next_batch(&mut rx).now_or_never(), Some(None));
     }
 
     const PANE_ID_REQUIRED_SUBSCRIPTIONS: &[&str] = &[

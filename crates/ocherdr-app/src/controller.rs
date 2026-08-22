@@ -1,3 +1,10 @@
+use std::task::Poll;
+
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::future::{self, Either, poll_fn};
+use futures::pin_mut;
+use ocherdr_herdr::{TerminalFrame, next_batch};
+
 use super::*;
 
 impl OcHerdrView {
@@ -100,6 +107,7 @@ impl OcHerdrView {
             session_index: None,
             connection: None,
             event_stream: EventStreamState::Idle,
+            event_listen: None,
             snapshot: None,
             selection: Selection {
                 connection_id: "local".into(),
@@ -112,8 +120,7 @@ impl OcHerdrView {
             event_epoch: 0,
             snapshot_refreshing: false,
             snapshot_refresh_pending: false,
-            terminal_epoch: 0,
-            panes: HashMap::new(),
+            session_panes: None,
             node_manager_open: false,
             remote_form: RemoteForm::Closed,
             appearance_open: false,
@@ -189,6 +196,7 @@ impl OcHerdrView {
     pub(super) fn reload(&mut self, preferred_session: Option<String>, cx: &mut Context<Self>) {
         self.load_epoch = self.load_epoch.wrapping_add(1);
         self.event_epoch = self.event_epoch.wrapping_add(1);
+        self.event_listen = None;
         self.event_stream = EventStreamState::Idle;
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
@@ -210,13 +218,13 @@ impl OcHerdrView {
                                 SessionConnection::connect(&profile, &sessions[index])?;
                             let snapshot = connection.snapshot()?;
                             let events =
-                                EventStreamState::from_subscribe(connection.subscribe_background());
+                                LoadedEvents::from_subscribe(connection.subscribe_background());
                             (Some(connection), events, Some(snapshot))
                         } else {
-                            (None, EventStreamState::Idle, None)
+                            (None, LoadedEvents::Idle, None)
                         }
                     } else {
-                        (None, EventStreamState::Idle, None)
+                        (None, LoadedEvents::Idle, None)
                     };
                     Ok::<_, HerdrError>(LoadedSession {
                         sessions,
@@ -237,7 +245,6 @@ impl OcHerdrView {
                         this.sessions = loaded.sessions;
                         this.session_index = loaded.selected;
                         this.connection = loaded.connection;
-                        this.event_stream = loaded.events;
                         this.snapshot = loaded.snapshot;
                         this.selection.connection_id = this.current_profile().id().into();
                         this.selection.session_name =
@@ -246,8 +253,17 @@ impl OcHerdrView {
                             this.selection.reconcile(snapshot);
                         }
                         this.ensure_session_terminals(cx);
-                        if matches!(this.event_stream, EventStreamState::Live(_)) {
-                            this.schedule_event_poll(this.event_epoch, cx);
+                        match loaded.events {
+                            LoadedEvents::Idle => {
+                                this.event_stream = EventStreamState::Idle;
+                            }
+                            LoadedEvents::Lost(detail) => {
+                                this.event_stream = EventStreamState::Lost(detail);
+                            }
+                            LoadedEvents::Live(subscription) => {
+                                this.event_stream = EventStreamState::Live;
+                                this.event_listen = Some(Self::listen_events(subscription, cx));
+                            }
                         }
                     }
                     Err(error) => {
@@ -255,8 +271,9 @@ impl OcHerdrView {
                         this.session_index = None;
                         this.connection = None;
                         this.event_stream = EventStreamState::Idle;
+                        this.event_listen = None;
                         this.snapshot = None;
-                        this.panes.clear();
+                        this.session_panes = None;
                         this.error = Some(error.to_string().into());
                     }
                 }
@@ -277,8 +294,9 @@ impl OcHerdrView {
         self.session_index = None;
         self.connection = None;
         self.event_stream = EventStreamState::Idle;
+        self.event_listen = None;
         self.snapshot = None;
-        self.panes.clear();
+        self.session_panes = None;
         self.reload(None, cx);
     }
 
@@ -301,75 +319,103 @@ impl OcHerdrView {
         )
     }
 
-    fn live_herdr_session(&self) -> bool {
-        self.connection.is_some() || self.snapshot.is_some() || !self.panes.is_empty()
+    pub(super) fn pane(&self, pane_id: &str) -> Option<&PaneRuntime> {
+        self.session_panes.as_ref()?.panes.get(pane_id)
     }
 
-    pub(super) fn schedule_event_poll(&self, epoch: u64, cx: &mut Context<Self>) {
+    fn pane_mut(&mut self, pane_id: &str) -> Option<&mut PaneRuntime> {
+        self.session_panes.as_mut()?.panes.get_mut(pane_id)
+    }
+
+    fn live_herdr_session(&self) -> bool {
+        self.connection.is_some()
+            || self.snapshot.is_some()
+            || self
+                .session_panes
+                .as_ref()
+                .is_some_and(|session| !session.panes.is_empty())
+    }
+
+    fn listen_events(mut events: EventSubscription, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(100))
-                .await;
-            this.update(cx, |this, cx| {
-                if this.event_epoch != epoch {
-                    return;
+            loop {
+                let batch = events.next_batch().await;
+                let keep = this
+                    .update(cx, |this, cx| this.apply_event_batch(batch, cx))
+                    .unwrap_or(false);
+                if !keep {
+                    break;
                 }
-                let old_tab = this.selection.tab_id.clone();
-                let old_selected = this.selection.pane_id.clone();
-                let old_panes = this
-                    .snapshot
-                    .as_ref()
-                    .map(snapshot_pane_ids)
-                    .unwrap_or_default();
-                let action = {
-                    let EventStreamState::Live(events) = &this.event_stream else {
-                        return;
-                    };
-                    let Some(snapshot) = this.snapshot.as_mut() else {
-                        return;
-                    };
-                    poll_event_stream(snapshot, || events.try_event())
-                };
-                let effects = effects_for(&action);
-                if let Some(error) = effects.error {
-                    this.error = Some(error);
-                }
-                if effects.resync {
-                    this.resync_snapshot(epoch, cx);
-                }
-                if effects.apply_local
-                    && let Some(snapshot) = &this.snapshot
-                {
-                    this.selection.reconcile(snapshot);
-                    let closed_stream = this
-                        .panes
-                        .values()
-                        .any(|runtime| runtime.exit_seen || runtime.session.is_closed());
-                    if session_terminals_need_rebuild(
-                        old_tab.as_deref(),
-                        old_selected.as_deref(),
-                        &old_panes,
-                        &this.selection,
-                        snapshot,
-                        closed_stream,
-                    ) {
-                        this.ensure_session_terminals(cx);
-                    }
-                }
-                if effects.notify {
-                    cx.notify();
-                }
-                if let Some(stream) = action.event_stream() {
-                    this.event_stream = stream;
-                    cx.notify();
-                }
-                if effects.reschedule {
-                    this.schedule_event_poll(epoch, cx);
-                }
-            })
-            .ok();
+            }
         })
-        .detach();
+    }
+
+    fn apply_event_batch(
+        &mut self,
+        batch: Option<Vec<std::result::Result<HerdrEvent, HerdrError>>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let old_tab = self.selection.tab_id.clone();
+        let old_selected = self.selection.pane_id.clone();
+        let old_panes = self
+            .snapshot
+            .as_ref()
+            .map(snapshot_pane_ids)
+            .unwrap_or_default();
+        let action = match batch {
+            None => EventPollAction::Disconnect(
+                HerdrError::EventStreamClosed("event worker stopped".into())
+                    .to_string()
+                    .into(),
+            ),
+            Some(items) => {
+                let Some(snapshot) = self.snapshot.as_mut() else {
+                    return false;
+                };
+                let mut items = items.into_iter();
+                poll_event_stream(snapshot, || match items.next() {
+                    Some(Ok(event)) => Ok(Some(event)),
+                    Some(Err(err)) => Err(err),
+                    None => Ok(None),
+                })
+            }
+        };
+        let effects = effects_for(&action);
+        if let Some(error) = effects.error {
+            self.error = Some(error);
+        }
+        if effects.resync {
+            self.resync_snapshot(self.event_epoch, cx);
+        }
+        if effects.apply_local
+            && let Some(snapshot) = &self.snapshot
+        {
+            self.selection.reconcile(snapshot);
+            let closed_stream = self.session_panes.as_ref().is_some_and(|session| {
+                session
+                    .panes
+                    .values()
+                    .any(|runtime| runtime.exit_seen || runtime.session.is_closed())
+            });
+            if session_terminals_need_rebuild(
+                old_tab.as_deref(),
+                old_selected.as_deref(),
+                &old_panes,
+                &self.selection,
+                snapshot,
+                closed_stream,
+            ) {
+                self.ensure_session_terminals(cx);
+            }
+        }
+        if effects.notify {
+            cx.notify();
+        }
+        if let Some(stream) = action.event_stream() {
+            self.event_stream = stream;
+            cx.notify();
+        }
+        effects.reschedule
     }
 
     pub(super) fn resync_snapshot(&mut self, epoch: u64, cx: &mut Context<Self>) {
@@ -410,10 +456,12 @@ impl OcHerdrView {
                         this.snapshot = Some(snapshot);
                         if let Some(snapshot) = &this.snapshot {
                             this.selection.reconcile(snapshot);
-                            let closed_stream = this
-                                .panes
-                                .values()
-                                .any(|runtime| runtime.exit_seen || runtime.session.is_closed());
+                            let closed_stream =
+                                this.session_panes.as_ref().is_some_and(|session| {
+                                    session.panes.values().any(|runtime| {
+                                        runtime.exit_seen || runtime.session.is_closed()
+                                    })
+                                });
                             if session_terminals_need_rebuild(
                                 old_tab.as_deref(),
                                 old_selected.as_deref(),
@@ -1102,7 +1150,11 @@ impl OcHerdrView {
         theme::apply_window_background(window);
         let palette = current_terminal_palette(&self.appearance);
         let mut palette_error = None;
-        for runtime in self.panes.values_mut() {
+        for runtime in self
+            .session_panes
+            .iter_mut()
+            .flat_map(|session| session.panes.values_mut())
+        {
             if let Err(error) = runtime.terminal.apply_palette(&palette) {
                 palette_error = Some(error);
             }
@@ -1887,146 +1939,200 @@ impl OcHerdrView {
             .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
             .collect::<HashMap<_, _>>();
         let wanted = snapshot_runtime_targets(snapshot, selected_pane.as_deref());
-        let poll_alive = !self.panes.is_empty();
-        self.panes
-            .retain(|pane_id, _| live_pane_ids.contains(pane_id));
+        let incoming = SessionKey {
+            profile_id: profile.id().to_owned(),
+            session_name: session_name.clone(),
+        };
+        if session_panes_plan(
+            self.session_panes.as_ref().map(|session| &session.owner),
+            &incoming,
+        ) == SessionPanesPlan::Replace
+        {
+            self.session_panes = Some(SessionPanes::new(incoming));
+        }
         let palette = current_terminal_palette(&self.appearance);
         let color_scheme_dark = palette.dark;
         let mut palette_error = None;
+        let mut spawn_error = None;
         let mut spawned = HashSet::new();
-        for (pane_id, mode) in &wanted {
-            match visible_pane_plan(
-                self.panes.get(pane_id).map(|runtime| runtime.mode),
-                self.panes
-                    .get(pane_id)
-                    .is_some_and(|runtime| runtime.session.is_closed() || runtime.exit_seen),
-                *mode,
-            ) {
-                VisiblePanePlan::Keep
-                | VisiblePanePlan::PromoteToControl
-                | VisiblePanePlan::DemoteToObserve => {
-                    if let Some(runtime) = self.panes.get_mut(pane_id) {
-                        if runtime.palette_signature != palette.signature() {
-                            if let Err(error) = runtime.terminal.apply_palette(&palette) {
-                                palette_error = Some(error);
+        let mut pending_listens = Vec::new();
+        {
+            let panes = &mut self
+                .session_panes
+                .as_mut()
+                .expect("live session adopted panes")
+                .panes;
+            panes.retain(|pane_id, _| live_pane_ids.contains(pane_id));
+            for (pane_id, mode) in &wanted {
+                match visible_pane_plan(
+                    panes.get(pane_id).map(|runtime| runtime.mode),
+                    panes
+                        .get(pane_id)
+                        .is_some_and(|runtime| runtime.session.is_closed() || runtime.exit_seen),
+                    *mode,
+                ) {
+                    VisiblePanePlan::Keep
+                    | VisiblePanePlan::PromoteToControl
+                    | VisiblePanePlan::DemoteToObserve => {
+                        if let Some(runtime) = panes.get_mut(pane_id) {
+                            if runtime.palette_signature != palette.signature() {
+                                if let Err(error) = runtime.terminal.apply_palette(&palette) {
+                                    palette_error = Some(error);
+                                }
+                                runtime.color_scheme_dark = palette.dark;
+                                runtime.palette_signature = palette.signature();
                             }
-                            runtime.color_scheme_dark = palette.dark;
-                            runtime.palette_signature = palette.signature();
+                            if let Some(frames) = sync_pane_session(
+                                runtime,
+                                *mode,
+                                profile.clone(),
+                                session_name.clone(),
+                                pane_id.clone(),
+                            ) {
+                                pending_listens.push((pane_id.clone(), frames));
+                            }
                         }
-                        sync_pane_session(
-                            runtime,
-                            *mode,
+                    }
+                    VisiblePanePlan::Spawn => {
+                        let cols = 80;
+                        let rows = 24;
+                        let (session, frames) = TerminalSession::spawn(
                             profile.clone(),
                             session_name.clone(),
                             pane_id.clone(),
+                            *mode,
+                            cols,
+                            rows,
                         );
+                        match Terminal::new(cols, rows, 10_000, &palette) {
+                            Ok(terminal) => {
+                                terminal.set_focus(*mode == TerminalMode::ControlTakeover);
+                                panes.insert(
+                                    pane_id.clone(),
+                                    PaneRuntime {
+                                        session,
+                                        terminal,
+                                        frame: None,
+                                        mode: *mode,
+                                        size: (cols, rows),
+                                        pixel_size: (0, 0),
+                                        frame_context: 0,
+                                        color_scheme_dark,
+                                        palette_signature: palette.signature(),
+                                        listen: None,
+                                        exit_seen: false,
+                                        scroll_px: 0.,
+                                        body_bounds: (0., 0., 0., 0.),
+                                    },
+                                );
+                                spawned.insert(pane_id.clone());
+                                pending_listens.push((pane_id.clone(), frames));
+                            }
+                            Err(error) => spawn_error = Some(error.to_string().into()),
+                        }
                     }
                 }
-                VisiblePanePlan::Spawn => {
-                    let cols = 80;
-                    let rows = 24;
-                    let session = TerminalSession::spawn(
-                        profile.clone(),
-                        session_name.clone(),
-                        pane_id.clone(),
-                        *mode,
-                        cols,
-                        rows,
-                    );
-                    match Terminal::new(cols, rows, 10_000, &palette) {
-                        Ok(terminal) => {
-                            terminal.set_focus(*mode == TerminalMode::ControlTakeover);
-                            self.panes.insert(
-                                pane_id.clone(),
-                                PaneRuntime {
-                                    session,
-                                    terminal,
-                                    frame: None,
-                                    mode: *mode,
-                                    size: (cols, rows),
-                                    pixel_size: (0, 0),
-                                    frame_context: 0,
-                                    color_scheme_dark,
-                                    palette_signature: palette.signature(),
-                                    exit_seen: false,
-                                    scroll_px: 0.,
-                                    body_bounds: (0., 0., 0., 0.),
-                                },
-                            );
-                            spawned.insert(pane_id.clone());
-                        }
-                        Err(error) => self.error = Some(error.to_string().into()),
-                    }
+            }
+            for (pane_id, _) in &wanted {
+                let pane_tab = pane_tabs.get(pane_id).map(String::as_str);
+                if !should_flush_session_pane(
+                    pane_tab,
+                    visible_tab_id.as_deref(),
+                    spawned.contains(pane_id),
+                ) {
+                    continue;
+                }
+                if let Some(runtime) = panes.get_mut(pane_id) {
+                    flush_pane_surface(runtime);
                 }
             }
         }
         if let Some(error) = palette_error {
             self.error = Some(error.to_string().into());
         }
-        for (pane_id, _) in &wanted {
-            let pane_tab = pane_tabs.get(pane_id).map(String::as_str);
-            if !should_flush_session_pane(
-                pane_tab,
-                visible_tab_id.as_deref(),
-                spawned.contains(pane_id),
-            ) {
-                continue;
-            }
-            if let Some(runtime) = self.panes.get_mut(pane_id) {
-                flush_pane_surface(runtime);
-            }
+        if let Some(error) = spawn_error {
+            self.error = Some(error);
         }
-        if !poll_alive && !self.panes.is_empty() {
-            self.terminal_epoch = self.terminal_epoch.wrapping_add(1);
-            let epoch = self.terminal_epoch;
-            self.schedule_terminal_poll(epoch, cx);
+        for (pane_id, frames) in pending_listens {
+            let task = Self::listen_pane(pane_id.clone(), frames, cx);
+            if let Some(runtime) = self.pane_mut(&pane_id) {
+                runtime.listen = Some(task);
+            }
         }
     }
 
     fn stop_session_terminals(&mut self) {
-        self.panes.clear();
-        self.terminal_epoch = self.terminal_epoch.wrapping_add(1);
+        self.session_panes = None;
     }
 
-    pub(super) fn schedule_terminal_poll(&self, epoch: u64, cx: &mut Context<Self>) {
+    fn listen_pane(
+        pane_id: String,
+        mut frames: UnboundedReceiver<std::result::Result<TerminalFrame, HerdrError>>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(16))
-                .await;
-            this.update(cx, |this, cx| {
-                if this.terminal_epoch != epoch || this.panes.is_empty() {
-                    return;
-                }
-                let mut changed = false;
-                let mut error = None;
-                let mut hierarchy_changed = false;
-                if let Err(runtime_error) = Terminal::tick_runtime() {
-                    error = Some(runtime_error.to_string().into());
-                }
-                let composing = this.ime_marked.clone();
-                let selected_pane = this.selection.pane_id.clone();
-                let visible_pane_ids = this
-                    .snapshot
-                    .as_ref()
-                    .zip(this.selection.tab_id.as_deref())
-                    .map(|(snapshot, tab_id)| {
-                        snapshot
-                            .panes_for(tab_id)
-                            .map(|pane| pane.pane_id.clone())
-                            .collect::<HashSet<_>>()
+            loop {
+                let herdr = next_batch(&mut frames);
+                let ghostty = poll_fn(|task_cx| {
+                    this.update(cx, |this, _| {
+                        let Some(runtime) = this.pane_mut(&pane_id) else {
+                            return Poll::Ready(None);
+                        };
+                        runtime.terminal.poll_frame(task_cx)
                     })
-                    .unwrap_or_default();
-                for (pane_id, runtime) in this.panes.iter_mut() {
-                    if runtime.session.is_closed() {
-                        if !runtime.exit_seen {
-                            runtime.exit_seen = true;
-                            hierarchy_changed = true;
+                    .unwrap_or(Poll::Ready(None))
+                });
+                pin_mut!(herdr, ghostty);
+                match future::select(herdr, ghostty).await {
+                    Either::Left((batch, _)) => {
+                        let keep = this
+                            .update(cx, |this, cx| this.apply_herdr_frames(&pane_id, batch, cx))
+                            .unwrap_or(false);
+                        if !keep {
+                            break;
                         }
-                        continue;
                     }
-                    for _ in 0..64 {
-                        match runtime.session.try_frame() {
-                            Ok(Some(frame)) => {
+                    Either::Right((frame, _)) => {
+                        let keep = this
+                            .update(cx, |this, cx| this.apply_ghostty_frame(&pane_id, frame, cx))
+                            .unwrap_or(false);
+                        if !keep {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn apply_herdr_frames(
+        &mut self,
+        pane_id: &str,
+        batch: Option<Vec<std::result::Result<TerminalFrame, HerdrError>>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let composing = self.ime_marked.clone();
+        let selected_pane = self.selection.pane_id.clone();
+        let visible_pane_ids =
+            visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
+        let mut error = None;
+        let mut hierarchy_changed = false;
+        let mut changed = false;
+        let keep = {
+            let Some(runtime) = self.pane_mut(pane_id) else {
+                return false;
+            };
+            match batch {
+                None => {
+                    runtime.exit_seen = true;
+                    hierarchy_changed = true;
+                    false
+                }
+                Some(items) => {
+                    let mut closed = false;
+                    for item in items {
+                        match item {
+                            Ok(frame) => {
                                 if runtime.size != (frame.width, frame.height)
                                     && incoming_frame_should_replace_grid(runtime.pixel_size)
                                 {
@@ -2042,16 +2148,16 @@ impl OcHerdrView {
                                     }
                                 }
                                 runtime.terminal.apply_frame(&frame.bytes, frame.full);
-                                if selected_pane.as_deref() == Some(pane_id.as_str())
+                                if selected_pane.as_deref() == Some(pane_id)
                                     && let Some(preedit) = composing.as_deref()
                                 {
                                     runtime.terminal.set_preedit(Some(preedit));
                                 }
                             }
-                            Ok(None) => break,
                             Err(stream_error) => {
                                 runtime.exit_seen = true;
                                 hierarchy_changed = true;
+                                closed = true;
                                 if !is_expected_terminal_exit(&stream_error) {
                                     error = Some(stream_error.to_string().into());
                                 }
@@ -2059,9 +2165,13 @@ impl OcHerdrView {
                             }
                         }
                     }
+                    if let Err(runtime_error) = Terminal::tick_runtime() {
+                        error = Some(runtime_error.to_string().into());
+                    }
                     if forward_terminal_input(runtime).is_err() {
                         runtime.exit_seen = true;
                         hierarchy_changed = true;
+                        closed = true;
                     }
                     match runtime.terminal.try_frame() {
                         Ok(Some(frame)) if frame.host_context == runtime.frame_context => {
@@ -2073,21 +2183,66 @@ impl OcHerdrView {
                         Ok(Some(_)) | Ok(None) => {}
                         Err(frame_error) => error = Some(frame_error.to_string().into()),
                     }
+                    !closed
                 }
-                if let Some(error) = error {
-                    this.error = Some(error);
+            }
+        };
+        if let Some(error) = error {
+            self.error = Some(error);
+        }
+        if hierarchy_changed {
+            self.resync_snapshot(self.event_epoch, cx);
+        }
+        if changed {
+            cx.notify();
+        }
+        keep
+    }
+
+    fn apply_ghostty_frame(
+        &mut self,
+        pane_id: &str,
+        frame: Option<std::result::Result<RenderedFrame, ocherdr_terminal::TerminalError>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let visible_pane_ids =
+            visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
+        let mut error = None;
+        let mut changed = false;
+        let mut hierarchy_changed = false;
+        let keep = {
+            let Some(runtime) = self.pane_mut(pane_id) else {
+                return false;
+            };
+            let Some(frame) = frame else {
+                return false;
+            };
+            match frame {
+                Ok(frame) if frame.host_context == runtime.frame_context => {
+                    runtime.frame = Some(frame);
+                    changed = visible_pane_ids.contains(pane_id);
                 }
-                if hierarchy_changed {
-                    this.resync_snapshot(this.event_epoch, cx);
-                }
-                if changed {
-                    cx.notify();
-                }
-                this.schedule_terminal_poll(epoch, cx);
-            })
-            .ok();
-        })
-        .detach();
+                Ok(_) => {}
+                Err(frame_error) => error = Some(frame_error.to_string().into()),
+            }
+            if forward_terminal_input(runtime).is_err() {
+                runtime.exit_seen = true;
+                hierarchy_changed = true;
+                false
+            } else {
+                true
+            }
+        };
+        if let Some(error) = error {
+            self.error = Some(error);
+        }
+        if hierarchy_changed {
+            self.resync_snapshot(self.event_epoch, cx);
+        }
+        if changed {
+            cx.notify();
+        }
+        keep
     }
 
     pub(super) fn resize_session_terminals(&mut self, window: &Window) {
@@ -2101,7 +2256,10 @@ impl OcHerdrView {
             return;
         };
         let mut palette_error = None;
-        for (pane_id, runtime) in &mut self.panes {
+        let Some(session_panes) = self.session_panes.as_mut() else {
+            return;
+        };
+        for (pane_id, runtime) in &mut session_panes.panes {
             if runtime.palette_signature != palette.signature() {
                 if let Err(error) = runtime.terminal.apply_palette(&palette) {
                     palette_error = Some(error);
@@ -2432,7 +2590,7 @@ impl OcHerdrView {
         };
         let key = &event.keystroke;
         let stream_closed = {
-            let Some(runtime) = self.panes.get_mut(&pane_id) else {
+            let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
             };
             if key.modifiers.platform && key.key == "v" {
@@ -2481,14 +2639,14 @@ impl OcHerdrView {
     ) {
         if let Some(previous) = self.text_drag_pane.take()
             && previous != pane_id
-            && let Some(runtime) = self.panes.get_mut(&previous)
+            && let Some(runtime) = self.pane_mut(&previous)
         {
             runtime
                 .terminal
                 .end_text_selection(None, KeyModifiers::default(), 1.0);
         }
         self.select_pane(pane_id.clone(), window, cx);
-        let Some(runtime) = self.panes.get(&pane_id) else {
+        let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
         let mouse = mouse_point(event.position);
@@ -2508,7 +2666,7 @@ impl OcHerdrView {
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
         self.text_drag_pane = Some(pane_id.clone());
-        if let Some(runtime) = self.panes.get_mut(&pane_id) {
+        if let Some(runtime) = self.pane_mut(&pane_id) {
             runtime.terminal.begin_text_selection(
                 surface.0,
                 surface.1,
@@ -2531,7 +2689,7 @@ impl OcHerdrView {
         let Some(pane_id) = self.text_drag_pane.clone() else {
             return;
         };
-        let Some(runtime) = self.panes.get(&pane_id) else {
+        let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
         let scale = f64::from(window.scale_factor());
@@ -2544,7 +2702,7 @@ impl OcHerdrView {
             return;
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
-        if let Some(runtime) = self.panes.get_mut(&pane_id) {
+        if let Some(runtime) = self.pane_mut(&pane_id) {
             runtime
                 .terminal
                 .update_text_selection(surface.0, surface.1, modifiers, scale);
@@ -2565,7 +2723,7 @@ impl OcHerdrView {
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
         let scale = f64::from(window.scale_factor());
-        if let Some(runtime) = self.panes.get_mut(&pane_id) {
+        if let Some(runtime) = self.pane_mut(&pane_id) {
             let point = map_mouse_to_surface(
                 mouse_point(event.position),
                 runtime.body_bounds,
@@ -2584,7 +2742,7 @@ impl OcHerdrView {
         let Some(pane_id) = self.selection.pane_id.clone() else {
             return;
         };
-        let Some(runtime) = self.panes.get(&pane_id) else {
+        let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
         if !runtime.terminal.has_selection() {
@@ -2604,7 +2762,7 @@ impl OcHerdrView {
         let Some(pane_id) = self.selection.pane_id.clone() else {
             return;
         };
-        let Some(runtime) = self.panes.get_mut(&pane_id) else {
+        let Some(runtime) = self.pane_mut(&pane_id) else {
             return;
         };
         if !runtime.terminal.select_all_visible() {
@@ -2622,7 +2780,7 @@ impl OcHerdrView {
         event: &ScrollWheelEvent,
         cx: &mut Context<Self>,
     ) {
-        let Some(runtime) = self.panes.get_mut(pane_id) else {
+        let Some(runtime) = self.pane_mut(pane_id) else {
             return;
         };
         let line_height = if runtime.size.1 == 0 {
@@ -2681,7 +2839,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn store_pane_body_bounds(&mut self, pane_id: &str, geometry: (f32, f32, f32, f32)) {
-        if let Some(runtime) = self.panes.get_mut(pane_id) {
+        if let Some(runtime) = self.pane_mut(pane_id) {
             runtime.body_bounds = terminal_body_bounds(geometry);
         }
     }
@@ -2713,7 +2871,7 @@ impl OcHerdrView {
             return;
         };
         let stream_closed = {
-            let Some(runtime) = self.panes.get_mut(&pane_id) else {
+            let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
             };
             let closed = runtime
@@ -2744,7 +2902,7 @@ impl OcHerdrView {
         }
         self.ime_marked = Some(text.to_owned());
         if let Some(pane_id) = self.selection.pane_id.clone()
-            && let Some(runtime) = self.panes.get_mut(&pane_id)
+            && let Some(runtime) = self.pane_mut(&pane_id)
         {
             runtime.terminal.set_preedit(Some(text));
             flush_pane_surface(runtime);
@@ -2758,7 +2916,7 @@ impl OcHerdrView {
             return;
         }
         if let Some(pane_id) = self.selection.pane_id.clone()
-            && let Some(runtime) = self.panes.get_mut(&pane_id)
+            && let Some(runtime) = self.pane_mut(&pane_id)
         {
             runtime.terminal.set_preedit(None);
             flush_pane_surface(runtime);
@@ -2772,7 +2930,7 @@ impl OcHerdrView {
         window: &Window,
     ) -> Option<Bounds<ochub_ui::gpui::Pixels>> {
         let pane_id = self.selection.pane_id.as_deref()?;
-        let runtime = self.panes.get(pane_id)?;
+        let runtime = self.pane(pane_id)?;
         let (x, y, width, height) = runtime.terminal.ime_point();
         let (left, top, w, h) = map_surface_rect_to_window(
             (x, y - height, width.max(1.0), height.max(1.0)),
@@ -2893,6 +3051,19 @@ fn incoming_frame_should_replace_grid(pixel_size: (u32, u32)) -> bool {
     // (or takeover) frames must not shrink it. That shrink-then-grow is the
     // flash seen when clicking another pane.
     pixel_size == (0, 0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPanesPlan {
+    Keep,
+    Replace,
+}
+
+fn session_panes_plan(current: Option<&SessionKey>, incoming: &SessionKey) -> SessionPanesPlan {
+    match current {
+        Some(owner) if owner == incoming => SessionPanesPlan::Keep,
+        _ => SessionPanesPlan::Replace,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3202,21 +3373,34 @@ fn terminal_palette_from_theme(
     }
 }
 
+fn visible_pane_ids(snapshot: Option<&HierarchySnapshot>, tab_id: Option<&str>) -> HashSet<String> {
+    snapshot
+        .zip(tab_id)
+        .map(|(snapshot, tab_id)| {
+            snapshot
+                .panes_for(tab_id)
+                .map(|pane| pane.pane_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn sync_pane_session(
     runtime: &mut PaneRuntime,
     wanted: TerminalMode,
     profile: ConnectionProfile,
     session_name: String,
     pane_id: String,
-) {
+) -> Option<UnboundedReceiver<std::result::Result<TerminalFrame, HerdrError>>> {
     runtime
         .terminal
         .set_focus(wanted == TerminalMode::ControlTakeover);
     if runtime.mode == wanted {
-        return;
+        return None;
     }
+    runtime.listen = None;
     let (cols, rows) = runtime.size;
-    runtime.session = TerminalSession::spawn(
+    let (session, frames) = TerminalSession::spawn(
         profile,
         session_name,
         pane_id,
@@ -3224,10 +3408,12 @@ fn sync_pane_session(
         cols.max(1),
         rows.max(1),
     );
+    runtime.session = session;
     runtime.mode = wanted;
     if wanted == TerminalMode::ControlTakeover {
         send_session_resize(runtime);
     }
+    Some(frames)
 }
 
 fn send_session_resize(runtime: &PaneRuntime) {
@@ -3701,6 +3887,34 @@ mod tests {
     }
 
     #[test]
+    fn switching_sessions_does_not_reuse_the_previous_session_panes() {
+        let current = SessionKey {
+            profile_id: "local".into(),
+            session_name: "work".into(),
+        };
+        let incoming = SessionKey {
+            profile_id: "local".into(),
+            session_name: "other".into(),
+        };
+        assert_eq!(
+            session_panes_plan(Some(&current), &incoming),
+            SessionPanesPlan::Replace
+        );
+    }
+
+    #[test]
+    fn reloading_the_same_session_keeps_existing_session_panes() {
+        let owner = SessionKey {
+            profile_id: "local".into(),
+            session_name: "work".into(),
+        };
+        assert_eq!(
+            session_panes_plan(Some(&owner), &owner),
+            SessionPanesPlan::Keep
+        );
+    }
+
+    #[test]
     fn a_closed_stream_is_respawned_instead_of_kept() {
         assert_eq!(
             visible_pane_plan(
@@ -3737,11 +3951,11 @@ mod tests {
 
     #[test]
     fn a_rejected_subscription_is_lost_instead_of_idle() {
-        let stream = EventStreamState::from_subscribe(Err(HerdrError::Api {
+        let loaded = LoadedEvents::from_subscribe(Err(HerdrError::Api {
             code: "unknown_type".into(),
             message: "events.subscribe rejected".into(),
         }));
-        let EventStreamState::Lost(detail) = stream else {
+        let LoadedEvents::Lost(detail) = loaded else {
             panic!("a failed subscribe is Lost, not Idle");
         };
         assert!(detail.contains("events.subscribe rejected"));
@@ -3749,9 +3963,9 @@ mod tests {
 
     #[test]
     fn a_successful_subscription_is_live() {
-        let (_tx, rx) = std::sync::mpsc::channel();
-        let stream = EventStreamState::from_subscribe(Ok(EventSubscription::new(rx)));
-        assert!(matches!(stream, EventStreamState::Live(_)));
+        let (_tx, rx) = futures::channel::mpsc::unbounded();
+        let loaded = LoadedEvents::from_subscribe(Ok(EventSubscription::new(rx)));
+        assert!(matches!(loaded, LoadedEvents::Live(_)));
     }
 
     #[test]

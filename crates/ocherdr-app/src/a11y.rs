@@ -385,7 +385,7 @@ pub(crate) fn event_stream_status_copy(
 ) -> String {
     match stream {
         EventStreamState::Lost(_) => event_stream_lost_copy(i18n),
-        EventStreamState::Live(_) => i18n.herdr_status(
+        EventStreamState::Live => i18n.herdr_status(
             &snapshot.version,
             snapshot.protocol,
             snapshot.workspaces.len(),
@@ -427,14 +427,11 @@ mod tests {
 
     use ocherdr_core::{AgentStatus, PaneInfo, TabInfo, WorkspaceInfo};
 
-    use ocherdr_herdr::EventSubscription;
-
     use super::*;
     use crate::i18n::Language;
 
     fn live_event_stream() -> EventStreamState {
-        let (_tx, rx) = std::sync::mpsc::channel();
-        EventStreamState::Live(EventSubscription::new(rx))
+        EventStreamState::Live
     }
 
     fn sample_snapshot() -> HierarchySnapshot {
