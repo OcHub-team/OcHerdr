@@ -368,7 +368,6 @@ fn zh_hans(english: &'static str) -> &'static str {
         "C new tab · ⇧N new workspace · S settings in Terminal · 1–9 switch tab" => {
             "C 新建标签页 · ⇧N 新建工作区 · S 在终端中打开设置 · 1–9 切换标签页"
         }
-        "Connection unavailable" => "连接不可用",
         "Live updates disconnected — click to reconnect" => "实时更新已断开 · 点击重新连接",
         "No Herdr session" => "没有 Herdr 会话",
         "Refresh" => "刷新",
@@ -490,6 +489,42 @@ fn zh_hans(english: &'static str) -> &'static str {
         "Split down" => "向下拆分",
         "Zoom" => "缩放",
         "Discovering Herdr sessions…" => "正在发现 Herdr 会话…",
+        "Could not discover Herdr sessions" => "无法发现 Herdr 会话",
+        "Could not refresh the session" => "无法刷新会话",
+        "Could not apply a live update" => "无法应用实时更新",
+        "Could not update favorites" => "无法更新收藏",
+        "Could not apply organization" => "无法应用分组与标签",
+        "Could not remove hosts" => "无法移除所选主机",
+        "Could not save appearance" => "无法保存外观设置",
+        "Could not save language" => "无法保存语言设置",
+        "Could not remove host" => "无法移除主机",
+        "Could not save host" => "无法保存主机",
+        "Could not create a workspace" => "无法创建工作区",
+        "Could not close the workspace" => "无法关闭工作区",
+        "Could not rename the workspace" => "无法重命名工作区",
+        "Could not create a tab" => "无法创建标签页",
+        "Could not close the tab" => "无法关闭标签页",
+        "Could not rename the tab" => "无法重命名标签页",
+        "Could not close the pane" => "无法关闭窗格",
+        "Could not rename the pane" => "无法重命名窗格",
+        "Could not split the pane" => "无法拆分窗格",
+        "Could not zoom the pane" => "无法缩放窗格",
+        "Could not move pane focus" => "无法切换窗格焦点",
+        "Could not run the Herdr command" => "无法执行 Herdr 命令",
+        "Could not open Terminal" => "打开终端失败",
+        "Could not apply the terminal theme" => "无法应用终端主题",
+        "Could not open a terminal pane" => "无法打开终端窗格",
+        "Could not resize the terminal" => "无法调整终端尺寸",
+        "Could not render the terminal" => "无法渲染终端",
+        "Terminal stream failed" => "终端数据流出错",
+        "Terminal runtime failed" => "终端运行时出错",
+        "Cannot edit this Mac" => "无法编辑这台 Mac",
+        "Cannot apply organization" => "无法应用分组与标签",
+        "Cannot remove host" => "无法移除主机",
+        "Cannot rename" => "无法重命名",
+        "Invalid SSH destination" => "SSH 目标地址无效",
+        "Invalid SSH port" => "SSH 端口无效",
+        "Cannot open Terminal" => "无法打开终端",
         "Workspace and tab names cannot be empty." => "工作区和标签页名称不能为空。",
         "SSH destination is required." => "必须填写 SSH 目标地址。",
         "SSH port must be a number from 1 to 65535." => "SSH 端口必须是 1 到 65535 之间的数字。",
@@ -525,6 +560,13 @@ mod tests {
         assert_eq!(i18n.text("Status bar"), "状态栏");
         assert_eq!(i18n.text("Terminal type"), "终端字体");
         assert_eq!(i18n.text("Ligatures"), "连字");
+        assert_eq!(
+            i18n.text("Could not discover Herdr sessions"),
+            "无法发现 Herdr 会话"
+        );
+        assert_eq!(i18n.text("Could not update favorites"), "无法更新收藏");
+        assert_eq!(i18n.text("Could not split the pane"), "无法拆分窗格");
+        assert_eq!(i18n.text("Invalid SSH destination"), "SSH 目标地址无效");
         assert_eq!(i18n.text("OcHerdr"), "OcHerdr");
     }
 

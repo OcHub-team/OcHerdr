@@ -601,14 +601,6 @@ impl OcHerdrView {
                     .child(spinner(theme::muted(), 11.))
                     .child(operation.clone())
                     .into_any_element()
-            } else if self.error.is_some() {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_dot(theme::red()))
-                    .child(i18n.text("Connection unavailable"))
-                    .into_any_element()
             } else if let EventStreamState::Lost(reason) = &self.event_stream {
                 let message = event_stream_lost_copy(i18n);
                 div()
@@ -692,7 +684,7 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) -> ochub_ui::gpui::AnyElement {
         let i18n = self.i18n;
-        self.resize_session_terminals(window);
+        self.resize_session_terminals(window, cx);
         let Some(snapshot) = self.snapshot.clone() else {
             let cta = button(
                 "retry-empty",

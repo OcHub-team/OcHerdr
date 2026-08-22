@@ -30,6 +30,7 @@ use ochub_ui::gpui::{
     point, prelude::*, px, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
+use ochub_ui::notifications::NotificationHost;
 use ochub_ui::text_input::{TextInput, TextInputEvent};
 use ochub_ui::{assets, theme};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,7 @@ mod controller;
 mod fonts;
 mod i18n;
 mod ime;
+mod notify;
 mod ui;
 
 use i18n::{I18n, Language};
@@ -404,7 +406,7 @@ struct OcHerdrView {
     snapshot: Option<HierarchySnapshot>,
     selection: Selection,
     operation: Option<SharedString>,
-    error: Option<SharedString>,
+    notifications: Entity<NotificationHost>,
     focus: FocusHandle,
     load_epoch: u64,
     /// Invalidates in-flight snapshot refreshes when the live session is replaced.

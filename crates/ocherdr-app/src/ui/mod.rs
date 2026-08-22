@@ -8,7 +8,7 @@ mod remote;
 impl Render for OcHerdrView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let chrome = self.chrome_a11y();
-        let mut main = crate::a11y::apply_region(div().id(chrome.main.id), &chrome.main)
+        let main = crate::a11y::apply_region(div().id(chrome.main.id), &chrome.main)
             .flex()
             .flex_col()
             .flex_1()
@@ -17,27 +17,6 @@ impl Render for OcHerdrView {
             .bg(theme::surface().alpha(0.))
             .child(self.render_tab_bar(cx))
             .child(self.render_terminal(window, cx));
-        if let Some(error) = &self.error {
-            main = main.child(
-                div()
-                    .id("error-toast")
-                    .role(ochub_ui::gpui::Role::Alert)
-                    .aria_label(error.clone())
-                    .absolute()
-                    .right_4()
-                    .bottom_4()
-                    .max_w(px(480.))
-                    .px_3()
-                    .py_2()
-                    .rounded(px(CORNER_CONTROL))
-                    .border_1()
-                    .border_color(theme::red())
-                    .bg(theme::error_surface())
-                    .text_xs()
-                    .text_color(theme::red())
-                    .child(error.clone()),
-            );
-        }
         let workspace_body = div()
             .flex()
             .flex_row()
@@ -99,6 +78,6 @@ impl Render for OcHerdrView {
                 root = root.child(self.render_rename(&target, cx));
             }
         }
-        root
+        root.child(self.notifications.clone())
     }
 }

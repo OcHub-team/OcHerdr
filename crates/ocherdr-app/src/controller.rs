@@ -5,7 +5,10 @@ use futures::future::{self, Either, poll_fn};
 use futures::pin_mut;
 use ocherdr_herdr::{TerminalFrame, next_batch};
 
+use ochub_ui::notifications::NotificationHost;
+
 use super::*;
+use crate::notify::{FailureKind, FailureNotice, command_notification, notification_for};
 
 impl OcHerdrView {
     pub(super) fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
@@ -114,7 +117,7 @@ impl OcHerdrView {
                 ..Default::default()
             },
             operation: None,
-            error: None,
+            notifications: cx.new(|_| NotificationHost::new()),
             focus: cx.focus_handle(),
             load_epoch: 0,
             event_epoch: 0,
@@ -189,6 +192,33 @@ impl OcHerdrView {
             .and_then(|index| self.sessions.get(index))
     }
 
+    fn notify_failure(
+        &mut self,
+        kind: FailureKind,
+        detail: impl std::fmt::Display,
+        cx: &mut Context<Self>,
+    ) {
+        self.post_notice(notification_for(kind, &detail.to_string(), self.i18n), cx);
+    }
+
+    fn notify_command_failure(
+        &mut self,
+        method: &str,
+        detail: impl std::fmt::Display,
+        cx: &mut Context<Self>,
+    ) {
+        self.post_notice(
+            command_notification(method, &detail.to_string(), self.i18n),
+            cx,
+        );
+    }
+
+    fn post_notice(&mut self, notice: FailureNotice, cx: &mut Context<Self>) {
+        self.notifications.update(cx, |host, cx| {
+            host.notify(notice.request(), cx);
+        });
+    }
+
     pub(super) fn reload(&mut self, preferred_session: Option<String>, cx: &mut Context<Self>) {
         self.load_epoch = self.load_epoch.wrapping_add(1);
         self.event_epoch = self.event_epoch.wrapping_add(1);
@@ -198,7 +228,6 @@ impl OcHerdrView {
         self.snapshot_refresh_pending = false;
         let epoch = self.load_epoch;
         let profile = self.current_profile();
-        self.error = None;
         self.operation = Some(self.i18n.text("Discovering Herdr sessions…").into());
         cx.spawn(async move |this, cx| {
             let loaded = cx
@@ -270,7 +299,7 @@ impl OcHerdrView {
                         this.event_listen = None;
                         this.snapshot = None;
                         this.session_panes = None;
-                        this.error = Some(error.to_string().into());
+                        this.notify_failure(FailureKind::DiscoverSessions, error, cx);
                     }
                 }
                 cx.notify();
@@ -378,7 +407,7 @@ impl OcHerdrView {
         };
         let effects = effects_for(&action);
         if let Some(error) = effects.error {
-            self.error = Some(error);
+            self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
         }
         if effects.resync {
             self.resync_snapshot(self.event_epoch, cx);
@@ -472,7 +501,7 @@ impl OcHerdrView {
                         cx.notify();
                     }
                     Err(error) => {
-                        this.error = Some(error.to_string().into());
+                        this.notify_failure(FailureKind::RefreshSnapshot, error, cx);
                         cx.notify();
                     }
                 }
@@ -488,7 +517,6 @@ impl OcHerdrView {
     pub(super) fn open_add_remote(&mut self, cx: &mut Context<Self>) {
         self.overlay = Overlay::RemoteForm(RemoteForm::Create);
         self.remote_advanced_open = false;
-        self.error = None;
         self.clear_remote_form(cx);
         cx.notify();
     }
@@ -499,7 +527,6 @@ impl OcHerdrView {
         self.host_filter = HostFilter::All;
         self.host_bulk_mode = false;
         self.host_bulk_selection.clear();
-        self.error = None;
         self.refresh_common_host_health(cx);
         cx.notify();
     }
@@ -548,7 +575,11 @@ impl OcHerdrView {
             return;
         };
         if matches!(profile, ConnectionProfile::Local { .. }) {
-            self.error = Some(self.i18n.text("This Mac cannot be edited.").into());
+            self.notify_failure(
+                FailureKind::CannotEditThisMac,
+                self.i18n.text("This Mac cannot be edited."),
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -581,7 +612,7 @@ impl OcHerdrView {
         };
         if let Err(error) = self.persist_settings() {
             self.host_metadata.entry(id).or_default().favorite = !favorite;
-            self.error = Some(error.into());
+            self.notify_failure(FailureKind::UpdateFavorites, error, cx);
         }
         cx.notify();
     }
@@ -611,7 +642,7 @@ impl OcHerdrView {
         }
         if let Err(error) = self.persist_settings() {
             self.host_metadata = original_metadata;
-            self.error = Some(error.into());
+            self.notify_failure(FailureKind::UpdateFavorites, error, cx);
         }
         cx.notify();
     }
@@ -624,7 +655,11 @@ impl OcHerdrView {
         let group = (!group.is_empty()).then_some(group);
         let tags = parse_host_tags(&self.remote_tags.read(cx).content());
         if group.is_none() && tags.is_empty() {
-            self.error = Some(self.i18n.text("Enter a group or at least one tag.").into());
+            self.notify_failure(
+                FailureKind::NeedGroupOrTag,
+                self.i18n.text("Enter a group or at least one tag."),
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -657,7 +692,7 @@ impl OcHerdrView {
         if let Err(error) = self.persist_settings() {
             self.host_metadata = original_metadata;
             self.host_groups = original_groups;
-            self.error = Some(error.into());
+            self.notify_failure(FailureKind::ApplyOrganization, error, cx);
         }
         cx.notify();
     }
@@ -668,10 +703,11 @@ impl OcHerdrView {
         }
         let active_id = self.current_profile().id().to_owned();
         if self.host_bulk_selection.contains(&active_id) {
-            self.error = Some(
+            self.notify_failure(
+                FailureKind::CannotRemoveActiveHost,
                 self.i18n
-                    .text("Switch hosts before removing the active host.")
-                    .into(),
+                    .text("Switch hosts before removing the active host."),
+                cx,
             );
             cx.notify();
             return;
@@ -757,7 +793,7 @@ impl OcHerdrView {
             self.host_metadata = original_metadata;
             self.host_health = original_health;
             self.orphaned_ssh_hosts = original_orphans;
-            self.error = Some(error.into());
+            self.notify_failure(FailureKind::RemoveHosts, error, cx);
             cx.notify();
             return;
         }
@@ -772,7 +808,6 @@ impl OcHerdrView {
             .position(|profile| profile.id() == managed_id)
             .unwrap_or(self.profile_index);
         self.host_bulk_selection.clear();
-        self.error = None;
         cx.notify();
     }
 
@@ -819,7 +854,7 @@ impl OcHerdrView {
             return;
         };
         if let Err(error) = open_system_terminal(&command) {
-            self.error = Some(error.to_string().into());
+            self.notify_failure(FailureKind::OpenTerminal, error, cx);
         }
         cx.notify();
     }
@@ -1078,10 +1113,10 @@ impl OcHerdrView {
             runtime.palette_signature = palette.signature();
         }
         if let Some(error) = palette_error {
-            self.error = Some(error.to_string().into());
+            self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }
         if let Err(error) = self.persist_settings() {
-            self.error = Some(error.into());
+            self.notify_failure(FailureKind::SaveAppearance, error, cx);
         }
         cx.refresh_windows();
         cx.notify();
@@ -1210,17 +1245,18 @@ impl OcHerdrView {
             input.set_placeholder(self.i18n.text("Name"), cx)
         });
         if let Err(error) = self.persist_settings() {
-            self.error = Some(error.into());
+            self.notify_failure(FailureKind::SaveLanguage, error, cx);
         }
         cx.notify();
     }
 
     pub(super) fn request_remove_node(&mut self, index: usize, cx: &mut Context<Self>) {
         if index == self.profile_index {
-            self.error = Some(
+            self.notify_failure(
+                FailureKind::CannotRemoveActiveHost,
                 self.i18n
-                    .text("Switch hosts before removing the active host.")
-                    .into(),
+                    .text("Switch hosts before removing the active host."),
+                cx,
             );
             cx.notify();
             return;
@@ -1259,7 +1295,7 @@ impl OcHerdrView {
             if let Some(health) = removed_health {
                 self.host_health.insert(removed_id, health);
             }
-            self.error = Some(error.into());
+            self.notify_failure(FailureKind::RemoveHost, error, cx);
             cx.notify();
             return;
         }
@@ -1405,10 +1441,10 @@ impl OcHerdrView {
         let target = target.clone();
         let label = self.rename_input.read(cx).content().trim().to_owned();
         if label.is_empty() && !matches!(target, HierarchyTarget::Pane { .. }) {
-            self.error = Some(
-                self.i18n
-                    .text("Workspace and tab names cannot be empty.")
-                    .into(),
+            self.notify_failure(
+                FailureKind::EmptyWorkspaceOrTabName,
+                self.i18n.text("Workspace and tab names cannot be empty."),
+                cx,
             );
             cx.notify();
             return;
@@ -1527,13 +1563,12 @@ impl OcHerdrView {
             self.profiles = original_profiles;
             self.host_metadata = original_metadata;
             self.host_groups = original_groups;
-            self.error = Some(error.into());
+            self.notify_failure(FailureKind::SaveHost, error, cx);
             cx.notify();
             return;
         }
         self.managed_profile_index = index;
         self.overlay = Overlay::NodeManager;
-        self.error = None;
         if connect {
             self.request_choose_node(index, cx);
             return;
@@ -1544,7 +1579,11 @@ impl OcHerdrView {
     fn parse_remote_draft(&mut self, cx: &mut Context<Self>) -> Option<ConnectionProfile> {
         let destination = self.remote_destination.read(cx).content().trim().to_owned();
         if destination.is_empty() {
-            self.error = Some(self.i18n.text("SSH destination is required.").into());
+            self.notify_failure(
+                FailureKind::SshDestinationRequired,
+                self.i18n.text("SSH destination is required."),
+                cx,
+            );
             cx.notify();
             return None;
         }
@@ -1563,10 +1602,10 @@ impl OcHerdrView {
             match port_text.parse::<u16>() {
                 Ok(port) if port > 0 => Some(port),
                 _ => {
-                    self.error = Some(
-                        self.i18n
-                            .text("SSH port must be a number from 1 to 65535.")
-                            .into(),
+                    self.notify_failure(
+                        FailureKind::SshPortInvalid,
+                        self.i18n.text("SSH port must be a number from 1 to 65535."),
+                        cx,
                     );
                     cx.notify();
                     return None;
@@ -1709,7 +1748,7 @@ impl OcHerdrView {
         if !session.running {
             let command = attach_command(&self.current_profile(), &session.name);
             if let Err(error) = open_system_terminal(&command) {
-                self.error = Some(error.to_string().into());
+                self.notify_failure(FailureKind::OpenTerminal, error, cx);
             }
             return;
         }
@@ -1719,13 +1758,17 @@ impl OcHerdrView {
 
     pub(super) fn open_native_tui(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.current_session() else {
-            self.error = Some(self.i18n.text("No Herdr session is selected.").into());
+            self.notify_failure(
+                FailureKind::NoSessionSelected,
+                self.i18n.text("No Herdr session is selected."),
+                cx,
+            );
             cx.notify();
             return;
         };
         let command = attach_command(&self.current_profile(), &session.name);
         if let Err(error) = open_system_terminal(&command) {
-            self.error = Some(error.to_string().into());
+            self.notify_failure(FailureKind::OpenTerminal, error, cx);
         }
         cx.notify();
     }
@@ -1902,7 +1945,7 @@ impl OcHerdrView {
                                 spawned.insert(pane_id.clone());
                                 pending_listens.push((pane_id.clone(), frames));
                             }
-                            Err(error) => spawn_error = Some(error.to_string().into()),
+                            Err(error) => spawn_error = Some(error.to_string()),
                         }
                     }
                 }
@@ -1922,10 +1965,10 @@ impl OcHerdrView {
             }
         }
         if let Some(error) = palette_error {
-            self.error = Some(error.to_string().into());
+            self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }
         if let Some(error) = spawn_error {
-            self.error = Some(error);
+            self.notify_failure(FailureKind::SpawnTerminal, error, cx);
         }
         for (pane_id, frames) in pending_listens {
             let task = Self::listen_pane(pane_id.clone(), frames, cx);
@@ -2017,7 +2060,10 @@ impl OcHerdrView {
                                             runtime.pixel_size = (0, 0);
                                         }
                                         Err(resize_error) => {
-                                            error = Some(resize_error.to_string().into())
+                                            error = Some((
+                                                FailureKind::ResizeTerminal,
+                                                resize_error.to_string(),
+                                            ))
                                         }
                                     }
                                 }
@@ -2033,14 +2079,17 @@ impl OcHerdrView {
                                 hierarchy_changed = true;
                                 closed = true;
                                 if !is_expected_terminal_exit(&stream_error) {
-                                    error = Some(stream_error.to_string().into());
+                                    error = Some((
+                                        FailureKind::TerminalStream,
+                                        stream_error.to_string(),
+                                    ));
                                 }
                                 break;
                             }
                         }
                     }
                     if let Err(runtime_error) = Terminal::tick_runtime() {
-                        error = Some(runtime_error.to_string().into());
+                        error = Some((FailureKind::TerminalRuntime, runtime_error.to_string()));
                     }
                     if forward_terminal_input(runtime).is_err() {
                         runtime.exit_seen = true;
@@ -2055,14 +2104,16 @@ impl OcHerdrView {
                             }
                         }
                         Ok(Some(_)) | Ok(None) => {}
-                        Err(frame_error) => error = Some(frame_error.to_string().into()),
+                        Err(frame_error) => {
+                            error = Some((FailureKind::RenderTerminal, frame_error.to_string()))
+                        }
                     }
                     !closed
                 }
             }
         };
-        if let Some(error) = error {
-            self.error = Some(error);
+        if let Some((kind, detail)) = error {
+            self.notify_failure(kind, detail, cx);
         }
         if hierarchy_changed {
             self.resync_snapshot(self.event_epoch, cx);
@@ -2097,7 +2148,9 @@ impl OcHerdrView {
                     changed = visible_pane_ids.contains(pane_id);
                 }
                 Ok(_) => {}
-                Err(frame_error) => error = Some(frame_error.to_string().into()),
+                Err(frame_error) => {
+                    error = Some((FailureKind::RenderTerminal, frame_error.to_string()))
+                }
             }
             if forward_terminal_input(runtime).is_err() {
                 runtime.exit_seen = true;
@@ -2107,8 +2160,8 @@ impl OcHerdrView {
                 true
             }
         };
-        if let Some(error) = error {
-            self.error = Some(error);
+        if let Some((kind, detail)) = error {
+            self.notify_failure(kind, detail, cx);
         }
         if hierarchy_changed {
             self.resync_snapshot(self.event_epoch, cx);
@@ -2119,7 +2172,7 @@ impl OcHerdrView {
         keep
     }
 
-    pub(super) fn resize_session_terminals(&mut self, window: &Window) {
+    pub(super) fn resize_session_terminals(&mut self, window: &Window, cx: &mut Context<Self>) {
         let viewport = window.viewport_size();
         let available_width = (f32::from(viewport.width) - SIDEBAR_WIDTH).max(320.);
         let available_height =
@@ -2172,7 +2225,7 @@ impl OcHerdrView {
             }
         }
         if let Some(error) = palette_error {
-            self.error = Some(error.to_string().into());
+            self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }
     }
 
@@ -2682,7 +2735,6 @@ impl OcHerdrView {
         };
         let socket = connection.socket_path().to_owned();
         self.operation = Some(self.i18n.running_operation(method).into());
-        self.error = None;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -2704,7 +2756,7 @@ impl OcHerdrView {
                         }
                         this.ensure_session_terminals(cx);
                     }
-                    Err(error) => this.error = Some(error.to_string().into()),
+                    Err(error) => this.notify_command_failure(method, error, cx),
                 }
                 cx.notify();
             })

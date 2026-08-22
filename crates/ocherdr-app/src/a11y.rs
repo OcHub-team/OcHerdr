@@ -101,7 +101,6 @@ pub struct ChromeA11yInput<'a> {
     pub node_manager_open: bool,
     pub prefix_pending: bool,
     pub operation: Option<&'a str>,
-    pub has_error: bool,
     pub event_stream: &'a EventStreamState,
     pub profile_label: &'a str,
 }
@@ -361,8 +360,6 @@ fn status_value(input: &ChromeA11yInput<'_>) -> String {
         )
     } else if let Some(operation) = input.operation {
         operation.to_owned()
-    } else if input.has_error {
-        i18n.text("Connection unavailable").to_owned()
     } else if matches!(input.event_stream, EventStreamState::Lost(_)) {
         event_stream_lost_copy(i18n)
     } else if let Some(snapshot) = input.snapshot {
@@ -411,7 +408,6 @@ impl OcHerdrView {
             node_manager_open: self.overlay.host_center(),
             prefix_pending: self.prefix_pending,
             operation: self.operation.as_deref(),
-            has_error: self.error.is_some(),
             event_stream: &self.event_stream,
             profile_label: &profile_label,
         })
@@ -564,7 +560,6 @@ mod tests {
             node_manager_open: true,
             prefix_pending: false,
             operation: None,
-            has_error: false,
             event_stream,
             profile_label: "This Mac",
         }
@@ -747,7 +742,6 @@ mod tests {
             node_manager_open: false,
             prefix_pending: false,
             operation: None,
-            has_error: false,
             event_stream: &EventStreamState::Idle,
             profile_label: "This Mac",
         });
