@@ -1,25 +1,34 @@
 use super::super::*;
+use ochub_ui::layout::{group, row, row_label, section_header};
+use ochub_ui::scrollbar::{VerticalScrollbar, contain_vertical_scroll};
 
 impl OcHerdrView {
     pub(super) fn render_node_manager(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
         let indexes = self.filtered_profile_indexes(cx);
         let count = indexes.len();
-        let mut rows = indexes
-            .into_iter()
-            .map(|index| self.managed_host_row(index, cx))
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
-            rows.push(
-                empty_state(
-                    IconName::Search,
-                    i18n.text("No matching hosts"),
-                    i18n.text("Adjust the search or choose another filter."),
-                    None,
-                )
-                .into_any_element(),
-            );
-        }
+        self.sync_host_list_state(&indexes, cx);
+        let list_state = self.host_list_state.clone();
+        let list = ochub_ui::gpui::list(
+            list_state.clone(),
+            cx.processor(move |this, ix: usize, _window, cx| {
+                match this.host_list_revision.indexes.get(ix).copied() {
+                    Some(index) => div()
+                        .w_full()
+                        .pb_1()
+                        .child(this.managed_host_row(index, cx))
+                        .into_any_element(),
+                    None => empty_state(
+                        IconName::Search,
+                        this.i18n.text("No matching hosts"),
+                        this.i18n
+                            .text("Adjust the search or choose another filter."),
+                        None,
+                    )
+                    .into_any_element(),
+                }
+            }),
+        );
         let detail = if matches!(self.overlay, Overlay::RemoteForm(_)) {
             self.render_remote_form(cx).into_any_element()
         } else if self.host_bulk_mode {
@@ -160,13 +169,28 @@ impl OcHerdrView {
                                     .id("host-center-list")
                                     .role(ochub_ui::gpui::Role::List)
                                     .aria_label(i18n.text("Hosts"))
+                                    .relative()
                                     .flex()
                                     .flex_col()
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_scroll()
-                                    .py_2()
-                                    .children(rows),
+                                    .w_full()
+                                    .on_scroll_wheel(contain_vertical_scroll(list_state.clone()))
+                                    .child(
+                                        list.with_sizing_behavior(
+                                            ochub_ui::gpui::ListSizingBehavior::Auto,
+                                        )
+                                        .flex_1()
+                                        .min_h_0()
+                                        .w_full()
+                                        .py_2(),
+                                    )
+                                    .child(VerticalScrollbar::new(
+                                        ochub_ui::gpui::ElementId::Name(
+                                            "host-center-list-scrollbar".into(),
+                                        ),
+                                        list_state,
+                                    )),
                             ),
                     )
                     .child(
@@ -271,22 +295,38 @@ impl OcHerdrView {
             ));
         }
 
+        let nav_scroll = self.host_nav_scroll.clone();
         div()
-            .id("host-center-navigation")
-            .role(ochub_ui::gpui::Role::Navigation)
-            .aria_label(i18n.text("Host filters"))
+            .relative()
             .flex()
             .flex_col()
             .w(px(196.))
             .flex_none()
             .min_h_0()
-            .overflow_scroll()
             .border_r_1()
             .border_color(theme::border())
             .bg(theme::sidebar_background())
-            .px_2()
-            .py_3()
-            .children(items)
+            .child(
+                div()
+                    .id("host-center-navigation")
+                    .role(ochub_ui::gpui::Role::Navigation)
+                    .aria_label(i18n.text("Host filters"))
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&nav_scroll)
+                    .on_scroll_wheel(contain_vertical_scroll(nav_scroll.clone()))
+                    .px_2()
+                    .py_3()
+                    .children(items),
+            )
+            .child(VerticalScrollbar::new(
+                ochub_ui::gpui::ElementId::Name("host-center-navigation-scrollbar".into()),
+                nav_scroll,
+            ))
             .into_any_element()
     }
 
@@ -348,39 +388,31 @@ impl OcHerdrView {
         let Some(profile) = self.profiles.get(index) else {
             return false;
         };
-        if connection_source(profile) == ConnectionSource::SshConfig
-            && ssh_destination(profile)
-                .is_some_and(|destination| ssh_config_covered_by_saved(&self.profiles, destination))
-        {
-            return false;
-        }
-        let metadata = self.host_metadata.get(profile.id());
-        match filter {
-            HostFilter::All => true,
-            HostFilter::Favorites => metadata.is_some_and(|value| value.favorite),
-            HostFilter::Recent => self
-                .recent_connection_ids
-                .iter()
-                .any(|id| id == profile.id()),
-            HostFilter::Attention => {
-                self.orphaned_ssh_hosts.contains(profile.id())
-                    || self
-                        .host_health
-                        .get(profile.id())
-                        .is_some_and(|health| match health {
-                            HostHealthView::Checking => false,
-                            HostHealthView::Checked { cached, .. } => {
-                                cached.status != HostHealthStatus::Ready
-                            }
-                        })
-            }
-            HostFilter::Source(source) => connection_source(profile) == *source,
-            HostFilter::Group(group) => {
-                metadata.and_then(|value| value.group.as_deref()) == Some(group.as_str())
-            }
-            HostFilter::Tag(tag) => {
-                metadata.is_some_and(|value| value.tags.iter().any(|candidate| candidate == tag))
-            }
+        !ssh_config_entry_is_hidden(&self.profiles, profile)
+            && host_fits_filter(
+                profile,
+                filter,
+                self.host_metadata.get(profile.id()),
+                &self.recent_connection_ids,
+                &self.orphaned_ssh_hosts,
+                &self.host_health,
+            )
+    }
+
+    /// Rebuild the virtual list when the visible set or the inputs that produce
+    /// it change. `ListState` addresses rows by index, so a stale count paints
+    /// the wrong host or reads past the end.
+    fn sync_host_list_state(&mut self, indexes: &[usize], cx: &App) {
+        let revision = HostListRevision {
+            filter: self.host_filter.clone(),
+            query: self.remote_search.read(cx).content().trim().to_owned(),
+            bulk: self.host_bulk_mode,
+            indexes: indexes.to_vec(),
+        };
+        let count = indexes.len().max(1);
+        if self.host_list_revision != revision || self.host_list_state.item_count() != count {
+            self.host_list_state.reset(count);
+            self.host_list_revision = revision;
         }
     }
 
@@ -582,7 +614,7 @@ impl OcHerdrView {
             .cloned()
             .unwrap_or_default();
         let favorite = metadata.favorite;
-        let group = metadata
+        let group_name = metadata
             .group
             .clone()
             .unwrap_or_else(|| i18n.text("Ungrouped").to_owned());
@@ -688,56 +720,63 @@ impl OcHerdrView {
                         )
                     }),
             )
-            .child(
+            .child({
+                let inspector_scroll = self.host_inspector_scroll.clone();
                 div()
-                    .id("host-inspector-scroll")
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_scroll()
-                    .gap_6()
-                    .px_6()
-                    .py_5()
-                    .child(self.render_health_panel(index, health.as_ref(), cx))
+                    .min_w_0()
+                    .overflow_hidden()
                     .child(
                         div()
+                            .id("host-inspector-scroll")
                             .flex()
                             .flex_col()
-                            .gap_2()
-                            .child(inspector_heading(i18n.text("Organization")))
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&inspector_scroll)
+                            .on_scroll_wheel(contain_vertical_scroll(inspector_scroll.clone()))
+                            .gap_6()
+                            .px_6()
+                            .py_5()
+                            .child(self.render_health_panel(index, health.as_ref(), cx))
                             .child(
                                 div()
-                                    .border_t_1()
-                                    .border_color(theme::border())
-                                    .child(remote_detail_row(i18n.text("Group"), group, true))
-                                    .child(remote_detail_row(i18n.text("Tags"), tags, false)),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .child(section_header(i18n.text("Organization"), None))
+                                    .child(group(vec![
+                                        inspector_row(i18n.text("Group"), group_name),
+                                        inspector_row(i18n.text("Tags"), tags),
+                                    ])),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .child(section_header(i18n.text("Connection"), None))
+                                    .child(group(vec![
+                                        inspector_row(
+                                            i18n.text("Source"),
+                                            source.description(i18n).to_owned(),
+                                        ),
+                                        inspector_row(i18n.text("Identity"), identity),
+                                        inspector_row(i18n.text("Herdr command"), herdr_path),
+                                    ])),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(inspector_heading(i18n.text("Connection")))
-                            .child(
-                                div()
-                                    .border_t_1()
-                                    .border_color(theme::border())
-                                    .child(remote_detail_row(
-                                        i18n.text("Source"),
-                                        source.description(i18n).to_owned(),
-                                        true,
-                                    ))
-                                    .child(remote_detail_row(i18n.text("Identity"), identity, true))
-                                    .child(remote_detail_row(
-                                        i18n.text("Herdr command"),
-                                        herdr_path,
-                                        false,
-                                    )),
-                            ),
-                    ),
-            )
+                    .child(VerticalScrollbar::new(
+                        ochub_ui::gpui::ElementId::Name("host-inspector-scroll-scrollbar".into()),
+                        inspector_scroll,
+                    ))
+            })
             .child(
                 div()
                     .flex()
@@ -872,6 +911,7 @@ impl OcHerdrView {
             .map(connection_source)
             .unwrap_or(ConnectionSource::Saved);
         let active = index == Some(self.profile_index);
+        let form_scroll = self.host_form_scroll.clone();
         div()
             .flex()
             .flex_col()
@@ -922,113 +962,147 @@ impl OcHerdrView {
             )
             .child(
                 div()
-                    .id("host-form-scroll")
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_scroll()
-                    .gap_4()
-                    .px_6()
-                    .py_5()
-                    .child(field(
-                        i18n.text("Name"),
-                        false,
-                        Some(i18n.text("Name shown in OcHerdr.").into()),
-                        self.remote_label.clone(),
-                    ))
-                    .child(if source == ConnectionSource::SshConfig {
-                        remote_readonly_field(
-                            i18n.text("Destination"),
-                            self.profiles
-                                .get(index.unwrap_or_default())
-                                .map(profile_endpoint)
-                                .unwrap_or_default(),
-                            i18n.text("Managed by ~/.ssh/config"),
-                        )
-                        .into_any_element()
-                    } else {
-                        field(
-                            i18n.text("Destination"),
-                            true,
-                            Some(
-                                i18n.text("SSH alias or user@host from ~/.ssh/config.")
-                                    .into(),
-                            ),
-                            self.remote_destination.clone(),
-                        )
-                        .into_any_element()
-                    })
+                    .min_w_0()
+                    .overflow_hidden()
                     .child(
                         div()
+                            .id("host-form-scroll")
                             .flex()
-                            .gap_3()
-                            .child(div().flex_1().min_w_0().child(field(
-                                i18n.text("Group"),
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&form_scroll)
+                            .on_scroll_wheel(contain_vertical_scroll(form_scroll.clone()))
+                            .gap_4()
+                            .px_6()
+                            .py_5()
+                            .child(field(
+                                i18n.text("Name"),
                                 false,
-                                Some(i18n.text("One group provides the primary location.").into()),
-                                self.remote_group.clone(),
-                            )))
-                            .child(div().flex_1().min_w_0().child(field(
-                                i18n.text("Tags"),
-                                false,
-                                Some(i18n.text("Separate multiple tags with commas.").into()),
-                                self.remote_tags.clone(),
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .id("remote-advanced-toggle")
-                            .role(ochub_ui::gpui::Role::Button)
-                            .tab_stop(false)
-                            .aria_label(i18n.text("Advanced"))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .h(px(32.))
-                            .text_sm()
-                            .text_color(theme::subtext())
-                            .cursor_pointer()
-                            .on_click(
-                                cx.listener(|this, _, _window, cx| this.toggle_remote_advanced(cx)),
-                            )
-                            .child(icon(
-                                if self.remote_advanced_open {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                },
-                                theme::muted(),
-                                13.,
+                                Some(i18n.text("Name shown in OcHerdr.").into()),
+                                self.remote_label.clone(),
                             ))
-                            .child(i18n.text("Advanced connection overrides")),
+                            .child(if source == ConnectionSource::SshConfig {
+                                field(
+                                    i18n.text("Destination"),
+                                    false,
+                                    Some(i18n.text("Managed by ~/.ssh/config").into()),
+                                    readonly_field_control(
+                                        self.profiles
+                                            .get(index.unwrap_or_default())
+                                            .map(profile_endpoint)
+                                            .unwrap_or_default(),
+                                    ),
+                                )
+                                .into_any_element()
+                            } else {
+                                field(
+                                    i18n.text("Destination"),
+                                    true,
+                                    Some(
+                                        i18n.text("SSH alias or user@host from ~/.ssh/config.")
+                                            .into(),
+                                    ),
+                                    self.remote_destination.clone(),
+                                )
+                                .into_any_element()
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .child(
+                                        div().flex_1().min_w_0().child(field(
+                                            i18n.text("Group"),
+                                            false,
+                                            Some(
+                                                i18n.text(
+                                                    "One group provides the primary location.",
+                                                )
+                                                .into(),
+                                            ),
+                                            self.remote_group.clone(),
+                                        )),
+                                    )
+                                    .child(div().flex_1().min_w_0().child(field(
+                                        i18n.text("Tags"),
+                                        false,
+                                        Some(
+                                            i18n.text("Separate multiple tags with commas.").into(),
+                                        ),
+                                        self.remote_tags.clone(),
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .id("remote-advanced-toggle")
+                                    .role(ochub_ui::gpui::Role::Button)
+                                    .tab_stop(false)
+                                    .aria_label(i18n.text("Advanced"))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .h(px(32.))
+                                    .text_sm()
+                                    .text_color(theme::subtext())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.toggle_remote_advanced(cx)
+                                    }))
+                                    .child(icon(
+                                        if self.remote_advanced_open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        },
+                                        theme::muted(),
+                                        13.,
+                                    ))
+                                    .child(i18n.text("Advanced connection overrides")),
+                            )
+                            .when(self.remote_advanced_open, |form| {
+                                form.child(
+                                    div()
+                                        .flex()
+                                        .items_start()
+                                        .gap_3()
+                                        .child(div().flex_1().min_w_0().child(field(
+                                            i18n.text("Port"),
+                                            false,
+                                            Some(i18n.text("Uses SSH config when empty.").into()),
+                                            self.remote_port.clone(),
+                                        )))
+                                        .child(div().flex_1().min_w_0().child(field(
+                                            i18n.text("Herdr command"),
+                                            false,
+                                            Some(i18n.text("Remote command or path.").into()),
+                                            self.remote_herdr_path.clone(),
+                                        )))
+                                        .child(
+                                            div().flex_1().min_w_0().child(field(
+                                                i18n.text("Identity file"),
+                                                false,
+                                                Some(
+                                                    i18n.text("SSH agent still works when empty.")
+                                                        .into(),
+                                                ),
+                                                self.remote_identity_file.clone(),
+                                            )),
+                                        ),
+                                )
+                            }),
                     )
-                    .when(self.remote_advanced_open, |form| {
-                        form.child(
-                            div()
-                                .flex()
-                                .items_start()
-                                .gap_3()
-                                .child(div().flex_1().min_w_0().child(field(
-                                    i18n.text("Port"),
-                                    false,
-                                    Some(i18n.text("Uses SSH config when empty.").into()),
-                                    self.remote_port.clone(),
-                                )))
-                                .child(div().flex_1().min_w_0().child(field(
-                                    i18n.text("Herdr command"),
-                                    false,
-                                    Some(i18n.text("Remote command or path.").into()),
-                                    self.remote_herdr_path.clone(),
-                                )))
-                                .child(div().flex_1().min_w_0().child(field(
-                                    i18n.text("Identity file"),
-                                    false,
-                                    Some(i18n.text("SSH agent still works when empty.").into()),
-                                    self.remote_identity_file.clone(),
-                                ))),
-                        )
-                    }),
+                    .child(VerticalScrollbar::new(
+                        ochub_ui::gpui::ElementId::Name("host-form-scroll-scrollbar".into()),
+                        form_scroll,
+                    )),
             )
             .child(
                 div()
@@ -1129,25 +1203,26 @@ impl OcHerdrView {
                         "Choose hosts in the list, then apply a lightweight organization action.",
                     )),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .w_full()
-                    .max_w(px(520.))
-                    .child(div().flex_1().min_w_0().child(field(
-                        i18n.text("Group"),
-                        false,
-                        None,
-                        self.remote_group.clone(),
-                    )))
-                    .child(div().flex_1().min_w_0().child(field(
-                        i18n.text("Tags"),
-                        false,
-                        None,
-                        self.remote_tags.clone(),
-                    ))),
-            )
+            .child(div().w_full().max_w(px(520.)).child(group(vec![
+                        field(
+                            i18n.text("Group"),
+                            false,
+                            None,
+                            self.remote_group.clone(),
+                        )
+                        .px_4()
+                        .py_3()
+                        .into_any_element(),
+                        field(
+                            i18n.text("Tags"),
+                            false,
+                            None,
+                            self.remote_tags.clone(),
+                        )
+                        .px_4()
+                        .py_3()
+                        .into_any_element(),
+                    ])))
             .child(
                 div()
                     .flex()
@@ -1305,6 +1380,8 @@ impl OcHerdrView {
     }
 }
 
+// Compact muted labels for the 196px filter rail. `section_header` is text_sm
+// on `theme::text()` and too loud for this sidebar.
 fn host_nav_heading(label: &'static str) -> ochub_ui::gpui::AnyElement {
     div()
         .px_2()
@@ -1351,72 +1428,36 @@ fn host_pill(label: &'static str) -> impl IntoElement {
         .child(label)
 }
 
-fn inspector_heading(label: &'static str) -> impl IntoElement {
-    div()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme::muted())
-        .child(label)
-}
-
-fn remote_detail_row(label: &'static str, value: String, separated: bool) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .min_h(px(44.))
-        .when(separated, |row| {
-            row.border_b_1().border_color(theme::border())
-        })
+fn inspector_row(label: &'static str, value: String) -> ochub_ui::gpui::AnyElement {
+    row()
+        .child(row_label(label, None))
         .child(
             div()
-                .w(px(126.))
                 .flex_none()
-                .text_xs()
-                .text_color(theme::muted())
-                .child(label),
-        )
-        .child(
-            div()
-                .flex_1()
+                .max_w(px(240.))
                 .min_w_0()
                 .truncate()
                 .text_sm()
-                .text_color(theme::text())
+                .text_color(theme::muted())
                 .child(value),
         )
+        .into_any_element()
 }
 
-fn remote_readonly_field(
-    label: &'static str,
-    value: String,
-    hint: &'static str,
-) -> impl IntoElement {
+fn readonly_field_control(value: String) -> impl IntoElement {
     div()
         .flex()
-        .flex_col()
-        .gap(px(6.))
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::subtext())
-                .child(label),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .h(px(34.))
-                .px_3()
-                .rounded(px(CORNER_CONTROL))
-                .border_1()
-                .border_color(theme::border())
-                .bg(theme::inset())
-                .text_sm()
-                .text_color(theme::subtext())
-                .child(value),
-        )
-        .child(div().text_xs().text_color(theme::muted()).child(hint))
+        .items_center()
+        .h(px(34.))
+        .w_full()
+        .px_3()
+        .rounded(px(CORNER_CONTROL))
+        .border_1()
+        .border_color(theme::border())
+        .bg(theme::inset())
+        .text_sm()
+        .text_color(theme::subtext())
+        .child(value)
 }
 
 fn host_health_summary(

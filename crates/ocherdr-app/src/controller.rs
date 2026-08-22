@@ -124,6 +124,11 @@ impl OcHerdrView {
             overlay: Overlay::None,
             open_select: None,
             appearance_scroll: ScrollHandle::new(),
+            host_nav_scroll: ScrollHandle::new(),
+            host_inspector_scroll: ScrollHandle::new(),
+            host_form_scroll: ScrollHandle::new(),
+            host_list_state: ListState::new(0, ListAlignment::Top, px(192.)),
+            host_list_revision: HostListRevision::default(),
             managed_profile_index: 0,
             remote_advanced_open: false,
             recent_connection_ids,
@@ -772,94 +777,26 @@ impl OcHerdrView {
     }
 
     pub(super) fn filtered_profile_indexes(&self, cx: &App) -> Vec<usize> {
-        let query = self.remote_search.read(cx).content().trim().to_lowercase();
-        let recent_positions = self
-            .recent_connection_ids
-            .iter()
-            .enumerate()
-            .map(|(position, id)| (id.as_str(), position))
-            .collect::<HashMap<_, _>>();
-        let mut indexes = self
-            .profiles
-            .iter()
-            .enumerate()
-            .filter(|(_, profile)| {
-                if connection_source(profile) == ConnectionSource::SshConfig
-                    && ssh_destination(profile).is_some_and(|destination| {
-                        ssh_config_covered_by_saved(&self.profiles, destination)
-                    })
-                {
-                    return false;
-                }
-                let metadata = self.host_metadata.get(profile.id());
-                let search_matches = profile_matches_search(profile, &query, self.i18n)
-                    || metadata.is_some_and(|metadata| {
-                        metadata
-                            .display_name
-                            .as_deref()
-                            .is_some_and(|name| name.to_lowercase().contains(&query))
-                            || metadata
-                                .group
-                                .as_deref()
-                                .is_some_and(|group| group.to_lowercase().contains(&query))
-                            || metadata
-                                .tags
-                                .iter()
-                                .any(|tag| tag.to_lowercase().contains(&query))
-                    });
-                if !search_matches {
-                    return false;
-                }
-                match &self.host_filter {
-                    HostFilter::All => true,
-                    HostFilter::Favorites => metadata.is_some_and(|value| value.favorite),
-                    HostFilter::Recent => recent_positions.contains_key(profile.id()),
-                    HostFilter::Attention => {
-                        self.orphaned_ssh_hosts.contains(profile.id())
-                            || self
-                                .host_health
-                                .get(profile.id())
-                                .is_some_and(|health| match health {
-                                    HostHealthView::Checking => false,
-                                    HostHealthView::Checked { cached, .. } => {
-                                        cached.status != HostHealthStatus::Ready
-                                    }
-                                })
-                    }
-                    HostFilter::Source(source) => connection_source(profile) == *source,
-                    HostFilter::Group(group) => {
-                        metadata.and_then(|value| value.group.as_deref()) == Some(group.as_str())
-                    }
-                    HostFilter::Tag(tag) => metadata
-                        .is_some_and(|value| value.tags.iter().any(|candidate| candidate == tag)),
-                }
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        indexes.sort_by_key(|index| {
-            let profile = &self.profiles[*index];
-            let metadata = self.host_metadata.get(profile.id());
-            (
-                usize::from(*index != self.profile_index),
-                usize::from(!metadata.is_some_and(|value| value.favorite)),
-                recent_positions
-                    .get(profile.id())
-                    .copied()
-                    .unwrap_or(usize::MAX),
-                self.host_display_label(*index).to_lowercase(),
-            )
-        });
-        indexes
+        visible_host_indices(
+            &HostCatalog {
+                profiles: &self.profiles,
+                metadata: &self.host_metadata,
+                recent_ids: &self.recent_connection_ids,
+                orphaned: &self.orphaned_ssh_hosts,
+                health: &self.host_health,
+            },
+            &self.host_filter,
+            self.remote_search.read(cx).content().as_ref(),
+            self.profile_index,
+            self.i18n,
+        )
     }
 
     pub(super) fn host_display_label(&self, index: usize) -> String {
         let Some(profile) = self.profiles.get(index) else {
             return String::new();
         };
-        self.host_metadata
-            .get(profile.id())
-            .and_then(|metadata| metadata.display_name.clone())
-            .unwrap_or_else(|| profile_display_label(profile, self.i18n))
+        host_display_label_for(profile, self.host_metadata.get(profile.id()), self.i18n)
     }
 
     pub(super) fn test_managed_host(&mut self, index: usize, cx: &mut Context<Self>) {

@@ -23,11 +23,11 @@ use ochub_ui::components::{
 };
 use ochub_ui::gpui::{
     App, AppContext, AssetSource, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, Task, TitlebarOptions, UTF16Selection, WeakEntity, Window,
-    WindowAppearance, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, size,
-    surface,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Task, TitlebarOptions,
+    UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds, WindowOptions, canvas, div,
+    point, prelude::*, px, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::text_input::{TextInput, TextInputEvent};
@@ -384,6 +384,14 @@ enum HostFilter {
     Tag(String),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HostListRevision {
+    filter: HostFilter,
+    query: String,
+    bulk: bool,
+    indexes: Vec<usize>,
+}
+
 struct OcHerdrView {
     profiles: Vec<ConnectionProfile>,
     profile_index: usize,
@@ -407,6 +415,11 @@ struct OcHerdrView {
     overlay: Overlay,
     open_select: Option<SharedString>,
     appearance_scroll: ScrollHandle,
+    host_nav_scroll: ScrollHandle,
+    host_inspector_scroll: ScrollHandle,
+    host_form_scroll: ScrollHandle,
+    host_list_state: ListState,
+    host_list_revision: HostListRevision,
     managed_profile_index: usize,
     remote_advanced_open: bool,
     recent_connection_ids: Vec<String>,
@@ -620,6 +633,127 @@ fn profile_matches_search(profile: &ConnectionProfile, query: &str, i18n: I18n) 
             .description(i18n)
             .to_lowercase()
             .contains(query)
+}
+
+fn ssh_config_entry_is_hidden(profiles: &[ConnectionProfile], profile: &ConnectionProfile) -> bool {
+    connection_source(profile) == ConnectionSource::SshConfig
+        && ssh_destination(profile)
+            .is_some_and(|destination| ssh_config_covered_by_saved(profiles, destination))
+}
+
+fn host_display_label_for(
+    profile: &ConnectionProfile,
+    metadata: Option<&HostMetadata>,
+    i18n: I18n,
+) -> String {
+    metadata
+        .and_then(|metadata| metadata.display_name.clone())
+        .unwrap_or_else(|| profile_display_label(profile, i18n))
+}
+
+fn host_fits_filter(
+    profile: &ConnectionProfile,
+    filter: &HostFilter,
+    metadata: Option<&HostMetadata>,
+    recent_ids: &[String],
+    orphaned: &HashSet<String>,
+    health: &HashMap<String, HostHealthView>,
+) -> bool {
+    match filter {
+        HostFilter::All => true,
+        HostFilter::Favorites => metadata.is_some_and(|value| value.favorite),
+        HostFilter::Recent => recent_ids.iter().any(|id| id == profile.id()),
+        HostFilter::Attention => {
+            orphaned.contains(profile.id())
+                || health.get(profile.id()).is_some_and(|health| match health {
+                    HostHealthView::Checking => false,
+                    HostHealthView::Checked { cached, .. } => {
+                        cached.status != HostHealthStatus::Ready
+                    }
+                })
+        }
+        HostFilter::Source(source) => connection_source(profile) == *source,
+        HostFilter::Group(group) => {
+            metadata.and_then(|value| value.group.as_deref()) == Some(group.as_str())
+        }
+        HostFilter::Tag(tag) => {
+            metadata.is_some_and(|value| value.tags.iter().any(|candidate| candidate == tag))
+        }
+    }
+}
+
+struct HostCatalog<'a> {
+    profiles: &'a [ConnectionProfile],
+    metadata: &'a HashMap<String, HostMetadata>,
+    recent_ids: &'a [String],
+    orphaned: &'a HashSet<String>,
+    health: &'a HashMap<String, HostHealthView>,
+}
+
+fn visible_host_indices(
+    catalog: &HostCatalog<'_>,
+    filter: &HostFilter,
+    query: &str,
+    current_index: usize,
+    i18n: I18n,
+) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let recent_positions = catalog
+        .recent_ids
+        .iter()
+        .enumerate()
+        .map(|(position, id)| (id.as_str(), position))
+        .collect::<HashMap<_, _>>();
+    let mut indexes = catalog
+        .profiles
+        .iter()
+        .enumerate()
+        .filter(|(_, profile)| {
+            if ssh_config_entry_is_hidden(catalog.profiles, profile) {
+                return false;
+            }
+            let meta = catalog.metadata.get(profile.id());
+            let search_matches = profile_matches_search(profile, &query, i18n)
+                || meta.is_some_and(|metadata| {
+                    metadata
+                        .display_name
+                        .as_deref()
+                        .is_some_and(|name| name.to_lowercase().contains(&query))
+                        || metadata
+                            .group
+                            .as_deref()
+                            .is_some_and(|group| group.to_lowercase().contains(&query))
+                        || metadata
+                            .tags
+                            .iter()
+                            .any(|tag| tag.to_lowercase().contains(&query))
+                });
+            search_matches
+                && host_fits_filter(
+                    profile,
+                    filter,
+                    meta,
+                    catalog.recent_ids,
+                    catalog.orphaned,
+                    catalog.health,
+                )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    indexes.sort_by_key(|index| {
+        let profile = &catalog.profiles[*index];
+        let meta = catalog.metadata.get(profile.id());
+        (
+            usize::from(*index != current_index),
+            usize::from(!meta.is_some_and(|value| value.favorite)),
+            recent_positions
+                .get(profile.id())
+                .copied()
+                .unwrap_or(usize::MAX),
+            host_display_label_for(profile, meta, i18n).to_lowercase(),
+        )
+    });
+    indexes
 }
 
 fn install_appearance(
@@ -907,5 +1041,81 @@ mod tests {
         assert_eq!(connection_source(&profiles[0]), ConnectionSource::ThisMac);
         assert_eq!(connection_source(&profiles[1]), ConnectionSource::Saved);
         assert_eq!(connection_source(&profiles[2]), ConnectionSource::SshConfig);
+    }
+
+    fn sample_visible_hosts() -> (Vec<ConnectionProfile>, HashMap<String, HostMetadata>) {
+        let profiles = vec![
+            ConnectionProfile::default(),
+            ConnectionProfile::Ssh {
+                id: "manual-1".into(),
+                label: "Alpha".into(),
+                destination: "alpha.example".into(),
+                port: None,
+                identity_file: None,
+                herdr_path: "herdr".into(),
+            },
+            ConnectionProfile::Ssh {
+                id: "manual-2".into(),
+                label: "Beta".into(),
+                destination: "beta.example".into(),
+                port: None,
+                identity_file: None,
+                herdr_path: "herdr".into(),
+            },
+        ];
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "manual-1".into(),
+            HostMetadata {
+                favorite: true,
+                ..HostMetadata::default()
+            },
+        );
+        (profiles, metadata)
+    }
+
+    fn indices_for(filter: HostFilter) -> (Vec<ConnectionProfile>, Vec<usize>) {
+        let (profiles, metadata) = sample_visible_hosts();
+        let recent_ids = Vec::<String>::new();
+        let orphaned = HashSet::new();
+        let health = HashMap::new();
+        let indexes = visible_host_indices(
+            &HostCatalog {
+                profiles: &profiles,
+                metadata: &metadata,
+                recent_ids: &recent_ids,
+                orphaned: &orphaned,
+                health: &health,
+            },
+            &filter,
+            "",
+            0,
+            I18n::new(Language::English),
+        );
+        (profiles, indexes)
+    }
+
+    #[test]
+    fn changing_the_host_filter_changes_the_visible_index_set() {
+        let (_, all) = indices_for(HostFilter::All);
+        let (_, favorites) = indices_for(HostFilter::Favorites);
+        assert_ne!(all, favorites);
+        assert!(all.contains(&1) && all.contains(&2));
+        assert_eq!(favorites, vec![1]);
+    }
+
+    #[test]
+    fn visible_host_indices_are_always_in_range_of_the_profile_list() {
+        let (profiles, all) = indices_for(HostFilter::All);
+        let (_, favorites) = indices_for(HostFilter::Favorites);
+        for index in all.iter().chain(&favorites) {
+            assert!(*index < profiles.len());
+        }
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_returns_no_indices() {
+        let (_, indexes) = indices_for(HostFilter::Tag("no-such-tag".into()));
+        assert!(indexes.is_empty());
     }
 }
