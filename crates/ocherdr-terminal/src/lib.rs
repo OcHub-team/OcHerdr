@@ -5,14 +5,17 @@
     reason = "core-video 0.5 requires the matching io-surface wrapper"
 )]
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, OnceLock, Weak};
 
-use core_foundation::base::TCFType as _;
+use core_foundation::base::{CFRelease, TCFType as _};
+use core_foundation::data::CFData;
+use core_foundation::string::CFString;
 use core_video::pixel_buffer::CVPixelBuffer;
 use io_surface::{IOSurface, IOSurfaceRef};
 use thiserror::Error;
@@ -47,6 +50,80 @@ pub struct KeyModifiers {
     pub alt: bool,
     pub shift: bool,
     pub platform: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceMouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// Colors and type settings for the embedded Ghostty surface.
+/// Color values are `0xRRGGBB`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TerminalPalette {
+    pub dark: bool,
+    pub background: u32,
+    pub foreground: u32,
+    pub cursor: u32,
+    pub selection: u32,
+    pub ansi: [u32; 16],
+    pub font_family: String,
+    pub font_size: u8,
+    pub ligatures: bool,
+    pub thicken: bool,
+    pub cell_width_percent: i8,
+    pub cell_height_percent: i8,
+}
+
+impl TerminalPalette {
+    pub fn signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        Hash::hash(self, &mut hasher);
+        hasher.finish()
+    }
+
+    fn config_text(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "background = {}", hex_color(self.background));
+        let _ = writeln!(out, "foreground = {}", hex_color(self.foreground));
+        let _ = writeln!(out, "cursor-color = {}", hex_color(self.cursor));
+        let _ = writeln!(out, "cursor-text = {}", hex_color(self.background));
+        let _ = writeln!(out, "selection-background = {}", hex_color(self.selection));
+        let _ = writeln!(out, "selection-foreground = {}", hex_color(self.foreground));
+        for (index, color) in self.ansi.iter().copied().enumerate() {
+            let _ = writeln!(out, "palette = {index}={}", hex_color(color));
+        }
+        if !self.font_family.trim().is_empty() {
+            let _ = writeln!(out, "font-family = {}", ghostty_quoted(&self.font_family));
+        }
+        let _ = writeln!(out, "font-size = {}", self.font_size.clamp(8, 32));
+        if !self.ligatures {
+            let _ = writeln!(out, "font-feature = -calt");
+            let _ = writeln!(out, "font-feature = -liga");
+            let _ = writeln!(out, "font-feature = -dlig");
+        }
+        if self.thicken {
+            let _ = writeln!(out, "font-thicken = true");
+        }
+        if self.cell_width_percent != 0 {
+            let _ = writeln!(out, "adjust-cell-width = {}%", self.cell_width_percent);
+        }
+        if self.cell_height_percent != 0 {
+            let _ = writeln!(out, "adjust-cell-height = {}%", self.cell_height_percent);
+        }
+        out
+    }
+}
+
+fn ghostty_quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn hex_color(color: u32) -> String {
+    format!("#{color:06X}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,18 +268,22 @@ impl GhosttyRuntime {
             if config.is_null() {
                 return Err("ghostty_config_new returned null".into());
             }
-            ffi::ghostty_config_load_default_files(config);
-            ffi::ghostty_config_load_recursive_files(config);
+            // Do not load the user's Ghostty config. That file is almost always
+            // a dark terminal theme and would pin the embedded surface away
+            // from OcHerdr's light/dark appearance.
             ffi::ghostty_config_finalize(config);
 
+            // Ghostty's embedded runtime treats clipboard callbacks as required
+            // function pointers. Leaving them None jumps to address 0 on
+            // copy-on-select (mouse-up after a drag selection).
             let runtime = ffi::ghostty_runtime_config_s {
                 userdata: std::ptr::null_mut(),
                 supports_selection_clipboard: false,
                 wakeup_cb: Some(runtime_wakeup),
                 action_cb: Some(runtime_action),
-                read_clipboard_cb: None,
-                confirm_read_clipboard_cb: None,
-                write_clipboard_cb: None,
+                read_clipboard_cb: Some(runtime_read_clipboard),
+                confirm_read_clipboard_cb: Some(runtime_confirm_read_clipboard),
+                write_clipboard_cb: Some(runtime_write_clipboard),
                 close_surface_cb: Some(runtime_close_surface),
                 tmux_control_cb: None,
             };
@@ -229,6 +310,36 @@ impl GhosttyRuntime {
         // SAFETY: the process-global app remains alive for the duration of OcHerdr.
         unsafe { ffi::ghostty_app_set_color_scheme(self.app.as_ptr(), scheme) };
     }
+
+    fn apply_palette(&self, palette: &TerminalPalette) -> Result<(), TerminalError> {
+        with_palette_config(palette, |config| unsafe {
+            ffi::ghostty_app_update_config(self.app.as_ptr(), config);
+        })
+    }
+}
+
+fn with_palette_config<T>(
+    palette: &TerminalPalette,
+    apply: impl FnOnce(ffi::ghostty_config_t) -> T,
+) -> Result<T, TerminalError> {
+    let path = std::env::temp_dir().join(format!("ocherdr-ghostty-{}.conf", std::process::id()));
+    std::fs::write(&path, palette.config_text())
+        .map_err(|error| TerminalError::Initialization(error.to_string()))?;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| TerminalError::Initialization(error.to_string()))?;
+    unsafe {
+        let config = ffi::ghostty_config_new();
+        if config.is_null() {
+            return Err(TerminalError::Initialization(
+                "ghostty_config_new returned null".into(),
+            ));
+        }
+        ffi::ghostty_config_load_file(config, c_path.as_ptr());
+        ffi::ghostty_config_finalize(config);
+        let value = apply(config);
+        ffi::ghostty_config_free(config);
+        Ok(value)
+    }
 }
 
 unsafe extern "C" fn runtime_wakeup(_userdata: *mut c_void) {}
@@ -242,6 +353,109 @@ unsafe extern "C" fn runtime_action(
 }
 
 unsafe extern "C" fn runtime_close_surface(_userdata: *mut c_void, _process_alive: bool) {}
+
+unsafe extern "C" fn runtime_read_clipboard(
+    _userdata: *mut c_void,
+    _clipboard: ffi::ghostty_clipboard_e,
+    _state: *mut c_void,
+) -> bool {
+    false
+}
+
+unsafe extern "C" fn runtime_confirm_read_clipboard(
+    _userdata: *mut c_void,
+    _text: *const c_char,
+    _state: *mut c_void,
+    _request: ffi::ghostty_clipboard_request_e,
+) {
+}
+
+unsafe extern "C" fn runtime_write_clipboard(
+    _userdata: *mut c_void,
+    _clipboard: ffi::ghostty_clipboard_e,
+    contents: *const ffi::ghostty_clipboard_content_s,
+    count: usize,
+    confirm: bool,
+) {
+    if confirm {
+        return;
+    }
+    if let Some(text) = clipboard_text_from_contents(contents, count) {
+        write_macos_clipboard(&text);
+    }
+}
+
+fn clipboard_text_from_contents(
+    contents: *const ffi::ghostty_clipboard_content_s,
+    count: usize,
+) -> Option<String> {
+    if contents.is_null() || count == 0 {
+        return None;
+    }
+    // SAFETY: Ghostty keeps this array alive for the write callback.
+    clipboard_text_from_items(unsafe { std::slice::from_raw_parts(contents, count) })
+}
+
+fn clipboard_text_from_items(items: &[ffi::ghostty_clipboard_content_s]) -> Option<String> {
+    let preferred = items.iter().find(|item| mime_is_plain_text(item.mime));
+    let item = preferred.or(items.first())?;
+    c_ptr_to_string(item.data).filter(|text| !text.is_empty())
+}
+
+fn mime_is_plain_text(ptr: *const c_char) -> bool {
+    let Some(bytes) = c_ptr_to_bytes(ptr) else {
+        return false;
+    };
+    bytes == b"text/plain" || bytes.starts_with(b"text/plain;")
+}
+
+fn c_ptr_to_bytes(ptr: *const c_char) -> Option<&'static [u8]> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Ghostty clipboard payloads are NUL-terminated for the callback.
+    Some(unsafe { CStr::from_ptr(ptr) }.to_bytes())
+}
+
+fn c_ptr_to_string(ptr: *const c_char) -> Option<String> {
+    Some(String::from_utf8_lossy(c_ptr_to_bytes(ptr)?).into_owned())
+}
+
+unsafe extern "C" {
+    fn PasteboardCreate(name: *const c_void, pasteboard: *mut *mut c_void) -> i32;
+    fn PasteboardClear(pasteboard: *mut c_void) -> i32;
+    fn PasteboardPutItemFlavor(
+        pasteboard: *mut c_void,
+        item_id: *mut c_void,
+        flavor_type: *const c_void,
+        data: *const c_void,
+        flags: u32,
+    ) -> i32;
+}
+
+fn write_macos_clipboard(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let name = CFString::from_static_string("com.apple.pasteboard.clipboard");
+    let flavor = CFString::from_static_string("public.utf8-plain-text");
+    let data = CFData::from_buffer(text.as_bytes());
+    unsafe {
+        let mut pasteboard = std::ptr::null_mut();
+        if PasteboardCreate(name.as_CFTypeRef(), &mut pasteboard) != 0 || pasteboard.is_null() {
+            return;
+        }
+        let _ = PasteboardClear(pasteboard);
+        let _ = PasteboardPutItemFlavor(
+            pasteboard,
+            std::ptr::without_provenance_mut(1),
+            flavor.as_CFTypeRef(),
+            data.as_CFTypeRef(),
+            0,
+        );
+        CFRelease(pasteboard.cast());
+    }
+}
 
 unsafe extern "C" fn present_frame(
     userdata: *mut c_void,
@@ -301,9 +515,15 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    pub fn new(cols: u16, rows: u16, scrollback: usize, dark: bool) -> Result<Self, TerminalError> {
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+        palette: &TerminalPalette,
+    ) -> Result<Self, TerminalError> {
         let runtime = GhosttyRuntime::shared()?;
-        runtime.set_color_scheme(dark);
+        runtime.apply_palette(palette)?;
+        runtime.set_color_scheme(palette.dark);
         let (frame_sender, frames) = mpsc::sync_channel(3);
         let (input_sender, input) = mpsc::channel();
         let surface = Arc::new(SurfaceCore {
@@ -354,7 +574,7 @@ impl Terminal {
             input,
         };
         terminal.set_grid_size(cols, rows)?;
-        terminal.set_color_scheme(dark);
+        terminal.apply_palette(palette)?;
         terminal.set_focus(false);
         terminal.refresh();
         Ok(terminal)
@@ -420,6 +640,11 @@ impl Terminal {
         }
     }
 
+    pub fn surface_size(&self) -> SurfaceSize {
+        // SAFETY: the surface is live and queried on GPUI's application thread.
+        unsafe { ffi::ghostty_surface_size(self.raw()).into() }
+    }
+
     pub fn try_frame(&self) -> Result<Option<RenderedFrame>, TerminalError> {
         let mut newest = match self.frames.try_recv() {
             Ok(frame) => frame,
@@ -458,13 +683,22 @@ impl Terminal {
 
         let keycode = ghostty_key(key);
         if keycode == ffi::ghostty_input_key_e_GHOSTTY_KEY_UNIDENTIFIED {
-            if let Some(text) = text.filter(|text| !text.is_empty()) {
+            if !modifiers.control
+                && !modifiers.alt
+                && let Some(text) = text.filter(|text| !text.is_empty())
+            {
                 self.send_committed_text(text);
                 return true;
             }
             return false;
         }
-        let text = text.and_then(|text| CString::new(text).ok());
+        // Ctrl/Alt chords must be encoded from the key+mods, not from the
+        // printable `key_char` ("c" + Ctrl would type `c` instead of `^C`).
+        let text = if modifiers.control || modifiers.alt {
+            None
+        } else {
+            text.and_then(|text| CString::new(text).ok())
+        };
         let input = ffi::ghostty_input_key_s {
             action: ffi::ghostty_input_action_e_GHOSTTY_ACTION_PRESS,
             mods: ghostty_modifiers(modifiers),
@@ -492,6 +726,156 @@ impl Terminal {
         };
     }
 
+    pub fn set_preedit(&self, text: Option<&str>) {
+        let (ptr, len) = text
+            .filter(|text| !text.is_empty())
+            .map(|text| (text.as_ptr().cast::<c_char>(), text.len()))
+            .unwrap_or((std::ptr::null(), 0));
+        // SAFETY: Ghostty borrows the UTF-8 bytes only for this call; empty
+        // length clears the composition underline.
+        unsafe { ffi::ghostty_surface_preedit(self.raw(), ptr, len) };
+        self.refresh();
+    }
+
+    pub fn ime_point(&self) -> (f64, f64, f64, f64) {
+        let mut x = 0.0;
+        let mut y = 0.0;
+        let mut width = 0.0;
+        let mut height = 0.0;
+        // SAFETY: the surface is live; Ghostty writes the four out-params.
+        unsafe {
+            ffi::ghostty_surface_ime_point(self.raw(), &mut x, &mut y, &mut width, &mut height);
+        }
+        (x, y, width, height)
+    }
+
+    pub fn mouse_captured(&self) -> bool {
+        // SAFETY: the surface is live and queried on GPUI's application thread.
+        unsafe { ffi::ghostty_surface_mouse_captured(self.raw()) }
+    }
+
+    pub fn mouse_pos(&self, x: f64, y: f64, modifiers: KeyModifiers) {
+        // SAFETY: the surface is live and called on GPUI's application thread.
+        unsafe {
+            ffi::ghostty_surface_mouse_pos(self.raw(), x, y, ghostty_modifiers(modifiers));
+        }
+    }
+
+    pub fn mouse_button(
+        &self,
+        pressed: bool,
+        button: SurfaceMouseButton,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        let state = if pressed {
+            ffi::ghostty_input_mouse_state_e_GHOSTTY_MOUSE_PRESS
+        } else {
+            ffi::ghostty_input_mouse_state_e_GHOSTTY_MOUSE_RELEASE
+        };
+        let button = match button {
+            SurfaceMouseButton::Left => ffi::ghostty_input_mouse_button_e_GHOSTTY_MOUSE_LEFT,
+            SurfaceMouseButton::Right => ffi::ghostty_input_mouse_button_e_GHOSTTY_MOUSE_RIGHT,
+            SurfaceMouseButton::Middle => ffi::ghostty_input_mouse_button_e_GHOSTTY_MOUSE_MIDDLE,
+        };
+        // SAFETY: the surface is live and called on GPUI's application thread.
+        unsafe {
+            ffi::ghostty_surface_mouse_button(
+                self.raw(),
+                state,
+                button,
+                ghostty_modifiers(modifiers),
+            )
+        }
+    }
+
+    pub fn has_selection(&self) -> bool {
+        // SAFETY: the surface is live and queried on GPUI's application thread.
+        unsafe { ffi::ghostty_surface_has_selection(self.raw()) }
+    }
+
+    pub fn read_selection(&self) -> Option<String> {
+        let mut result = empty_ghostty_text();
+        // SAFETY: the surface is live; Ghostty fills `result` until free_text.
+        let ok = unsafe { ffi::ghostty_surface_read_selection(self.raw(), &mut result) };
+        if !ok {
+            return None;
+        }
+        Some(take_ghostty_text(self.raw(), &mut result))
+    }
+
+    pub fn set_selection_endpoint(&self, col: u16, row: u16, extending: bool) -> bool {
+        // SAFETY: the surface is live and called on GPUI's application thread.
+        let ok = unsafe {
+            ffi::ghostty_surface_set_selection_endpoint_viewport(self.raw(), col, row, extending)
+        };
+        if ok {
+            self.refresh();
+        }
+        ok
+    }
+
+    pub fn select_all_visible(&self) -> bool {
+        let size = self.surface_size();
+        if size.rows == 0 {
+            return false;
+        }
+        // SAFETY: the surface is live and called on GPUI's application thread.
+        let ok = unsafe {
+            ffi::ghostty_surface_select_viewport_rows(self.raw(), 0, size.rows.saturating_sub(1))
+        };
+        if ok {
+            self.refresh();
+        }
+        ok
+    }
+
+    pub fn begin_text_selection(
+        &self,
+        x: f64,
+        y: f64,
+        modifiers: KeyModifiers,
+        click_count: usize,
+        scale_factor: f64,
+    ) {
+        self.mouse_pos(x, y, modifiers);
+        let captured = self.mouse_button(true, SurfaceMouseButton::Left, modifiers);
+        if captured || click_count > 1 {
+            self.refresh();
+            return;
+        }
+        let (col, row) = cell_at_surface_point(x, y, self.surface_size(), scale_factor);
+        let _ = self.set_selection_endpoint(col, row, false);
+    }
+
+    pub fn update_text_selection(
+        &self,
+        x: f64,
+        y: f64,
+        modifiers: KeyModifiers,
+        scale_factor: f64,
+    ) {
+        self.mouse_pos(x, y, modifiers);
+        if self.mouse_captured() {
+            self.refresh();
+            return;
+        }
+        let (col, row) = cell_at_surface_point(x, y, self.surface_size(), scale_factor);
+        let _ = self.set_selection_endpoint(col, row, true);
+    }
+
+    pub fn end_text_selection(
+        &self,
+        point: Option<(f64, f64)>,
+        modifiers: KeyModifiers,
+        scale_factor: f64,
+    ) {
+        if let Some((x, y)) = point {
+            self.update_text_selection(x, y, modifiers, scale_factor);
+        }
+        let _ = self.mouse_button(false, SurfaceMouseButton::Left, modifiers);
+        self.refresh();
+    }
+
     pub fn set_focus(&self, focused: bool) {
         // SAFETY: the surface is live and called on GPUI's application thread.
         unsafe { ffi::ghostty_surface_set_focus(self.raw(), focused) };
@@ -508,6 +892,17 @@ impl Terminal {
         self.refresh();
     }
 
+    pub fn apply_palette(&self, palette: &TerminalPalette) -> Result<(), TerminalError> {
+        let runtime = GhosttyRuntime::shared()?;
+        runtime.apply_palette(palette)?;
+        runtime.set_color_scheme(palette.dark);
+        with_palette_config(palette, |config| unsafe {
+            ffi::ghostty_surface_update_config(self.raw(), config);
+        })?;
+        self.set_color_scheme(palette.dark);
+        Ok(())
+    }
+
     pub fn refresh(&self) {
         // SAFETY: the surface is live and called on GPUI's application thread.
         unsafe { ffi::ghostty_surface_refresh(self.raw()) };
@@ -516,14 +911,7 @@ impl Terminal {
     /// Visible viewport text for assistive technology. `None` if Ghostty cannot
     /// produce a selection; an empty string means the screen is blank.
     pub fn read_visible_text(&self) -> Option<String> {
-        let mut result = ffi::ghostty_text_s {
-            tl_px_x: 0.0,
-            tl_px_y: 0.0,
-            offset_start: 0,
-            offset_len: 0,
-            text: std::ptr::null(),
-            text_len: 0,
-        };
+        let mut result = empty_ghostty_text();
         let sel = ffi::ghostty_selection_s {
             top_left: ffi::ghostty_point_s {
                 tag: ffi::ghostty_point_tag_e_GHOSTTY_POINT_VIEWPORT,
@@ -545,18 +933,7 @@ impl Terminal {
         if !ok {
             return None;
         }
-        let text = if result.text.is_null() || result.text_len == 0 {
-            String::new()
-        } else {
-            // SAFETY: `text_len` is the length Ghostty reported for this buffer.
-            let bytes =
-                unsafe { std::slice::from_raw_parts(result.text.cast::<u8>(), result.text_len) };
-            String::from_utf8_lossy(bytes).into_owned()
-        };
-        if !result.text.is_null() {
-            unsafe { ffi::ghostty_surface_free_text(self.raw(), &mut result) };
-        }
-        Some(text)
+        Some(take_ghostty_text(self.raw(), &mut result))
     }
 
     fn send_committed_text(&self, text: &str) {
@@ -571,6 +948,45 @@ impl Terminal {
         debug_assert!(!raw.is_null());
         raw
     }
+}
+
+fn empty_ghostty_text() -> ffi::ghostty_text_s {
+    ffi::ghostty_text_s {
+        tl_px_x: 0.0,
+        tl_px_y: 0.0,
+        offset_start: 0,
+        offset_len: 0,
+        text: std::ptr::null(),
+        text_len: 0,
+    }
+}
+
+fn take_ghostty_text(raw: ffi::ghostty_surface_t, result: &mut ffi::ghostty_text_s) -> String {
+    let text = if result.text.is_null() || result.text_len == 0 {
+        String::new()
+    } else {
+        // SAFETY: `text_len` is the length Ghostty reported for this buffer.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(result.text.cast::<u8>(), result.text_len) };
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    if !result.text.is_null() {
+        unsafe { ffi::ghostty_surface_free_text(raw, result) };
+    }
+    text
+}
+
+pub fn cell_at_surface_point(x: f64, y: f64, size: SurfaceSize, scale_factor: f64) -> (u16, u16) {
+    let scale = scale_factor.max(1.0);
+    let cell_w = f64::from(size.cell_width_px.max(1)) / scale;
+    let cell_h = f64::from(size.cell_height_px.max(1)) / scale;
+    let col = (x / cell_w)
+        .floor()
+        .clamp(0.0, f64::from(size.columns.saturating_sub(1))) as u16;
+    let row = (y / cell_h)
+        .floor()
+        .clamp(0.0, f64::from(size.rows.saturating_sub(1))) as u16;
+    (col, row)
 }
 
 fn ghostty_modifiers(modifiers: KeyModifiers) -> ffi::ghostty_input_mods_e {
@@ -700,5 +1116,103 @@ mod tests {
         });
         assert_ne!(modifiers & ffi::ghostty_input_mods_e_GHOSTTY_MODS_CTRL, 0);
         assert_ne!(modifiers & ffi::ghostty_input_mods_e_GHOSTTY_MODS_ALT, 0);
+    }
+
+    #[test]
+    fn cell_at_surface_point_uses_unscaled_view_coordinates() {
+        let size = SurfaceSize {
+            columns: 80,
+            rows: 24,
+            width_px: 1600,
+            height_px: 768,
+            cell_width_px: 20,
+            cell_height_px: 32,
+        };
+        assert_eq!(cell_at_surface_point(0.0, 0.0, size, 2.0), (0, 0));
+        assert_eq!(cell_at_surface_point(10.0, 16.0, size, 2.0), (1, 1));
+        assert_eq!(
+            cell_at_surface_point(10_000.0, 10_000.0, size, 2.0),
+            (79, 23)
+        );
+        assert_eq!(cell_at_surface_point(-4.0, -4.0, size, 2.0), (0, 0));
+    }
+
+    #[test]
+    fn palette_config_uses_light_background_and_ansi_slots() {
+        let palette = TerminalPalette {
+            dark: false,
+            background: 0xEFF1F5,
+            foreground: 0x4C4F69,
+            cursor: 0x8839EF,
+            selection: 0xCCD0DA,
+            ansi: [
+                0x5C5F77, 0xD20F39, 0x40A02B, 0xDF8E1D, 0x1E66F5, 0xEA76CB, 0x179299, 0xACB0BE,
+                0x6C6F85, 0xD20F39, 0x40A02B, 0xDF8E1D, 0x1E66F5, 0xEA76CB, 0x179299, 0x4C4F69,
+            ],
+            font_family: "SF Mono".into(),
+            font_size: 14,
+            ligatures: false,
+            thicken: true,
+            cell_width_percent: -8,
+            cell_height_percent: 12,
+        };
+        let config = palette.config_text();
+        assert!(config.contains("background = #EFF1F5"));
+        assert!(config.contains("foreground = #4C4F69"));
+        assert!(config.contains("palette = 0=#5C5F77"));
+        assert!(config.contains("palette = 15=#4C4F69"));
+        assert!(config.contains("font-family = \"SF Mono\""));
+        assert!(config.contains("font-size = 14"));
+        assert!(config.contains("font-feature = -calt"));
+        assert!(config.contains("font-thicken = true"));
+        assert!(config.contains("adjust-cell-width = -8%"));
+        assert!(config.contains("adjust-cell-height = 12%"));
+        let builtin = TerminalPalette {
+            font_family: String::new(),
+            ligatures: true,
+            thicken: false,
+            cell_width_percent: 0,
+            cell_height_percent: 0,
+            ..palette.clone()
+        };
+        let builtin_config = builtin.config_text();
+        assert!(!builtin_config.contains("font-family"));
+        assert!(!builtin_config.contains("font-thicken"));
+        assert!(!builtin_config.contains("adjust-cell-width"));
+        assert_ne!(palette.signature(), builtin.signature());
+    }
+
+    #[test]
+    fn clipboard_write_prefers_plain_text_payload() {
+        let mime_html = CString::new("text/html").unwrap();
+        let html = CString::new("<b>x</b>").unwrap();
+        let mime_plain = CString::new("text/plain").unwrap();
+        let plain = CString::new("hello\nworld").unwrap();
+        let contents = [
+            ffi::ghostty_clipboard_content_s {
+                mime: mime_html.as_ptr(),
+                data: html.as_ptr(),
+            },
+            ffi::ghostty_clipboard_content_s {
+                mime: mime_plain.as_ptr(),
+                data: plain.as_ptr(),
+            },
+        ];
+        assert_eq!(
+            clipboard_text_from_items(&contents).as_deref(),
+            Some("hello\nworld")
+        );
+    }
+
+    #[test]
+    fn clipboard_write_skips_empty_payloads() {
+        let mime = CString::new("text/plain").unwrap();
+        let data = CString::new("").unwrap();
+        let contents = [ffi::ghostty_clipboard_content_s {
+            mime: mime.as_ptr(),
+            data: data.as_ptr(),
+        }];
+        assert_eq!(clipboard_text_from_items(&contents), None);
+        assert_eq!(clipboard_text_from_contents(std::ptr::null(), 2), None);
     }
 }

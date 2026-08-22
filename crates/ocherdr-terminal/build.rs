@@ -48,6 +48,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=ocherdr-ghostty");
     println!("cargo:rustc-link-lib=c++");
     for framework in [
+        "ApplicationServices",
         "Carbon",
         "Foundation",
         "IOSurface",

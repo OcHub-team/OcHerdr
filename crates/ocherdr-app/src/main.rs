@@ -1,8 +1,8 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui_platform::application;
@@ -11,21 +11,22 @@ use ocherdr_core::{
     SplitDirection,
 };
 use ocherdr_herdr::{
-    EventSubscription, HerdrError, SessionConnection, TerminalCommand, TerminalMode,
-    TerminalSession, attach_command, discover_sessions, open_system_terminal, request_socket,
-    ssh_host_aliases,
+    EventSubscription, HerdrError, HostHealthCheck, HostHealthStatus, SessionConnection,
+    TerminalCommand, TerminalMode, TerminalSession, attach_command, check_host, discover_sessions,
+    open_system_terminal, request_socket, ssh_host_aliases, ssh_login_command,
 };
-use ocherdr_terminal::{KeyModifiers, RenderedFrame, Terminal};
+use ocherdr_terminal::{KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
 use ochub_ui::components::{
     ButtonSize, ButtonTone, button, context_menu, context_menu_item, empty_state, field,
     icon_button_tone, icon_only_button_tone, modal_body, modal_card, modal_footer, modal_header,
     modal_overlay, segmented, spinner, status_dot,
 };
 use ochub_ui::gpui::{
-    App, AppContext, AssetSource, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Render, SharedString,
-    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions, div, point, prelude::*,
-    px, size, surface,
+    App, AppContext, AssetSource, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
+    WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::text_input::{TextInput, TextInputEvent};
@@ -33,14 +34,18 @@ use ochub_ui::{assets, theme};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod a11y;
 mod controller;
+mod fonts;
 mod i18n;
+mod ime;
 mod ui;
 
 use i18n::{I18n, Language};
 
 const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;
+const TAB_PILL_HEIGHT: f32 = 28.;
 const STATUS_BAR_HEIGHT: f32 = 28.;
 const PANE_HEADER_HEIGHT: f32 = 26.;
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
@@ -79,6 +84,9 @@ struct LoadedSession {
 }
 
 struct PaneRuntime {
+    /// Observe for every pane that is not selected; takeover for the selected
+    /// pane. Snapshot panes stay alive across tabs so hidden terminals keep
+    /// their Ghostty surface, last Metal frame, and observe stream.
     session: TerminalSession,
     terminal: Terminal,
     frame: Option<RenderedFrame>,
@@ -87,6 +95,13 @@ struct PaneRuntime {
     pixel_size: (u32, u32),
     frame_context: u64,
     color_scheme_dark: bool,
+    palette_signature: u64,
+    /// The Herdr stream ended; keep the last frame until the snapshot drops this pane.
+    exit_seen: bool,
+    /// Leftover pixel delta from trackpad wheel events, in the pane's Y axis.
+    scroll_px: f32,
+    /// Terminal body in window coordinates: `(x, y, width, height)`.
+    body_bounds: (f32, f32, f32, f32),
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +200,8 @@ struct AppearanceSettings {
     backdrop: BackdropMode,
     #[serde(default = "default_background_opacity")]
     background_opacity: u8,
+    #[serde(default)]
+    font: TerminalFontSettings,
 }
 
 impl Default for AppearanceSettings {
@@ -194,6 +211,47 @@ impl Default for AppearanceSettings {
             mode: AppearanceMode::Dark,
             backdrop: BackdropMode::Blurred,
             background_opacity: default_background_opacity(),
+            font: TerminalFontSettings::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TerminalFontSettings {
+    #[serde(default)]
+    family: String,
+    #[serde(default = "default_font_size")]
+    size: u8,
+    #[serde(default = "default_true")]
+    ligatures: bool,
+    #[serde(default)]
+    thicken: bool,
+    #[serde(default)]
+    cell_width_percent: i8,
+    #[serde(default)]
+    cell_height_percent: i8,
+}
+
+impl Default for TerminalFontSettings {
+    fn default() -> Self {
+        Self {
+            family: String::new(),
+            size: default_font_size(),
+            ligatures: true,
+            thicken: false,
+            cell_width_percent: 0,
+            cell_height_percent: 0,
+        }
+    }
+}
+
+impl TerminalFontSettings {
+    fn clamped(self) -> Self {
+        Self {
+            size: self.size.clamp(8, 32),
+            cell_width_percent: self.cell_width_percent.clamp(-30, 30),
+            cell_height_percent: self.cell_height_percent.clamp(-30, 40),
+            ..self
         }
     }
 }
@@ -206,14 +264,85 @@ const fn default_background_opacity() -> u8 {
     92
 }
 
+const fn default_font_size() -> u8 {
+    13
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const FONT_SIZES: [u8; 8] = [11, 12, 13, 14, 15, 16, 18, 20];
+const CELL_WIDTHS: [i8; 3] = [-10, 0, 10];
+const CELL_HEIGHTS: [i8; 4] = [-8, 0, 12, 20];
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
     connections: Vec<ConnectionProfile>,
     #[serde(default)]
+    recent_connection_ids: Vec<String>,
+    #[serde(default)]
+    host_metadata: HashMap<String, HostMetadata>,
+    #[serde(default)]
+    host_groups: Vec<String>,
+    #[serde(default)]
+    host_health: HashMap<String, CachedHostHealth>,
+    #[serde(default)]
     appearance: AppearanceSettings,
     #[serde(default)]
     language: Language,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct HostMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default)]
+    favorite: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port_override: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_file_override: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    herdr_path_override: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedHostHealth {
+    status: HostHealthStatus,
+    checked_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    herdr_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_count: Option<usize>,
+    #[serde(default)]
+    latency_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+enum HostHealthView {
+    Checking,
+    Checked {
+        cached: CachedHostHealth,
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum HostFilter {
+    #[default]
+    All,
+    Favorites,
+    Recent,
+    Attention,
+    Source(ConnectionSource),
+    Group(String),
+    Tag(String),
 }
 
 struct OcHerdrView {
@@ -231,33 +360,60 @@ struct OcHerdrView {
     load_epoch: u64,
     event_epoch: u64,
     snapshot_refreshing: bool,
+    snapshot_refresh_pending: bool,
     terminal_epoch: u64,
     panes: HashMap<String, PaneRuntime>,
     node_manager_open: bool,
-    add_remote_open: bool,
+    remote_form: RemoteForm,
     appearance_open: bool,
     herdr_settings_open: bool,
     herdr_settings_section: usize,
     managed_profile_index: usize,
     pending_remove_profile: Option<usize>,
+    pending_switch_profile: Option<usize>,
+    host_switcher_open: bool,
+    remote_advanced_open: bool,
+    recent_connection_ids: Vec<String>,
+    host_metadata: HashMap<String, HostMetadata>,
+    host_groups: Vec<String>,
+    host_health: HashMap<String, HostHealthView>,
+    host_filter: HostFilter,
+    host_check_epoch: u64,
+    host_check_queue: VecDeque<(u64, String, ConnectionProfile)>,
+    host_checks_running: usize,
+    host_bulk_mode: bool,
+    host_bulk_selection: HashSet<String>,
+    pending_bulk_remove: bool,
+    orphaned_ssh_hosts: HashSet<String>,
     pending_close: Option<HierarchyTarget>,
     rename_target: Option<HierarchyTarget>,
     context_menu: Option<HierarchyContextMenu>,
     prefix_pending: bool,
+    text_drag_pane: Option<String>,
+    ime_marked: Option<String>,
     remote_label: Entity<TextInput>,
     remote_destination: Entity<TextInput>,
     remote_port: Entity<TextInput>,
     remote_identity_file: Entity<TextInput>,
     remote_herdr_path: Entity<TextInput>,
+    remote_group: Entity<TextInput>,
+    remote_tags: Entity<TextInput>,
     remote_search: Entity<TextInput>,
     rename_input: Entity<TextInput>,
     appearance: AppearanceSettings,
     i18n: I18n,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteForm {
+    Closed,
+    Create,
+    Edit(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionSource {
-    Current,
+    ThisMac,
     Saved,
     SshConfig,
 }
@@ -265,29 +421,111 @@ enum ConnectionSource {
 impl ConnectionSource {
     fn label(self, i18n: I18n) -> &'static str {
         i18n.text(match self {
-            Self::Current => "CURRENT",
-            Self::Saved => "SAVED",
-            Self::SshConfig => "SSH CONFIG",
+            Self::ThisMac => "This Mac",
+            Self::Saved => "Saved",
+            Self::SshConfig => "SSH config",
         })
     }
 
     fn description(self, i18n: I18n) -> &'static str {
         i18n.text(match self {
-            Self::Current => "This Mac",
+            Self::ThisMac => "Herdr on this computer",
             Self::Saved => "Saved in OcHerdr",
-            Self::SshConfig => "Imported from ~/.ssh/config",
+            Self::SshConfig => "Read-only from ~/.ssh/config",
         })
     }
 }
 
 fn connection_source(profile: &ConnectionProfile) -> ConnectionSource {
     if matches!(profile, ConnectionProfile::Local { .. }) {
-        ConnectionSource::Current
+        ConnectionSource::ThisMac
     } else if profile.id().starts_with("manual-") {
         ConnectionSource::Saved
     } else {
         ConnectionSource::SshConfig
     }
+}
+
+fn is_saved_profile(profile: &ConnectionProfile) -> bool {
+    profile.id().starts_with("manual-")
+}
+
+fn ssh_destination(profile: &ConnectionProfile) -> Option<&str> {
+    match profile {
+        ConnectionProfile::Ssh { destination, .. } => Some(destination.as_str()),
+        ConnectionProfile::Local { .. } => None,
+    }
+}
+
+fn ssh_config_covered_by_saved(profiles: &[ConnectionProfile], destination: &str) -> bool {
+    profiles
+        .iter()
+        .any(|profile| is_saved_profile(profile) && ssh_destination(profile) == Some(destination))
+}
+
+fn remember_recent(recents: &mut Vec<String>, id: &str) {
+    recents.retain(|existing| existing != id);
+    recents.insert(0, id.to_owned());
+    recents.truncate(8);
+}
+
+fn normalize_recent_host_id(id: &str, profiles: &[ConnectionProfile]) -> Option<String> {
+    if profiles.iter().any(|profile| profile.id() == id) {
+        return Some(id.to_owned());
+    }
+    let legacy_alias = id
+        .strip_prefix("ssh-")
+        .and_then(|rest| rest.split_once('-').map(|(_, alias)| alias))?;
+    profiles
+        .iter()
+        .find(|profile| ssh_destination(profile) == Some(legacy_alias))
+        .map(|profile| profile.id().to_owned())
+}
+
+fn parse_host_tags(value: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    for tag in value
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+    {
+        if !tags
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(tag))
+        {
+            tags.push(tag.to_owned());
+        }
+    }
+    tags
+}
+
+fn switch_requires_confirm(from: usize, to: usize, live_session: bool) -> bool {
+    from != to && live_session
+}
+
+fn next_manual_profile_id(profiles: &[ConnectionProfile]) -> u64 {
+    profiles
+        .iter()
+        .filter_map(|profile| profile.id().strip_prefix("manual-"))
+        .filter_map(|suffix| suffix.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn profile_display_label(profile: &ConnectionProfile, i18n: I18n) -> String {
+    if matches!(profile, ConnectionProfile::Local { .. }) {
+        i18n.text("This Mac").to_owned()
+    } else {
+        profile.label().to_owned()
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn profile_endpoint(profile: &ConnectionProfile) -> String {
@@ -358,16 +596,30 @@ fn load_settings() -> Settings {
 
 fn save_settings(
     profiles: &[ConnectionProfile],
+    recent_connection_ids: &[String],
+    host_metadata: &HashMap<String, HostMetadata>,
+    host_groups: &[String],
+    host_health: &HashMap<String, HostHealthView>,
     appearance: &AppearanceSettings,
     language: Language,
 ) -> std::result::Result<(), String> {
     let connections = profiles
         .iter()
-        .filter(|profile| profile.id().starts_with("manual-"))
+        .filter(|profile| is_saved_profile(profile))
         .cloned()
         .collect();
     let settings = Settings {
         connections,
+        recent_connection_ids: recent_connection_ids.to_vec(),
+        host_metadata: host_metadata.clone(),
+        host_groups: host_groups.to_vec(),
+        host_health: host_health
+            .iter()
+            .filter_map(|(id, health)| match health {
+                HostHealthView::Checking => None,
+                HostHealthView::Checked { cached, .. } => Some((id.clone(), cached.clone())),
+            })
+            .collect(),
         appearance: appearance.clone(),
         language,
     };
@@ -450,7 +702,40 @@ mod tests {
         assert_eq!(settings.appearance.mode, AppearanceMode::Dark);
         assert_eq!(settings.appearance.backdrop, BackdropMode::Blurred);
         assert_eq!(settings.appearance.background_opacity, 92);
+        assert_eq!(settings.appearance.font, TerminalFontSettings::default());
+        assert_eq!(settings.appearance.font.size, 13);
+        assert!(settings.appearance.font.ligatures);
         assert_eq!(settings.language, Language::System);
+        assert!(settings.host_metadata.is_empty());
+        assert!(settings.host_groups.is_empty());
+        assert!(settings.host_health.is_empty());
+    }
+
+    #[test]
+    fn legacy_recent_ssh_ids_migrate_to_stable_alias_ids() {
+        let profiles = vec![
+            ConnectionProfile::default(),
+            ConnectionProfile::Ssh {
+                id: "ssh-config:build-box".into(),
+                label: "build-box".into(),
+                destination: "build-box".into(),
+                port: None,
+                identity_file: None,
+                herdr_path: "herdr".into(),
+            },
+        ];
+        assert_eq!(
+            normalize_recent_host_id("ssh-7-build-box", &profiles).as_deref(),
+            Some("ssh-config:build-box")
+        );
+    }
+
+    #[test]
+    fn host_tags_are_trimmed_and_deduplicated_case_insensitively() {
+        assert_eq!(
+            parse_host_tags(" production, gpu,Production, , arm64 "),
+            ["production", "gpu", "arm64"]
+        );
     }
 
     #[test]
@@ -469,5 +754,52 @@ mod tests {
         assert!(profile_matches_search(&profile, "2222", i18n));
         assert!(profile_matches_search(&profile, "ssh config", i18n));
         assert!(!profile_matches_search(&profile, "production", i18n));
+    }
+
+    #[test]
+    fn recent_hosts_move_to_the_front_and_stay_bounded() {
+        let mut recents = vec!["a".into(), "b".into(), "c".into()];
+        remember_recent(&mut recents, "b");
+        assert_eq!(recents, ["b", "a", "c"]);
+        for index in 0..10 {
+            remember_recent(&mut recents, &format!("h{index}"));
+        }
+        assert_eq!(recents.len(), 8);
+        assert_eq!(recents[0], "h9");
+    }
+
+    #[test]
+    fn switching_hosts_confirms_only_when_leaving_a_live_session() {
+        assert!(!switch_requires_confirm(0, 0, true));
+        assert!(!switch_requires_confirm(1, 2, false));
+        assert!(switch_requires_confirm(1, 2, true));
+    }
+
+    #[test]
+    fn saved_hosts_hide_the_matching_ssh_config_entry() {
+        let profiles = vec![
+            ConnectionProfile::default(),
+            ConnectionProfile::Ssh {
+                id: "manual-1".into(),
+                label: "Build".into(),
+                destination: "build".into(),
+                port: None,
+                identity_file: None,
+                herdr_path: "herdr".into(),
+            },
+            ConnectionProfile::Ssh {
+                id: "ssh-0-build".into(),
+                label: "build".into(),
+                destination: "build".into(),
+                port: None,
+                identity_file: None,
+                herdr_path: "herdr".into(),
+            },
+        ];
+        assert!(ssh_config_covered_by_saved(&profiles, "build"));
+        assert!(!ssh_config_covered_by_saved(&profiles, "prod"));
+        assert_eq!(connection_source(&profiles[0]), ConnectionSource::ThisMac);
+        assert_eq!(connection_source(&profiles[1]), ConnectionSource::Saved);
+        assert_eq!(connection_source(&profiles[2]), ConnectionSource::SshConfig);
     }
 }

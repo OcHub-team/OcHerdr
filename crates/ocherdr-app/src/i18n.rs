@@ -102,6 +102,13 @@ impl I18n {
         format!("{}?", self.close_action(kind))
     }
 
+    pub(crate) fn switch_host_prompt(self, current: &str, next: &str) -> String {
+        match self.locale {
+            Locale::English => format!("Leave {current} and connect to {next}?"),
+            Locale::SimplifiedChinese => format!("离开“{current}”，连接到“{next}”？"),
+        }
+    }
+
     pub(crate) fn close_prompt(self, label: &str) -> String {
         match self.locale {
             Locale::English => format!("Close {label}?"),
@@ -120,6 +127,28 @@ impl I18n {
         match self.locale {
             Locale::English => format!("Remove {node_name} from OcHerdr?"),
             Locale::SimplifiedChinese => format!("从 OcHerdr 中移除“{node_name}”？"),
+        }
+    }
+
+    pub(crate) fn selected_hosts(self, count: usize) -> String {
+        match self.locale {
+            Locale::English => {
+                format!("{count} host{} selected", if count == 1 { "" } else { "s" })
+            }
+            Locale::SimplifiedChinese => format!("已选择 {count} 台主机"),
+        }
+    }
+
+    pub(crate) fn checked_ago(self, seconds: u64) -> String {
+        match self.locale {
+            Locale::English if seconds < 60 => "checked just now".into(),
+            Locale::English if seconds < 3_600 => format!("checked {}m ago", seconds / 60),
+            Locale::English => format!("checked {}h ago", seconds / 3_600),
+            Locale::SimplifiedChinese if seconds < 60 => "刚刚检查".into(),
+            Locale::SimplifiedChinese if seconds < 3_600 => {
+                format!("{} 分钟前检查", seconds / 60)
+            }
+            Locale::SimplifiedChinese => format!("{} 小时前检查", seconds / 3_600),
         }
     }
 
@@ -182,7 +211,13 @@ impl I18n {
 fn zh_hans(english: &'static str) -> &'static str {
     match english {
         "Spaces" => "空间",
-        "CONNECTIONS" => "连接",
+        "Terminal" => "终端",
+        "Status bar" => "状态栏",
+        "Tabs" => "标签页",
+        "Pane actions" => "窗格操作",
+        "Empty terminal" => "空终端",
+        "CONNECTIONS" => "会话",
+        "SESSIONS" => "会话",
         "WORKSPACES" => "工作区",
         "New workspace" => "新建工作区",
         "new" => "新建",
@@ -201,7 +236,119 @@ fn zh_hans(english: &'static str) -> &'static str {
         "Close pane" => "关闭窗格",
         "Appearance" => "外观",
         "Herdr settings" => "Herdr 设置",
-        "Remote" => "远程连接",
+        "Remote" => "主机",
+        "Hosts" => "主机",
+        "Host center" => "主机中心",
+        "Connections, organization, and diagnostics" => "连接、组织与诊断",
+        "Back to workspace" => "返回工作区",
+        "Host filters" => "主机筛选",
+        "All hosts" => "全部主机",
+        "Favorites" => "收藏",
+        "Favorite" => "收藏",
+        "Favorited" => "已收藏",
+        "Recent" => "最近使用",
+        "Needs attention" => "需要处理",
+        "Groups" => "分组",
+        "Group" => "分组",
+        "Tags" => "标签",
+        "Sources" => "来源",
+        "Select" => "多选",
+        "Current" => "当前",
+        "hosts" => "台主机",
+        "sessions" => "个会话",
+        "Adjust the search or choose another filter." => "调整搜索内容，或选择其他筛选条件。",
+        "Choose a host to inspect its connection and health." => {
+            "选择一台主机以查看连接配置和健康状态。"
+        }
+        "Organization" => "组织信息",
+        "Connection" => "连接配置",
+        "Ungrouped" => "未分组",
+        "No tags" => "无标签",
+        "Add to favorites" => "添加到收藏",
+        "Remove from favorites" => "取消收藏",
+        "OpenSSH remains the source of keys and trust." => "密钥与信任关系仍由 OpenSSH 管理。",
+        "Open in Terminal" => "在终端中打开",
+        "Test connection" => "测试连接",
+        "Not checked" => "尚未检查",
+        "Checking…" => "正在检查…",
+        "Ready" => "已就绪",
+        "Herdr not ready" => "Herdr 未就绪",
+        "Herdr update required" => "需要更新 Herdr",
+        "Authentication required" => "需要认证",
+        "Host key needs attention" => "主机密钥需要处理",
+        "Unreachable" => "无法访问",
+        "Check failed" => "检查失败",
+        "Run a check to verify SSH and Herdr." => "运行检查以验证 SSH 与 Herdr。",
+        "SSH and Herdr are ready." => "SSH 与 Herdr 均已就绪。",
+        "SSH works, but Herdr could not be found on this host." => {
+            "SSH 可以连接，但在此主机上找不到 Herdr。"
+        }
+        "Update Herdr or configure a newer executable path." => {
+            "请更新 Herdr，或配置较新的可执行文件路径。"
+        }
+        "Open Terminal to complete authentication, then check again." => {
+            "请在终端中完成认证，然后重新检查。"
+        }
+        "Open Terminal to review and enroll this host key." => "请在终端中检查并登记此主机密钥。",
+        "Check the alias, network, VPN, and SSH port." => "请检查别名、网络、VPN 与 SSH 端口。",
+        "Review the SSH error, adjust the host, and try again." => {
+            "请查看 SSH 错误，调整主机配置后重试。"
+        }
+        "Edit" => "编辑",
+        "Edit host" => "编辑主机",
+        "Keep current values" => "保留当前设置",
+        "SSH config stays read-only; these are local overrides." => {
+            "SSH 配置保持只读；此处只保存本地覆盖项。"
+        }
+        "Connection changes apply the next time you connect." => "连接设置将在下次连接时生效。",
+        "Managed by ~/.ssh/config" => "由 ~/.ssh/config 管理",
+        "Optional group" => "可选分组",
+        "Comma-separated tags" => "用逗号分隔标签",
+        "One group provides the primary location." => "每台主机可归入一个主要分组。",
+        "Separate multiple tags with commas." => "多个标签请使用逗号分隔。",
+        "Advanced connection overrides" => "高级连接覆盖项",
+        "SSH agent still works when empty." => "留空时仍可使用 SSH 代理。",
+        "Save & reconnect" => "保存并重新连接",
+        "Choose hosts in the list, then apply a lightweight organization action." => {
+            "在列表中选择主机，然后应用轻量组织操作。"
+        }
+        "Apply organization" => "应用分组与标签",
+        "Remove local data…" => "移除本地数据…",
+        "Remove local data" => "移除本地数据",
+        "Remove local host data?" => "移除本地主机数据？",
+        "Saved hosts will be removed. SSH config entries keep their OpenSSH definitions and lose only OcHerdr metadata and overrides." => {
+            "已保存主机将被移除；SSH 配置项仍保留 OpenSSH 定义，仅清除 OcHerdr 元数据与覆盖项。"
+        }
+        "Enter a group or at least one tag." => "请输入分组或至少一个标签。",
+        "Switch hosts before removing the active host." => "请先切换主机，再移除当前使用的主机。",
+        "New host" => "新建主机",
+        "Saved host" => "已保存的主机",
+        "Select a host" => "选择一台主机",
+        "In use" => "使用中",
+        "Save" => "保存",
+        "Save in OcHerdr" => "保存到 OcHerdr",
+        "Advanced" => "高级选项",
+        "Hide advanced" => "隐藏高级选项",
+        "Hide" => "隐藏",
+        "Show" => "显示",
+        "SSH config" => "SSH 配置",
+        "Saved" => "已保存",
+        "Herdr on this computer" => "这台电脑上的 Herdr",
+        "Read-only from ~/.ssh/config" => "只读，来自 ~/.ssh/config",
+        "Name the machine OcHerdr should open Herdr on." => {
+            "给 OcHerdr 要打开 Herdr 的那台机器起个名字。"
+        }
+        "Changes apply the next time you connect." => "下次连接时才会生效。",
+        "Manage hosts" => "管理主机",
+        "Manage hosts…" => "管理主机…",
+        "Switch host" => "切换主机",
+        "Switch host?" => "切换主机？",
+        "Switch" => "切换",
+        "this host" => "此主机",
+        "This Mac cannot be edited." => "无法编辑这台 Mac。",
+        "OcHerdr will leave the current Herdr session and attach to the other machine." => {
+            "OcHerdr 会离开当前 Herdr 会话，并连接到另一台机器。"
+        }
         "PREFIX" => "前缀键",
         "C new tab · ⇧N new workspace · S settings · 1–9 switch tab" => {
             "C 新建标签页 · ⇧N 新建工作区 · S 设置 · 1–9 切换标签页"
@@ -211,7 +358,7 @@ fn zh_hans(english: &'static str) -> &'static str {
         "Refresh" => "刷新",
         "No running Herdr session" => "没有正在运行的 Herdr 会话",
         "Start Herdr locally or open Remote in the top-right." => {
-            "请在本机启动 Herdr，或打开右上角的远程连接。"
+            "请在本机启动 Herdr，或打开右上角的主机列表。"
         }
         "This session has no tabs" => "此会话没有标签页",
         "Create a workspace to open the first terminal." => "新建工作区以打开第一个终端。",
@@ -242,10 +389,32 @@ fn zh_hans(english: &'static str) -> &'static str {
         "Applied to terminal and shell surfaces when transparency is enabled." => {
             "启用透明背景时应用于终端及应用表面。"
         }
+        "Terminal type" => "终端字体",
+        "Choose the font used by embedded terminals. Ghostty default is JetBrains Mono." => {
+            "选择嵌入终端使用的字体。Ghostty 默认是 JetBrains Mono。"
+        }
+        "JetBrains Mono (Ghostty)" => "JetBrains Mono（Ghostty）",
+        "Size" => "字号",
+        "Point size used by the terminal grid." => "终端网格使用的点数大小。",
+        "Ligatures" => "连字",
+        "Programming ligatures such as => and !=." => "编程连字，例如 => 和 !=。",
+        "On" => "开",
+        "Off" => "关",
+        "Thicken" => "加粗描边",
+        "Draw a heavier stroke. macOS only." => "加粗笔画，仅 macOS 有效。",
+        "Cell width" => "字宽",
+        "Tighten or loosen the terminal cell width." => "收紧或放宽终端单元格宽度。",
+        "Tight" => "紧凑",
+        "Wide" => "宽松",
+        "Cell height" => "行高",
+        "Change the vertical space of each terminal row." => "调整每一行的垂直间距。",
+        "Compact" => "压缩",
+        "Relaxed" => "舒展",
+        "Loose" => "更宽",
         "Search hosts" => "搜索主机",
         "Local" => "本机",
         "Default" => "默认",
-        "CURRENT" => "当前",
+        "CURRENT" => "这台 Mac",
         "SAVED" => "已保存",
         "SSH CONFIG" => "SSH 配置",
         "This Mac" => "这台 Mac",
@@ -301,6 +470,7 @@ fn zh_hans(english: &'static str) -> &'static str {
         "Rename" => "重命名",
         "Leave empty to clear the custom pane name." => "留空可清除自定义窗格名称。",
         "Saved directly to the active Herdr session." => "名称将直接保存到当前 Herdr 会话。",
+        "Copy" => "复制",
         "Rename pane" => "重命名窗格",
         "Split right" => "向右拆分",
         "Split down" => "向下拆分",
@@ -383,7 +553,12 @@ mod tests {
     fn chinese_catalog_translates_connections_and_falls_back_to_english() {
         let i18n = I18n::new(Language::SimplifiedChinese);
 
-        assert_eq!(i18n.text("CONNECTIONS"), "连接");
+        assert_eq!(i18n.text("SESSIONS"), "会话");
+        assert_eq!(i18n.text("Hosts"), "主机");
+        assert_eq!(i18n.text("Empty terminal"), "空终端");
+        assert_eq!(i18n.text("Status bar"), "状态栏");
+        assert_eq!(i18n.text("Terminal type"), "终端字体");
+        assert_eq!(i18n.text("Ligatures"), "连字");
         assert_eq!(i18n.text("OcHerdr"), "OcHerdr");
     }
 

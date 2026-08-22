@@ -3,6 +3,7 @@ use super::*;
 impl OcHerdrView {
     pub(super) fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
         let i18n = I18n::new(settings.language);
+        let host_metadata = settings.host_metadata;
         let mut profiles = vec![ConnectionProfile::default()];
         profiles.extend(settings.connections);
         let saved_destinations = profiles
@@ -16,16 +17,49 @@ impl OcHerdrView {
             ssh_host_aliases()
                 .into_iter()
                 .filter(|host| !saved_destinations.contains(host))
-                .enumerate()
-                .map(|(index, host)| ConnectionProfile::Ssh {
-                    id: format!("ssh-{index}-{host}"),
-                    label: host.clone(),
-                    destination: host,
-                    port: None,
-                    identity_file: None,
-                    herdr_path: "herdr".into(),
+                .map(|host| {
+                    let id = format!("ssh-config:{host}");
+                    let metadata = host_metadata.get(&id).cloned().unwrap_or_default();
+                    ConnectionProfile::Ssh {
+                        id,
+                        label: metadata.display_name.unwrap_or_else(|| host.clone()),
+                        destination: host,
+                        port: metadata.port_override,
+                        identity_file: metadata.identity_file_override,
+                        herdr_path: metadata
+                            .herdr_path_override
+                            .unwrap_or_else(|| "herdr".into()),
+                    }
                 }),
         );
+        let mut orphaned_ssh_hosts = HashSet::new();
+        for (id, metadata) in &host_metadata {
+            let Some(alias) = id.strip_prefix("ssh-config:") else {
+                continue;
+            };
+            if profiles.iter().any(|profile| profile.id() == id)
+                || saved_destinations
+                    .iter()
+                    .any(|destination| destination == alias)
+            {
+                continue;
+            }
+            profiles.push(ConnectionProfile::Ssh {
+                id: id.clone(),
+                label: metadata
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| alias.to_owned()),
+                destination: alias.to_owned(),
+                port: metadata.port_override,
+                identity_file: metadata.identity_file_override.clone(),
+                herdr_path: metadata
+                    .herdr_path_override
+                    .clone()
+                    .unwrap_or_else(|| "herdr".into()),
+            });
+            orphaned_ssh_hosts.insert(id.clone());
+        }
         let remote_search = cx.new(|cx| {
             TextInput::new(cx, i18n.text("Search hosts"))
                 .search_field()
@@ -35,6 +69,30 @@ impl OcHerdrView {
             this.ensure_managed_profile_visible(cx);
         })
         .detach();
+        let known_ids = profiles
+            .iter()
+            .map(|profile| profile.id().to_owned())
+            .collect::<HashSet<_>>();
+        let recent_connection_ids = settings
+            .recent_connection_ids
+            .into_iter()
+            .filter_map(|id| normalize_recent_host_id(&id, &profiles))
+            .filter(|id| known_ids.contains(id))
+            .collect::<Vec<_>>();
+        let host_health = settings
+            .host_health
+            .into_iter()
+            .filter(|(id, _)| known_ids.contains(id))
+            .map(|(id, cached)| {
+                (
+                    id,
+                    HostHealthView::Checked {
+                        cached,
+                        detail: String::new(),
+                    },
+                )
+            })
+            .collect();
         let mut view = Self {
             profiles,
             profile_index: 0,
@@ -53,19 +111,37 @@ impl OcHerdrView {
             load_epoch: 0,
             event_epoch: 0,
             snapshot_refreshing: false,
+            snapshot_refresh_pending: false,
             terminal_epoch: 0,
             panes: HashMap::new(),
             node_manager_open: false,
-            add_remote_open: false,
+            remote_form: RemoteForm::Closed,
             appearance_open: false,
             herdr_settings_open: false,
             herdr_settings_section: 0,
             managed_profile_index: 0,
             pending_remove_profile: None,
+            pending_switch_profile: None,
+            host_switcher_open: false,
+            remote_advanced_open: false,
+            recent_connection_ids,
+            host_metadata,
+            host_groups: settings.host_groups,
+            host_health,
+            host_filter: HostFilter::All,
+            host_check_epoch: 0,
+            host_check_queue: VecDeque::new(),
+            host_checks_running: 0,
+            host_bulk_mode: false,
+            host_bulk_selection: HashSet::new(),
+            pending_bulk_remove: false,
+            orphaned_ssh_hosts,
             pending_close: None,
             rename_target: None,
             context_menu: None,
             prefix_pending: false,
+            text_drag_pane: None,
+            ime_marked: None,
             remote_label: cx.new(|cx| TextInput::new(cx, i18n.text("Production"))),
             remote_destination: cx
                 .new(|cx| TextInput::new(cx, i18n.text("user@example.com or SSH alias"))),
@@ -73,11 +149,30 @@ impl OcHerdrView {
             remote_identity_file: cx
                 .new(|cx| TextInput::new(cx, i18n.text("~/.ssh/id_ed25519 (optional)"))),
             remote_herdr_path: cx.new(|cx| TextInput::new(cx, "herdr").with_content("herdr")),
+            remote_group: cx.new(|cx| TextInput::new(cx, i18n.text("Optional group"))),
+            remote_tags: cx.new(|cx| TextInput::new(cx, i18n.text("Comma-separated tags"))),
             remote_search,
             rename_input: cx.new(|cx| TextInput::new(cx, i18n.text("Name"))),
             appearance: settings.appearance,
             i18n,
         };
+        let host = cx.weak_entity();
+        bind_enter_submit(&view.rename_input, host.clone(), cx, |this, window, cx| {
+            this.submit_rename(window, cx);
+        });
+        for field in [
+            &view.remote_label,
+            &view.remote_destination,
+            &view.remote_port,
+            &view.remote_identity_file,
+            &view.remote_herdr_path,
+            &view.remote_group,
+            &view.remote_tags,
+        ] {
+            bind_enter_submit(field, host.clone(), cx, |this, _window, cx| {
+                this.save_remote(false, cx);
+            });
+        }
         view.reload(None, cx);
         view
     }
@@ -96,6 +191,7 @@ impl OcHerdrView {
         self.event_epoch = self.event_epoch.wrapping_add(1);
         self.events = None;
         self.snapshot_refreshing = false;
+        self.snapshot_refresh_pending = false;
         let epoch = self.load_epoch;
         let profile = self.current_profile();
         self.error = None;
@@ -148,7 +244,7 @@ impl OcHerdrView {
                         if let Some(snapshot) = &this.snapshot {
                             this.selection.reconcile(snapshot);
                         }
-                        this.start_visible_terminals(cx);
+                        this.ensure_session_terminals(cx);
                         if this.events.is_some() {
                             this.schedule_event_poll(this.event_epoch, cx);
                         }
@@ -175,6 +271,7 @@ impl OcHerdrView {
             return;
         }
         self.profile_index = index;
+        self.remember_current_host();
         self.sessions.clear();
         self.session_index = None;
         self.connection = None;
@@ -182,6 +279,29 @@ impl OcHerdrView {
         self.snapshot = None;
         self.panes.clear();
         self.reload(None, cx);
+    }
+
+    fn remember_current_host(&mut self) {
+        if let Some(profile) = self.profiles.get(self.profile_index) {
+            remember_recent(&mut self.recent_connection_ids, profile.id());
+            let _ = self.persist_settings();
+        }
+    }
+
+    fn persist_settings(&self) -> std::result::Result<(), String> {
+        save_settings(
+            &self.profiles,
+            &self.recent_connection_ids,
+            &self.host_metadata,
+            &self.host_groups,
+            &self.host_health,
+            &self.appearance,
+            self.i18n.preference(),
+        )
+    }
+
+    fn live_herdr_session(&self) -> bool {
+        self.connection.is_some() || self.snapshot.is_some() || !self.panes.is_empty()
     }
 
     pub(super) fn schedule_event_poll(&self, epoch: u64, cx: &mut Context<Self>) {
@@ -221,13 +341,15 @@ impl OcHerdrView {
     }
 
     pub(super) fn refresh_snapshot_from_event(&mut self, epoch: u64, cx: &mut Context<Self>) {
-        if self.snapshot_refreshing {
+        if snapshot_refresh_should_queue(self.snapshot_refreshing) {
+            self.snapshot_refresh_pending = true;
             return;
         }
         let Some(connection) = &self.connection else {
             return;
         };
         self.snapshot_refreshing = true;
+        self.snapshot_refresh_pending = false;
         let socket = connection.socket_path().to_owned();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -247,16 +369,11 @@ impl OcHerdrView {
                 match result {
                     Ok(snapshot) => {
                         let old_tab = this.selection.tab_id.clone();
+                        let old_selected = this.selection.pane_id.clone();
                         let old_panes = this
                             .snapshot
                             .as_ref()
-                            .zip(old_tab.as_deref())
-                            .map(|(snapshot, tab)| {
-                                snapshot
-                                    .panes_for(tab)
-                                    .map(|pane| pane.pane_id.clone())
-                                    .collect::<Vec<_>>()
-                            })
+                            .map(snapshot_pane_ids)
                             .unwrap_or_default();
                         this.snapshot = Some(snapshot);
                         if let Some(snapshot) = &this.snapshot {
@@ -265,16 +382,18 @@ impl OcHerdrView {
                         let new_panes = this
                             .snapshot
                             .as_ref()
-                            .zip(this.selection.tab_id.as_deref())
-                            .map(|(snapshot, tab)| {
-                                snapshot
-                                    .panes_for(tab)
-                                    .map(|pane| pane.pane_id.clone())
-                                    .collect::<Vec<_>>()
-                            })
+                            .map(snapshot_pane_ids)
                             .unwrap_or_default();
-                        if old_tab != this.selection.tab_id || old_panes != new_panes {
-                            this.start_visible_terminals(cx);
+                        let closed_stream = this
+                            .panes
+                            .values()
+                            .any(|runtime| runtime.exit_seen || runtime.session.is_closed());
+                        if old_tab != this.selection.tab_id
+                            || old_selected != this.selection.pane_id
+                            || old_panes != new_panes
+                            || closed_stream
+                        {
+                            this.ensure_session_terminals(cx);
                         }
                         cx.notify();
                     }
@@ -283,6 +402,9 @@ impl OcHerdrView {
                         cx.notify();
                     }
                 }
+                if this.snapshot_refresh_pending {
+                    this.refresh_snapshot_from_event(epoch, cx);
+                }
             })
             .ok();
         })
@@ -290,25 +412,37 @@ impl OcHerdrView {
     }
 
     pub(super) fn open_add_remote(&mut self, cx: &mut Context<Self>) {
-        self.add_remote_open = true;
+        self.remote_form = RemoteForm::Create;
+        self.remote_advanced_open = false;
         self.error = None;
+        self.clear_remote_form(cx);
         cx.notify();
     }
 
     pub(super) fn open_node_manager(&mut self, cx: &mut Context<Self>) {
         self.node_manager_open = true;
+        self.host_switcher_open = false;
         self.appearance_open = false;
         self.herdr_settings_open = false;
         self.context_menu = None;
+        self.remote_form = RemoteForm::Closed;
         self.managed_profile_index = self.profile_index;
+        self.host_filter = HostFilter::All;
+        self.host_bulk_mode = false;
+        self.host_bulk_selection.clear();
+        self.pending_bulk_remove = false;
         self.error = None;
+        self.refresh_common_host_health(cx);
         cx.notify();
     }
 
     pub(super) fn close_node_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.node_manager_open = false;
-        self.add_remote_open = false;
+        self.remote_form = RemoteForm::Closed;
         self.pending_remove_profile = None;
+        self.host_bulk_mode = false;
+        self.host_bulk_selection.clear();
+        self.pending_bulk_remove = false;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -348,52 +482,607 @@ impl OcHerdrView {
 
     pub(super) fn select_managed_profile(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.profiles.len() {
+            if self.host_bulk_mode && index != 0 {
+                let id = self.profiles[index].id().to_owned();
+                if !self.host_bulk_selection.insert(id.clone()) {
+                    self.host_bulk_selection.remove(&id);
+                }
+                cx.notify();
+                return;
+            }
             self.managed_profile_index = index;
-            self.add_remote_open = false;
+            self.remote_form = RemoteForm::Closed;
             cx.notify();
         }
     }
 
-    pub(super) fn ensure_managed_profile_visible(&mut self, cx: &mut Context<Self>) {
-        let query = self.remote_search.read(cx).content().trim().to_lowercase();
-        if self
-            .profiles
-            .get(self.managed_profile_index)
-            .is_some_and(|profile| profile_matches_search(profile, &query, self.i18n))
-        {
+    pub(super) fn open_edit_remote(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.get(index).cloned() else {
+            return;
+        };
+        if matches!(profile, ConnectionProfile::Local { .. }) {
+            self.error = Some(self.i18n.text("This Mac cannot be edited.").into());
             cx.notify();
             return;
         }
-        if let Some(index) = self
-            .profiles
-            .iter()
-            .position(|profile| profile_matches_search(profile, &query, self.i18n))
-        {
+        self.managed_profile_index = index;
+        self.remote_form = RemoteForm::Edit(index);
+        self.fill_remote_form(&profile, cx);
+        cx.notify();
+    }
+
+    pub(super) fn set_host_filter(&mut self, filter: HostFilter, cx: &mut Context<Self>) {
+        self.host_filter = filter;
+        self.remote_form = RemoteForm::Closed;
+        if let Some(index) = self.filtered_profile_indexes(cx).first().copied() {
             self.managed_profile_index = index;
         }
         cx.notify();
     }
 
-    pub(super) fn choose_node(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.node_manager_open = false;
-        if index == self.profile_index {
-            cx.notify();
-        } else {
-            self.select_profile(index, cx);
+    pub(super) fn toggle_host_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
+        let id = profile.id().to_owned();
+        let favorite = {
+            let metadata = self.host_metadata.entry(id.clone()).or_default();
+            metadata.favorite = !metadata.favorite;
+            metadata.favorite
+        };
+        if let Err(error) = self.persist_settings() {
+            self.host_metadata.entry(id).or_default().favorite = !favorite;
+            self.error = Some(error.into());
         }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_host_bulk_mode(&mut self, cx: &mut Context<Self>) {
+        self.host_bulk_mode = !self.host_bulk_mode;
+        self.host_bulk_selection.clear();
+        self.remote_form = RemoteForm::Closed;
+        if self.host_bulk_mode {
+            self.remote_group
+                .update(cx, |input, cx| input.set_content("", cx));
+            self.remote_tags
+                .update(cx, |input, cx| input.set_content("", cx));
+        }
+        cx.notify();
+    }
+
+    pub(super) fn bulk_set_favorite(&mut self, favorite: bool, cx: &mut Context<Self>) {
+        if self.host_bulk_selection.is_empty() {
+            return;
+        }
+        let original_metadata = self.host_metadata.clone();
+        for id in &self.host_bulk_selection {
+            self.host_metadata.entry(id.clone()).or_default().favorite = favorite;
+        }
+        if let Err(error) = self.persist_settings() {
+            self.host_metadata = original_metadata;
+            self.error = Some(error.into());
+        }
+        cx.notify();
+    }
+
+    pub(super) fn bulk_apply_organization(&mut self, cx: &mut Context<Self>) {
+        if self.host_bulk_selection.is_empty() {
+            return;
+        }
+        let group = self.remote_group.read(cx).content().trim().to_owned();
+        let group = (!group.is_empty()).then_some(group);
+        let tags = parse_host_tags(&self.remote_tags.read(cx).content());
+        if group.is_none() && tags.is_empty() {
+            self.error = Some(self.i18n.text("Enter a group or at least one tag.").into());
+            cx.notify();
+            return;
+        }
+        let original_metadata = self.host_metadata.clone();
+        let original_groups = self.host_groups.clone();
+        for id in &self.host_bulk_selection {
+            let metadata = self.host_metadata.entry(id.clone()).or_default();
+            if let Some(group) = &group {
+                metadata.group = Some(group.clone());
+            }
+            for tag in &tags {
+                if !metadata
+                    .tags
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(tag))
+                {
+                    metadata.tags.push(tag.clone());
+                }
+            }
+        }
+        if let Some(group) = group
+            && !self
+                .host_groups
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&group))
+        {
+            self.host_groups.push(group);
+            self.host_groups.sort_by_key(|group| group.to_lowercase());
+        }
+        if let Err(error) = self.persist_settings() {
+            self.host_metadata = original_metadata;
+            self.host_groups = original_groups;
+            self.error = Some(error.into());
+        }
+        cx.notify();
+    }
+
+    pub(super) fn request_bulk_remove(&mut self, cx: &mut Context<Self>) {
+        if self.host_bulk_selection.is_empty() {
+            return;
+        }
+        let active_id = self.current_profile().id().to_owned();
+        if self.host_bulk_selection.contains(&active_id) {
+            self.error = Some(
+                self.i18n
+                    .text("Switch hosts before removing the active host.")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        self.pending_bulk_remove = true;
+        cx.notify();
+    }
+
+    pub(super) fn cancel_bulk_remove(&mut self, cx: &mut Context<Self>) {
+        self.pending_bulk_remove = false;
+        cx.notify();
+    }
+
+    pub(super) fn confirm_bulk_remove(&mut self, cx: &mut Context<Self>) {
+        if !self.pending_bulk_remove {
+            return;
+        }
+        self.pending_bulk_remove = false;
+        let selected = self.host_bulk_selection.clone();
+        let original_profiles = self.profiles.clone();
+        let original_recents = self.recent_connection_ids.clone();
+        let original_metadata = self.host_metadata.clone();
+        let original_health = self.host_health.clone();
+        let original_orphans = self.orphaned_ssh_hosts.clone();
+        let current_id = self.current_profile().id().to_owned();
+        let managed_id = self
+            .profiles
+            .get(self.managed_profile_index)
+            .map(|profile| profile.id().to_owned())
+            .unwrap_or_else(|| current_id.clone());
+
+        let removed_ids = self
+            .profiles
+            .iter()
+            .filter(|profile| {
+                selected.contains(profile.id())
+                    && (is_saved_profile(profile) || self.orphaned_ssh_hosts.contains(profile.id()))
+            })
+            .map(|profile| profile.id().to_owned())
+            .collect::<HashSet<_>>();
+        self.profiles
+            .retain(|profile| !removed_ids.contains(profile.id()));
+        for profile in &mut self.profiles {
+            if !selected.contains(profile.id())
+                || connection_source(profile) != ConnectionSource::SshConfig
+            {
+                continue;
+            }
+            let ConnectionProfile::Ssh {
+                id,
+                label,
+                destination,
+                port,
+                identity_file,
+                herdr_path,
+            } = profile
+            else {
+                continue;
+            };
+            let alias = id
+                .strip_prefix("ssh-config:")
+                .unwrap_or(destination)
+                .to_owned();
+            *label = alias.clone();
+            *destination = alias;
+            *port = None;
+            *identity_file = None;
+            *herdr_path = "herdr".into();
+        }
+        for id in &selected {
+            self.host_metadata.remove(id);
+            self.host_health.remove(id);
+        }
+        self.orphaned_ssh_hosts.retain(|id| !selected.contains(id));
+        self.recent_connection_ids
+            .retain(|id| !removed_ids.contains(id));
+
+        if let Err(error) = self.persist_settings() {
+            self.profiles = original_profiles;
+            self.recent_connection_ids = original_recents;
+            self.host_metadata = original_metadata;
+            self.host_health = original_health;
+            self.orphaned_ssh_hosts = original_orphans;
+            self.error = Some(error.into());
+            cx.notify();
+            return;
+        }
+        self.profile_index = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id() == current_id)
+            .unwrap_or(0);
+        self.managed_profile_index = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id() == managed_id)
+            .unwrap_or(self.profile_index);
+        self.host_bulk_selection.clear();
+        self.error = None;
+        cx.notify();
+    }
+
+    pub(super) fn filtered_profile_indexes(&self, cx: &App) -> Vec<usize> {
+        let query = self.remote_search.read(cx).content().trim().to_lowercase();
+        let recent_positions = self
+            .recent_connection_ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| (id.as_str(), position))
+            .collect::<HashMap<_, _>>();
+        let mut indexes = self
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| {
+                if connection_source(profile) == ConnectionSource::SshConfig
+                    && ssh_destination(profile).is_some_and(|destination| {
+                        ssh_config_covered_by_saved(&self.profiles, destination)
+                    })
+                {
+                    return false;
+                }
+                let metadata = self.host_metadata.get(profile.id());
+                let search_matches = profile_matches_search(profile, &query, self.i18n)
+                    || metadata.is_some_and(|metadata| {
+                        metadata
+                            .display_name
+                            .as_deref()
+                            .is_some_and(|name| name.to_lowercase().contains(&query))
+                            || metadata
+                                .group
+                                .as_deref()
+                                .is_some_and(|group| group.to_lowercase().contains(&query))
+                            || metadata
+                                .tags
+                                .iter()
+                                .any(|tag| tag.to_lowercase().contains(&query))
+                    });
+                if !search_matches {
+                    return false;
+                }
+                match &self.host_filter {
+                    HostFilter::All => true,
+                    HostFilter::Favorites => metadata.is_some_and(|value| value.favorite),
+                    HostFilter::Recent => recent_positions.contains_key(profile.id()),
+                    HostFilter::Attention => {
+                        self.orphaned_ssh_hosts.contains(profile.id())
+                            || self
+                                .host_health
+                                .get(profile.id())
+                                .is_some_and(|health| match health {
+                                    HostHealthView::Checking => false,
+                                    HostHealthView::Checked { cached, .. } => {
+                                        cached.status != HostHealthStatus::Ready
+                                    }
+                                })
+                    }
+                    HostFilter::Source(source) => connection_source(profile) == *source,
+                    HostFilter::Group(group) => {
+                        metadata.and_then(|value| value.group.as_deref()) == Some(group.as_str())
+                    }
+                    HostFilter::Tag(tag) => metadata
+                        .is_some_and(|value| value.tags.iter().any(|candidate| candidate == tag)),
+                }
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        indexes.sort_by_key(|index| {
+            let profile = &self.profiles[*index];
+            let metadata = self.host_metadata.get(profile.id());
+            (
+                usize::from(*index != self.profile_index),
+                usize::from(!metadata.is_some_and(|value| value.favorite)),
+                recent_positions
+                    .get(profile.id())
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                self.host_display_label(*index).to_lowercase(),
+            )
+        });
+        indexes
+    }
+
+    pub(super) fn host_display_label(&self, index: usize) -> String {
+        let Some(profile) = self.profiles.get(index) else {
+            return String::new();
+        };
+        self.host_metadata
+            .get(profile.id())
+            .and_then(|metadata| metadata.display_name.clone())
+            .unwrap_or_else(|| profile_display_label(profile, self.i18n))
+    }
+
+    pub(super) fn test_managed_host(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.get(index).cloned() else {
+            return;
+        };
+        let id = profile.id().to_owned();
+        self.host_check_queue
+            .retain(|(_, queued_id, _)| queued_id != &id);
+        self.host_health
+            .insert(id.clone(), HostHealthView::Checking);
+        self.host_check_queue
+            .push_back((self.host_check_epoch, id, profile));
+        self.pump_host_checks(cx);
+        cx.notify();
+    }
+
+    pub(super) fn open_managed_host_in_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(command) = self.profiles.get(index).and_then(ssh_login_command) else {
+            return;
+        };
+        if let Err(error) = open_system_terminal(&command) {
+            self.error = Some(error.to_string().into());
+        }
+        cx.notify();
+    }
+
+    pub(super) fn refresh_common_host_health(&mut self, cx: &mut Context<Self>) {
+        self.reload_ssh_config_hosts();
+        self.host_check_epoch = self.host_check_epoch.wrapping_add(1);
+        self.host_check_queue.clear();
+        let mut ids = Vec::new();
+        if let Some(profile) = self.profiles.get(self.profile_index) {
+            ids.push(profile.id().to_owned());
+        }
+        ids.extend(
+            self.profiles
+                .iter()
+                .filter(|profile| {
+                    self.host_metadata
+                        .get(profile.id())
+                        .is_some_and(|metadata| metadata.favorite)
+                })
+                .map(|profile| profile.id().to_owned()),
+        );
+        ids.extend(self.recent_connection_ids.iter().take(8).cloned());
+        let mut seen = HashSet::new();
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(profile) = self
+                .profiles
+                .iter()
+                .find(|profile| profile.id() == id)
+                .cloned()
+            else {
+                continue;
+            };
+            self.host_health
+                .insert(id.clone(), HostHealthView::Checking);
+            self.host_check_queue
+                .push_back((self.host_check_epoch, id, profile));
+        }
+        self.pump_host_checks(cx);
+        cx.notify();
+    }
+
+    fn reload_ssh_config_hosts(&mut self) {
+        let current_id = self
+            .profiles
+            .get(self.profile_index)
+            .map(|profile| profile.id().to_owned())
+            .unwrap_or_else(|| "local".into());
+        let managed_id = self
+            .profiles
+            .get(self.managed_profile_index)
+            .map(|profile| profile.id().to_owned())
+            .unwrap_or_else(|| current_id.clone());
+        let old_config = self
+            .profiles
+            .iter()
+            .filter(|profile| connection_source(profile) == ConnectionSource::SshConfig)
+            .map(|profile| (profile.id().to_owned(), profile.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut profiles = self
+            .profiles
+            .iter()
+            .filter(|profile| connection_source(profile) != ConnectionSource::SshConfig)
+            .cloned()
+            .collect::<Vec<_>>();
+        let saved_destinations = profiles
+            .iter()
+            .filter_map(ssh_destination)
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let aliases = ssh_host_aliases();
+        let mut discovered_ids = HashSet::new();
+        for alias in aliases {
+            if saved_destinations.contains(&alias) {
+                continue;
+            }
+            let id = format!("ssh-config:{alias}");
+            discovered_ids.insert(id.clone());
+            let metadata = self.host_metadata.get(&id).cloned().unwrap_or_default();
+            profiles.push(ConnectionProfile::Ssh {
+                id,
+                label: metadata.display_name.unwrap_or_else(|| alias.clone()),
+                destination: alias,
+                port: metadata.port_override,
+                identity_file: metadata.identity_file_override,
+                herdr_path: metadata
+                    .herdr_path_override
+                    .unwrap_or_else(|| "herdr".into()),
+            });
+        }
+        self.orphaned_ssh_hosts.clear();
+        for (id, profile) in old_config {
+            if discovered_ids.contains(&id) {
+                continue;
+            }
+            if self.host_metadata.contains_key(&id) || id == current_id {
+                self.orphaned_ssh_hosts.insert(id);
+                profiles.push(profile);
+            }
+        }
+        self.profiles = profiles;
+        self.profile_index = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id() == current_id)
+            .unwrap_or(0);
+        self.managed_profile_index = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id() == managed_id)
+            .unwrap_or(self.profile_index);
+    }
+
+    fn pump_host_checks(&mut self, cx: &mut Context<Self>) {
+        while self.host_checks_running < 3 {
+            let Some((epoch, id, profile)) = self.host_check_queue.pop_front() else {
+                break;
+            };
+            self.host_checks_running += 1;
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move { check_host(&profile) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.host_checks_running = this.host_checks_running.saturating_sub(1);
+                    if this.host_check_epoch == epoch {
+                        this.store_host_health(id, result);
+                        let _ = this.persist_settings();
+                    }
+                    this.pump_host_checks(cx);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn store_host_health(&mut self, id: String, result: HostHealthCheck) {
+        let cached = CachedHostHealth {
+            status: result.status,
+            checked_at: unix_timestamp(),
+            herdr_version: result.herdr_version,
+            session_count: result.session_count,
+            latency_ms: result.latency_ms,
+        };
+        self.host_health.insert(
+            id,
+            HostHealthView::Checked {
+                cached,
+                detail: result.detail,
+            },
+        );
+    }
+
+    pub(super) fn ensure_managed_profile_visible(&mut self, cx: &mut Context<Self>) {
+        let indexes = self.filtered_profile_indexes(cx);
+        if indexes.contains(&self.managed_profile_index) {
+            cx.notify();
+            return;
+        }
+        if let Some(index) = indexes.first().copied() {
+            self.managed_profile_index = index;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn request_choose_node(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.profiles.len() {
+            return;
+        }
+        if switch_requires_confirm(self.profile_index, index, self.live_herdr_session()) {
+            self.pending_switch_profile = Some(index);
+            self.host_switcher_open = false;
+            cx.notify();
+            return;
+        }
+        self.apply_profile(index, cx);
+    }
+
+    pub(super) fn cancel_switch_profile(&mut self, cx: &mut Context<Self>) {
+        self.pending_switch_profile = None;
+        cx.notify();
+    }
+
+    pub(super) fn confirm_switch_profile(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.pending_switch_profile.take() else {
+            return;
+        };
+        self.apply_profile(index, cx);
+    }
+
+    pub(super) fn toggle_host_switcher(&mut self, cx: &mut Context<Self>) {
+        self.host_switcher_open = !self.host_switcher_open;
+        if self.host_switcher_open {
+            self.node_manager_open = false;
+            self.context_menu = None;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn close_host_switcher(&mut self, cx: &mut Context<Self>) {
+        if self.host_switcher_open {
+            self.host_switcher_open = false;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn toggle_remote_advanced(&mut self, cx: &mut Context<Self>) {
+        self.remote_advanced_open = !self.remote_advanced_open;
+        cx.notify();
+    }
+
+    fn apply_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.node_manager_open = false;
+        self.host_switcher_open = false;
+        self.pending_switch_profile = None;
+        self.remote_form = RemoteForm::Closed;
+        if index == self.profile_index {
+            self.remember_current_host();
+            self.reload(None, cx);
+            cx.notify();
+            return;
+        }
+        self.select_profile(index, cx);
     }
 
     pub(super) fn apply_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.appearance.background_opacity = self.appearance.background_opacity.clamp(40, 100);
+        self.appearance.font = self.appearance.font.clone().clamped();
         self.appearance.theme_family = install_appearance(&self.appearance, window.appearance());
         theme::apply_window_background(window);
-        let dark = theme::is_dark();
+        let palette = current_terminal_palette(&self.appearance);
+        let mut palette_error = None;
         for runtime in self.panes.values_mut() {
-            runtime.terminal.set_color_scheme(dark);
-            runtime.color_scheme_dark = dark;
+            if let Err(error) = runtime.terminal.apply_palette(&palette) {
+                palette_error = Some(error);
+            }
+            runtime.color_scheme_dark = palette.dark;
+            runtime.palette_signature = palette.signature();
         }
-        if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
-        {
+        if let Some(error) = palette_error {
+            self.error = Some(error.to_string().into());
+        }
+        if let Err(error) = self.persist_settings() {
             self.error = Some(error.into());
         }
         cx.refresh_windows();
@@ -440,6 +1129,61 @@ impl OcHerdrView {
         self.apply_appearance(window, cx);
     }
 
+    pub(super) fn set_font_family(
+        &mut self,
+        family: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.appearance.font.family = family;
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_font_size(&mut self, size: u8, window: &mut Window, cx: &mut Context<Self>) {
+        self.appearance.font.size = size;
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_font_ligatures(
+        &mut self,
+        ligatures: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.appearance.font.ligatures = ligatures;
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_font_thicken(
+        &mut self,
+        thicken: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.appearance.font.thicken = thicken;
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_cell_width(
+        &mut self,
+        percent: i8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.appearance.font.cell_width_percent = percent;
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_cell_height(
+        &mut self,
+        percent: i8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.appearance.font.cell_height_percent = percent;
+        self.apply_appearance(window, cx);
+    }
+
     pub(super) fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
         self.i18n.set_preference(language);
         theme::reload_registry();
@@ -458,22 +1202,32 @@ impl OcHerdrView {
         self.remote_identity_file.update(cx, |input, cx| {
             input.set_placeholder(self.i18n.text("~/.ssh/id_ed25519 (optional)"), cx)
         });
+        self.remote_group.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text("Optional group"), cx)
+        });
+        self.remote_tags.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text("Comma-separated tags"), cx)
+        });
         self.rename_input.update(cx, |input, cx| {
             input.set_placeholder(self.i18n.text("Name"), cx)
         });
-        if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
-        {
+        if let Err(error) = self.persist_settings() {
             self.error = Some(error.into());
         }
         cx.notify();
     }
 
     pub(super) fn request_remove_node(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self
-            .profiles
-            .get(index)
-            .is_some_and(|profile| profile.id().starts_with("manual-"))
-        {
+        if index == self.profile_index {
+            self.error = Some(
+                self.i18n
+                    .text("Switch hosts before removing the active host.")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        if self.profiles.get(index).is_some_and(is_saved_profile) {
             self.pending_remove_profile = Some(index);
             cx.notify();
         }
@@ -492,9 +1246,18 @@ impl OcHerdrView {
             return;
         }
         let removed = self.profiles.remove(index);
-        if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
-        {
+        let removed_id = removed.id().to_owned();
+        self.recent_connection_ids.retain(|id| id != removed.id());
+        let removed_metadata = self.host_metadata.remove(&removed_id);
+        let removed_health = self.host_health.remove(&removed_id);
+        if let Err(error) = self.persist_settings() {
             self.profiles.insert(index, removed);
+            if let Some(metadata) = removed_metadata {
+                self.host_metadata.insert(removed_id.clone(), metadata);
+            }
+            if let Some(health) = removed_health {
+                self.host_health.insert(removed_id, health);
+            }
             self.error = Some(error.into());
             cx.notify();
             return;
@@ -512,7 +1275,8 @@ impl OcHerdrView {
     }
 
     pub(super) fn close_add_remote(&mut self, cx: &mut Context<Self>) {
-        self.add_remote_open = false;
+        self.remote_form = RemoteForm::Closed;
+        self.sync_remote_form_with_selection(cx);
         cx.notify();
     }
 
@@ -525,6 +1289,91 @@ impl OcHerdrView {
     pub(super) fn cancel_close(&mut self, cx: &mut Context<Self>) {
         self.pending_close = None;
         cx.notify();
+    }
+
+    pub(super) fn handle_overlay_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(confirm) = overlay_confirm_or_cancel(event) else {
+            return false;
+        };
+        let enter = confirm;
+        let escape = !confirm;
+        if self.pending_close.is_some() {
+            if enter {
+                self.confirm_close(cx);
+            } else {
+                self.cancel_close(cx);
+            }
+            cx.stop_propagation();
+            return true;
+        }
+        if self.pending_remove_profile.is_some() {
+            if enter {
+                self.confirm_remove_node(cx);
+            } else {
+                self.cancel_remove_node(cx);
+            }
+            cx.stop_propagation();
+            return true;
+        }
+        if self.pending_bulk_remove {
+            if enter {
+                self.confirm_bulk_remove(cx);
+            } else {
+                self.cancel_bulk_remove(cx);
+            }
+            cx.stop_propagation();
+            return true;
+        }
+        if self.rename_target.is_some() {
+            if enter {
+                self.submit_rename(window, cx);
+            } else {
+                self.cancel_rename(window, cx);
+            }
+            cx.stop_propagation();
+            return true;
+        }
+        if self.pending_switch_profile.is_some() {
+            if enter {
+                self.confirm_switch_profile(cx);
+            } else {
+                self.cancel_switch_profile(cx);
+            }
+            cx.stop_propagation();
+            return true;
+        }
+        if self.remote_form != RemoteForm::Closed && escape {
+            self.close_add_remote(cx);
+            cx.stop_propagation();
+            return true;
+        }
+        if escape && self.host_switcher_open {
+            self.close_host_switcher(cx);
+            cx.stop_propagation();
+            return true;
+        }
+        if escape
+            && (self.context_menu.take().is_some()
+                || self.node_manager_open
+                || self.appearance_open
+                || self.herdr_settings_open)
+        {
+            self.node_manager_open = false;
+            self.remote_form = RemoteForm::Closed;
+            self.host_switcher_open = false;
+            self.appearance_open = false;
+            self.herdr_settings_open = false;
+            self.focus.focus(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     pub(super) fn confirm_close(&mut self, cx: &mut Context<Self>) {
@@ -630,11 +1479,113 @@ impl OcHerdrView {
         self.focus.focus(window, cx);
     }
 
-    pub(super) fn save_remote(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn save_remote(&mut self, connect: bool, cx: &mut Context<Self>) {
+        let Some(draft) = self.parse_remote_draft(cx) else {
+            return;
+        };
+        let group = self.remote_group.read(cx).content().trim().to_owned();
+        let group = (!group.is_empty()).then_some(group);
+        let tags = parse_host_tags(&self.remote_tags.read(cx).content());
+        let original_profiles = self.profiles.clone();
+        let original_metadata = self.host_metadata.clone();
+        let original_groups = self.host_groups.clone();
+        let index = match self.remote_form {
+            RemoteForm::Create => {
+                self.profiles.push(draft);
+                let index = self.profiles.len() - 1;
+                let id = self.profiles[index].id().to_owned();
+                self.host_metadata.insert(
+                    id,
+                    HostMetadata {
+                        group: group.clone(),
+                        tags: tags.clone(),
+                        ..HostMetadata::default()
+                    },
+                );
+                index
+            }
+            RemoteForm::Edit(index) if index < self.profiles.len() => {
+                let source = connection_source(&self.profiles[index]);
+                let ConnectionProfile::Ssh {
+                    label: new_label,
+                    destination: new_destination,
+                    port: new_port,
+                    identity_file: new_identity,
+                    herdr_path: new_herdr,
+                    ..
+                } = draft
+                else {
+                    return;
+                };
+                let id = self.profiles[index].id().to_owned();
+                let metadata = self.host_metadata.entry(id).or_default();
+                metadata.group = group.clone();
+                metadata.tags = tags.clone();
+                if source == ConnectionSource::SshConfig {
+                    metadata.display_name = Some(new_label.clone()).filter(|label| {
+                        label != ssh_destination(&self.profiles[index]).unwrap_or_default()
+                    });
+                    metadata.port_override = new_port;
+                    metadata.identity_file_override = new_identity.clone();
+                    metadata.herdr_path_override =
+                        (new_herdr != "herdr").then_some(new_herdr.clone());
+                }
+                match &mut self.profiles[index] {
+                    ConnectionProfile::Ssh {
+                        label,
+                        destination,
+                        port,
+                        identity_file,
+                        herdr_path,
+                        ..
+                    } => {
+                        *label = new_label;
+                        if source == ConnectionSource::Saved {
+                            *destination = new_destination;
+                        }
+                        *port = new_port;
+                        *identity_file = new_identity;
+                        *herdr_path = new_herdr;
+                    }
+                    ConnectionProfile::Local { .. } => unreachable!(),
+                }
+                index
+            }
+            RemoteForm::Closed | RemoteForm::Edit(_) => return,
+        };
+        if let Some(group) = &group
+            && !self
+                .host_groups
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(group))
+        {
+            self.host_groups.push(group.clone());
+            self.host_groups.sort_by_key(|group| group.to_lowercase());
+        }
+        if let Err(error) = self.persist_settings() {
+            self.profiles = original_profiles;
+            self.host_metadata = original_metadata;
+            self.host_groups = original_groups;
+            self.error = Some(error.into());
+            cx.notify();
+            return;
+        }
+        self.managed_profile_index = index;
+        self.remote_form = RemoteForm::Closed;
+        self.error = None;
+        if connect {
+            self.request_choose_node(index, cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    fn parse_remote_draft(&mut self, cx: &mut Context<Self>) -> Option<ConnectionProfile> {
         let destination = self.remote_destination.read(cx).content().trim().to_owned();
         if destination.is_empty() {
             self.error = Some(self.i18n.text("SSH destination is required.").into());
-            return;
+            cx.notify();
+            return None;
         }
         let label = self.remote_label.read(cx).content().trim().to_owned();
         let port_text = self.remote_port.read(cx).content().trim().to_owned();
@@ -656,20 +1607,21 @@ impl OcHerdrView {
                             .text("SSH port must be a number from 1 to 65535.")
                             .into(),
                     );
-                    return;
+                    cx.notify();
+                    return None;
                 }
             }
         };
-        let next_id = self
-            .profiles
-            .iter()
-            .filter_map(|profile| profile.id().strip_prefix("manual-"))
-            .filter_map(|suffix| suffix.parse::<u64>().ok())
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let profile = ConnectionProfile::Ssh {
-            id: format!("manual-{next_id}"),
+        let id = match self.remote_form {
+            RemoteForm::Edit(index) => self
+                .profiles
+                .get(index)
+                .map(|profile| profile.id().to_owned())
+                .unwrap_or_else(|| format!("manual-{}", next_manual_profile_id(&self.profiles))),
+            _ => format!("manual-{}", next_manual_profile_id(&self.profiles)),
+        };
+        Some(ConnectionProfile::Ssh {
+            id,
             label: if label.is_empty() {
                 destination.clone()
             } else {
@@ -683,17 +1635,10 @@ impl OcHerdrView {
             } else {
                 herdr_path
             },
-        };
-        self.profiles.push(profile);
-        if let Err(error) = save_settings(&self.profiles, &self.appearance, self.i18n.preference())
-        {
-            self.profiles.pop();
-            self.error = Some(error.into());
-            return;
-        }
-        self.profile_index = self.profiles.len() - 1;
-        self.add_remote_open = false;
-        self.node_manager_open = false;
+        })
+    }
+
+    fn clear_remote_form(&mut self, cx: &mut Context<Self>) {
         self.remote_label
             .update(cx, |input, cx| input.set_content("", cx));
         self.remote_destination
@@ -704,7 +1649,101 @@ impl OcHerdrView {
             .update(cx, |input, cx| input.set_content("", cx));
         self.remote_herdr_path
             .update(cx, |input, cx| input.set_content("herdr", cx));
-        self.reload(None, cx);
+        self.remote_group
+            .update(cx, |input, cx| input.set_content("", cx));
+        self.remote_tags
+            .update(cx, |input, cx| input.set_content("", cx));
+    }
+
+    fn fill_remote_form(&mut self, profile: &ConnectionProfile, cx: &mut Context<Self>) {
+        let metadata = self
+            .host_metadata
+            .get(profile.id())
+            .cloned()
+            .unwrap_or_default();
+        self.remote_group.update(cx, |input, cx| {
+            input.set_content(metadata.group.clone().unwrap_or_default(), cx)
+        });
+        self.remote_tags.update(cx, |input, cx| {
+            input.set_content(metadata.tags.join(", "), cx)
+        });
+        match profile {
+            ConnectionProfile::Local { herdr_path } => {
+                let label = self.i18n.text("This Mac").to_owned();
+                self.remote_label
+                    .update(cx, |input, cx| input.set_content(label, cx));
+                self.remote_destination
+                    .update(cx, |input, cx| input.set_content("", cx));
+                self.remote_port
+                    .update(cx, |input, cx| input.set_content("", cx));
+                self.remote_identity_file
+                    .update(cx, |input, cx| input.set_content("", cx));
+                self.remote_herdr_path
+                    .update(cx, |input, cx| input.set_content(herdr_path.clone(), cx));
+                self.remote_advanced_open = herdr_path != "herdr";
+            }
+            ConnectionProfile::Ssh {
+                label,
+                destination,
+                port,
+                identity_file,
+                herdr_path,
+                ..
+            } => {
+                self.remote_label
+                    .update(cx, |input, cx| input.set_content(label.clone(), cx));
+                self.remote_destination
+                    .update(cx, |input, cx| input.set_content(destination.clone(), cx));
+                self.remote_port.update(cx, |input, cx| {
+                    input.set_content(port.map(|port| port.to_string()).unwrap_or_default(), cx)
+                });
+                self.remote_identity_file.update(cx, |input, cx| {
+                    input.set_content(
+                        identity_file
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                        cx,
+                    )
+                });
+                self.remote_herdr_path
+                    .update(cx, |input, cx| input.set_content(herdr_path.clone(), cx));
+                self.remote_advanced_open =
+                    port.is_some() || identity_file.is_some() || herdr_path != "herdr";
+            }
+        }
+    }
+
+    fn sync_remote_form_with_selection(&mut self, cx: &mut Context<Self>) {
+        self.remote_form = RemoteForm::Closed;
+        cx.notify();
+    }
+
+    pub(super) fn host_switcher_entries(&self) -> Vec<usize> {
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+        let push = |index: usize, entries: &mut Vec<usize>, seen: &mut HashSet<usize>| {
+            if seen.insert(index) {
+                entries.push(index);
+            }
+        };
+        push(0, &mut entries, &mut seen);
+        for (index, profile) in self.profiles.iter().enumerate() {
+            if self
+                .host_metadata
+                .get(profile.id())
+                .is_some_and(|metadata| metadata.favorite)
+            {
+                push(index, &mut entries, &mut seen);
+            }
+        }
+        for id in &self.recent_connection_ids {
+            if let Some(index) = self.profiles.iter().position(|profile| profile.id() == id) {
+                push(index, &mut entries, &mut seen);
+            }
+        }
+        entries.truncate(8);
+        entries
     }
 
     pub(super) fn select_session(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -752,7 +1791,7 @@ impl OcHerdrView {
                 .or_else(|| snapshot.panes_for(tab_id).next())
                 .map(|pane| pane.pane_id.clone())
         });
-        self.start_visible_terminals(cx);
+        self.ensure_session_terminals(cx);
         cx.notify();
     }
 
@@ -766,7 +1805,7 @@ impl OcHerdrView {
             .find(|pane| pane.focused)
             .or_else(|| snapshot.panes_for(&tab_id).next())
             .map(|pane| pane.pane_id.clone());
-        self.start_visible_terminals(cx);
+        self.ensure_session_terminals(cx);
         cx.notify();
     }
 
@@ -792,64 +1831,131 @@ impl OcHerdrView {
         }
         self.selection.pane_id = Some(pane_id);
         if changed {
-            self.start_visible_terminals(cx);
+            self.ensure_session_terminals(cx);
         }
         self.focus.focus(window, cx);
         cx.notify();
     }
 
-    pub(super) fn start_visible_terminals(&mut self, cx: &mut Context<Self>) {
-        self.terminal_epoch = self.terminal_epoch.wrapping_add(1);
-        let epoch = self.terminal_epoch;
-        self.panes.clear();
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
-        let Some(tab_id) = self.selection.tab_id.as_deref() else {
-            return;
-        };
+    pub(super) fn ensure_session_terminals(&mut self, cx: &mut Context<Self>) {
         let Some(session_name) = self.current_session().map(|session| session.name.clone()) else {
+            self.stop_session_terminals();
             return;
         };
+        if self.snapshot.is_none() {
+            self.stop_session_terminals();
+            return;
+        }
         let profile = self.current_profile();
-        for pane in snapshot.panes_for(tab_id) {
-            let mode = if self.selection.pane_id.as_deref() == Some(&pane.pane_id) {
-                TerminalMode::ControlTakeover
-            } else {
-                TerminalMode::Observe
-            };
-            let cols = 80;
-            let rows = 24;
-            let session = TerminalSession::spawn(
-                profile.clone(),
-                session_name.clone(),
-                pane.pane_id.clone(),
-                mode,
-                cols,
-                rows,
-            );
-            let color_scheme_dark = theme::is_dark();
-            match Terminal::new(cols, rows, 10_000, color_scheme_dark) {
-                Ok(terminal) => {
-                    terminal.set_focus(mode == TerminalMode::ControlTakeover);
-                    self.panes.insert(
-                        pane.pane_id.clone(),
-                        PaneRuntime {
-                            session,
-                            terminal,
-                            frame: None,
-                            mode,
-                            size: (cols, rows),
-                            pixel_size: (0, 0),
-                            frame_context: 0,
-                            color_scheme_dark,
-                        },
-                    );
+        let selected_pane = self.selection.pane_id.clone();
+        let visible_tab_id = self.selection.tab_id.clone();
+        let snapshot = self.snapshot.as_ref().expect("snapshot checked above");
+        let live_pane_ids = snapshot_pane_ids(snapshot);
+        let pane_tabs = snapshot
+            .panes
+            .iter()
+            .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
+            .collect::<HashMap<_, _>>();
+        let wanted = snapshot_runtime_targets(snapshot, selected_pane.as_deref());
+        let poll_alive = !self.panes.is_empty();
+        self.panes
+            .retain(|pane_id, _| live_pane_ids.contains(pane_id));
+        let palette = current_terminal_palette(&self.appearance);
+        let color_scheme_dark = palette.dark;
+        let mut palette_error = None;
+        let mut spawned = HashSet::new();
+        for (pane_id, mode) in &wanted {
+            match visible_pane_plan(
+                self.panes.get(pane_id).map(|runtime| runtime.mode),
+                self.panes
+                    .get(pane_id)
+                    .is_some_and(|runtime| runtime.session.is_closed() || runtime.exit_seen),
+                *mode,
+            ) {
+                VisiblePanePlan::Keep
+                | VisiblePanePlan::PromoteToControl
+                | VisiblePanePlan::DemoteToObserve => {
+                    if let Some(runtime) = self.panes.get_mut(pane_id) {
+                        if runtime.palette_signature != palette.signature() {
+                            if let Err(error) = runtime.terminal.apply_palette(&palette) {
+                                palette_error = Some(error);
+                            }
+                            runtime.color_scheme_dark = palette.dark;
+                            runtime.palette_signature = palette.signature();
+                        }
+                        sync_pane_session(
+                            runtime,
+                            *mode,
+                            profile.clone(),
+                            session_name.clone(),
+                            pane_id.clone(),
+                        );
+                    }
                 }
-                Err(error) => self.error = Some(error.to_string().into()),
+                VisiblePanePlan::Spawn => {
+                    let cols = 80;
+                    let rows = 24;
+                    let session = TerminalSession::spawn(
+                        profile.clone(),
+                        session_name.clone(),
+                        pane_id.clone(),
+                        *mode,
+                        cols,
+                        rows,
+                    );
+                    match Terminal::new(cols, rows, 10_000, &palette) {
+                        Ok(terminal) => {
+                            terminal.set_focus(*mode == TerminalMode::ControlTakeover);
+                            self.panes.insert(
+                                pane_id.clone(),
+                                PaneRuntime {
+                                    session,
+                                    terminal,
+                                    frame: None,
+                                    mode: *mode,
+                                    size: (cols, rows),
+                                    pixel_size: (0, 0),
+                                    frame_context: 0,
+                                    color_scheme_dark,
+                                    palette_signature: palette.signature(),
+                                    exit_seen: false,
+                                    scroll_px: 0.,
+                                    body_bounds: (0., 0., 0., 0.),
+                                },
+                            );
+                            spawned.insert(pane_id.clone());
+                        }
+                        Err(error) => self.error = Some(error.to_string().into()),
+                    }
+                }
             }
         }
-        self.schedule_terminal_poll(epoch, cx);
+        if let Some(error) = palette_error {
+            self.error = Some(error.to_string().into());
+        }
+        for (pane_id, _) in &wanted {
+            let pane_tab = pane_tabs.get(pane_id).map(String::as_str);
+            if !should_flush_session_pane(
+                pane_tab,
+                visible_tab_id.as_deref(),
+                spawned.contains(pane_id),
+            ) {
+                continue;
+            }
+            if let Some(runtime) = self.panes.get_mut(pane_id) {
+                flush_pane_surface(runtime);
+            }
+        }
+        if !poll_alive && !self.panes.is_empty() {
+            self.terminal_epoch = self.terminal_epoch.wrapping_add(1);
+            let epoch = self.terminal_epoch;
+            self.schedule_terminal_poll(epoch, cx);
+        }
+    }
+
+    fn stop_session_terminals(&mut self) {
+        self.panes.clear();
+        self.terminal_epoch = self.terminal_epoch.wrapping_add(1);
     }
 
     pub(super) fn schedule_terminal_poll(&self, epoch: u64, cx: &mut Context<Self>) {
@@ -863,21 +1969,42 @@ impl OcHerdrView {
                 }
                 let mut changed = false;
                 let mut error = None;
+                let mut hierarchy_changed = false;
                 if let Err(runtime_error) = Terminal::tick_runtime() {
                     error = Some(runtime_error.to_string().into());
                 }
-                for runtime in this.panes.values_mut() {
+                let composing = this.ime_marked.clone();
+                let selected_pane = this.selection.pane_id.clone();
+                let visible_pane_ids = this
+                    .snapshot
+                    .as_ref()
+                    .zip(this.selection.tab_id.as_deref())
+                    .map(|(snapshot, tab_id)| {
+                        snapshot
+                            .panes_for(tab_id)
+                            .map(|pane| pane.pane_id.clone())
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                for (pane_id, runtime) in this.panes.iter_mut() {
+                    if runtime.session.is_closed() {
+                        if !runtime.exit_seen {
+                            runtime.exit_seen = true;
+                            hierarchy_changed = true;
+                        }
+                        continue;
+                    }
                     for _ in 0..64 {
                         match runtime.session.try_frame() {
                             Ok(Some(frame)) => {
-                                if runtime.size != (frame.width, frame.height) {
+                                if runtime.size != (frame.width, frame.height)
+                                    && incoming_frame_should_replace_grid(runtime.pixel_size)
+                                {
                                     match runtime.terminal.set_grid_size(frame.width, frame.height)
                                     {
                                         Ok(resolved) => {
                                             runtime.size = (resolved.columns, resolved.rows);
-                                            if runtime.mode == TerminalMode::ControlTakeover {
-                                                runtime.pixel_size = (0, 0);
-                                            }
+                                            runtime.pixel_size = (0, 0);
                                         }
                                         Err(resize_error) => {
                                             error = Some(resize_error.to_string().into())
@@ -885,29 +2012,33 @@ impl OcHerdrView {
                                     }
                                 }
                                 runtime.terminal.apply_frame(&frame.bytes, frame.full);
+                                if selected_pane.as_deref() == Some(pane_id.as_str())
+                                    && let Some(preedit) = composing.as_deref()
+                                {
+                                    runtime.terminal.set_preedit(Some(preedit));
+                                }
                             }
                             Ok(None) => break,
                             Err(stream_error) => {
-                                error = Some(stream_error.to_string().into());
+                                runtime.exit_seen = true;
+                                hierarchy_changed = true;
+                                if !is_expected_terminal_exit(&stream_error) {
+                                    error = Some(stream_error.to_string().into());
+                                }
                                 break;
                             }
                         }
                     }
-                    while let Some(bytes) = runtime.terminal.try_input() {
-                        if runtime.mode == TerminalMode::ControlTakeover
-                            && runtime.session.send(TerminalCommand::Input(bytes)).is_err()
-                        {
-                            error = Some(
-                                this.i18n
-                                    .text("The terminal input stream is no longer available.")
-                                    .into(),
-                            );
-                        }
+                    if forward_terminal_input(runtime).is_err() {
+                        runtime.exit_seen = true;
+                        hierarchy_changed = true;
                     }
                     match runtime.terminal.try_frame() {
                         Ok(Some(frame)) if frame.host_context == runtime.frame_context => {
                             runtime.frame = Some(frame);
-                            changed = true;
+                            if visible_pane_ids.contains(pane_id) {
+                                changed = true;
+                            }
                         }
                         Ok(Some(_)) | Ok(None) => {}
                         Err(frame_error) => error = Some(frame_error.to_string().into()),
@@ -915,6 +2046,9 @@ impl OcHerdrView {
                 }
                 if let Some(error) = error {
                     this.error = Some(error);
+                }
+                if hierarchy_changed {
+                    this.refresh_snapshot_from_event(this.event_epoch, cx);
                 }
                 if changed {
                     cx.notify();
@@ -926,48 +2060,34 @@ impl OcHerdrView {
         .detach();
     }
 
-    pub(super) fn resize_visible_terminals(&mut self, window: &Window) {
+    pub(super) fn resize_session_terminals(&mut self, window: &Window) {
         let viewport = window.viewport_size();
         let available_width = (f32::from(viewport.width) - SIDEBAR_WIDTH).max(320.);
         let available_height =
             (f32::from(viewport.height) - HEADER_HEIGHT - STATUS_BAR_HEIGHT).max(180.);
         let scale_factor = f64::from(window.scale_factor());
-        let color_scheme_dark = theme::is_dark();
+        let palette = current_terminal_palette(&self.appearance);
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let Some(tab_id) = self.selection.tab_id.as_deref() else {
-            return;
-        };
-        let layout = snapshot.layout_for(tab_id);
+        let mut palette_error = None;
         for (pane_id, runtime) in &mut self.panes {
-            if runtime.color_scheme_dark != color_scheme_dark {
-                runtime.terminal.set_color_scheme(color_scheme_dark);
-                runtime.color_scheme_dark = color_scheme_dark;
+            if runtime.palette_signature != palette.signature() {
+                if let Err(error) = runtime.terminal.apply_palette(&palette) {
+                    palette_error = Some(error);
+                }
+                runtime.color_scheme_dark = palette.dark;
+                runtime.palette_signature = palette.signature();
             }
-            if runtime.mode != TerminalMode::ControlTakeover {
+            let Some(ratio) = pane_layout_ratio(snapshot, pane_id) else {
                 continue;
-            }
-            let ratio = layout
-                .and_then(|layout| {
-                    layout
-                        .panes
-                        .iter()
-                        .find(|pane| &pane.pane_id == pane_id)
-                        .map(|pane| {
-                            let width =
-                                pane.rect.width.max(1) as f32 / layout.area.width.max(1) as f32;
-                            let height =
-                                pane.rect.height.max(1) as f32 / layout.area.height.max(1) as f32;
-                            (width, height)
-                        })
-                })
-                .unwrap_or((1., 1.));
-            let width_px =
-                ((available_width * ratio.0 - 6.).max(1.) * window.scale_factor()).round() as u32;
-            let height_px = ((available_height * ratio.1 - PANE_HEADER_HEIGHT - 6.).max(1.)
-                * window.scale_factor())
-            .round() as u32;
+            };
+            let (width_px, height_px) = visible_pane_framebuffer_px(
+                available_width,
+                available_height,
+                window.scale_factor(),
+                ratio,
+            );
             if runtime.pixel_size != (width_px, height_px) {
                 runtime.frame_context = runtime.frame_context.wrapping_add(1);
                 let resolved = runtime.terminal.resize_pixels(
@@ -988,6 +2108,9 @@ impl OcHerdrView {
                 runtime.size = size;
                 runtime.pixel_size = (width_px, height_px);
             }
+        }
+        if let Some(error) = palette_error {
+            self.error = Some(error.to_string().into());
         }
     }
 
@@ -1026,6 +2149,12 @@ impl OcHerdrView {
             id: pane.pane_id.clone(),
             label: pane.display_name().to_owned(),
         })
+    }
+
+    fn cmd_w_close_target(&self) -> Option<HierarchyTarget> {
+        let snapshot = self.snapshot.as_ref()?;
+        let tab_id = self.selection.tab_id.as_deref()?;
+        cmd_w_close_target(snapshot, tab_id, self.selection.pane_id.as_deref())
     }
 
     pub(super) fn create_workspace(&mut self, cx: &mut Context<Self>) {
@@ -1072,10 +2201,7 @@ impl OcHerdrView {
                 .workspace_id
                 .as_deref()
                 .and_then(|workspace_id| {
-                    snapshot
-                        .tabs_for(workspace_id)
-                        .nth(number.saturating_sub(1))
-                        .map(|tab| tab.tab_id.clone())
+                    tab_id_for_shortcut(snapshot.tabs_for(workspace_id), number)
                 })
         });
         if let Some(tab_id) = tab_id {
@@ -1138,13 +2264,13 @@ impl OcHerdrView {
             ("j", false) => self.focus_pane_direction("down", cx),
             ("k", false) => self.focus_pane_direction("up", cx),
             ("l", false) => self.focus_pane_direction("right", cx),
-            (key, false) if key.len() == 1 && key.as_bytes()[0].is_ascii_digit() => {
-                let number = (key.as_bytes()[0] - b'0') as usize;
-                if number > 0 {
+            _ => {
+                if let Some(number) =
+                    tab_index_from_keystroke(key, event.keystroke.key_char.as_deref())
+                {
                     self.select_tab_number(number, cx);
                 }
             }
-            _ => {}
         }
         cx.stop_propagation();
         cx.notify();
@@ -1173,9 +2299,11 @@ impl OcHerdrView {
                 || self.node_manager_open
                 || self.appearance_open
                 || self.herdr_settings_open
+                || self.host_switcher_open
             {
                 self.node_manager_open = false;
-                self.add_remote_open = false;
+                self.remote_form = RemoteForm::Closed;
+                self.host_switcher_open = false;
                 self.appearance_open = false;
                 self.herdr_settings_open = false;
                 self.focus.focus(window, cx);
@@ -1188,6 +2316,11 @@ impl OcHerdrView {
             }
         }
         if modifiers.platform && !modifiers.alt && !modifiers.control {
+            if let Some(number) = tab_index_from_keystroke(key, event.keystroke.key_char.as_deref())
+            {
+                self.select_tab_number(number, cx);
+                return true;
+            }
             let handled = match (key, modifiers.shift) {
                 ("t", false) => {
                     self.create_tab(cx);
@@ -1200,7 +2333,7 @@ impl OcHerdrView {
                     true
                 }
                 ("w", false) => {
-                    if let Some(target) = self.selected_tab_target() {
+                    if let Some(target) = self.cmd_w_close_target() {
                         self.request_close(target, cx);
                     }
                     true
@@ -1213,19 +2346,20 @@ impl OcHerdrView {
                     self.open_herdr_settings(cx);
                     true
                 }
+                ("c", false) => {
+                    self.copy_selection(cx);
+                    true
+                }
+                ("a", false) => {
+                    self.select_all_visible(cx);
+                    true
+                }
                 ("[", false) => {
                     self.cycle_tab(-1, cx);
                     true
                 }
                 ("]", false) => {
                     self.cycle_tab(1, cx);
-                    true
-                }
-                (key, false) if key.len() == 1 && key.as_bytes()[0].is_ascii_digit() => {
-                    let number = (key.as_bytes()[0] - b'0') as usize;
-                    if number > 0 {
-                        self.select_tab_number(number, cx);
-                    }
                     true
                 }
                 _ => false,
@@ -1260,35 +2394,223 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
-        let Some(pane_id) = self.selection.pane_id.as_deref() else {
+        if self.ime_marked.is_some() {
             return;
-        };
-        let Some(runtime) = self.panes.get(pane_id) else {
+        }
+        let Some(pane_id) = self.selection.pane_id.clone() else {
             return;
         };
         let key = &event.keystroke;
-        if key.modifiers.platform && key.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                runtime.terminal.paste(&text);
+        let stream_closed = {
+            let Some(runtime) = self.panes.get_mut(&pane_id) else {
+                return;
+            };
+            if key.modifiers.platform && key.key == "v" {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    runtime.terminal.paste(&text);
+                    let _ = Terminal::tick_runtime();
+                    let closed = forward_terminal_input(runtime).is_err();
+                    if closed {
+                        runtime.exit_seen = true;
+                    }
+                    cx.stop_propagation();
+                    closed
+                } else {
+                    false
+                }
+            } else {
+                let modifiers = KeyModifiers {
+                    control: key.modifiers.control,
+                    alt: key.modifiers.alt,
+                    shift: key.modifiers.shift,
+                    platform: key.modifiers.platform,
+                };
+                let Some(bytes) = encode_pty_bytes(&key.key, key.key_char.as_deref(), modifiers)
+                else {
+                    return;
+                };
+                let closed = runtime.session.send(TerminalCommand::Input(bytes)).is_err();
+                if closed {
+                    runtime.exit_seen = true;
+                }
                 cx.stop_propagation();
+                closed
             }
+        };
+        if stream_closed {
+            self.refresh_snapshot_from_event(self.event_epoch, cx);
+        }
+    }
+
+    pub(super) fn pane_mouse_down(
+        &mut self,
+        pane_id: String,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(previous) = self.text_drag_pane.take()
+            && previous != pane_id
+            && let Some(runtime) = self.panes.get_mut(&previous)
+        {
+            runtime
+                .terminal
+                .end_text_selection(None, KeyModifiers::default(), 1.0);
+        }
+        self.select_pane(pane_id.clone(), window, cx);
+        let Some(runtime) = self.panes.get(&pane_id) else {
+            return;
+        };
+        let mouse = mouse_point(event.position);
+        if !point_in_rect(mouse, runtime.body_bounds) {
+            self.text_drag_pane = None;
             return;
         }
-        if key.modifiers.platform {
+        let scale = f64::from(window.scale_factor());
+        let Some(surface) = map_mouse_to_surface(
+            mouse,
+            runtime.body_bounds,
+            runtime.pixel_size,
+            window.scale_factor(),
+        ) else {
+            self.text_drag_pane = None;
+            return;
+        };
+        let modifiers = gpui_key_modifiers(event.modifiers);
+        self.text_drag_pane = Some(pane_id.clone());
+        if let Some(runtime) = self.panes.get_mut(&pane_id) {
+            runtime.terminal.begin_text_selection(
+                surface.0,
+                surface.1,
+                modifiers,
+                event.click_count,
+                scale,
+            );
+            flush_pane_surface(runtime);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn pane_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane_id) = self.text_drag_pane.clone() else {
+            return;
+        };
+        let Some(runtime) = self.panes.get(&pane_id) else {
+            return;
+        };
+        let scale = f64::from(window.scale_factor());
+        let Some(surface) = map_mouse_to_surface(
+            mouse_point(event.position),
+            runtime.body_bounds,
+            runtime.pixel_size,
+            window.scale_factor(),
+        ) else {
+            return;
+        };
+        let modifiers = gpui_key_modifiers(event.modifiers);
+        if let Some(runtime) = self.panes.get_mut(&pane_id) {
+            runtime
+                .terminal
+                .update_text_selection(surface.0, surface.1, modifiers, scale);
+            flush_pane_surface(runtime);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn pane_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane_id) = self.text_drag_pane.take() else {
+            return;
+        };
+        let modifiers = gpui_key_modifiers(event.modifiers);
+        let scale = f64::from(window.scale_factor());
+        if let Some(runtime) = self.panes.get_mut(&pane_id) {
+            let point = map_mouse_to_surface(
+                mouse_point(event.position),
+                runtime.body_bounds,
+                runtime.pixel_size,
+                window.scale_factor(),
+            );
+            runtime.terminal.end_text_selection(point, modifiers, scale);
+            flush_pane_surface(runtime);
+            copy_terminal_selection(runtime, cx);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.selection.pane_id.clone() else {
+            return;
+        };
+        let Some(runtime) = self.panes.get(&pane_id) else {
+            return;
+        };
+        if !runtime.terminal.has_selection() {
             return;
         }
-        if runtime.terminal.send_key(
-            &key.key,
-            key.key_char.as_deref(),
-            KeyModifiers {
-                control: key.modifiers.control,
-                alt: key.modifiers.alt,
-                shift: key.modifiers.shift,
-                platform: key.modifiers.platform,
-            },
-        ) {
+        let Some(text) = runtime.terminal.read_selection() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        cx.stop_propagation();
+    }
+
+    pub(super) fn select_all_visible(&mut self, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.selection.pane_id.clone() else {
+            return;
+        };
+        let Some(runtime) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        if !runtime.terminal.select_all_visible() {
+            return;
+        }
+        flush_pane_surface(runtime);
+        copy_terminal_selection(runtime, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn scroll_pane(
+        &mut self,
+        pane_id: &str,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = self.panes.get_mut(pane_id) else {
+            return;
+        };
+        let line_height = if runtime.size.1 == 0 {
+            16.
+        } else {
+            (runtime.pixel_size.1 as f32 / f32::from(runtime.size.1)).max(1.)
+        };
+        let lines = wheel_scroll_lines(event.delta, line_height, &mut runtime.scroll_px);
+        if lines == 0 {
             cx.stop_propagation();
+            return;
         }
+        let direction = if lines > 0 { "up" } else { "down" };
+        let _ = runtime.session.send(TerminalCommand::Scroll {
+            direction,
+            lines: lines.unsigned_abs() as u16,
+        });
+        cx.stop_propagation();
     }
 
     pub(super) fn invoke(&mut self, method: &'static str, params: Value, cx: &mut Context<Self>) {
@@ -1317,7 +2639,7 @@ impl OcHerdrView {
                         if let Some(snapshot) = &this.snapshot {
                             this.selection.reconcile(snapshot);
                         }
-                        this.start_visible_terminals(cx);
+                        this.ensure_session_terminals(cx);
                     }
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
@@ -1326,5 +2648,1247 @@ impl OcHerdrView {
             .ok();
         })
         .detach();
+    }
+
+    pub(super) fn store_pane_body_bounds(&mut self, pane_id: &str, geometry: (f32, f32, f32, f32)) {
+        if let Some(runtime) = self.panes.get_mut(pane_id) {
+            runtime.body_bounds = terminal_body_bounds(geometry);
+        }
+    }
+
+    pub(super) fn accepts_ime(&self) -> bool {
+        self.rename_target.is_none()
+            && self.remote_form == RemoteForm::Closed
+            && !self.appearance_open
+            && !self.herdr_settings_open
+            && !self.node_manager_open
+            && !self.host_switcher_open
+            && self.pending_close.is_none()
+            && self.pending_remove_profile.is_none()
+            && self.pending_switch_profile.is_none()
+            && self.selection.pane_id.is_some()
+    }
+
+    pub(super) fn commit_ime_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_ime_preedit(window, cx);
+        if text.is_empty() {
+            return;
+        }
+        let Some(pane_id) = self.selection.pane_id.clone() else {
+            return;
+        };
+        let stream_closed = {
+            let Some(runtime) = self.panes.get_mut(&pane_id) else {
+                return;
+            };
+            let closed = runtime
+                .session
+                .send(TerminalCommand::Input(text.as_bytes().to_vec()))
+                .is_err();
+            if closed {
+                runtime.exit_seen = true;
+            }
+            closed
+        };
+        window.invalidate_character_coordinates();
+        cx.notify();
+        if stream_closed {
+            self.refresh_snapshot_from_event(self.event_epoch, cx);
+        }
+    }
+
+    pub(super) fn set_ime_preedit(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() {
+            self.clear_ime_preedit(window, cx);
+            return;
+        }
+        self.ime_marked = Some(text.to_owned());
+        if let Some(pane_id) = self.selection.pane_id.clone()
+            && let Some(runtime) = self.panes.get_mut(&pane_id)
+        {
+            runtime.terminal.set_preedit(Some(text));
+            flush_pane_surface(runtime);
+        }
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
+    pub(super) fn clear_ime_preedit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ime_marked.take().is_none() {
+            return;
+        }
+        if let Some(pane_id) = self.selection.pane_id.clone()
+            && let Some(runtime) = self.panes.get_mut(&pane_id)
+        {
+            runtime.terminal.set_preedit(None);
+            flush_pane_surface(runtime);
+        }
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
+    pub(super) fn ime_cursor_bounds(
+        &self,
+        window: &Window,
+    ) -> Option<Bounds<ochub_ui::gpui::Pixels>> {
+        let pane_id = self.selection.pane_id.as_deref()?;
+        let runtime = self.panes.get(pane_id)?;
+        let (x, y, width, height) = runtime.terminal.ime_point();
+        let (left, top, w, h) = map_surface_rect_to_window(
+            (x, y - height, width.max(1.0), height.max(1.0)),
+            runtime.body_bounds,
+            runtime.pixel_size,
+            window.scale_factor(),
+        )?;
+        Some(Bounds {
+            origin: point(px(left), px(top)),
+            size: size(px(w.max(1.)), px(h.max(1.))),
+        })
+    }
+}
+
+fn visible_pane_framebuffer_px(
+    available_width: f32,
+    available_height: f32,
+    scale_factor: f32,
+    ratio: (f32, f32),
+) -> (u32, u32) {
+    let width_px = ((available_width * ratio.0 - 6.).max(1.) * scale_factor).round() as u32;
+    let height_px = ((available_height * ratio.1 - PANE_HEADER_HEIGHT - 6.).max(1.) * scale_factor)
+        .round() as u32;
+    (width_px, height_px)
+}
+
+fn layout_ratio_for_pane(
+    layout: Option<&ocherdr_core::PaneLayout>,
+    pane_id: &str,
+) -> Option<(f32, f32)> {
+    layout.and_then(|layout| {
+        layout
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .map(|pane| {
+                let width = pane.rect.width.max(1) as f32 / layout.area.width.max(1) as f32;
+                let height = pane.rect.height.max(1) as f32 / layout.area.height.max(1) as f32;
+                (width, height)
+            })
+    })
+}
+
+fn pane_layout_ratio(snapshot: &HierarchySnapshot, pane_id: &str) -> Option<(f32, f32)> {
+    let pane = snapshot.pane(pane_id)?;
+    layout_ratio_for_pane(snapshot.layout_for(&pane.tab_id), pane_id)
+}
+
+fn snapshot_pane_ids(snapshot: &HierarchySnapshot) -> HashSet<String> {
+    snapshot
+        .panes
+        .iter()
+        .map(|pane| pane.pane_id.clone())
+        .collect()
+}
+
+fn snapshot_runtime_targets(
+    snapshot: &HierarchySnapshot,
+    selected_pane: Option<&str>,
+) -> Vec<(String, TerminalMode)> {
+    snapshot
+        .panes
+        .iter()
+        .map(|pane| {
+            let mode = if selected_pane == Some(pane.pane_id.as_str()) {
+                TerminalMode::ControlTakeover
+            } else {
+                TerminalMode::Observe
+            };
+            (pane.pane_id.clone(), mode)
+        })
+        .collect()
+}
+
+fn should_flush_session_pane(
+    pane_tab_id: Option<&str>,
+    visible_tab_id: Option<&str>,
+    newly_spawned: bool,
+) -> bool {
+    newly_spawned || pane_tab_id == visible_tab_id
+}
+
+fn cmd_w_close_target(
+    snapshot: &HierarchySnapshot,
+    tab_id: &str,
+    pane_id: Option<&str>,
+) -> Option<HierarchyTarget> {
+    if snapshot.panes_for(tab_id).count() > 1 {
+        let pane = snapshot.pane(pane_id?)?;
+        return Some(HierarchyTarget::Pane {
+            id: pane.pane_id.clone(),
+            label: pane.display_name().to_owned(),
+        });
+    }
+    let tab = snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id)?;
+    Some(HierarchyTarget::Tab {
+        id: tab.tab_id.clone(),
+        label: tab.label.clone(),
+    })
+}
+
+fn incoming_frame_should_replace_grid(pixel_size: (u32, u32)) -> bool {
+    // Once layout has sized the local Metal surface, incoming 80×24 observe
+    // (or takeover) frames must not shrink it. That shrink-then-grow is the
+    // flash seen when clicking another pane.
+    pixel_size == (0, 0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisiblePanePlan {
+    Keep,
+    PromoteToControl,
+    DemoteToObserve,
+    Spawn,
+}
+
+fn visible_pane_plan(
+    existing: Option<TerminalMode>,
+    existing_closed: bool,
+    wanted: TerminalMode,
+) -> VisiblePanePlan {
+    if existing_closed {
+        return VisiblePanePlan::Spawn;
+    }
+    match existing {
+        None => VisiblePanePlan::Spawn,
+        Some(current) if current == wanted => VisiblePanePlan::Keep,
+        Some(TerminalMode::Observe) => VisiblePanePlan::PromoteToControl,
+        Some(TerminalMode::ControlTakeover) => VisiblePanePlan::DemoteToObserve,
+    }
+}
+
+fn is_expected_terminal_exit(error: &HerdrError) -> bool {
+    matches!(error, HerdrError::TerminalClosed(_))
+}
+
+fn snapshot_refresh_should_queue(refreshing: bool) -> bool {
+    refreshing
+}
+
+fn mouse_point(position: ochub_ui::gpui::Point<ochub_ui::gpui::Pixels>) -> (f32, f32) {
+    (f32::from(position.x), f32::from(position.y))
+}
+
+fn gpui_key_modifiers(modifiers: ochub_ui::gpui::Modifiers) -> KeyModifiers {
+    KeyModifiers {
+        control: modifiers.control,
+        alt: modifiers.alt,
+        shift: modifiers.shift,
+        platform: modifiers.platform,
+    }
+}
+
+fn point_in_rect(point: (f32, f32), rect: (f32, f32, f32, f32)) -> bool {
+    point.0 >= rect.0 && point.1 >= rect.1 && point.0 < rect.0 + rect.2 && point.1 < rect.1 + rect.3
+}
+
+fn terminal_body_bounds(geometry: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    let (left, top, width, height) = geometry;
+    let pane_w = (width - 4.).max(40.);
+    let pane_h = (height - 4.).max(40.);
+    (
+        SIDEBAR_WIDTH + left + 2.,
+        HEADER_HEIGHT + top + 2. + PANE_HEADER_HEIGHT,
+        pane_w,
+        (pane_h - PANE_HEADER_HEIGHT).max(1.),
+    )
+}
+
+struct FittedSurface {
+    origin: (f32, f32),
+    fitted: (f32, f32),
+    surface: (f32, f32),
+}
+
+fn fitted_surface(
+    body: (f32, f32, f32, f32),
+    pixel_size: (u32, u32),
+    scale_factor: f32,
+) -> Option<FittedSurface> {
+    let (bx, by, bw, bh) = body;
+    if bw <= 0. || bh <= 0. || pixel_size.0 == 0 || pixel_size.1 == 0 {
+        return None;
+    }
+    let image_w = pixel_size.0 as f32;
+    let image_h = pixel_size.1 as f32;
+    let image_ratio = image_w / image_h;
+    let bounds_ratio = bw / bh;
+    let (fitted_w, fitted_h) = if bounds_ratio > image_ratio {
+        (image_w * (bh / image_h), bh)
+    } else {
+        (bw, image_h * (bw / image_w))
+    };
+    if fitted_w <= 0. || fitted_h <= 0. {
+        return None;
+    }
+    let scale = scale_factor.max(1.);
+    Some(FittedSurface {
+        origin: (bx + (bw - fitted_w) / 2., by + (bh - fitted_h) / 2.),
+        fitted: (fitted_w, fitted_h),
+        surface: (image_w / scale, image_h / scale),
+    })
+}
+
+/// Map a window-space click onto Ghostty view points, matching GPUI
+/// `ObjectFit::Contain` (device pixels treated as `Pixels` 1:1).
+fn map_mouse_to_surface(
+    mouse: (f32, f32),
+    body: (f32, f32, f32, f32),
+    pixel_size: (u32, u32),
+    scale_factor: f32,
+) -> Option<(f64, f64)> {
+    let fitted = fitted_surface(body, pixel_size, scale_factor)?;
+    Some((
+        f64::from((mouse.0 - fitted.origin.0) / fitted.fitted.0 * fitted.surface.0),
+        f64::from((mouse.1 - fitted.origin.1) / fitted.fitted.1 * fitted.surface.1),
+    ))
+}
+
+fn map_surface_rect_to_window(
+    rect: (f64, f64, f64, f64),
+    body: (f32, f32, f32, f32),
+    pixel_size: (u32, u32),
+    scale_factor: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let fitted = fitted_surface(body, pixel_size, scale_factor)?;
+    if fitted.surface.0 <= 0. || fitted.surface.1 <= 0. {
+        return None;
+    }
+    let left = fitted.origin.0 + (rect.0 as f32) / fitted.surface.0 * fitted.fitted.0;
+    let top = fitted.origin.1 + (rect.1 as f32) / fitted.surface.1 * fitted.fitted.1;
+    let width = (rect.2 as f32) / fitted.surface.0 * fitted.fitted.0;
+    let height = (rect.3 as f32) / fitted.surface.1 * fitted.fitted.1;
+    Some((left, top, width, height))
+}
+
+fn copy_terminal_selection(runtime: &PaneRuntime, cx: &mut Context<OcHerdrView>) {
+    if !runtime.terminal.has_selection() {
+        return;
+    }
+    let Some(text) = runtime.terminal.read_selection() else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+}
+
+fn flush_pane_surface(runtime: &mut PaneRuntime) {
+    runtime.terminal.refresh();
+    let _ = Terminal::tick_runtime();
+    let _ = forward_terminal_input(runtime);
+    if let Ok(Some(frame)) = runtime.terminal.try_frame()
+        && frame.host_context == runtime.frame_context
+    {
+        runtime.frame = Some(frame);
+    }
+}
+
+fn wheel_scroll_lines(delta: ScrollDelta, line_height: f32, leftover: &mut f32) -> i32 {
+    match delta {
+        ScrollDelta::Lines(delta) => {
+            *leftover = 0.;
+            delta.y.round() as i32
+        }
+        ScrollDelta::Pixels(delta) => {
+            if line_height <= 0. {
+                return 0;
+            }
+            *leftover += f32::from(delta.y);
+            let lines = (*leftover / line_height).trunc() as i32;
+            *leftover -= lines as f32 * line_height;
+            lines
+        }
+    }
+}
+
+fn current_terminal_palette(appearance: &AppearanceSettings) -> TerminalPalette {
+    terminal_palette_from_theme(theme::current(), theme::is_dark(), &appearance.font)
+}
+
+fn terminal_palette_from_theme(
+    theme: ochub_ui::theme::Theme,
+    dark: bool,
+    font: &TerminalFontSettings,
+) -> TerminalPalette {
+    let font = font.clone().clamped();
+    TerminalPalette {
+        dark,
+        background: theme.bg.0,
+        foreground: theme.text.0,
+        cursor: theme.accent.0,
+        selection: theme.selection.0,
+        ansi: [
+            theme.overlay.0,
+            theme.red.0,
+            theme.green.0,
+            theme.yellow.0,
+            theme.accent.0,
+            theme.mauve.0,
+            theme.teal.0,
+            theme.subtext.0,
+            theme.muted.0,
+            theme.red.0,
+            theme.green.0,
+            theme.yellow.0,
+            theme.accent.0,
+            theme.mauve.0,
+            theme.teal.0,
+            theme.text.0,
+        ],
+        font_family: font.family,
+        font_size: font.size,
+        ligatures: font.ligatures,
+        thicken: font.thicken,
+        cell_width_percent: font.cell_width_percent,
+        cell_height_percent: font.cell_height_percent,
+    }
+}
+
+fn sync_pane_session(
+    runtime: &mut PaneRuntime,
+    wanted: TerminalMode,
+    profile: ConnectionProfile,
+    session_name: String,
+    pane_id: String,
+) {
+    runtime
+        .terminal
+        .set_focus(wanted == TerminalMode::ControlTakeover);
+    if runtime.mode == wanted {
+        return;
+    }
+    let (cols, rows) = runtime.size;
+    runtime.session = TerminalSession::spawn(
+        profile,
+        session_name,
+        pane_id,
+        wanted,
+        cols.max(1),
+        rows.max(1),
+    );
+    runtime.mode = wanted;
+    if wanted == TerminalMode::ControlTakeover {
+        send_session_resize(runtime);
+    }
+}
+
+fn send_session_resize(runtime: &PaneRuntime) {
+    let size = runtime.terminal.surface_size();
+    if size.columns == 0 || size.rows == 0 {
+        return;
+    }
+    let _ = runtime.session.send(TerminalCommand::Resize {
+        cols: size.columns,
+        rows: size.rows,
+        cell_width_px: size.cell_width_px.max(1),
+        cell_height_px: size.cell_height_px.max(1),
+    });
+}
+
+fn forward_terminal_input(runtime: &PaneRuntime) -> Result<(), ()> {
+    while let Some(bytes) = runtime.terminal.try_input() {
+        if runtime.mode == TerminalMode::ControlTakeover
+            && runtime.session.send(TerminalCommand::Input(bytes)).is_err()
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn control_letter_bytes(key: &str, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    if !modifiers.control || modifiers.alt || modifiers.platform {
+        return None;
+    }
+    let letter = key.chars().next()?;
+    if key.len() != letter.len_utf8() || !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(vec![letter as u8 & 0x1f])
+}
+
+fn encode_pty_bytes(key: &str, key_char: Option<&str>, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    let key = key.strip_prefix("ctrl-").unwrap_or(key);
+    if modifiers.platform && !modifiers.control {
+        return encode_super_edit_bytes(key);
+    }
+    if modifiers.control && !modifiers.alt && !modifiers.platform {
+        if let Some(bytes) = control_letter_bytes(
+            key,
+            KeyModifiers {
+                control: true,
+                ..KeyModifiers::default()
+            },
+        ) {
+            return Some(bytes);
+        }
+        return match key {
+            "[" => Some(vec![0x1b]),
+            "\\" => Some(vec![0x1c]),
+            "]" => Some(vec![0x1d]),
+            "6" | "^" => Some(vec![0x1e]),
+            "-" | "_" => Some(vec![0x1f]),
+            "/" | "?" => Some(vec![0x7f]),
+            "space" => Some(vec![0x00]),
+            "backspace" | "back" => Some(vec![0x08]),
+            _ => None,
+        };
+    }
+    if modifiers.alt && !modifiers.platform {
+        return encode_alt_edit_bytes(key, key_char);
+    }
+    if modifiers.shift && key == "tab" {
+        return Some(b"\x1b[Z".to_vec());
+    }
+    Some(match key {
+        "enter" | "return" => vec![b'\r'],
+        "tab" => vec![b'\t'],
+        "backspace" | "back" => vec![0x7f],
+        "delete" => b"\x1b[3~".to_vec(),
+        "escape" => vec![0x1b],
+        "up" => b"\x1b[A".to_vec(),
+        "down" => b"\x1b[B".to_vec(),
+        "right" => b"\x1b[C".to_vec(),
+        "left" => b"\x1b[D".to_vec(),
+        "home" => b"\x1b[H".to_vec(),
+        "end" => b"\x1b[F".to_vec(),
+        "pageup" => b"\x1b[5~".to_vec(),
+        "pagedown" => b"\x1b[6~".to_vec(),
+        _ => {
+            if let Some(text) = key_char.filter(|text| !text.is_empty()) {
+                return Some(text.as_bytes().to_vec());
+            }
+            if key.chars().count() == 1 {
+                return Some(key.as_bytes().to_vec());
+            }
+            return None;
+        }
+    })
+}
+
+fn encode_super_edit_bytes(key: &str) -> Option<Vec<u8>> {
+    Some(match key {
+        "backspace" | "back" => vec![0x15],
+        "delete" => vec![0x0b],
+        "left" => vec![0x01],
+        "right" => vec![0x05],
+        "up" => b"\x1b[H".to_vec(),
+        "down" => b"\x1b[F".to_vec(),
+        _ => return None,
+    })
+}
+
+fn overlay_confirm_or_cancel(event: &KeyDownEvent) -> Option<bool> {
+    if event.is_held || event.keystroke.modifiers.modified() {
+        return None;
+    }
+    match event.keystroke.key.as_str() {
+        "enter" | "return" => Some(true),
+        "escape" => Some(false),
+        _ => None,
+    }
+}
+
+fn bind_enter_submit(
+    input: &Entity<TextInput>,
+    host: WeakEntity<OcHerdrView>,
+    cx: &mut Context<OcHerdrView>,
+    on_enter: impl Fn(&mut OcHerdrView, &mut Window, &mut Context<OcHerdrView>) + 'static,
+) {
+    input.update(cx, move |input, _| {
+        input.set_on_enter(move |window, cx| {
+            host.update(cx, |this, cx| on_enter(this, window, cx)).ok();
+        });
+    });
+}
+
+fn tab_index_from_keystroke(key: &str, key_char: Option<&str>) -> Option<usize> {
+    for candidate in [Some(key), key_char].into_iter().flatten() {
+        if let Some(digit) = candidate.chars().rev().find_map(digit_from_char) {
+            return Some(digit);
+        }
+    }
+    None
+}
+
+fn digit_from_char(character: char) -> Option<usize> {
+    if character.is_ascii_digit() {
+        return Some((character as u8 - b'0') as usize);
+    }
+    const FULLWIDTH: [char; 10] = ['０', '１', '２', '３', '４', '５', '６', '７', '８', '９'];
+    FULLWIDTH.iter().position(|&digit| digit == character)
+}
+
+fn tab_id_for_shortcut<'a>(
+    tabs: impl Iterator<Item = &'a ocherdr_core::TabInfo>,
+    number: usize,
+) -> Option<String> {
+    let mut tabs = tabs.collect::<Vec<_>>();
+    if tabs.is_empty() {
+        return None;
+    }
+    tabs.sort_by_key(|tab| tab.number);
+    if number == 0 {
+        return tabs.last().map(|tab| tab.tab_id.clone());
+    }
+    tabs.iter()
+        .find(|tab| tab.number == number)
+        .or_else(|| tabs.get(number.saturating_sub(1)))
+        .map(|tab| tab.tab_id.clone())
+}
+
+fn encode_alt_edit_bytes(key: &str, key_char: Option<&str>) -> Option<Vec<u8>> {
+    Some(match key {
+        "backspace" | "back" => b"\x1b\x7f".to_vec(),
+        "delete" => b"\x1bd".to_vec(),
+        "left" => b"\x1bb".to_vec(),
+        "right" => b"\x1bf".to_vec(),
+        "up" => b"\x1b[1;3A".to_vec(),
+        "down" => b"\x1b[1;3B".to_vec(),
+        "enter" | "return" => b"\x1b\r".to_vec(),
+        other if other.chars().count() == 1 => {
+            let mut out = vec![0x1b];
+            out.extend(other.as_bytes());
+            out
+        }
+        _ => {
+            let text = key_char.filter(|text| !text.is_empty())?;
+            let mut out = vec![0x1b];
+            out.extend(text.as_bytes());
+            out
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_pane(pane_id: &str, tab_id: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.into(),
+            terminal_id: pane_id.into(),
+            workspace_id: "w".into(),
+            tab_id: tab_id.into(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+            agent: None,
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status: AgentStatus::Idle,
+            state_labels: HashMap::new(),
+            tokens: HashMap::new(),
+            revision: 0,
+        }
+    }
+
+    fn test_tab(tab_id: &str, number: usize, label: &str) -> ocherdr_core::TabInfo {
+        ocherdr_core::TabInfo {
+            tab_id: tab_id.into(),
+            workspace_id: "w".into(),
+            number,
+            label: label.into(),
+            focused: number == 1,
+            pane_count: 1,
+            agent_status: AgentStatus::Idle,
+        }
+    }
+
+    fn two_tab_snapshot() -> HierarchySnapshot {
+        HierarchySnapshot {
+            tabs: vec![test_tab("t-a", 1, "alpha"), test_tab("t-b", 2, "beta")],
+            panes: vec![test_pane("p-a", "t-a"), test_pane("p-b", "t-b")],
+            layouts: vec![
+                ocherdr_core::PaneLayout {
+                    workspace_id: "w".into(),
+                    tab_id: "t-a".into(),
+                    zoomed: false,
+                    area: ocherdr_core::LayoutRect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 50,
+                    },
+                    focused_pane_id: "p-a".into(),
+                    panes: vec![ocherdr_core::LayoutPane {
+                        pane_id: "p-a".into(),
+                        focused: true,
+                        rect: ocherdr_core::LayoutRect {
+                            x: 0,
+                            y: 0,
+                            width: 100,
+                            height: 50,
+                        },
+                    }],
+                    splits: Vec::new(),
+                },
+                ocherdr_core::PaneLayout {
+                    workspace_id: "w".into(),
+                    tab_id: "t-b".into(),
+                    zoomed: false,
+                    area: ocherdr_core::LayoutRect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 50,
+                    },
+                    focused_pane_id: "p-b".into(),
+                    panes: vec![ocherdr_core::LayoutPane {
+                        pane_id: "p-b".into(),
+                        focused: true,
+                        rect: ocherdr_core::LayoutRect {
+                            x: 0,
+                            y: 0,
+                            width: 50,
+                            height: 50,
+                        },
+                    }],
+                    splits: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cmd_w_closes_the_selected_split_pane() {
+        let mut snapshot = two_tab_snapshot();
+        snapshot.panes.push(test_pane("p-a2", "t-a"));
+        snapshot.tabs[0].pane_count = 2;
+        match cmd_w_close_target(&snapshot, "t-a", Some("p-a2")) {
+            Some(HierarchyTarget::Pane { id, .. }) => assert_eq!(id, "p-a2"),
+            other => panic!("expected pane close, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_w_closes_the_tab_when_it_is_the_last_pane() {
+        let snapshot = two_tab_snapshot();
+        match cmd_w_close_target(&snapshot, "t-a", Some("p-a")) {
+            Some(HierarchyTarget::Tab { id, label }) => {
+                assert_eq!(id, "t-a");
+                assert_eq!(label, "alpha");
+            }
+            other => panic!("expected tab close, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observer_and_takeover_panes_share_the_same_framebuffer_pixel_math() {
+        let half = visible_pane_framebuffer_px(1000., 520., 2., (1., 0.5));
+        let full = visible_pane_framebuffer_px(1000., 520., 2., (1., 1.));
+        assert_eq!(half.0, full.0);
+        assert!(half.1 > 0);
+        assert!(half.1 < full.1);
+        assert!(
+            half.0 > 80 * 8,
+            "pane framebuffer is larger than a default 80-col grid"
+        );
+    }
+
+    #[test]
+    fn observe_frames_do_not_replace_the_local_display_grid() {
+        assert!(!incoming_frame_should_replace_grid((800, 600)));
+        assert!(incoming_frame_should_replace_grid((0, 0)));
+    }
+
+    #[test]
+    fn off_tab_panes_are_not_resized_to_the_visible_tab() {
+        let layout = ocherdr_core::PaneLayout {
+            workspace_id: "w".into(),
+            tab_id: "t".into(),
+            zoomed: false,
+            area: ocherdr_core::LayoutRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+            },
+            focused_pane_id: "visible".into(),
+            panes: vec![ocherdr_core::LayoutPane {
+                pane_id: "visible".into(),
+                focused: true,
+                rect: ocherdr_core::LayoutRect {
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 50,
+                },
+            }],
+            splits: Vec::new(),
+        };
+        assert_eq!(
+            layout_ratio_for_pane(Some(&layout), "visible"),
+            Some((0.5, 1.0))
+        );
+        assert_eq!(layout_ratio_for_pane(Some(&layout), "hidden"), None);
+        assert_eq!(layout_ratio_for_pane(None, "visible"), None);
+    }
+
+    #[test]
+    fn hidden_tab_panes_use_their_own_layout_ratio() {
+        let snapshot = two_tab_snapshot();
+        assert_eq!(pane_layout_ratio(&snapshot, "p-a"), Some((1.0, 1.0)));
+        assert_eq!(pane_layout_ratio(&snapshot, "p-b"), Some((0.5, 1.0)));
+        assert_eq!(
+            layout_ratio_for_pane(snapshot.layout_for("t-a"), "p-b"),
+            None
+        );
+    }
+
+    #[test]
+    fn session_targets_every_snapshot_pane_and_only_selects_one_control() {
+        let snapshot = two_tab_snapshot();
+        let targets = snapshot_runtime_targets(&snapshot, Some("p-a"));
+        assert_eq!(
+            targets,
+            vec![
+                ("p-a".into(), TerminalMode::ControlTakeover),
+                ("p-b".into(), TerminalMode::Observe),
+            ]
+        );
+        let switched = snapshot_runtime_targets(&snapshot, Some("p-b"));
+        assert_eq!(
+            switched,
+            vec![
+                ("p-a".into(), TerminalMode::Observe),
+                ("p-b".into(), TerminalMode::ControlTakeover),
+            ]
+        );
+        assert_eq!(
+            snapshot_pane_ids(&snapshot),
+            ["p-a", "p-b"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn tab_switch_flushes_visible_or_newly_spawned_panes() {
+        assert!(should_flush_session_pane(Some("t-a"), Some("t-a"), false));
+        assert!(!should_flush_session_pane(Some("t-b"), Some("t-a"), false));
+        assert!(should_flush_session_pane(Some("t-b"), Some("t-a"), true));
+        assert!(should_flush_session_pane(Some("t-b"), None, true));
+    }
+
+    #[test]
+    fn tab_switch_keeps_snapshot_panes_instead_of_only_the_visible_tab() {
+        let cached = ["p-a", "p-b", "closed"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let snapshot = two_tab_snapshot();
+        let live = snapshot_pane_ids(&snapshot);
+        let kept = cached.intersection(&live).cloned().collect::<HashSet<_>>();
+        assert!(kept.contains("p-a"));
+        assert!(kept.contains("p-b"));
+        assert!(!kept.contains("closed"));
+    }
+
+    #[test]
+    fn switching_the_selected_pane_keeps_the_local_surface() {
+        assert_eq!(
+            visible_pane_plan(Some(TerminalMode::Observe), false, TerminalMode::Observe),
+            VisiblePanePlan::Keep
+        );
+        assert_eq!(
+            visible_pane_plan(
+                Some(TerminalMode::ControlTakeover),
+                false,
+                TerminalMode::ControlTakeover
+            ),
+            VisiblePanePlan::Keep
+        );
+        assert_eq!(
+            visible_pane_plan(
+                Some(TerminalMode::Observe),
+                false,
+                TerminalMode::ControlTakeover
+            ),
+            VisiblePanePlan::PromoteToControl
+        );
+        assert_eq!(
+            visible_pane_plan(
+                Some(TerminalMode::ControlTakeover),
+                false,
+                TerminalMode::Observe
+            ),
+            VisiblePanePlan::DemoteToObserve
+        );
+        assert_eq!(
+            visible_pane_plan(None, false, TerminalMode::Observe),
+            VisiblePanePlan::Spawn
+        );
+        assert_ne!(
+            visible_pane_plan(
+                Some(TerminalMode::Observe),
+                false,
+                TerminalMode::ControlTakeover
+            ),
+            VisiblePanePlan::Spawn
+        );
+        assert_ne!(
+            visible_pane_plan(
+                Some(TerminalMode::ControlTakeover),
+                false,
+                TerminalMode::Observe
+            ),
+            VisiblePanePlan::Spawn
+        );
+    }
+
+    #[test]
+    fn a_closed_stream_is_respawned_instead_of_kept() {
+        assert_eq!(
+            visible_pane_plan(
+                Some(TerminalMode::ControlTakeover),
+                true,
+                TerminalMode::ControlTakeover
+            ),
+            VisiblePanePlan::Spawn
+        );
+        assert_eq!(
+            visible_pane_plan(Some(TerminalMode::Observe), true, TerminalMode::Observe),
+            VisiblePanePlan::Spawn
+        );
+    }
+
+    #[test]
+    fn a_process_exit_closes_the_stream_without_an_app_error() {
+        assert!(is_expected_terminal_exit(&HerdrError::TerminalClosed(
+            "terminal t1 exited".into()
+        )));
+        assert!(is_expected_terminal_exit(&HerdrError::TerminalClosed(
+            "terminal worker stopped".into()
+        )));
+        assert!(!is_expected_terminal_exit(&HerdrError::Protocol(
+            "frame gap".into()
+        )));
+    }
+
+    #[test]
+    fn snapshot_refresh_queues_when_one_is_already_in_flight() {
+        assert!(snapshot_refresh_should_queue(true));
+        assert!(!snapshot_refresh_should_queue(false));
+    }
+
+    #[test]
+    fn wheel_delta_accumulates_into_terminal_scroll_lines() {
+        assert_eq!(
+            wheel_scroll_lines(ScrollDelta::Lines(point(0., 3.)), 16., &mut 0.),
+            3
+        );
+        assert_eq!(
+            wheel_scroll_lines(ScrollDelta::Lines(point(0., -2.4)), 16., &mut 0.),
+            -2
+        );
+        let mut leftover = 0.;
+        assert_eq!(
+            wheel_scroll_lines(
+                ScrollDelta::Pixels(point(px(0.), px(8.))),
+                16.,
+                &mut leftover
+            ),
+            0
+        );
+        assert!((leftover - 8.).abs() < f32::EPSILON);
+        assert_eq!(
+            wheel_scroll_lines(
+                ScrollDelta::Pixels(point(px(0.), px(10.))),
+                16.,
+                &mut leftover
+            ),
+            1
+        );
+        assert!((leftover - 2.).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn terminal_palette_follows_the_gui_light_and_dark_theme() {
+        let family = ochub_ui::theme::ochub_family();
+        let font = TerminalFontSettings::default();
+        let light = terminal_palette_from_theme(family.light, false, &font);
+        let dark = terminal_palette_from_theme(family.dark, true, &font);
+        assert!(!light.dark);
+        assert!(dark.dark);
+        assert_eq!(light.background, family.light.bg.0);
+        assert_eq!(light.foreground, family.light.text.0);
+        assert_eq!(dark.background, family.dark.bg.0);
+        assert_ne!(light.background, dark.background);
+        assert_ne!(light.background, 0x1E1E1E);
+        assert_ne!(light.signature(), dark.signature());
+        assert_eq!(light.font_size, 13);
+        assert!(light.ligatures);
+        assert!(light.font_family.is_empty());
+    }
+
+    #[test]
+    fn terminal_font_settings_change_the_ghostty_signature() {
+        let family = ochub_ui::theme::ochub_family();
+        let default = TerminalFontSettings::default();
+        let menlo = TerminalFontSettings {
+            family: "Menlo".into(),
+            size: 16,
+            ligatures: false,
+            thicken: true,
+            cell_width_percent: -10,
+            cell_height_percent: 12,
+        };
+        let left = terminal_palette_from_theme(family.light, false, &default);
+        let right = terminal_palette_from_theme(family.light, false, &menlo);
+        assert_eq!(right.font_family, "Menlo");
+        assert_eq!(right.font_size, 16);
+        assert!(!right.ligatures);
+        assert!(right.thicken);
+        assert_ne!(left.signature(), right.signature());
+    }
+
+    #[test]
+    fn control_letter_bytes_encode_ctrl_c() {
+        let ctrl = KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        };
+        assert_eq!(control_letter_bytes("c", ctrl), Some(vec![0x03]));
+        assert_eq!(control_letter_bytes("C", ctrl), Some(vec![0x03]));
+        assert_eq!(control_letter_bytes("d", ctrl), Some(vec![0x04]));
+        assert_eq!(control_letter_bytes("c", KeyModifiers::default()), None);
+        assert_eq!(
+            control_letter_bytes(
+                "c",
+                KeyModifiers {
+                    control: true,
+                    platform: true,
+                    ..KeyModifiers::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(control_letter_bytes("enter", ctrl), None);
+    }
+
+    #[test]
+    fn encode_pty_bytes_pass_through_ctrl_c_and_q() {
+        let none = KeyModifiers::default();
+        let ctrl = KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        };
+        assert_eq!(encode_pty_bytes("c", Some("c"), ctrl), Some(vec![0x03]));
+        assert_eq!(encode_pty_bytes("ctrl-c", None, ctrl), Some(vec![0x03]));
+        assert_eq!(encode_pty_bytes("q", Some("q"), none), Some(b"q".to_vec()));
+        assert_eq!(encode_pty_bytes("enter", None, none), Some(vec![b'\r']));
+        assert_eq!(encode_pty_bytes("up", None, none), Some(b"\x1b[A".to_vec()));
+    }
+
+    #[test]
+    fn encode_pty_bytes_maps_macos_edit_shortcuts() {
+        let super_key = KeyModifiers {
+            platform: true,
+            ..KeyModifiers::default()
+        };
+        let alt = KeyModifiers {
+            alt: true,
+            ..KeyModifiers::default()
+        };
+        let shift = KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        };
+        assert_eq!(
+            encode_pty_bytes("backspace", None, super_key),
+            Some(vec![0x15])
+        );
+        assert_eq!(
+            encode_pty_bytes("delete", None, super_key),
+            Some(vec![0x0b])
+        );
+        assert_eq!(encode_pty_bytes("left", None, super_key), Some(vec![0x01]));
+        assert_eq!(encode_pty_bytes("right", None, super_key), Some(vec![0x05]));
+        assert_eq!(
+            encode_pty_bytes("backspace", None, alt),
+            Some(b"\x1b\x7f".to_vec())
+        );
+        assert_eq!(encode_pty_bytes("left", None, alt), Some(b"\x1bb".to_vec()));
+        assert_eq!(
+            encode_pty_bytes("right", None, alt),
+            Some(b"\x1bf".to_vec())
+        );
+        assert_eq!(
+            encode_pty_bytes("delete", None, alt),
+            Some(b"\x1bd".to_vec())
+        );
+        assert_eq!(
+            encode_pty_bytes("tab", None, shift),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            encode_pty_bytes("v", Some("v"), super_key),
+            None,
+            "Cmd+V stays with the clipboard paste path"
+        );
+    }
+
+    #[test]
+    fn overlay_enter_confirms_and_escape_cancels() {
+        let enter = KeyDownEvent {
+            keystroke: ochub_ui::gpui::Keystroke {
+                key: "enter".into(),
+                key_char: Some("\n".into()),
+                modifiers: ochub_ui::gpui::Modifiers::default(),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        let held = KeyDownEvent {
+            is_held: true,
+            ..enter.clone()
+        };
+        let escape = KeyDownEvent {
+            keystroke: ochub_ui::gpui::Keystroke {
+                key: "escape".into(),
+                key_char: None,
+                modifiers: ochub_ui::gpui::Modifiers::default(),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert_eq!(overlay_confirm_or_cancel(&enter), Some(true));
+        assert_eq!(overlay_confirm_or_cancel(&escape), Some(false));
+        assert_eq!(overlay_confirm_or_cancel(&held), None);
+    }
+
+    #[test]
+    fn tab_index_reads_plain_digit_and_named_keys() {
+        assert_eq!(tab_index_from_keystroke("1", None), Some(1));
+        assert_eq!(tab_index_from_keystroke("9", Some("9")), Some(9));
+        assert_eq!(tab_index_from_keystroke("0", None), Some(0));
+        assert_eq!(tab_index_from_keystroke("digit3", None), Some(3));
+        assert_eq!(tab_index_from_keystroke("numpad8", None), Some(8));
+        assert_eq!(tab_index_from_keystroke("t", None), None);
+        assert_eq!(tab_index_from_keystroke("w", Some("w")), None);
+        assert_eq!(tab_index_from_keystroke("１", None), Some(1));
+    }
+
+    #[test]
+    fn tab_shortcut_uses_number_then_visual_index_and_zero_for_last() {
+        let tabs = [
+            ocherdr_core::TabInfo {
+                tab_id: "first".into(),
+                workspace_id: "w".into(),
+                number: 1,
+                label: "one".into(),
+                focused: true,
+                pane_count: 1,
+                agent_status: AgentStatus::Idle,
+            },
+            ocherdr_core::TabInfo {
+                tab_id: "third".into(),
+                workspace_id: "w".into(),
+                number: 3,
+                label: "three".into(),
+                focused: false,
+                pane_count: 1,
+                agent_status: AgentStatus::Idle,
+            },
+            ocherdr_core::TabInfo {
+                tab_id: "second".into(),
+                workspace_id: "w".into(),
+                number: 2,
+                label: "two".into(),
+                focused: false,
+                pane_count: 1,
+                agent_status: AgentStatus::Idle,
+            },
+        ];
+        assert_eq!(
+            tab_id_for_shortcut(tabs.iter(), 1).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            tab_id_for_shortcut(tabs.iter(), 2).as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            tab_id_for_shortcut(tabs.iter(), 3).as_deref(),
+            Some("third")
+        );
+        assert_eq!(
+            tab_id_for_shortcut(tabs.iter(), 0).as_deref(),
+            Some("third")
+        );
+        assert_eq!(tab_id_for_shortcut(tabs.iter(), 8).as_deref(), None);
+    }
+
+    #[test]
+    fn surface_rect_mapping_inverts_mouse_mapping() {
+        let body = (100., 50., 800., 400.);
+        let pixel_size = (1600, 800);
+        let mouse = map_mouse_to_surface((500., 250.), body, pixel_size, 2.).unwrap();
+        let rect =
+            map_surface_rect_to_window((mouse.0, mouse.1, 10., 16.), body, pixel_size, 2.).unwrap();
+        assert!((rect.0 - 500.).abs() < 0.02);
+        assert!((rect.1 - 250.).abs() < 0.02);
+        assert!((rect.2 - 10.).abs() < 0.02);
+        assert!((rect.3 - 16.).abs() < 0.02);
+    }
+
+    #[test]
+    fn mouse_to_surface_fills_a_matching_retina_framebuffer() {
+        let body = (100., 50., 800., 400.);
+        let pixel_size = (1600, 800);
+        assert_eq!(
+            map_mouse_to_surface((100., 50.), body, pixel_size, 2.),
+            Some((0., 0.))
+        );
+        let bottom_right = map_mouse_to_surface((900., 450.), body, pixel_size, 2.).unwrap();
+        assert!((bottom_right.0 - 800.).abs() < 0.01);
+        assert!((bottom_right.1 - 400.).abs() < 0.01);
+        assert_eq!(map_mouse_to_surface((100., 50.), body, (0, 0), 2.), None);
+    }
+
+    #[test]
+    fn mouse_to_surface_accounts_for_contain_letterboxing() {
+        let body = (0., 0., 1000., 400.);
+        let mapped = map_mouse_to_surface((100., 0.), body, (1600, 800), 2.).unwrap();
+        assert!(mapped.0.abs() < 0.01);
+        assert!(mapped.1.abs() < 0.01);
+        let mapped = map_mouse_to_surface((900., 400.), body, (1600, 800), 2.).unwrap();
+        assert!((mapped.0 - 800.).abs() < 0.01);
+        assert!((mapped.1 - 400.).abs() < 0.01);
+    }
+
+    #[test]
+    fn terminal_body_sits_below_the_pane_header() {
+        let body = terminal_body_bounds((10., 20., 200., 160.));
+        assert!((body.0 - (SIDEBAR_WIDTH + 12.)).abs() < f32::EPSILON);
+        assert!((body.1 - (HEADER_HEIGHT + 22. + PANE_HEADER_HEIGHT)).abs() < f32::EPSILON);
+        assert!((body.2 - 196.).abs() < f32::EPSILON);
+        assert!((body.3 - (156. - PANE_HEADER_HEIGHT)).abs() < f32::EPSILON);
     }
 }

@@ -9,6 +9,7 @@ description = "A native macOS GUI client for Herdr"
 
 [dependencies]
 anyhow.workspace = true
+core-foundation = "0.10"
 dirs.workspace = true
 gpui-platform.workspace = true
 ochub-ui.workspace = true

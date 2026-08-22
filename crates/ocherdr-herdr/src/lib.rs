@@ -10,13 +10,13 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use ocherdr_core::{ConnectionProfile, HierarchySnapshot, SessionSummary};
+use ocherdr_core::{ConnectionProfile, HierarchySnapshot, MINIMUM_HERDR_VERSION, SessionSummary};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -46,6 +46,41 @@ pub enum HerdrError {
 
 pub type Result<T> = std::result::Result<T, HerdrError>;
 
+/// A user-facing summary of a host probe. The transport owns classification so
+/// the app never has to infer state from raw OpenSSH stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostHealthStatus {
+    Ready,
+    SshOnly,
+    UnsupportedHerdr,
+    AuthenticationRequired,
+    HostKeyRequired,
+    Unreachable,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostHealthCheck {
+    pub status: HostHealthStatus,
+    pub detail: String,
+    pub herdr_version: Option<String>,
+    pub session_count: Option<usize>,
+    pub latency_ms: u64,
+}
+
+impl HostHealthCheck {
+    fn failed(status: HostHealthStatus, detail: impl Into<String>, started: Instant) -> Self {
+        Self {
+            status,
+            detail: detail.into(),
+            herdr_version: None,
+            session_count: None,
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionList {
     sessions: Vec<SessionSummary>,
@@ -60,6 +95,132 @@ pub fn discover_sessions(profile: &ConnectionProfile) -> Result<Vec<SessionSumma
 pub fn herdr_version(profile: &ConnectionProfile) -> Result<String> {
     let output = command_output(profile, &["--version"])?;
     Ok(String::from_utf8_lossy(&output).trim().to_owned())
+}
+
+/// Check the layers OcHerdr needs in order: SSH, a compatible Herdr binary,
+/// and session discovery. This deliberately uses BatchMode and the same
+/// bounded OpenSSH settings as normal background work.
+pub fn check_host(profile: &ConnectionProfile) -> HostHealthCheck {
+    let started = Instant::now();
+    if matches!(profile, ConnectionProfile::Ssh { .. })
+        && let Err(error) = probe_ssh(profile)
+    {
+        let detail = error.to_string();
+        return HostHealthCheck::failed(classify_ssh_failure(&detail), detail, started);
+    }
+
+    let version = match herdr_version(profile) {
+        Ok(version) => version,
+        Err(error) => {
+            let detail = error.to_string();
+            let status = if matches!(profile, ConnectionProfile::Ssh { .. })
+                && looks_like_missing_herdr(&detail)
+            {
+                HostHealthStatus::SshOnly
+            } else {
+                classify_ssh_failure(&detail)
+            };
+            return HostHealthCheck::failed(status, detail, started);
+        }
+    };
+    if !version_at_least(&version, MINIMUM_HERDR_VERSION) {
+        return HostHealthCheck {
+            status: HostHealthStatus::UnsupportedHerdr,
+            detail: format!("Herdr {version} is older than the required {MINIMUM_HERDR_VERSION}"),
+            herdr_version: Some(version),
+            session_count: None,
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        };
+    }
+    match discover_sessions(profile) {
+        Ok(sessions) => HostHealthCheck {
+            status: HostHealthStatus::Ready,
+            detail: "SSH and Herdr are ready".into(),
+            herdr_version: Some(version),
+            session_count: Some(sessions.len()),
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        },
+        Err(error) => HostHealthCheck::failed(HostHealthStatus::Failed, error.to_string(), started),
+    }
+}
+
+fn probe_ssh(profile: &ConnectionProfile) -> Result<()> {
+    let ConnectionProfile::Ssh {
+        destination,
+        port,
+        identity_file,
+        ..
+    } = profile
+    else {
+        return Ok(());
+    };
+    let mut command = Command::new("/usr/bin/ssh");
+    add_ssh_common(&mut command, destination, *port, identity_file.as_deref());
+    let output = command
+        .arg("--")
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(HerdrError::Ssh(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+    }
+}
+
+fn classify_ssh_failure(detail: &str) -> HostHealthStatus {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("permission denied")
+        || detail.contains("authentication failed")
+        || detail.contains("too many authentication failures")
+    {
+        HostHealthStatus::AuthenticationRequired
+    } else if detail.contains("host key verification failed")
+        || detail.contains("remote host identification has changed")
+        || detail.contains("authenticity of host")
+    {
+        HostHealthStatus::HostKeyRequired
+    } else if detail.contains("could not resolve hostname")
+        || detail.contains("name or service not known")
+        || detail.contains("operation timed out")
+        || detail.contains("connection timed out")
+        || detail.contains("no route to host")
+        || detail.contains("connection refused")
+    {
+        HostHealthStatus::Unreachable
+    } else {
+        HostHealthStatus::Failed
+    }
+}
+
+fn looks_like_missing_herdr(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("remote herdr executable was not found")
+        || detail.contains("herdr: command not found")
+        || detail.contains("no such file or directory")
+}
+
+fn version_at_least(actual: &str, minimum: &str) -> bool {
+    fn parts(value: &str) -> [u64; 3] {
+        let version = value
+            .split_whitespace()
+            .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .unwrap_or(value);
+        let mut numbers = version
+            .split(|character: char| !character.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse::<u64>().ok());
+        [
+            numbers.next().unwrap_or(0),
+            numbers.next().unwrap_or(0),
+            numbers.next().unwrap_or(0),
+        ]
+    }
+    parts(actual) >= parts(minimum)
 }
 
 pub fn stop_session(profile: &ConnectionProfile, name: &str) -> Result<Value> {
@@ -764,6 +925,7 @@ pub struct TerminalSession {
     commands: Sender<TerminalCommand>,
     frames: Receiver<Result<TerminalFrame>>,
     process_id: Arc<AtomicU32>,
+    alive: Arc<AtomicBool>,
 }
 
 impl TerminalSession {
@@ -778,12 +940,15 @@ impl TerminalSession {
         let (command_tx, command_rx) = mpsc::channel::<TerminalCommand>();
         let (frame_tx, frame_rx) = mpsc::channel::<Result<TerminalFrame>>();
         let process_id = Arc::new(AtomicU32::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
         let worker_process_id = process_id.clone();
+        let worker_alive = alive.clone();
         thread::spawn(move || {
             let stream = TerminalStream::spawn(&profile, &session_name, &target, mode, cols, rows);
             let mut stream = match stream {
                 Ok(stream) => stream,
                 Err(error) => {
+                    worker_alive.store(false, Ordering::Release);
                     let _ = frame_tx.send(Err(error));
                     return;
                 }
@@ -817,12 +982,14 @@ impl TerminalSession {
             }
             drop(stream);
             worker_process_id.store(0, Ordering::Release);
+            worker_alive.store(false, Ordering::Release);
             let _ = writer.join();
         });
         Self {
             commands: command_tx,
             frames: frame_rx,
             process_id,
+            alive,
         }
     }
 
@@ -832,11 +999,21 @@ impl TerminalSession {
             .map_err(|_| HerdrError::TerminalClosed("terminal worker stopped".into()))
     }
 
+    pub fn is_closed(&self) -> bool {
+        !self.alive.load(Ordering::Acquire)
+    }
+
     pub fn try_frame(&self) -> Result<Option<TerminalFrame>> {
-        match self.frames.try_recv() {
-            Ok(frame) => frame.map(Some),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Ok(None),
+        recv_terminal_frame(&self.frames)
+    }
+}
+
+fn recv_terminal_frame(frames: &Receiver<Result<TerminalFrame>>) -> Result<Option<TerminalFrame>> {
+    match frames.try_recv() {
+        Ok(frame) => frame.map(Some),
+        Err(TryRecvError::Empty) => Ok(None),
+        Err(TryRecvError::Disconnected) => {
+            Err(HerdrError::TerminalClosed("terminal worker stopped".into()))
         }
     }
 }
@@ -859,7 +1036,110 @@ pub fn ssh_host_aliases() -> Vec<String> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    parse_ssh_hosts(&fs::read_to_string(home.join(".ssh/config")).unwrap_or_default())
+    let ssh_dir = home.join(".ssh");
+    let mut hosts = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    collect_ssh_hosts(&ssh_dir.join("config"), &ssh_dir, &mut visited, &mut hosts);
+    hosts
+}
+
+fn collect_ssh_hosts(
+    path: &Path,
+    ssh_dir: &Path,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    hosts: &mut Vec<String>,
+) {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    if !visited.insert(canonical) {
+        return;
+    }
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    for host in parse_ssh_hosts(&contents) {
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    for line in contents.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("Include ")
+            .or_else(|| line.strip_prefix("include "))
+        else {
+            continue;
+        };
+        for include in rest.split_whitespace() {
+            let expanded = if let Some(relative) = include.strip_prefix("~/") {
+                dirs::home_dir().map(|home| home.join(relative))
+            } else {
+                let include = PathBuf::from(include);
+                Some(if include.is_absolute() {
+                    include
+                } else {
+                    ssh_dir.join(include)
+                })
+            };
+            let Some(expanded) = expanded else {
+                continue;
+            };
+            for included_path in expand_simple_glob(&expanded) {
+                collect_ssh_hosts(&included_path, ssh_dir, visited, hosts);
+            }
+        }
+    }
+}
+
+fn expand_simple_glob(path: &Path) -> Vec<PathBuf> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    if !file_name.contains(['*', '?']) {
+        return vec![path.to_owned()];
+    }
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut matches = entries
+        .flatten()
+        .filter_map(|entry| {
+            let candidate = entry.file_name();
+            let candidate = candidate.to_str()?;
+            wildcard_matches(file_name.as_bytes(), candidate.as_bytes()).then(|| entry.path())
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+}
+
+fn wildcard_matches(pattern: &[u8], value: &[u8]) -> bool {
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut star, mut retry_value) = (None, 0);
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            retry_value = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            retry_value += 1;
+            value_index = retry_value;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 pub fn parse_ssh_hosts(contents: &str) -> Vec<String> {
@@ -903,6 +1183,32 @@ pub fn attach_command(profile: &ConnectionProfile, session_name: &str) -> String
             )
         }
     }
+}
+
+/// An interactive OpenSSH command for authentication, host-key enrollment, or
+/// manual repair in the user's system Terminal.
+pub fn ssh_login_command(profile: &ConnectionProfile) -> Option<String> {
+    let ConnectionProfile::Ssh {
+        destination,
+        port,
+        identity_file,
+        ..
+    } = profile
+    else {
+        return None;
+    };
+    let mut arguments = vec!["ssh".to_owned()];
+    if let Some(port) = port {
+        arguments.extend(["-p".into(), port.to_string()]);
+    }
+    if let Some(identity_file) = identity_file {
+        arguments.extend([
+            "-i".into(),
+            posix_quote(&identity_file.display().to_string()),
+        ]);
+    }
+    arguments.push(posix_quote(destination));
+    Some(arguments.join(" "))
 }
 
 #[cfg(target_os = "macos")]
@@ -981,6 +1287,36 @@ mod tests {
     }
 
     #[test]
+    fn classifies_actionable_ssh_failures() {
+        assert_eq!(
+            classify_ssh_failure("Permission denied (publickey)."),
+            HostHealthStatus::AuthenticationRequired
+        );
+        assert_eq!(
+            classify_ssh_failure("Host key verification failed."),
+            HostHealthStatus::HostKeyRequired
+        );
+        assert_eq!(
+            classify_ssh_failure("ssh: Could not resolve hostname nowhere"),
+            HostHealthStatus::Unreachable
+        );
+    }
+
+    #[test]
+    fn compares_decorated_semantic_versions() {
+        assert!(version_at_least("herdr 0.8.1", "0.8.1"));
+        assert!(version_at_least("0.9.0-beta.1", "0.8.1"));
+        assert!(!version_at_least("herdr 0.7.9", "0.8.1"));
+    }
+
+    #[test]
+    fn simple_globs_match_config_fragments() {
+        assert!(wildcard_matches(b"*.conf", b"work.conf"));
+        assert!(wildcard_matches(b"host-?", b"host-a"));
+        assert!(!wildcard_matches(b"host-?", b"host-prod"));
+    }
+
+    #[test]
     fn attach_command_keeps_session_name_quoted() {
         let profile = ConnectionProfile::Ssh {
             id: "server".into(),
@@ -997,6 +1333,22 @@ mod tests {
     }
 
     #[test]
+    fn interactive_ssh_command_preserves_profile_overrides() {
+        let profile = ConnectionProfile::Ssh {
+            id: "server".into(),
+            label: "Server".into(),
+            destination: "deploy@example.com".into(),
+            port: Some(2202),
+            identity_file: Some("/Keys/work key".into()),
+            herdr_path: "herdr".into(),
+        };
+        assert_eq!(
+            ssh_login_command(&profile).as_deref(),
+            Some("ssh -p 2202 -i '/Keys/work key' deploy@example.com")
+        );
+    }
+
+    #[test]
     fn terminal_input_serializes_lossless_bytes() {
         let encoded = base64::engine::general_purpose::STANDARD.encode([0, 0x1b, 0x80, 0xff]);
         let value =
@@ -1005,5 +1357,13 @@ mod tests {
         assert_eq!(value["type"], "terminal.input");
         assert_eq!(value["bytes"], "ABuA/w==");
         assert!(value.get("text").is_none());
+    }
+
+    #[test]
+    fn try_frame_treats_a_stopped_worker_as_closed() {
+        let (tx, rx) = mpsc::channel::<Result<TerminalFrame>>();
+        drop(tx);
+        let error = recv_terminal_frame(&rx).unwrap_err();
+        assert!(matches!(error, HerdrError::TerminalClosed(reason) if reason.contains("stopped")));
     }
 }

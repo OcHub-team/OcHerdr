@@ -1,24 +1,19 @@
 use super::super::*;
+use crate::a11y::{apply_control, apply_list, apply_region, pane_a11y};
 
 impl OcHerdrView {
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
+        let chrome = self.chrome_a11y();
         let session_rows = self
             .sessions
             .iter()
             .enumerate()
-            .map(|(index, session)| {
-                let selected = self.session_index == Some(index);
+            .zip(chrome.connections.items.iter())
+            .map(|((index, session), control)| {
+                let selected = control.selected == Some(true);
                 let running = session.running;
-                let display_name = if session.default {
-                    i18n.text("Default").to_owned()
-                } else {
-                    session.display_name().to_owned()
-                };
-                div()
-                    .id(("session", index))
-                    .role(ochub_ui::gpui::Role::Button)
-                    .aria_label(display_name.clone())
+                apply_control(div().id(("session", index)), control)
                     .flex()
                     .items_center()
                     .gap_2()
@@ -40,7 +35,13 @@ impl OcHerdrView {
                     } else {
                         theme::muted()
                     }))
-                    .child(div().flex_1().truncate().text_sm().child(display_name))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text_sm()
+                            .child(control.name.clone()),
+                    )
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -56,10 +57,24 @@ impl OcHerdrView {
                     label: workspace.label.clone(),
                 };
                 let selected = self.selection.workspace_id.as_deref() == Some(&workspace_id);
+                let control = chrome
+                    .workspaces
+                    .items
+                    .iter()
+                    .find(|item| item.id == workspace_id)
+                    .cloned()
+                    .unwrap_or_else(|| crate::a11y::ControlA11y {
+                        id: workspace_id.clone(),
+                        role: ochub_ui::gpui::Role::Button,
+                        name: workspace.label.clone(),
+                        selected: Some(selected),
+                        toggled: None,
+                        tab_stop: false,
+                    });
                 hierarchy.push(
                     tree_row(
                         ("workspace", workspace.number),
-                        &workspace.label,
+                        &control,
                         12.,
                         IconName::Folder,
                         selected,
@@ -87,14 +102,30 @@ impl OcHerdrView {
                 }
                 let pane_id = pane.pane_id.clone();
                 let status = pane.agent_status;
-                agent_rows.push(
+                let control = chrome
+                    .agents
+                    .items
+                    .iter()
+                    .find(|item| item.id == agent_name)
+                    .cloned();
+                let row = if let Some(control) = control {
+                    apply_control(
+                        div().id(ochub_ui::gpui::ElementId::Name(
+                            format!("agent-{pane_id}").into(),
+                        )),
+                        &control,
+                    )
+                } else {
                     div()
                         .id(ochub_ui::gpui::ElementId::Name(
                             format!("agent-{pane_id}").into(),
                         ))
                         .role(ochub_ui::gpui::Role::Button)
                         .aria_label(agent_name.to_owned())
-                        .flex()
+                        .tab_stop(false)
+                };
+                agent_rows.push(
+                    row.flex()
                         .items_center()
                         .gap_2()
                         .h(px(30.))
@@ -124,7 +155,7 @@ impl OcHerdrView {
             }
         }
 
-        div()
+        apply_region(div().id(chrome.sidebar.id), &chrome.sidebar)
             .flex()
             .flex_col()
             .w(px(SIDEBAR_WIDTH))
@@ -144,9 +175,13 @@ impl OcHerdrView {
                     .gap_2()
                     .child(
                         div()
+                            .id("sidebar-title")
+                            .role(ochub_ui::gpui::Role::Heading)
+                            .aria_level(1)
+                            .aria_label(chrome.sidebar.name.clone())
                             .text_base()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(i18n.text("Spaces")),
+                            .child(chrome.sidebar.name.clone()),
                     ),
             )
             .child(
@@ -159,15 +194,22 @@ impl OcHerdrView {
                     .overflow_scroll()
                     .px_2()
                     .pb_3()
-                    .child(section_label(i18n.text("CONNECTIONS")))
-                    .children(session_rows)
-                    .child(section_label(i18n.text("WORKSPACES")))
-                    .children(hierarchy)
+                    .child(section_label("connections-heading", i18n.text("SESSIONS")))
                     .child(
-                        div()
-                            .id("new-workspace")
-                            .role(ochub_ui::gpui::Role::Button)
-                            .aria_label(i18n.text("New workspace"))
+                        apply_list(div().id(chrome.connections.id), &chrome.connections)
+                            .flex()
+                            .flex_col()
+                            .children(session_rows),
+                    )
+                    .child(section_label("workspaces-heading", i18n.text("WORKSPACES")))
+                    .child(
+                        apply_list(div().id(chrome.workspaces.id), &chrome.workspaces)
+                            .flex()
+                            .flex_col()
+                            .children(hierarchy),
+                    )
+                    .child(
+                        apply_control(div().id("new-workspace"), &chrome.new_workspace)
                             .flex()
                             .items_center()
                             .gap_2()
@@ -210,8 +252,7 @@ impl OcHerdrView {
                             .child(i18n.text("STATUS")),
                     )
                     .child(
-                        div()
-                            .id("agent-scroll")
+                        apply_list(div().id(chrome.agents.id), &chrome.agents)
                             .flex()
                             .flex_col()
                             .min_h_0()
@@ -223,11 +264,16 @@ impl OcHerdrView {
 
     pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
+        let chrome = self.chrome_a11y();
         let mut tabs = Vec::new();
         if let (Some(snapshot), Some(workspace_id)) =
             (&self.snapshot, self.selection.workspace_id.as_deref())
         {
-            for tab in snapshot.tabs_for(workspace_id) {
+            let mut workspace_tabs = snapshot.tabs_for(workspace_id).cloned().collect::<Vec<_>>();
+            workspace_tabs.sort_by_key(|tab| tab.number);
+            let tab_count = workspace_tabs.len();
+            for (index, tab) in workspace_tabs.into_iter().enumerate() {
+                let shortcut = tab_key_equivalent(index, tab_count);
                 let tab_id = tab.tab_id.clone();
                 let tab_target = HierarchyTarget::Tab {
                     id: tab.tab_id.clone(),
@@ -235,25 +281,41 @@ impl OcHerdrView {
                 };
                 let close_target = tab_target.clone();
                 let selected = self.selection.tab_id.as_deref() == Some(&tab_id);
-                tabs.push(
+                let control = chrome
+                    .tabs
+                    .items
+                    .iter()
+                    .find(|item| item.id == tab_id)
+                    .cloned();
+                let tab_row = if let Some(control) = control.as_ref() {
+                    apply_control(div().id(("main-tab", tab.number)), control)
+                } else {
                     div()
                         .id(("main-tab", tab.number))
-                        .role(ochub_ui::gpui::Role::Button)
+                        .role(ochub_ui::gpui::Role::Tab)
+                        .aria_label(tab.label.clone())
+                        .aria_selected(selected)
+                };
+                tabs.push(
+                    tab_row
                         .flex()
                         .items_center()
-                        .h_full()
+                        .flex_none()
+                        .h(px(TAB_PILL_HEIGHT))
                         .min_w(px(108.))
                         .max_w(px(180.))
                         .px_3()
-                        .gap_2()
-                        .border_b_2()
+                        .gap_1()
+                        .overflow_hidden()
+                        .rounded_full()
+                        .border_1()
                         .border_color(if selected {
-                            theme::accent()
+                            theme::border()
                         } else {
                             theme::surface().alpha(0.)
                         })
                         .bg(if selected {
-                            theme::selection()
+                            theme::current().bg.rgba()
                         } else {
                             theme::surface().alpha(0.)
                         })
@@ -263,7 +325,13 @@ impl OcHerdrView {
                         } else {
                             theme::muted()
                         })
-                        .hover(|style| style.bg(theme::surface_hover()))
+                        .hover(move |style| {
+                            style.bg(if selected {
+                                theme::current().bg.rgba()
+                            } else {
+                                theme::surface_hover()
+                            })
+                        })
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.select_tab(tab_id.clone(), cx)
@@ -274,8 +342,29 @@ impl OcHerdrView {
                                 this.open_context_menu(tab_target.clone(), event, window, cx)
                             }),
                         )
-                        .child(icon(IconName::Terminal, theme::muted(), 13.))
-                        .child(div().flex_1().truncate().child(tab.label.clone()))
+                        .child(icon(
+                            IconName::Terminal,
+                            if selected {
+                                theme::accent()
+                            } else {
+                                theme::muted()
+                            },
+                            13.,
+                        ))
+                        .child(div().flex_1().min_w_0().truncate().child(tab.label.clone()))
+                        .when_some(shortcut, |row, shortcut| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(if selected {
+                                        theme::text()
+                                    } else {
+                                        theme::muted()
+                                    })
+                                    .child(shortcut),
+                            )
+                        })
                         .when(selected, |row| {
                             row.child(
                                 icon_only_button_tone(
@@ -285,7 +374,8 @@ impl OcHerdrView {
                                     ButtonTone::Ghost,
                                     ButtonSize::Sm,
                                 )
-                                .size(px(22.))
+                                .size(px(18.))
+                                .rounded_full()
                                 .on_click(cx.listener(
                                     move |this, _, _window, cx| {
                                         this.request_close(close_target.clone(), cx)
@@ -307,37 +397,48 @@ impl OcHerdrView {
             .flex()
             .items_center()
             .h(px(HEADER_HEIGHT))
+            .pl_3()
+            .pr_2()
+            .gap_1()
             .border_b_1()
             .border_color(theme::border())
             .bg(theme::sidebar_background())
             .child(
-                div()
+                apply_list(div().id(chrome.tabs.id), &chrome.tabs)
                     .flex()
                     .items_center()
                     .h_full()
                     .min_w_0()
+                    .gap_1()
                     .overflow_hidden()
                     .children(tabs),
             )
             .child(
-                icon_only_button_tone(
-                    "new-tab",
-                    i18n.text("New tab"),
-                    IconName::Add,
-                    ButtonTone::Ghost,
-                    ButtonSize::Sm,
+                apply_control(
+                    icon_only_button_tone(
+                        "new-tab",
+                        chrome.toolbar.new_tab.name.clone(),
+                        IconName::Add,
+                        ButtonTone::Ghost,
+                        ButtonSize::Sm,
+                    )
+                    .rounded_full(),
+                    &chrome.toolbar.new_tab,
                 )
                 .on_click(cx.listener(|this, _, _window, cx| this.create_tab(cx))),
             )
             .child(div().flex_1())
-            .child(div().flex().items_center().gap_1().px_2()
+            .child(div().id("pane-actions").role(ochub_ui::gpui::Role::Toolbar).aria_label(i18n.text("Pane actions")).flex().items_center().gap_1().px_2()
             .child(
-                icon_only_button_tone(
+                apply_control(
+                    icon_only_button_tone(
                     "split-right",
-                    i18n.text("Split pane right"),
+                    chrome.toolbar.split_right.name.clone(),
                     IconName::Blocks,
                     ButtonTone::Primary,
                     ButtonSize::Sm,
+                ),
+                    &chrome.toolbar.split_right,
                 )
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     if let Some(pane_id) = pane_id_right.clone() {
@@ -350,12 +451,15 @@ impl OcHerdrView {
                 })),
             )
             .child(
-                icon_only_button_tone(
-                    "split-down",
-                    i18n.text("Split pane down"),
-                    IconName::ChevronDown,
-                    ButtonTone::Ghost,
-                    ButtonSize::Sm,
+                apply_control(
+                    icon_only_button_tone(
+                        "split-down",
+                        chrome.toolbar.split_down.name.clone(),
+                        IconName::ChevronDown,
+                        ButtonTone::Ghost,
+                        ButtonSize::Sm,
+                    ),
+                    &chrome.toolbar.split_down,
                 )
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     if let Some(pane_id) = pane_id_down.clone() {
@@ -368,12 +472,15 @@ impl OcHerdrView {
                 })),
             )
             .child(
-                icon_only_button_tone(
-                    "zoom-pane",
-                    i18n.text("Zoom pane"),
-                    IconName::Eye,
-                    ButtonTone::Ghost,
-                    ButtonSize::Sm,
+                apply_control(
+                    icon_only_button_tone(
+                        "zoom-pane",
+                        chrome.toolbar.zoom.name.clone(),
+                        IconName::Eye,
+                        ButtonTone::Ghost,
+                        ButtonSize::Sm,
+                    ),
+                    &chrome.toolbar.zoom,
                 )
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     if let Some(pane_id) = pane_id_zoom.clone() {
@@ -386,12 +493,15 @@ impl OcHerdrView {
                 })),
             )
             .child(
-                icon_only_button_tone(
-                    "close-pane",
-                    i18n.text("Close pane"),
-                    IconName::Close,
-                    ButtonTone::Ghost,
-                    ButtonSize::Sm,
+                apply_control(
+                    icon_only_button_tone(
+                        "close-pane",
+                        chrome.toolbar.close_pane.name.clone(),
+                        IconName::Close,
+                        ButtonTone::Ghost,
+                        ButtonSize::Sm,
+                    ),
+                    &chrome.toolbar.close_pane,
                 )
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     if let Some(pane_id) = pane_id_close.clone() {
@@ -409,55 +519,62 @@ impl OcHerdrView {
             )
             .child(div().h(px(22.)).w(px(1.)).bg(theme::border()))
             .child(
-                icon_only_button_tone(
-                    "open-appearance",
-                    i18n.text("Appearance"),
-                    IconName::Palette,
-                    if self.appearance_open {
-                        ButtonTone::Primary
-                    } else {
-                        ButtonTone::Ghost
-                    },
-                    ButtonSize::Sm,
+                apply_control(
+                    icon_only_button_tone(
+                        "open-appearance",
+                        chrome.toolbar.appearance.name.clone(),
+                        IconName::Palette,
+                        if self.appearance_open {
+                            ButtonTone::Primary
+                        } else {
+                            ButtonTone::Ghost
+                        },
+                        ButtonSize::Sm,
+                    ),
+                    &chrome.toolbar.appearance,
                 )
                 .on_click(cx.listener(|this, _, _window, cx| this.open_appearance(cx))),
             )
             .child(
-                icon_only_button_tone(
-                    "open-herdr-settings",
-                    i18n.text("Herdr settings"),
-                    IconName::Settings,
-                    if herdr_settings_open {
-                        ButtonTone::Primary
-                    } else {
-                        ButtonTone::Ghost
-                    },
-                    ButtonSize::Sm,
+                apply_control(
+                    icon_only_button_tone(
+                        "open-herdr-settings",
+                        chrome.toolbar.herdr_settings.name.clone(),
+                        IconName::Settings,
+                        if herdr_settings_open {
+                            ButtonTone::Primary
+                        } else {
+                            ButtonTone::Ghost
+                        },
+                        ButtonSize::Sm,
+                    ),
+                    &chrome.toolbar.herdr_settings,
                 )
                 .on_click(cx.listener(|this, _, _window, cx| this.open_herdr_settings(cx))),
             )
-            .child(icon_button_tone(
-                "manage-nodes",
-                i18n.text("Remote"),
-                IconName::Globe,
-                if node_manager_open { ButtonTone::Primary } else { ButtonTone::Neutral },
-                ButtonSize::Sm,
+            .child(apply_control(
+                icon_button_tone(
+                    "manage-nodes",
+                    chrome.toolbar.remote.name.clone(),
+                    IconName::Globe,
+                    if node_manager_open { ButtonTone::Primary } else { ButtonTone::Neutral },
+                    ButtonSize::Sm,
+                ),
+                &chrome.toolbar.remote,
             ).mr_3().on_click(cx.listener(|this, _, _window, cx| this.open_node_manager(cx))))
     }
 
-    pub(super) fn render_status_bar(&self) -> impl IntoElement {
+    pub(super) fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
+        let chrome = self.chrome_a11y();
         let profile = self.current_profile();
         let profile_icon = if matches!(profile, ConnectionProfile::Local { .. }) {
             IconName::Desktop
         } else {
-            IconName::Cloud
+            IconName::Globe
         };
-        let profile_label = if matches!(profile, ConnectionProfile::Local { .. }) {
-            i18n.text("Local").to_owned()
-        } else {
-            profile.label().to_owned()
-        };
+        let profile_label = profile_display_label(&profile, i18n);
+        let switcher_open = self.host_switcher_open;
         let status = if self.prefix_pending {
             div()
                 .flex()
@@ -513,7 +630,7 @@ impl OcHerdrView {
                 .child(i18n.text("No Herdr session"))
                 .into_any_element()
         };
-        div()
+        apply_region(div().id(chrome.status.id), &chrome.status)
             .flex()
             .items_center()
             .h(px(STATUS_BAR_HEIGHT))
@@ -524,7 +641,7 @@ impl OcHerdrView {
             .text_xs()
             .text_color(theme::muted())
             .child(
-                div()
+                apply_control(div().id("status-profile"), &chrome.status_profile)
                     .flex()
                     .items_center()
                     .gap_2()
@@ -533,10 +650,25 @@ impl OcHerdrView {
                     .px_3()
                     .border_r_1()
                     .border_color(theme::border())
+                    .bg(if switcher_open {
+                        theme::surface_hover()
+                    } else {
+                        theme::surface().alpha(0.)
+                    })
+                    .hover(|style| style.bg(theme::surface_hover()).text_color(theme::text()))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_host_switcher(cx)))
                     .child(icon(profile_icon, theme::muted(), 13.))
-                    .child(div().truncate().child(profile_label)),
+                    .child(div().flex_1().min_w_0().truncate().child(profile_label)),
             )
-            .child(div().flex().items_center().min_w_0().px_3().child(status))
+            .child(
+                apply_control(div().id("status-message"), &chrome.status_message)
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .px_3()
+                    .child(status),
+            )
     }
 
     pub(super) fn render_terminal(
@@ -545,7 +677,7 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) -> ochub_ui::gpui::AnyElement {
         let i18n = self.i18n;
-        self.resize_visible_terminals(window);
+        self.resize_session_terminals(window);
         let Some(snapshot) = self.snapshot.clone() else {
             let cta = button(
                 "retry-empty",
@@ -556,6 +688,10 @@ impl OcHerdrView {
             .on_click(cx.listener(|this, _, _window, cx| this.reload(None, cx)))
             .into_any_element();
             return div()
+                .id("empty-terminals")
+                .role(ochub_ui::gpui::Role::Button)
+                .tab_stop(false)
+                .aria_label(i18n.text("No running Herdr session"))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -571,6 +707,10 @@ impl OcHerdrView {
         };
         let Some(tab_id) = self.selection.tab_id.as_deref() else {
             return div()
+                .id("empty-tabs")
+                .role(ochub_ui::gpui::Role::Button)
+                .tab_stop(false)
+                .aria_label(i18n.text("This session has no tabs"))
                 .flex()
                 .flex_1()
                 .items_center()
@@ -615,6 +755,7 @@ impl OcHerdrView {
                 .unwrap_or((0., 0., width, height));
             let selected = self.selection.pane_id.as_deref() == Some(&pane.pane_id);
             let pane_id = pane.pane_id.clone();
+            self.store_pane_body_bounds(&pane_id, geometry);
             let pane_target = HierarchyTarget::Pane {
                 id: pane.pane_id.clone(),
                 label: pane.display_name().to_owned(),
@@ -623,11 +764,43 @@ impl OcHerdrView {
                 .panes
                 .get(&pane.pane_id)
                 .and_then(|runtime| runtime.frame.clone());
+            let waiting = frame.is_none();
+            let screen_text = if window.is_a11y_active() && !waiting {
+                self.panes
+                    .get(&pane.pane_id)
+                    .and_then(|runtime| runtime.terminal.read_visible_text())
+            } else {
+                None
+            };
+            let a11y = pane_a11y(&pane, selected, screen_text.as_deref(), waiting, i18n);
+            let scroll_pane_id = pane_id.clone();
+            let mouse_pane_id = pane_id.clone();
             elements.push(
-                render_pane(pane, frame, geometry, selected, i18n)
-                    .on_click(cx.listener(
-                        move |this, _event: &ochub_ui::gpui::ClickEvent, window, cx| {
-                            this.select_pane(pane_id.clone(), window, cx);
+                render_pane(pane, frame, geometry, a11y, i18n)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, window, cx| {
+                            this.pane_mouse_down(mouse_pane_id.clone(), event, window, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, window, cx| {
+                            this.pane_mouse_up(event, window, cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, window, cx| {
+                            this.pane_mouse_up(event, window, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, event, window, cx| {
+                        this.pane_mouse_move(event, window, cx);
+                    }))
+                    .on_scroll_wheel(cx.listener(
+                        move |this, event: &ScrollWheelEvent, _window, cx| {
+                            this.scroll_pane(&scroll_pane_id, event, cx);
                         },
                     ))
                     .on_mouse_down(
@@ -639,6 +812,8 @@ impl OcHerdrView {
                     .into_any_element(),
             );
         }
+        let ime_view = cx.entity();
+        let ime_focus = self.focus.clone();
         div()
             .id("terminal-surface")
             .relative()
@@ -646,18 +821,51 @@ impl OcHerdrView {
             .tab_stop(true)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.send_key(event, window, cx)))
+            .on_mouse_move(cx.listener(|this, event, window, cx| {
+                this.pane_mouse_move(event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
             .flex_1()
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
             .bg(theme::content_background())
             .children(elements)
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        window.handle_input(
+                            &ime_focus,
+                            ElementInputHandler::new(bounds, ime_view),
+                            cx,
+                        );
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .into_any_element()
     }
 }
 
-fn section_label(label: &'static str) -> impl IntoElement {
+fn tab_key_equivalent(index: usize, tab_count: usize) -> Option<String> {
+    if tab_count < 2 {
+        return None;
+    }
+    let number = index + 1;
+    (1..=9).contains(&number).then(|| format!("⌘{number}"))
+}
+
+fn section_label(id: &'static str, label: &'static str) -> impl IntoElement {
     div()
+        .id(id)
+        .role(ochub_ui::gpui::Role::Heading)
+        .aria_level(2)
+        .aria_label(label)
         .px_2()
         .pt_4()
         .pb_1()
@@ -669,16 +877,13 @@ fn section_label(label: &'static str) -> impl IntoElement {
 
 fn tree_row(
     id: impl Into<ochub_ui::gpui::ElementId>,
-    label: &str,
+    control: &crate::a11y::ControlA11y,
     indent: f32,
     icon_name: IconName,
     selected: bool,
     color: ochub_ui::gpui::Rgba,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
-    div()
-        .id(id)
-        .role(ochub_ui::gpui::Role::Button)
-        .aria_label(label.to_owned())
+    apply_control(div().id(id), control)
         .flex()
         .items_center()
         .gap_2()
@@ -709,7 +914,7 @@ fn tree_row(
                 .truncate()
                 .text_xs()
                 .text_color(theme::sidebar_text())
-                .child(label.to_owned()),
+                .child(control.name.clone()),
         )
         .child(status_dot(color))
 }
@@ -718,16 +923,21 @@ fn render_pane(
     pane: PaneInfo,
     frame: Option<RenderedFrame>,
     geometry: (f32, f32, f32, f32),
-    selected: bool,
+    a11y: crate::a11y::PaneA11y,
     i18n: I18n,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
     let (left, top, width, height) = geometry;
-    let pane_name = pane.display_name().to_owned();
+    let pane_name = a11y.name.clone();
+    let selected = a11y.selected;
     let waiting_for_frame = frame.is_none();
     div()
         .id(ochub_ui::gpui::ElementId::Name(
             format!("terminal-pane-{}", pane.pane_id).into(),
         ))
+        .role(a11y.role)
+        .aria_label(a11y.name.clone())
+        .aria_selected(selected)
+        .aria_value(a11y.value.clone())
         .absolute()
         .left(px(left + 2.))
         .top(px(top + 2.))
@@ -773,7 +983,7 @@ fn render_pane(
                 .min_h_0()
                 .w_full()
                 .overflow_hidden()
-                .bg(ochub_ui::gpui::rgb(0x1e1e1e))
+                .bg(theme::current().bg.rgba())
                 .when_some(frame, |container, frame| {
                     container.child(
                         surface(frame.pixel_buffer)
@@ -801,5 +1011,19 @@ fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
         AgentStatus::Done => theme::green(),
         AgentStatus::Idle => theme::muted(),
         AgentStatus::Unknown => theme::border_strong(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tab_key_equivalent;
+
+    #[test]
+    fn ghostty_style_tab_hints_use_command_glyph() {
+        assert_eq!(tab_key_equivalent(0, 1), None);
+        assert_eq!(tab_key_equivalent(0, 2).as_deref(), Some("⌘1"));
+        assert_eq!(tab_key_equivalent(1, 2).as_deref(), Some("⌘2"));
+        assert_eq!(tab_key_equivalent(8, 9).as_deref(), Some("⌘9"));
+        assert_eq!(tab_key_equivalent(9, 10), None);
     }
 }

@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::a11y::apply_dialog;
 
 impl OcHerdrView {
     pub(super) fn render_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -24,7 +25,9 @@ impl OcHerdrView {
                         format!("appearance-family-{family_id}").into(),
                     ))
                     .role(ochub_ui::gpui::Role::Button)
+                    .tab_stop(false)
                     .aria_label(i18n.use_theme_label(&family.name))
+                    .aria_selected(selected)
                     .flex()
                     .items_center()
                     .gap_3()
@@ -154,6 +157,73 @@ impl OcHerdrView {
             opacity_index,
             move |index, window, cx| opacity_listener(&index, window, cx),
         );
+        let size_labels = FONT_SIZES.map(|size| size.to_string());
+        let size_refs = size_labels.each_ref().map(String::as_str);
+        let size_index = FONT_SIZES
+            .iter()
+            .position(|size| *size == self.appearance.font.size)
+            .unwrap_or(2);
+        let size_listener = cx.listener(|this, index: &usize, window, cx| {
+            let size = FONT_SIZES.get(*index).copied().unwrap_or(13);
+            this.set_font_size(size, window, cx);
+        });
+        let font_size = segmented(
+            "appearance-font-size-control",
+            &size_refs,
+            size_index,
+            move |index, window, cx| size_listener(&index, window, cx),
+        );
+        let ligatures_listener = cx.listener(|this, index: &usize, window, cx| {
+            this.set_font_ligatures(*index == 0, window, cx);
+        });
+        let ligatures = segmented(
+            "appearance-ligatures-control",
+            &[i18n.text("On"), i18n.text("Off")],
+            if self.appearance.font.ligatures { 0 } else { 1 },
+            move |index, window, cx| ligatures_listener(&index, window, cx),
+        );
+        let thicken_listener = cx.listener(|this, index: &usize, window, cx| {
+            this.set_font_thicken(*index == 1, window, cx);
+        });
+        let thicken = segmented(
+            "appearance-thicken-control",
+            &[i18n.text("Off"), i18n.text("On")],
+            if self.appearance.font.thicken { 1 } else { 0 },
+            move |index, window, cx| thicken_listener(&index, window, cx),
+        );
+        let width_index = CELL_WIDTHS
+            .iter()
+            .position(|value| *value == self.appearance.font.cell_width_percent)
+            .unwrap_or(1);
+        let width_listener = cx.listener(|this, index: &usize, window, cx| {
+            let percent = CELL_WIDTHS.get(*index).copied().unwrap_or(0);
+            this.set_cell_width(percent, window, cx);
+        });
+        let cell_width = segmented(
+            "appearance-cell-width-control",
+            &[i18n.text("Tight"), i18n.text("Default"), i18n.text("Wide")],
+            width_index,
+            move |index, window, cx| width_listener(&index, window, cx),
+        );
+        let height_index = CELL_HEIGHTS
+            .iter()
+            .position(|value| *value == self.appearance.font.cell_height_percent)
+            .unwrap_or(1);
+        let height_listener = cx.listener(|this, index: &usize, window, cx| {
+            let percent = CELL_HEIGHTS.get(*index).copied().unwrap_or(0);
+            this.set_cell_height(percent, window, cx);
+        });
+        let cell_height = segmented(
+            "appearance-cell-height-control",
+            &[
+                i18n.text("Compact"),
+                i18n.text("Default"),
+                i18n.text("Relaxed"),
+                i18n.text("Loose"),
+            ],
+            height_index,
+            move |index, window, cx| height_listener(&index, window, cx),
+        );
         let done = button(
             "close-appearance-footer",
             i18n.text("Done"),
@@ -162,9 +232,9 @@ impl OcHerdrView {
         )
         .on_click(cx.listener(|this, _, window, cx| this.close_appearance(window, cx)))
         .into_any_element();
-        let card = modal_card()
+        let card = apply_dialog(modal_card(), "appearance-dialog", i18n.text("Appearance"))
             .w(px(720.))
-            .h(px(600.))
+            .h(px(640.))
             .rounded(px(CORNER_MODAL))
             .child(
                 modal_header(i18n.text("Appearance")).child(
@@ -199,7 +269,14 @@ impl OcHerdrView {
                         i18n.text(
                             "Choose a color family. Each family includes light and dark variants.",
                         ),
-                        div().grid().grid_cols(2).gap_2().children(family_rows),
+                        div()
+                            .id("appearance-theme-list")
+                            .role(ochub_ui::gpui::Role::List)
+                            .aria_label(i18n.text("Theme"))
+                            .grid()
+                            .grid_cols(2)
+                            .gap_2()
+                            .children(family_rows),
                     ))
                     .child(appearance_setting_row(
                         i18n.text("Appearance"),
@@ -219,10 +296,129 @@ impl OcHerdrView {
                             "Applied to terminal and shell surfaces when transparency is enabled.",
                         ),
                         opacity,
+                    ))
+                    .child(appearance_section(
+                        i18n.text("Terminal type"),
+                        i18n.text(
+                            "Choose the font used by embedded terminals. Ghostty default is JetBrains Mono.",
+                        ),
+                        self.render_font_family_list(cx),
+                    ))
+                    .child(appearance_setting_row(
+                        i18n.text("Size"),
+                        i18n.text("Point size used by the terminal grid."),
+                        font_size,
+                    ))
+                    .child(appearance_setting_row(
+                        i18n.text("Ligatures"),
+                        i18n.text("Programming ligatures such as => and !=."),
+                        ligatures,
+                    ))
+                    .child(appearance_setting_row(
+                        i18n.text("Thicken"),
+                        i18n.text("Draw a heavier stroke. macOS only."),
+                        thicken,
+                    ))
+                    .child(appearance_setting_row(
+                        i18n.text("Cell width"),
+                        i18n.text("Tighten or loosen the terminal cell width."),
+                        cell_width,
+                    ))
+                    .child(appearance_setting_row(
+                        i18n.text("Cell height"),
+                        i18n.text("Change the vertical space of each terminal row."),
+                        cell_height,
                     )),
             )
             .child(modal_footer(vec![done]));
         modal_overlay(card).top_0().left_0()
+    }
+
+    fn render_font_family_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
+        let selected_family = self.appearance.font.family.clone();
+        let mut families = vec![(
+            String::new(),
+            i18n.text("JetBrains Mono (Ghostty)").to_owned(),
+        )];
+        for family in crate::fonts::monospace_families() {
+            if family != "JetBrains Mono" {
+                families.push((family.clone(), family.clone()));
+            }
+        }
+        if !selected_family.is_empty()
+            && !families
+                .iter()
+                .any(|(family, _)| family == &selected_family)
+        {
+            families.insert(1, (selected_family.clone(), selected_family.clone()));
+        }
+        let rows = families
+            .into_iter()
+            .map(|(family, label)| {
+                let selected = family == selected_family;
+                let preview_family = family.clone();
+                div()
+                    .id(ochub_ui::gpui::ElementId::Name(
+                        format!(
+                            "appearance-font-{}",
+                            if family.is_empty() {
+                                "ghostty"
+                            } else {
+                                &family
+                            }
+                        )
+                        .into(),
+                    ))
+                    .role(ochub_ui::gpui::Role::Button)
+                    .tab_stop(false)
+                    .aria_label(label.clone())
+                    .aria_selected(selected)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .min_h(px(36.))
+                    .px_3()
+                    .rounded(px(CORNER_CONTROL))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::border()
+                    })
+                    .bg(if selected {
+                        theme::selection()
+                    } else {
+                        theme::surface()
+                    })
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_font_family(family.clone(), window, cx)
+                    }))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .when(!preview_family.is_empty(), |label| {
+                                label.font_family(preview_family.clone())
+                            })
+                            .child(label),
+                    )
+                    .when(selected, |row| row.child(status_dot(theme::accent())))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("appearance-font-list")
+            .role(ochub_ui::gpui::Role::List)
+            .aria_label(i18n.text("Terminal type"))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(220.))
+            .overflow_scroll()
+            .children(rows)
     }
 }
 

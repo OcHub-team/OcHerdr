@@ -1,6 +1,64 @@
 use super::super::*;
+use crate::a11y::apply_dialog;
 
 impl OcHerdrView {
+    pub(super) fn render_switch_host(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
+        let current = profile_display_label(&self.current_profile(), i18n);
+        let next = self
+            .pending_switch_profile
+            .and_then(|index| self.profiles.get(index))
+            .map(|profile| profile_display_label(profile, i18n))
+            .unwrap_or_else(|| i18n.text("this host").to_owned());
+        let cancel = button(
+            "cancel-switch-host",
+            i18n.text("Cancel"),
+            ButtonTone::Neutral,
+            ButtonSize::Sm,
+        )
+        .on_click(cx.listener(|this, _, _window, cx| this.cancel_switch_profile(cx)))
+        .into_any_element();
+        let confirm = button(
+            "confirm-switch-host",
+            i18n.text("Switch"),
+            ButtonTone::Primary,
+            ButtonSize::Sm,
+        )
+        .on_click(cx.listener(|this, _, _window, cx| this.confirm_switch_profile(cx)))
+        .into_any_element();
+        modal_overlay(
+            apply_dialog(
+                modal_card(),
+                "switch-host-dialog",
+                i18n.text("Switch host?"),
+            )
+            .child(modal_header(i18n.text("Switch host?")))
+            .child(
+                modal_body()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::text())
+                            .child(i18n.switch_host_prompt(&current, &next)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(i18n.text(
+                                "OcHerdr will leave the current Herdr session and attach to the other machine.",
+                            )),
+                    ),
+            )
+            .child(modal_footer(vec![cancel, confirm])),
+        )
+        .top_0()
+        .left_0()
+        .on_key_down(cx.listener(|this, event, window, cx| {
+            this.handle_overlay_key(event, window, cx);
+        }))
+    }
+
     pub(super) fn render_remove_node(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
         let node_name = self
@@ -26,7 +84,11 @@ impl OcHerdrView {
         .on_click(cx.listener(|this, _, _window, cx| this.confirm_remove_node(cx)))
         .into_any_element();
         modal_overlay(
-            modal_card()
+            apply_dialog(
+                modal_card(),
+                "remove-node-dialog",
+                i18n.text("Remove SSH node?"),
+            )
                 .child(modal_header(i18n.text("Remove SSH node?")))
                 .child(
                     modal_body()
@@ -49,6 +111,61 @@ impl OcHerdrView {
         )
         .top_0()
         .left_0()
+        .on_key_down(cx.listener(|this, event, window, cx| {
+            this.handle_overlay_key(event, window, cx);
+        }))
+    }
+
+    pub(super) fn render_bulk_remove(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
+        let count = self.host_bulk_selection.len();
+        let cancel = button(
+            "cancel-bulk-remove",
+            i18n.text("Cancel"),
+            ButtonTone::Neutral,
+            ButtonSize::Sm,
+        )
+        .on_click(cx.listener(|this, _, _window, cx| this.cancel_bulk_remove(cx)))
+        .into_any_element();
+        let remove = button(
+            "confirm-bulk-remove",
+            i18n.text("Remove local data"),
+            ButtonTone::Danger,
+            ButtonSize::Sm,
+        )
+        .on_click(cx.listener(|this, _, _window, cx| this.confirm_bulk_remove(cx)))
+        .into_any_element();
+        modal_overlay(
+            apply_dialog(
+                modal_card(),
+                "bulk-remove-hosts-dialog",
+                i18n.text("Remove local host data?"),
+            )
+            .child(modal_header(i18n.text("Remove local host data?")))
+            .child(
+                modal_body()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::text())
+                            .child(i18n.selected_hosts(count)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(i18n.text(
+                                "Saved hosts will be removed. SSH config entries keep their OpenSSH definitions and lose only OcHerdr metadata and overrides.",
+                            )),
+                    ),
+            )
+            .child(modal_footer(vec![cancel, remove])),
+        )
+        .top_0()
+        .left_0()
+        .on_key_down(cx.listener(|this, event, window, cx| {
+            this.handle_overlay_key(event, window, cx);
+        }))
     }
 
     pub(super) fn render_close_target(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -76,7 +193,7 @@ impl OcHerdrView {
         .on_click(cx.listener(|this, _, _window, cx| this.confirm_close(cx)))
         .into_any_element();
         modal_overlay(
-            modal_card()
+            apply_dialog(modal_card(), "close-target-dialog", i18n.close_title(kind))
                 .child(modal_header(i18n.close_title(kind)))
                 .child(
                     modal_body()
@@ -94,6 +211,9 @@ impl OcHerdrView {
         )
         .top_0()
         .left_0()
+        .on_key_down(cx.listener(|this, event, window, cx| {
+            this.handle_overlay_key(event, window, cx);
+        }))
     }
 
     pub(super) fn render_rename(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -120,7 +240,7 @@ impl OcHerdrView {
         .on_click(cx.listener(|this, _, window, cx| this.submit_rename(window, cx)))
         .into_any_element();
         modal_overlay(
-            modal_card()
+            apply_dialog(modal_card(), "rename-dialog", i18n.rename_title(kind))
                 .w(px(440.))
                 .rounded(px(CORNER_MODAL))
                 .child(modal_header(i18n.rename_title(kind)))
@@ -143,18 +263,8 @@ impl OcHerdrView {
         )
         .top_0()
         .left_0()
-        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-            match event.keystroke.key.as_str() {
-                "enter" => {
-                    this.submit_rename(window, cx);
-                    cx.stop_propagation();
-                }
-                "escape" => {
-                    this.cancel_rename(window, cx);
-                    cx.stop_propagation();
-                }
-                _ => {}
-            }
+        .on_key_down(cx.listener(|this, event, window, cx| {
+            this.handle_overlay_key(event, window, cx);
         }))
     }
 
@@ -227,7 +337,7 @@ impl OcHerdrView {
                     context_menu_item(
                         "tab-menu-close",
                         i18n.text("Close"),
-                        Some("⌘W"),
+                        Some("⌃B ⇧X"),
                         Some(IconName::Close),
                         true,
                     )
@@ -238,6 +348,20 @@ impl OcHerdrView {
                 );
             }
             HierarchyTarget::Pane { id, .. } => {
+                items.push(
+                    context_menu_item(
+                        "pane-menu-copy",
+                        i18n.text("Copy"),
+                        Some("⌘C"),
+                        Some(IconName::Copy),
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.context_menu = None;
+                        this.copy_selection(cx);
+                    }))
+                    .into_any_element(),
+                );
                 let rename_target = menu.target.clone();
                 items.push(
                     context_menu_item(
@@ -302,7 +426,7 @@ impl OcHerdrView {
                     context_menu_item(
                         "pane-menu-close",
                         i18n.text("Close pane"),
-                        None::<&str>,
+                        Some("⌘W"),
                         Some(IconName::Close),
                         true,
                     )
@@ -346,6 +470,7 @@ impl OcHerdrView {
                     .id(("herdr-settings-section", index))
                     .role(ochub_ui::gpui::Role::Tab)
                     .aria_label(localized_label)
+                    .aria_selected(selected)
                     .px_3()
                     .py_1()
                     .rounded(px(CORNER_COMPACT))
@@ -466,7 +591,7 @@ impl OcHerdrView {
         .on_click(cx.listener(|this, _, window, cx| this.close_herdr_settings(window, cx)))
         .into_any_element();
         modal_overlay(
-            modal_card()
+            apply_dialog(modal_card(), "herdr-settings-dialog", i18n.text("Herdr settings"))
                 .w(px(760.))
                 .h(px(560.))
                 .rounded(px(CORNER_MODAL))
@@ -488,6 +613,9 @@ impl OcHerdrView {
                 )
                 .child(
                     div()
+                        .id("herdr-settings-tabs")
+                        .role(ochub_ui::gpui::Role::TabList)
+                        .aria_label(i18n.text("Herdr settings"))
                         .flex()
                         .items_center()
                         .gap_1()

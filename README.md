@@ -18,7 +18,7 @@ OcHerdr is intentionally a client, not another multiplexer:
 The repository currently targets macOS and Herdr `0.8.1+`. The first milestone includes:
 
 - local and SSH-host session discovery;
-- an OcHub-style node manager for switching, adding, and removing SSH nodes;
+- an in-app host center for filtering, organizing, diagnosing, and switching SSH hosts;
 - live workspace, tab, pane, layout, and agent status rendering;
 - interactive `--takeover` control for the focused pane;
 - read-only observation of the other panes in the selected tab;
@@ -72,14 +72,17 @@ Start Herdr first if no running session appears:
 herdr
 ```
 
-SSH hosts are read from `~/.ssh/config`. Authentication and host-key enrollment stay
-with OpenSSH; establish them in Terminal before using a host in OcHerdr.
+SSH hosts are read from `~/.ssh/config` and its `Include` fragments. The files stay
+read-only: OcHerdr stores only local favorites, groups, tags, and selected overrides.
+Authentication and host-key enrollment remain with OpenSSH and the system Terminal.
 
 ## Keyboard
 
-OcHerdr supports `Cmd+T` (new tab), `Cmd+W` (close tab), `Cmd+Shift+W` (close
-workspace), `Cmd+Shift+N` (new workspace), `Cmd+1…9` (switch tab), `Ctrl+Tab`
-(cycle tabs), `F2` (rename), and `Cmd+,` (Herdr settings).
+OcHerdr supports `Cmd+T` (new tab), `Cmd+W` (close pane; last pane in a tab
+closes the tab), `Cmd+Shift+W` (close workspace), `Cmd+Shift+N` (new workspace),
+`Cmd+1…9` (switch tab), `Ctrl+Tab` (cycle tabs), `F2` (rename), and `Cmd+,`
+(Herdr settings). Click the status-bar host to switch machines; `Hosts` in the
+toolbar opens the connection manager. `Cmd+W` is for panes, not hosts.
 
 The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 `Shift+N` for a workspace, `N/P` to cycle tabs, `Shift+T/W/P` to rename,
