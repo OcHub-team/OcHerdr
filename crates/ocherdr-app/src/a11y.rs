@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use ocherdr_core::{
     AgentStatus, HierarchySnapshot, PaneInfo, Selection, SessionSummary, TabInfo, WorkspaceInfo,
+    WorkspaceWorktreeInfo,
 };
 use ochub_ui::gpui::{Div, Role, Stateful, Toggled, prelude::*};
 
@@ -45,6 +46,7 @@ pub struct SessionRow {
 pub struct WorkspaceRow {
     pub number: usize,
     pub agent_status: AgentStatus,
+    pub worktree: Option<WorkspaceWorktreeInfo>,
     pub a11y: ControlA11y,
 }
 
@@ -108,6 +110,8 @@ pub struct ChromeA11y {
     pub tabs: ListA11y<TabRow>,
     pub toolbar: ToolbarA11y,
     pub new_workspace: ControlA11y,
+    pub new_worktree: ControlA11y,
+    pub open_worktree: ControlA11y,
     pub status_profile: ControlA11y,
     pub status_message: ControlA11y,
     pub status_value: String,
@@ -229,6 +233,22 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
             toggled: None,
             tab_stop: true,
         },
+        new_worktree: ControlA11y {
+            id: "new-worktree".into(),
+            role: Role::Button,
+            name: i18n.text(k::WORKTREE_NEW).to_owned(),
+            selected: None,
+            toggled: None,
+            tab_stop: true,
+        },
+        open_worktree: ControlA11y {
+            id: "open-worktree".into(),
+            role: Role::Button,
+            name: i18n.text(k::WORKTREE_OPEN).to_owned(),
+            selected: None,
+            toggled: None,
+            tab_stop: true,
+        },
         status_profile: silent_button("status-profile", input.profile_label.to_owned()),
         status_message: silent_button("status-message", status_text.clone()),
         status_value: status_text,
@@ -327,6 +347,7 @@ fn workspace_rows(workspaces: &[WorkspaceInfo], selected_id: Option<&str>) -> Ve
         .map(|workspace| WorkspaceRow {
             number: workspace.number,
             agent_status: workspace.agent_status,
+            worktree: workspace.worktree.clone(),
             a11y: list_control(
                 workspace.workspace_id.clone(),
                 Role::Button,
@@ -808,6 +829,10 @@ mod tests {
 
         assert_eq!(chrome.new_workspace.role, Role::Button);
         assert_eq!(chrome.new_workspace.name, "New workspace");
+        assert_eq!(chrome.new_worktree.role, Role::Button);
+        assert_eq!(chrome.new_worktree.name, "New worktree");
+        assert_eq!(chrome.open_worktree.role, Role::Button);
+        assert_eq!(chrome.open_worktree.name, "Open worktree");
 
         for control in chrome
             .connections

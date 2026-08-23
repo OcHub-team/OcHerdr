@@ -1,5 +1,7 @@
 use std::task::Poll;
 
+use ocherdr_core::{WorkspaceInfo, WorktreeInfo, WorktreeList, WorktreeSourceInfo};
+
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::future::{self, Either, poll_fn};
 use futures::pin_mut;
@@ -58,6 +60,15 @@ impl OcHerdrView {
             text_drag_pane: None,
             ime_marked: None,
             rename_input: cx.new(|cx| TextInput::new(cx, i18n.text(k::COMMON_NAME))),
+            worktree_label_input: cx
+                .new(|cx| TextInput::new(cx, i18n.text(k::WORKTREE_FIELD_LABEL_HINT))),
+            worktree_branch_input: cx
+                .new(|cx| TextInput::new(cx, i18n.text(k::WORKTREE_FIELD_BRANCH_HINT))),
+            worktree_base_input: cx
+                .new(|cx| TextInput::new(cx, i18n.text(k::WORKTREE_FIELD_BASE_HINT))),
+            worktree_path_input: cx
+                .new(|cx| TextInput::new(cx, i18n.text(k::WORKTREE_FIELD_PATH_HINT))),
+            worktree_list_task: None,
             appearance,
             i18n,
             host_center,
@@ -65,8 +76,11 @@ impl OcHerdrView {
             persist_task: None,
         };
         let host = cx.weak_entity();
-        bind_enter_submit(&view.rename_input, host, cx, |this, window, cx| {
+        bind_enter_submit(&view.rename_input, host.clone(), cx, |this, window, cx| {
             this.submit_rename(window, cx);
+        });
+        bind_enter_submit(&view.worktree_label_input, host, cx, |this, window, cx| {
+            this.submit_worktree_create(window, cx)
         });
         view.reload(None, cx);
         if let Some(notice) = missing_theme_notice(&view.appearance.theme_family, view.i18n) {
@@ -118,6 +132,7 @@ impl OcHerdrView {
         self.event_stream = EventStreamState::Idle;
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
+        self.abandon_worktree_list();
         let epoch = self.load_epoch;
         let profile = self.current_profile();
         self.operation = Some(self.i18n.text(k::NOTIFY_DISCOVERING).into());
@@ -156,6 +171,7 @@ impl OcHerdrView {
                 if this.load_epoch != epoch {
                     return;
                 }
+                this.abandon_worktree_list();
                 this.operation = None;
                 match loaded {
                     Ok(loaded) => {
@@ -216,6 +232,7 @@ impl OcHerdrView {
         self.event_listen = None;
         self.snapshot = None;
         self.session_panes = None;
+        self.abandon_worktree_list();
         self.reload(None, cx);
     }
 
@@ -425,7 +442,15 @@ impl OcHerdrView {
         }
     }
 
+    fn abandon_worktree_list(&mut self) {
+        self.worktree_list_task = None;
+        self.overlay = overlay_after_abandoning_worktree_list(self.overlay.clone());
+    }
+
     fn set_overlay(&mut self, overlay: Overlay, cx: &mut Context<Self>) {
+        if !matches!(overlay, Overlay::WorktreeOpen(_)) {
+            self.worktree_list_task = None;
+        }
         let leaving_host_center = self.overlay.host_center() && !overlay.host_center();
         let form = match overlay {
             Overlay::RemoteForm(form) => Some(form),
@@ -492,6 +517,7 @@ impl OcHerdrView {
             ),
             Some(items) => {
                 let Some(snapshot) = self.snapshot.as_mut() else {
+                    self.abandon_worktree_list();
                     return false;
                 };
                 let mut items = items.into_iter();
@@ -503,6 +529,12 @@ impl OcHerdrView {
             }
         };
         let effects = effects_for(&action);
+        if effects.abandon_worktree_list {
+            self.abandon_worktree_list();
+        }
+        if worktree_open_target_is_missing(&self.overlay, self.snapshot.as_ref()) {
+            self.abandon_worktree_list();
+        }
         if let Some(error) = effects.error {
             self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
         }
@@ -575,6 +607,9 @@ impl OcHerdrView {
                             .map(snapshot_pane_ids)
                             .unwrap_or_default();
                         this.snapshot = Some(snapshot);
+                        if worktree_open_target_is_missing(&this.overlay, this.snapshot.as_ref()) {
+                            this.abandon_worktree_list();
+                        }
                         if let Some(snapshot) = &this.snapshot {
                             this.selection.reconcile(snapshot);
                             let closed_stream =
@@ -851,6 +886,18 @@ impl OcHerdrView {
         self.rename_input.update(cx, |input, cx| {
             input.set_placeholder(self.i18n.text(k::COMMON_NAME), cx)
         });
+        self.worktree_label_input.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text(k::WORKTREE_FIELD_LABEL_HINT), cx)
+        });
+        self.worktree_branch_input.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text(k::WORKTREE_FIELD_BRANCH_HINT), cx)
+        });
+        self.worktree_base_input.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text(k::WORKTREE_FIELD_BASE_HINT), cx)
+        });
+        self.worktree_path_input.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text(k::WORKTREE_FIELD_PATH_HINT), cx)
+        });
         self.persist_settings(FailureKind::SaveLanguage, cx);
         cx.notify();
     }
@@ -897,6 +944,11 @@ impl OcHerdrView {
         match (self.overlay.clone(), confirm) {
             (Overlay::ConfirmClose(_), true) => self.confirm_close(cx),
             (Overlay::ConfirmClose(_), false) => self.cancel_close(cx),
+            (Overlay::ConfirmRemoveWorktree { .. }, true) => self.confirm_remove_worktree(cx),
+            (Overlay::ConfirmRemoveWorktree { .. }, false) => self.cancel_remove_worktree(cx),
+            (Overlay::WorktreeCreate { .. }, true) => self.submit_worktree_create(window, cx),
+            (Overlay::WorktreeCreate { .. }, false) => self.close_worktree_overlay(window, cx),
+            (Overlay::WorktreeOpen(_), false) => self.close_worktree_overlay(window, cx),
             (Overlay::ConfirmRemoveProfile(_), true) => self.confirm_remove_node(cx),
             (Overlay::ConfirmRemoveProfile(_), false) => self.cancel_remove_node(cx),
             (Overlay::ConfirmBulkRemove, true) => self.confirm_bulk_remove(cx),
@@ -1038,6 +1090,7 @@ impl OcHerdrView {
             }
             return;
         }
+        self.abandon_worktree_list();
         self.session_index = Some(index);
         self.reload(Some(session.name), cx);
     }
@@ -1567,6 +1620,297 @@ impl OcHerdrView {
         self.invoke("workspace.create", json!({ "focus": true, "env": {} }), cx);
     }
 
+    pub(super) fn open_worktree_create_for_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.source_workspace_id() {
+            Some(workspace_id) => self.open_worktree_create(workspace_id, window, cx),
+            None => self.notify_need_workspace(cx),
+        }
+    }
+
+    pub(super) fn open_worktree_picker_for_selection(&mut self, cx: &mut Context<Self>) {
+        match self.source_workspace_id() {
+            Some(workspace_id) => self.open_worktree_picker(workspace_id, cx),
+            None => self.notify_need_workspace(cx),
+        }
+    }
+
+    /// `workspace_id` is the workspace the user pointed at (sidebar selection
+    /// or the right-clicked row), not "whatever is selected at submit time".
+    pub(super) fn open_worktree_create(
+        &mut self,
+        workspace_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace(&workspace_id).is_none() {
+            self.notify_need_workspace(cx);
+            return;
+        }
+        self.clear_worktree_create_fields(cx);
+        self.set_overlay(
+            Overlay::WorktreeCreate {
+                workspace_id,
+                advanced: false,
+            },
+            cx,
+        );
+        self.worktree_label_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+    }
+
+    pub(super) fn toggle_worktree_create_advanced(&mut self, cx: &mut Context<Self>) {
+        let Overlay::WorktreeCreate { advanced, .. } = &mut self.overlay else {
+            return;
+        };
+        *advanced = !*advanced;
+        cx.notify();
+    }
+
+    pub(super) fn submit_worktree_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::WorktreeCreate { workspace_id, .. } = &self.overlay else {
+            return;
+        };
+        let Some(workspace) = self.workspace(workspace_id).cloned() else {
+            self.notify_need_workspace(cx);
+            return;
+        };
+        let label = self.worktree_label_input.read(cx).content();
+        let branch = self.worktree_branch_input.read(cx).content();
+        let base = self.worktree_base_input.read(cx).content();
+        let path = self.worktree_path_input.read(cx).content();
+        let params = worktree_create_params(
+            &workspace,
+            label.as_ref(),
+            branch.as_ref(),
+            base.as_ref(),
+            path.as_ref(),
+        );
+        self.set_overlay(Overlay::None, cx);
+        self.focus.focus(window, cx);
+        self.invoke("worktree.create", params, cx);
+    }
+
+    pub(super) fn open_worktree_picker(&mut self, workspace_id: String, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace(&workspace_id).cloned() else {
+            self.notify_need_workspace(cx);
+            return;
+        };
+        let Some(owner) = self.current_session_key() else {
+            self.notify_need_workspace(cx);
+            return;
+        };
+        let params = Value::Object(worktree_repo_params(&workspace));
+        self.set_overlay(
+            Overlay::WorktreeOpen(WorktreeOpenState::Loading {
+                owner: owner.clone(),
+                workspace_id: workspace_id.clone(),
+            }),
+            cx,
+        );
+        self.fetch_worktree_list(owner, workspace_id, params, cx);
+    }
+
+    pub(super) fn open_listed_worktree(&mut self, path: String, cx: &mut Context<Self>) {
+        let Overlay::WorktreeOpen(WorktreeOpenState::Ready { source, .. }) = &self.overlay else {
+            return;
+        };
+        let params = worktree_open_params(source, &path);
+        self.set_overlay(Overlay::None, cx);
+        self.invoke("worktree.open", params, cx);
+    }
+
+    pub(super) fn request_remove_worktree(&mut self, workspace_id: String, cx: &mut Context<Self>) {
+        let Some(label) = self.workspace_label(&workspace_id) else {
+            return;
+        };
+        self.set_overlay(
+            Overlay::ConfirmRemoveWorktree {
+                workspace_id,
+                label,
+                prompt: RemoveWorktreePrompt::Safe,
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn cancel_remove_worktree(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Overlay::ConfirmRemoveWorktree { .. }) {
+            self.set_overlay(Overlay::None, cx);
+        }
+    }
+
+    pub(super) fn confirm_remove_worktree(&mut self, cx: &mut Context<Self>) {
+        let Overlay::ConfirmRemoveWorktree {
+            workspace_id,
+            prompt,
+            ..
+        } = &self.overlay
+        else {
+            return;
+        };
+        let params = worktree_remove_params(
+            workspace_id,
+            matches!(prompt, RemoveWorktreePrompt::Force { .. }),
+        );
+        self.set_overlay(Overlay::None, cx);
+        self.invoke("worktree.remove", params, cx);
+    }
+
+    pub(super) fn close_worktree_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.overlay,
+            Overlay::WorktreeCreate { .. } | Overlay::WorktreeOpen(_)
+        ) {
+            self.set_overlay(Overlay::None, cx);
+        }
+        self.focus.focus(window, cx);
+    }
+
+    fn source_workspace_id(&self) -> Option<String> {
+        self.source_workspace()
+            .map(|workspace| workspace.workspace_id.clone())
+    }
+
+    fn source_workspace(&self) -> Option<&WorkspaceInfo> {
+        let snapshot = self.snapshot.as_ref()?;
+        let id = self
+            .selection
+            .workspace_id
+            .as_deref()
+            .or(snapshot.focused_workspace_id.as_deref())?;
+        self.workspace(id)
+    }
+
+    fn workspace(&self, workspace_id: &str) -> Option<&WorkspaceInfo> {
+        self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+        })
+    }
+
+    fn current_session_key(&self) -> Option<SessionKey> {
+        Some(SessionKey {
+            profile_id: self.current_profile().id().to_owned(),
+            session_name: self.current_session()?.name.clone(),
+        })
+    }
+
+    fn workspace_label(&self, workspace_id: &str) -> Option<String> {
+        self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .map(|workspace| workspace.label.clone())
+        })
+    }
+
+    fn notify_need_workspace(&mut self, cx: &mut Context<Self>) {
+        self.post_notice(
+            FailureNotice {
+                level: ochub_ui::notifications::NotificationLevel::Warning,
+                title: self.i18n.text(k::WORKTREE_NEW).to_owned(),
+                message: self.i18n.text(k::WORKTREE_NEED_WORKSPACE).to_owned(),
+            },
+            cx,
+        );
+    }
+
+    fn clear_worktree_create_fields(&mut self, cx: &mut Context<Self>) {
+        for input in [
+            &self.worktree_label_input,
+            &self.worktree_branch_input,
+            &self.worktree_base_input,
+            &self.worktree_path_input,
+        ] {
+            input.update(cx, |input, cx| input.set_content("", cx));
+        }
+    }
+
+    fn fetch_worktree_list(
+        &mut self,
+        owner: SessionKey,
+        workspace_id: String,
+        params: Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = &self.connection else {
+            self.abandon_worktree_list();
+            return;
+        };
+        let socket = connection.socket_path().to_owned();
+        self.worktree_list_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { request_socket(&socket, "worktree.list", params) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.worktree_list_task = None;
+                if !worktree_list_applies(
+                    &this.overlay,
+                    this.current_session_key().as_ref(),
+                    &workspace_id,
+                    &owner,
+                    this.snapshot.as_ref(),
+                ) {
+                    return;
+                }
+                this.overlay = Overlay::WorktreeOpen(match result {
+                    Ok(value) => match serde_json::from_value::<WorktreeList>(value) {
+                        Ok(list) => WorktreeOpenState::Ready {
+                            source: list.source,
+                            worktrees: list
+                                .worktrees
+                                .into_iter()
+                                .filter(WorktreeInfo::is_openable)
+                                .collect(),
+                        },
+                        Err(error) => WorktreeOpenState::Failed {
+                            error: error.to_string(),
+                        },
+                    },
+                    Err(error) => WorktreeOpenState::Failed {
+                        error: error.to_string(),
+                    },
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn maybe_offer_force_remove_worktree(
+        &mut self,
+        params: &Value,
+        error: &HerdrError,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_id) = dirty_worktree_remove_offer("worktree.remove", params, error)
+        else {
+            return;
+        };
+        let Some(label) = self.workspace_label(&workspace_id) else {
+            return;
+        };
+        self.set_overlay(
+            Overlay::ConfirmRemoveWorktree {
+                workspace_id,
+                label,
+                prompt: RemoveWorktreePrompt::Force {
+                    error: error.to_string(),
+                },
+            },
+            cx,
+        );
+    }
+
     pub(super) fn create_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(workspace_id) = self.selection.workspace_id.clone() {
             self.invoke(
@@ -1715,8 +2059,15 @@ impl OcHerdrView {
                 self.focus.focus(window, cx);
                 return true;
             }
-            if matches!(self.overlay, Overlay::ConfirmClose(_)) {
+            if matches!(
+                self.overlay,
+                Overlay::ConfirmClose(_)
+                    | Overlay::ConfirmRemoveWorktree { .. }
+                    | Overlay::WorktreeCreate { .. }
+                    | Overlay::WorktreeOpen(_)
+            ) {
                 self.set_overlay(Overlay::None, cx);
+                self.focus.focus(window, cx);
                 return true;
             }
         }
@@ -2026,9 +2377,10 @@ impl OcHerdrView {
         self.operation = Some(self.i18n.running_operation(method).into());
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(
-                    async move { request_socket(&socket, method, params).map(|_| ()) },
-                )
+                .background_spawn({
+                    let params = params.clone();
+                    async move { request_socket(&socket, method, params).map(|_| ()) }
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.operation = None;
@@ -2038,7 +2390,10 @@ impl OcHerdrView {
                             this.resync_snapshot(this.event_epoch, cx);
                         }
                     }
-                    Err(error) => this.notify_command_failure(method, error, cx),
+                    Err(error) => {
+                        this.maybe_offer_force_remove_worktree(&params, &error, cx);
+                        this.notify_command_failure(method, error, cx);
+                    }
                 }
                 cx.notify();
             })
@@ -2264,6 +2619,138 @@ fn command_needs_snapshot_resync(method: &str) -> bool {
     matches!(method, "pane.rename" | "pane.close")
 }
 
+fn worktree_repo_params(workspace: &WorkspaceInfo) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    match workspace.worktree.as_ref() {
+        Some(worktree) if worktree.is_linked_worktree => {
+            params.insert("cwd".into(), json!(worktree.repo_root));
+        }
+        _ => {
+            params.insert("workspace_id".into(), json!(workspace.workspace_id));
+        }
+    }
+    params
+}
+
+fn worktree_create_params(
+    workspace: &WorkspaceInfo,
+    label: &str,
+    branch: &str,
+    base: &str,
+    path: &str,
+) -> Value {
+    let mut params = worktree_repo_params(workspace);
+    params.insert("focus".into(), json!(true));
+    for (key, value) in [
+        ("label", label),
+        ("branch", branch),
+        ("base", base),
+        ("path", path),
+    ] {
+        let value = value.trim();
+        if !value.is_empty() {
+            params.insert(key.into(), json!(value));
+        }
+    }
+    Value::Object(params)
+}
+
+fn overlay_after_abandoning_worktree_list(overlay: Overlay) -> Overlay {
+    if matches!(overlay, Overlay::WorktreeOpen(_)) {
+        Overlay::None
+    } else {
+        overlay
+    }
+}
+
+fn snapshot_contains_workspace(snapshot: Option<&HierarchySnapshot>, workspace_id: &str) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.workspace_id == workspace_id)
+    })
+}
+
+/// Workspace this picker was opened from. `worktree.open` still sends that id
+/// when Herdr returned it, so a missing workspace makes the list unusable.
+fn worktree_open_target_id(overlay: &Overlay) -> Option<&str> {
+    match overlay {
+        Overlay::WorktreeOpen(WorktreeOpenState::Loading { workspace_id, .. }) => {
+            Some(workspace_id.as_str())
+        }
+        Overlay::WorktreeOpen(WorktreeOpenState::Ready { source, .. }) => {
+            source.source_workspace_id.as_deref()
+        }
+        _ => None,
+    }
+}
+
+fn worktree_open_target_is_missing(
+    overlay: &Overlay,
+    snapshot: Option<&HierarchySnapshot>,
+) -> bool {
+    worktree_open_target_id(overlay)
+        .is_some_and(|workspace_id| !snapshot_contains_workspace(snapshot, workspace_id))
+}
+
+fn worktree_list_applies(
+    overlay: &Overlay,
+    live_session: Option<&SessionKey>,
+    fetched_workspace_id: &str,
+    fetched_session: &SessionKey,
+    snapshot: Option<&HierarchySnapshot>,
+) -> bool {
+    let Overlay::WorktreeOpen(WorktreeOpenState::Loading {
+        owner,
+        workspace_id,
+    }) = overlay
+    else {
+        return false;
+    };
+    live_session == Some(fetched_session)
+        && owner == fetched_session
+        && workspace_id == fetched_workspace_id
+        && snapshot_contains_workspace(snapshot, fetched_workspace_id)
+}
+
+fn worktree_open_params(source: &WorktreeSourceInfo, path: &str) -> Value {
+    let mut params = json!({ "path": path, "focus": true });
+    if let Some(workspace_id) = source.source_workspace_id.as_deref() {
+        params["workspace_id"] = json!(workspace_id);
+    } else {
+        params["cwd"] = json!(source.repo_root);
+    }
+    params
+}
+
+fn worktree_remove_params(workspace_id: &str, force: bool) -> Value {
+    if force {
+        json!({ "workspace_id": workspace_id, "force": true })
+    } else {
+        json!({ "workspace_id": workspace_id })
+    }
+}
+
+fn dirty_worktree_remove_offer(method: &str, params: &Value, error: &HerdrError) -> Option<String> {
+    if method != "worktree.remove" {
+        return None;
+    }
+    if params.get("force").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let HerdrError::Api { code, .. } = error else {
+        return None;
+    };
+    if code != "dirty_worktree_requires_force" {
+        return None;
+    }
+    params
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum EventPollAction {
     /// Replace Live with Lost. A dead stream has nothing left to poll.
@@ -2281,6 +2768,9 @@ struct PollEffects {
     apply_local: bool,
     notify: bool,
     reschedule: bool,
+    /// Drop `worktree_list_task` and its Loading overlay. A dead stream
+    /// keeps the same session id, so the list callback would otherwise apply.
+    abandon_worktree_list: bool,
     error: Option<SharedString>,
 }
 
@@ -2291,6 +2781,7 @@ fn effects_for(action: &EventPollAction) -> PollEffects {
             apply_local: false,
             notify: true,
             reschedule: false,
+            abandon_worktree_list: true,
             error: None,
         },
         EventPollAction::Idle => PollEffects {
@@ -2298,6 +2789,7 @@ fn effects_for(action: &EventPollAction) -> PollEffects {
             apply_local: false,
             notify: false,
             reschedule: true,
+            abandon_worktree_list: false,
             error: None,
         },
         EventPollAction::Applied => PollEffects {
@@ -2305,6 +2797,7 @@ fn effects_for(action: &EventPollAction) -> PollEffects {
             apply_local: true,
             notify: true,
             reschedule: true,
+            abandon_worktree_list: false,
             error: None,
         },
         EventPollAction::Resync { error } => PollEffects {
@@ -2312,6 +2805,7 @@ fn effects_for(action: &EventPollAction) -> PollEffects {
             apply_local: false,
             notify: false,
             reschedule: true,
+            abandon_worktree_list: false,
             error: error.clone(),
         },
     }
@@ -2807,6 +3301,10 @@ fn encode_alt_edit_bytes(key: &str, key_char: Option<&str>) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use ocherdr_core::WorkspaceWorktreeInfo;
+
     use super::*;
 
     fn persist_notice(kind: FailureKind) -> SettingsPersist {
@@ -3228,12 +3726,272 @@ mod tests {
             "pane.split",
             "pane.zoom",
             "pane.focus_direction",
+            "worktree.create",
+            "worktree.open",
+            "worktree.remove",
         ] {
             assert!(
                 !command_needs_snapshot_resync(method),
                 "{method} is pushed back as an event and must not reload the snapshot"
             );
         }
+    }
+
+    fn sample_workspace(id: &str, worktree: Option<WorkspaceWorktreeInfo>) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: id.into(),
+            number: 1,
+            label: id.into(),
+            focused: true,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: format!("{id}:t1"),
+            agent_status: AgentStatus::Idle,
+            tokens: HashMap::new(),
+            worktree,
+        }
+    }
+
+    #[test]
+    fn worktree_create_params_omit_empty_optionals_and_focus() {
+        let workspace = sample_workspace("w1", None);
+        let params = worktree_create_params(&workspace, "  ", "", " HEAD ", "");
+        assert_eq!(params["workspace_id"], "w1");
+        assert_eq!(params["focus"], true);
+        assert_eq!(params["base"], "HEAD");
+        assert!(params.get("label").is_none());
+        assert!(params.get("branch").is_none());
+        assert!(params.get("path").is_none());
+        assert!(params.get("force").is_none());
+    }
+
+    #[test]
+    fn worktree_repo_params_use_parent_cwd_for_linked_checkouts() {
+        let parent = sample_workspace("w1", None);
+        assert_eq!(
+            Value::Object(worktree_repo_params(&parent)),
+            json!({ "workspace_id": "w1" })
+        );
+
+        let linked = sample_workspace(
+            "w2",
+            Some(WorkspaceWorktreeInfo {
+                repo_key: "/repo/.git".into(),
+                repo_name: "repo".into(),
+                repo_root: "/repo".into(),
+                checkout_path: "/worktrees/repo/feature".into(),
+                is_linked_worktree: true,
+            }),
+        );
+        assert_eq!(
+            Value::Object(worktree_repo_params(&linked)),
+            json!({ "cwd": "/repo" })
+        );
+    }
+
+    #[test]
+    fn worktree_remove_omits_force_unless_the_user_asked() {
+        assert_eq!(
+            worktree_remove_params("w1", false),
+            json!({ "workspace_id": "w1" })
+        );
+        assert_eq!(
+            worktree_remove_params("w1", true),
+            json!({ "workspace_id": "w1", "force": true })
+        );
+    }
+
+    #[test]
+    fn dirty_remove_offers_force_only_for_the_safe_remove_error() {
+        let params = json!({ "workspace_id": "w1" });
+        let dirty = HerdrError::Api {
+            code: "dirty_worktree_requires_force".into(),
+            message: "uncommitted changes".into(),
+        };
+        assert_eq!(
+            dirty_worktree_remove_offer("worktree.remove", &params, &dirty).as_deref(),
+            Some("w1")
+        );
+        assert_eq!(
+            dirty_worktree_remove_offer(
+                "worktree.remove",
+                &json!({ "workspace_id": "w1", "force": true }),
+                &dirty
+            ),
+            None
+        );
+        assert_eq!(
+            dirty_worktree_remove_offer("worktree.create", &params, &dirty),
+            None
+        );
+        assert_eq!(
+            dirty_worktree_remove_offer(
+                "worktree.remove",
+                &params,
+                &HerdrError::Api {
+                    code: "not_git_worktree".into(),
+                    message: "nope".into(),
+                }
+            ),
+            None
+        );
+    }
+
+    fn sample_session(name: &str) -> SessionKey {
+        SessionKey {
+            profile_id: "local".into(),
+            session_name: name.into(),
+        }
+    }
+
+    fn snapshot_with_workspace(id: &str) -> HierarchySnapshot {
+        HierarchySnapshot {
+            workspaces: vec![sample_workspace(id, None)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn worktree_list_result_is_ignored_after_the_session_changes() {
+        let session_a = sample_session("alpha");
+        let session_b = sample_session("beta");
+        let loading = Overlay::WorktreeOpen(WorktreeOpenState::Loading {
+            owner: session_a.clone(),
+            workspace_id: "w1".into(),
+        });
+        let present = snapshot_with_workspace("w1");
+        assert!(worktree_list_applies(
+            &loading,
+            Some(&session_a),
+            "w1",
+            &session_a,
+            Some(&present),
+        ));
+        assert!(!worktree_list_applies(
+            &loading,
+            Some(&session_b),
+            "w1",
+            &session_a,
+            Some(&present),
+        ));
+        assert!(!worktree_list_applies(
+            &loading,
+            Some(&session_a),
+            "w2",
+            &session_a,
+            Some(&present),
+        ));
+        assert!(!worktree_list_applies(
+            &Overlay::None,
+            Some(&session_a),
+            "w1",
+            &session_a,
+            Some(&present),
+        ));
+    }
+
+    #[test]
+    fn worktree_list_result_is_ignored_after_the_target_workspace_is_gone() {
+        let session = sample_session("alpha");
+        let loading = Overlay::WorktreeOpen(WorktreeOpenState::Loading {
+            owner: session.clone(),
+            workspace_id: "w1".into(),
+        });
+        let present = snapshot_with_workspace("w1");
+        let gone = HierarchySnapshot::default();
+        assert!(
+            worktree_list_applies(&loading, Some(&session), "w1", &session, Some(&present)),
+            "a still-open target workspace must still accept the list"
+        );
+        assert!(
+            !worktree_list_applies(&loading, Some(&session), "w1", &session, Some(&gone)),
+            "injecting a list result after workspace.closed / matching worktree.removed / resync dropped the target must fail this test"
+        );
+        assert!(
+            !worktree_list_applies(&loading, Some(&session), "w1", &session, None),
+            "no snapshot means the target workspace is not known to still exist"
+        );
+        assert!(
+            worktree_open_target_is_missing(&loading, Some(&gone)),
+            "gate 1 (event/resync) must drop Loading when the pointed-at workspace is gone"
+        );
+        assert!(!worktree_open_target_is_missing(&loading, Some(&present)));
+        let ready_bound = Overlay::WorktreeOpen(WorktreeOpenState::Ready {
+            source: WorktreeSourceInfo {
+                repo_key: "/repo/.git".into(),
+                repo_name: "repo".into(),
+                repo_root: "/repo".into(),
+                source_checkout_path: "/repo".into(),
+                source_workspace_id: Some("w1".into()),
+            },
+            worktrees: Vec::new(),
+        });
+        assert!(worktree_open_target_is_missing(&ready_bound, Some(&gone)));
+        let ready_by_repo = Overlay::WorktreeOpen(WorktreeOpenState::Ready {
+            source: WorktreeSourceInfo {
+                repo_key: "/repo/.git".into(),
+                repo_name: "repo".into(),
+                repo_root: "/repo".into(),
+                source_checkout_path: "/repo".into(),
+                source_workspace_id: None,
+            },
+            worktrees: Vec::new(),
+        });
+        assert!(
+            !worktree_open_target_is_missing(&ready_by_repo, Some(&gone)),
+            "a cwd-only list is not bound to a workspace id"
+        );
+    }
+
+    #[test]
+    fn disconnecting_the_event_stream_abandons_an_in_flight_worktree_list() {
+        let action = poll_event_stream(&mut HierarchySnapshot::default(), || {
+            Err(HerdrError::EventStreamClosed("event worker stopped".into()))
+        });
+        assert!(
+            effects_for(&action).abandon_worktree_list,
+            "injecting Disconnect without dropping worktree_list_task must fail this test"
+        );
+        let loading = Overlay::WorktreeOpen(WorktreeOpenState::Loading {
+            owner: sample_session("alpha"),
+            workspace_id: "w1".into(),
+        });
+        assert!(
+            matches!(
+                overlay_after_abandoning_worktree_list(loading),
+                Overlay::None
+            ),
+            "disconnect must clear the Loading overlay, not leave it for a stale list result"
+        );
+        assert!(!effects_for(&EventPollAction::Applied).abandon_worktree_list);
+        assert!(!effects_for(&EventPollAction::Idle).abandon_worktree_list);
+        assert!(!effects_for(&EventPollAction::Resync { error: None }).abandon_worktree_list);
+        let closed_worker = EventPollAction::Disconnect("event worker stopped".into());
+        assert!(effects_for(&closed_worker).abandon_worktree_list);
+    }
+
+    #[test]
+    fn abandoning_a_session_clears_only_the_worktree_open_overlay() {
+        let loading = Overlay::WorktreeOpen(WorktreeOpenState::Loading {
+            owner: sample_session("alpha"),
+            workspace_id: "w1".into(),
+        });
+        assert!(matches!(
+            overlay_after_abandoning_worktree_list(loading),
+            Overlay::None
+        ));
+        assert!(matches!(
+            overlay_after_abandoning_worktree_list(Overlay::Appearance),
+            Overlay::Appearance
+        ));
+        let create = Overlay::WorktreeCreate {
+            workspace_id: "w1".into(),
+            advanced: false,
+        };
+        assert!(matches!(
+            overlay_after_abandoning_worktree_list(create),
+            Overlay::WorktreeCreate { .. }
+        ));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
     AgentStatus, ConnectionProfile, HerdrEvent, HierarchySnapshot, PaneInfo, Selection,
-    SessionSummary, SnapshotUpdate, SplitDirection,
+    SessionSummary, SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -646,6 +646,12 @@ struct OcHerdrView {
     text_drag_pane: Option<String>,
     ime_marked: Option<String>,
     rename_input: Entity<TextInput>,
+    worktree_label_input: Entity<TextInput>,
+    worktree_branch_input: Entity<TextInput>,
+    worktree_base_input: Entity<TextInput>,
+    worktree_path_input: Entity<TextInput>,
+    /// Dropping this cancels an in-flight `worktree.list`.
+    worktree_list_task: Option<Task<()>>,
     appearance: AppearanceSettings,
     i18n: I18n,
     host_center: Entity<HostCenter>,
@@ -679,9 +685,43 @@ enum Overlay {
     ContextMenu(HierarchyContextMenu),
     Rename(HierarchyTarget),
     ConfirmClose(HierarchyTarget),
+    ConfirmRemoveWorktree {
+        workspace_id: String,
+        label: String,
+        prompt: RemoveWorktreePrompt,
+    },
+    WorktreeCreate {
+        workspace_id: String,
+        advanced: bool,
+    },
+    WorktreeOpen(WorktreeOpenState),
     ConfirmRemoveProfile(String),
-    ConfirmSwitchProfile { id: String, from_hosts: bool },
+    ConfirmSwitchProfile {
+        id: String,
+        from_hosts: bool,
+    },
     ConfirmBulkRemove,
+}
+
+#[derive(Clone, Debug)]
+enum RemoveWorktreePrompt {
+    Safe,
+    Force { error: String },
+}
+
+#[derive(Clone, Debug)]
+enum WorktreeOpenState {
+    Loading {
+        owner: SessionKey,
+        workspace_id: String,
+    },
+    Ready {
+        source: WorktreeSourceInfo,
+        worktrees: Vec<WorktreeInfo>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 impl Overlay {
@@ -1322,6 +1362,22 @@ mod tests {
             }),
             Overlay::Rename(target.clone()),
             Overlay::ConfirmClose(target),
+            Overlay::ConfirmRemoveWorktree {
+                workspace_id: "w1".into(),
+                label: "feature".into(),
+                prompt: RemoveWorktreePrompt::Safe,
+            },
+            Overlay::WorktreeCreate {
+                workspace_id: "w1".into(),
+                advanced: false,
+            },
+            Overlay::WorktreeOpen(WorktreeOpenState::Loading {
+                owner: SessionKey {
+                    profile_id: "local".into(),
+                    session_name: "default".into(),
+                },
+                workspace_id: "w1".into(),
+            }),
             Overlay::ConfirmRemoveProfile("manual-1".into()),
             Overlay::ConfirmSwitchProfile {
                 id: "local".into(),

@@ -63,13 +63,23 @@ impl OcHerdrView {
                     label: row.a11y.name.clone(),
                 };
                 let selected = row.a11y.selected == Some(true);
+                let linked = row
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|info| info.is_linked_worktree);
+                let affiliation = row.worktree.as_ref().map(|info| info.affiliation_label());
                 tree_row(
                     ("workspace", row.number),
                     &row.a11y,
                     12.,
-                    IconName::Folder,
+                    if linked {
+                        IconName::Layers
+                    } else {
+                        IconName::Folder
+                    },
                     selected,
                     status_color(row.agent_status),
+                    affiliation.as_deref(),
                 )
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     this.select_workspace(workspace_id.clone(), cx)
@@ -203,6 +213,46 @@ impl OcHerdrView {
                             .on_click(cx.listener(|this, _, _window, cx| this.create_workspace(cx)))
                             .child(icon(IconName::Add, theme::muted(), 12.))
                             .child(i18n.text(k::TERMINAL_NEW_WORKSPACE_SHORT)),
+                    )
+                    .child(
+                        apply_control(div().id("new-worktree"), &chrome.new_worktree)
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(30.))
+                            .px_3()
+                            .rounded(px(CORNER_COMPACT))
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .hover(|style| {
+                                style.bg(theme::surface_hover()).text_color(theme::text())
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_worktree_create_for_selection(window, cx)
+                            }))
+                            .child(icon(IconName::Layers, theme::muted(), 12.))
+                            .child(i18n.text(k::WORKTREE_NEW_SHORT)),
+                    )
+                    .child(
+                        apply_control(div().id("open-worktree"), &chrome.open_worktree)
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(30.))
+                            .px_3()
+                            .rounded(px(CORNER_COMPACT))
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .hover(|style| {
+                                style.bg(theme::surface_hover()).text_color(theme::text())
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.open_worktree_picker_for_selection(cx)
+                            }))
+                            .child(icon(IconName::Folder, theme::muted(), 12.))
+                            .child(i18n.text(k::WORKTREE_OPEN_SHORT)),
                     ),
             )
             .child(
@@ -833,6 +883,7 @@ fn tree_row(
     icon_name: IconName,
     selected: bool,
     color: ochub_ui::gpui::Rgba,
+    affiliation: Option<&str>,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
     apply_control(div().id(id), control)
         .flex()
@@ -867,6 +918,17 @@ fn tree_row(
                 .text_color(theme::sidebar_text())
                 .child(control.name.clone()),
         )
+        .when_some(affiliation, |row, text| {
+            row.child(
+                div()
+                    .flex_none()
+                    .max_w(px(108.))
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(text.to_owned()),
+            )
+        })
         .child(status_dot(color))
 }
 

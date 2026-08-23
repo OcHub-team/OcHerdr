@@ -76,6 +76,15 @@ impl Render for OcHerdrView {
             Overlay::ConfirmClose(target) => {
                 root = root.child(self.render_close_target(&target, cx));
             }
+            Overlay::ConfirmRemoveWorktree { label, prompt, .. } => {
+                root = root.child(self.render_remove_worktree(&label, &prompt, cx));
+            }
+            Overlay::WorktreeCreate { advanced, .. } => {
+                root = root.child(self.render_worktree_create(advanced, cx));
+            }
+            Overlay::WorktreeOpen(state) => {
+                root = root.child(self.render_worktree_open(&state, cx));
+            }
             Overlay::Rename(target) => {
                 root = root.child(self.render_rename(&target, cx));
             }
