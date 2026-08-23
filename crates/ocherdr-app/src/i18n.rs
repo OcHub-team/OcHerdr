@@ -84,9 +84,14 @@ impl I18n {
             Language::English => Locale::English,
             Language::SimplifiedChinese => Locale::SimplifiedChinese,
         };
-        let i18n = Self { preference, locale };
-        i18n.install_component_locale();
-        i18n
+        Self { preference, locale }
+    }
+
+    /// Set ochub-ui's global locale. Call at startup before the component
+    /// registry is installed; `set_preference` calls this when the user
+    /// changes language.
+    pub(crate) fn install(preference: Language) {
+        Self::new(preference).install_component_locale();
     }
 
     pub(crate) const fn preference(self) -> Language {
@@ -95,6 +100,7 @@ impl I18n {
 
     pub(crate) fn set_preference(&mut self, preference: Language) {
         *self = Self::new(preference);
+        self.install_component_locale();
     }
 
     fn install_component_locale(self) {

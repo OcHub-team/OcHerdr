@@ -45,6 +45,8 @@ impl Render for OcHerdrView {
                 if !key_goes_to_terminal(&this.overlay) {
                     return;
                 }
+                // #terminal-surface also calls send_key. Duplicate dispatch is
+                // GPUI bubbling: send_key stops propagation after handling.
                 this.send_key(event, window, cx);
             }))
             .child(body);

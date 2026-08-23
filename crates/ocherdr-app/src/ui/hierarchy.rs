@@ -768,6 +768,9 @@ impl OcHerdrView {
             .focusable()
             .tab_stop(true)
             .track_focus(&self.focus)
+            // Focused descendant of the root on_key_down. send_key stops
+            // propagation after handling, so the same keystroke is not
+            // dispatched twice on the bubble path.
             .on_key_down(cx.listener(|this, event, window, cx| this.send_key(event, window, cx)))
             .on_mouse_move(cx.listener(|this, event, window, cx| {
                 this.pane_mouse_move(event, window, cx);

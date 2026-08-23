@@ -11,7 +11,7 @@ use super::*;
 use crate::notify::{FailureKind, FailureNotice, command_notification, notification_for};
 
 impl OcHerdrView {
-    pub(super) fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let i18n = I18n::new(settings.language);
         let appearance = settings.appearance.clone();
         let focus = cx.focus_handle();
@@ -19,6 +19,15 @@ impl OcHerdrView {
         let profiles = host_center.read(cx).profiles().to_vec();
         cx.subscribe(&host_center, |this, _center, event, cx| {
             this.handle_host_center_event(event.clone(), cx);
+        })
+        .detach();
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if this.appearance.mode != AppearanceMode::System {
+                return;
+            }
+            install_appearance(&this.appearance, window.appearance());
+            theme::apply_window_background(window);
+            cx.refresh_windows();
         })
         .detach();
         let mut view = Self {
@@ -52,6 +61,8 @@ impl OcHerdrView {
             appearance,
             i18n,
             host_center,
+            pending_persist: None,
+            persist_task: None,
         };
         let host = cx.weak_entity();
         bind_enter_submit(&view.rename_input, host, cx, |this, window, cx| {
@@ -213,53 +224,140 @@ impl OcHerdrView {
         }
     }
 
-    fn persist_settings(&self, cx: &App) -> std::result::Result<(), String> {
-        crate::host_center::persist_assembled_settings(
+    fn persist_settings(&mut self, kind: FailureKind, cx: &mut Context<Self>) {
+        self.queue_settings_persist(
+            SettingsPersist {
+                error: Some(kind),
+                host: None,
+                rollback: None,
+            },
+            cx,
+        );
+    }
+
+    fn queue_settings_persist(&mut self, request: SettingsPersist, cx: &mut Context<Self>) {
+        if let Some(request) = enqueue_settings_persist(
+            &mut self.pending_persist,
+            self.persist_task.is_some(),
+            request,
+        ) {
+            self.spawn_settings_persist(request, cx);
+        }
+    }
+
+    fn spawn_settings_persist(&mut self, request: SettingsPersist, cx: &mut Context<Self>) {
+        let settings = crate::host_center::assemble_settings(
             &self.host_center.read(cx).persist_state(),
-            &self.appearance,
+            self.appearance.clone(),
             self.i18n.preference(),
-        )
+        );
+        self.persist_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { crate::host_center::write_settings(&settings) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.persist_task = None;
+                this.apply_settings_persist_result(request, result, cx);
+                if let Some(next) = this.pending_persist.take() {
+                    this.spawn_settings_persist(next, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn apply_settings_persist_result(
+        &mut self,
+        request: SettingsPersist,
+        result: std::result::Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let SettingsPersist {
+            error,
+            host,
+            rollback,
+        } = request;
+        match (result, host) {
+            (Ok(()), None) => {}
+            (Ok(()), Some(HostPersistFollowUp::Revertible { .. })) => {
+                let profiles = self.host_center.read(cx).profiles().to_vec();
+                self.adopt_profiles(profiles, cx);
+            }
+            (Ok(()), Some(HostPersistFollowUp::Saved { index, then })) => {
+                self.host_center.update(cx, |center, cx| {
+                    center.invalidate_probe_for_saved_host(index, cx);
+                });
+                let profiles = self.host_center.read(cx).profiles().to_vec();
+                self.adopt_profiles(profiles, cx);
+                self.set_overlay(Overlay::NodeManager, cx);
+                if then == HostSaveThen::Connect {
+                    self.request_choose_node(index, cx);
+                }
+            }
+            (Err(detail), host) => {
+                let snapshot = persist_failure_rollback(&mut self.pending_persist, rollback);
+                let continuing = snapshot.is_none()
+                    && self
+                        .pending_persist
+                        .as_ref()
+                        .is_some_and(|pending| pending.host.is_some());
+                if let Some(snapshot) = snapshot {
+                    self.host_center
+                        .update(cx, |center, _| center.apply_rollback(snapshot));
+                }
+                if continuing {
+                    return;
+                }
+                let kind = match host {
+                    Some(HostPersistFollowUp::Revertible { error }) => error,
+                    Some(HostPersistFollowUp::Saved { .. }) => FailureKind::SaveHost,
+                    None => {
+                        let Some(kind) = error else {
+                            return;
+                        };
+                        kind
+                    }
+                };
+                self.notify_failure(kind, detail, cx);
+            }
+        }
     }
 
     fn handle_host_center_event(&mut self, event: HostCenterEvent, cx: &mut Context<Self>) {
         match event {
-            HostCenterEvent::PersistBestEffort(state) => {
-                let _ = self.write_host_settings(&state);
-                self.adopt_profiles(state.profiles, cx);
+            HostCenterEvent::PersistBestEffort => {
+                self.queue_settings_persist(
+                    SettingsPersist {
+                        error: None,
+                        host: None,
+                        rollback: None,
+                    },
+                    cx,
+                );
             }
-            HostCenterEvent::PersistRevertible { state, error } => {
-                match self.write_host_settings(&state) {
-                    Ok(()) => {
-                        self.host_center
-                            .update(cx, |center, _| center.commit_persist());
-                        self.adopt_profiles(state.profiles, cx);
-                    }
-                    Err(detail) => {
-                        self.host_center
-                            .update(cx, |center, _| center.rollback_persist());
-                        self.notify_failure(error, detail, cx);
-                    }
-                }
+            HostCenterEvent::PersistRevertible { rollback, error } => {
+                self.queue_settings_persist(
+                    SettingsPersist {
+                        error: Some(error),
+                        host: Some(HostPersistFollowUp::Revertible { error }),
+                        rollback: Some(rollback),
+                    },
+                    cx,
+                );
             }
-            HostCenterEvent::HostSaved { state, index, then } => {
-                match self.write_host_settings(&state) {
-                    Ok(()) => {
-                        self.host_center.update(cx, |center, cx| {
-                            center.commit_persist();
-                            center.invalidate_probe_for_saved_host(index, cx);
-                        });
-                        self.adopt_profiles(state.profiles, cx);
-                        self.set_overlay(Overlay::NodeManager, cx);
-                        if then == HostSaveThen::Connect {
-                            self.request_choose_node(index, cx);
-                        }
-                    }
-                    Err(detail) => {
-                        self.host_center
-                            .update(cx, |center, _| center.rollback_persist());
-                        self.notify_failure(FailureKind::SaveHost, detail, cx);
-                    }
-                }
+            HostCenterEvent::HostSaved {
+                rollback,
+                index,
+                then,
+            } => {
+                self.queue_settings_persist(
+                    SettingsPersist {
+                        error: Some(FailureKind::SaveHost),
+                        host: Some(HostPersistFollowUp::Saved { index, then }),
+                        rollback: Some(rollback),
+                    },
+                    cx,
+                );
             }
             HostCenterEvent::CatalogChanged(profiles) => {
                 self.adopt_profiles(profiles, cx);
@@ -289,17 +387,6 @@ impl OcHerdrView {
                 self.set_overlay(Overlay::None, cx);
             }
         }
-    }
-
-    fn write_host_settings(
-        &self,
-        state: &crate::host_center::HostPersistState,
-    ) -> std::result::Result<(), String> {
-        crate::host_center::persist_assembled_settings(
-            state,
-            &self.appearance,
-            self.i18n.preference(),
-        )
     }
 
     fn adopt_profiles(&mut self, profiles: Vec<ConnectionProfile>, cx: &mut Context<Self>) {
@@ -632,9 +719,7 @@ impl OcHerdrView {
         if let Some(error) = palette_error {
             self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }
-        if let Err(error) = self.persist_settings(cx) {
-            self.notify_failure(FailureKind::SaveAppearance, error, cx);
-        }
+        self.persist_settings(FailureKind::SaveAppearance, cx);
         cx.refresh_windows();
         cx.notify();
     }
@@ -743,9 +828,7 @@ impl OcHerdrView {
         self.rename_input.update(cx, |input, cx| {
             input.set_placeholder(self.i18n.text(k::COMMON_NAME), cx)
         });
-        if let Err(error) = self.persist_settings(cx) {
-            self.notify_failure(FailureKind::SaveLanguage, error, cx);
-        }
+        self.persist_settings(FailureKind::SaveLanguage, cx);
         cx.notify();
     }
 
@@ -2570,6 +2653,55 @@ fn encode_super_edit_bytes(key: &str) -> Option<Vec<u8>> {
     })
 }
 
+fn merge_settings_persist(previous: SettingsPersist, next: SettingsPersist) -> SettingsPersist {
+    SettingsPersist {
+        error: next.error.or(previous.error),
+        host: merge_host_follow_up(previous.host, next.host),
+        rollback: previous.rollback.or(next.rollback),
+    }
+}
+
+fn merge_host_follow_up(
+    previous: Option<HostPersistFollowUp>,
+    next: Option<HostPersistFollowUp>,
+) -> Option<HostPersistFollowUp> {
+    match (previous, next) {
+        (
+            Some(saved @ HostPersistFollowUp::Saved { .. }),
+            Some(HostPersistFollowUp::Revertible { .. }),
+        ) => Some(saved),
+        (previous, None) => previous,
+        (_, Some(next)) => Some(next),
+    }
+}
+
+/// A failed write rolls live state back only when nothing else is queued to
+/// save the user's latest host intent. Otherwise the earliest snapshot moves
+/// onto that queued request.
+fn persist_failure_rollback(
+    pending: &mut Option<SettingsPersist>,
+    failed_rollback: Option<HostRollback>,
+) -> Option<HostRollback> {
+    if let Some(queued) = pending.as_mut().filter(|queued| queued.host.is_some()) {
+        queued.rollback = failed_rollback.or(queued.rollback.take());
+        return None;
+    }
+    failed_rollback
+}
+
+/// Keep one waiting request. Start a write only when none is in flight.
+fn enqueue_settings_persist(
+    pending: &mut Option<SettingsPersist>,
+    in_flight: bool,
+    request: SettingsPersist,
+) -> Option<SettingsPersist> {
+    *pending = Some(match pending.take() {
+        Some(previous) => merge_settings_persist(previous, request),
+        None => request,
+    });
+    if in_flight { None } else { pending.take() }
+}
+
 fn overlay_confirm_or_cancel(event: &KeyDownEvent) -> Option<bool> {
     if event.is_held || event.keystroke.modifiers.modified() {
         return None;
@@ -2642,6 +2774,127 @@ fn encode_alt_edit_bytes(key: &str, key_char: Option<&str>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persist_notice(kind: FailureKind) -> SettingsPersist {
+        SettingsPersist {
+            error: Some(kind),
+            host: None,
+            rollback: None,
+        }
+    }
+
+    fn revertible_persist(kind: FailureKind, tag: &str) -> SettingsPersist {
+        SettingsPersist {
+            error: Some(kind),
+            host: Some(HostPersistFollowUp::Revertible { error: kind }),
+            rollback: Some(HostRollback::tagged(tag)),
+        }
+    }
+
+    #[test]
+    fn settings_persist_keeps_only_the_latest_unwritten_value() {
+        let mut pending = None;
+        let started = enqueue_settings_persist(
+            &mut pending,
+            false,
+            persist_notice(FailureKind::SaveAppearance),
+        );
+        assert_eq!(
+            started.and_then(|request| request.error),
+            Some(FailureKind::SaveAppearance)
+        );
+        assert!(pending.is_none());
+
+        assert!(
+            enqueue_settings_persist(
+                &mut pending,
+                true,
+                persist_notice(FailureKind::SaveLanguage)
+            )
+            .is_none()
+        );
+        assert!(
+            enqueue_settings_persist(
+                &mut pending,
+                true,
+                persist_notice(FailureKind::SaveAppearance)
+            )
+            .is_none()
+        );
+        assert_eq!(
+            pending.and_then(|request| request.error),
+            Some(FailureKind::SaveAppearance)
+        );
+    }
+
+    #[test]
+    fn settings_persist_keeps_a_host_follow_up_when_appearance_replaces_the_waiting_write() {
+        let host = HostPersistFollowUp::Revertible {
+            error: FailureKind::SaveHost,
+        };
+        let merged = merge_settings_persist(
+            SettingsPersist {
+                error: Some(FailureKind::SaveHost),
+                host: Some(host),
+                rollback: Some(HostRollback::tagged("before-host")),
+            },
+            persist_notice(FailureKind::SaveAppearance),
+        );
+        assert_eq!(merged.error, Some(FailureKind::SaveAppearance));
+        assert!(matches!(
+            merged.host,
+            Some(HostPersistFollowUp::Revertible {
+                error: FailureKind::SaveHost,
+                ..
+            })
+        ));
+        assert_eq!(
+            merged.rollback.as_ref().and_then(HostRollback::tag),
+            Some("before-host")
+        );
+    }
+
+    #[test]
+    fn merged_revertible_persists_keep_the_earliest_rollback() {
+        let merged = merge_settings_persist(
+            revertible_persist(FailureKind::UpdateFavorites, "before-first"),
+            revertible_persist(FailureKind::ApplyOrganization, "before-second"),
+        );
+        assert!(matches!(
+            merged.host,
+            Some(HostPersistFollowUp::Revertible {
+                error: FailureKind::ApplyOrganization,
+                ..
+            })
+        ));
+        assert_eq!(
+            merged.rollback.as_ref().and_then(HostRollback::tag),
+            Some("before-first")
+        );
+    }
+
+    #[test]
+    fn a_failed_host_write_keeps_a_queued_write_for_a_different_host() {
+        let mut pending = Some(revertible_persist(
+            FailureKind::UpdateFavorites,
+            "after-alpha-before-beta",
+        ));
+        let applied =
+            persist_failure_rollback(&mut pending, Some(HostRollback::tagged("before-alpha")));
+        let pending = pending.expect("beta persist stays queued");
+        assert!(applied.is_none());
+        assert!(matches!(
+            pending.host,
+            Some(HostPersistFollowUp::Revertible {
+                error: FailureKind::UpdateFavorites,
+                ..
+            })
+        ));
+        assert_eq!(
+            pending.rollback.as_ref().and_then(HostRollback::tag),
+            Some("before-alpha")
+        );
+    }
 
     fn test_pane(pane_id: &str, tab_id: &str) -> PaneInfo {
         PaneInfo {

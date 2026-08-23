@@ -45,8 +45,9 @@ mod ime;
 mod notify;
 mod ui;
 
-use host_center::{HostCenter, HostCenterEvent, HostSaveThen};
+use host_center::{HostCenter, HostCenterEvent, HostRollback, HostSaveThen};
 use i18n::{I18n, Language, k};
+use notify::FailureKind;
 
 const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;
@@ -429,6 +430,24 @@ struct OcHerdrView {
     appearance: AppearanceSettings,
     i18n: I18n,
     host_center: Entity<HostCenter>,
+    pending_persist: Option<SettingsPersist>,
+    /// Waiting for the current settings write to finish so the next can start.
+    persist_task: Option<Task<()>>,
+}
+
+/// One waiting settings write. Payload is assembled from live state when the
+/// write actually starts; rollback is the last known-good host catalog.
+#[derive(Clone, Debug)]
+struct SettingsPersist {
+    error: Option<FailureKind>,
+    host: Option<HostPersistFollowUp>,
+    rollback: Option<HostRollback>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HostPersistFollowUp {
+    Revertible { error: FailureKind },
+    Saved { index: usize, then: HostSaveThen },
 }
 
 #[derive(Clone, Debug)]
@@ -794,7 +813,7 @@ fn main() {
         .with_assets(OcHerdrAssets)
         .run(|cx: &mut App| {
             let mut settings = load_settings();
-            let _ = I18n::new(settings.language);
+            I18n::install(settings.language);
             ochub_ui::install(cx);
             settings.appearance.theme_family =
                 install_appearance(&settings.appearance, cx.window_appearance());
@@ -822,17 +841,7 @@ fn main() {
                 },
                 move |window, cx| {
                     window.set_window_title("OcHerdr");
-                    window
-                        .observe_window_appearance(|window, cx| {
-                            let settings = load_settings();
-                            if settings.appearance.mode == AppearanceMode::System {
-                                install_appearance(&settings.appearance, window.appearance());
-                                theme::apply_window_background(window);
-                                cx.refresh_windows();
-                            }
-                        })
-                        .detach();
-                    let view = cx.new(|cx| OcHerdrView::new(settings, cx));
+                    let view = cx.new(|cx| OcHerdrView::new(settings, window, cx));
                     let focus = view.read(cx).focus.clone();
                     focus.focus(window, cx);
                     view

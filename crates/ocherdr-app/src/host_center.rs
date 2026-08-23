@@ -56,7 +56,7 @@ pub(crate) fn assemble_settings(
     }
 }
 
-fn write_settings(settings: &Settings) -> std::result::Result<(), String> {
+pub(crate) fn write_settings(settings: &Settings) -> std::result::Result<(), String> {
     let path =
         settings_path().ok_or_else(|| "Application Support directory is unavailable".to_owned())?;
     let parent = path
@@ -67,14 +67,6 @@ fn write_settings(settings: &Settings) -> std::result::Result<(), String> {
     fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
-pub(crate) fn persist_assembled_settings(
-    host: &HostPersistState,
-    appearance: &AppearanceSettings,
-    language: Language,
-) -> std::result::Result<(), String> {
-    write_settings(&assemble_settings(host, appearance.clone(), language))
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostSaveThen {
     ShowHostCenter,
@@ -83,13 +75,13 @@ pub(crate) enum HostSaveThen {
 
 #[derive(Clone, Debug)]
 pub(crate) enum HostCenterEvent {
-    PersistBestEffort(HostPersistState),
+    PersistBestEffort,
     PersistRevertible {
-        state: HostPersistState,
+        rollback: HostRollback,
         error: FailureKind,
     },
     HostSaved {
-        state: HostPersistState,
+        rollback: HostRollback,
         index: usize,
         then: HostSaveThen,
     },
@@ -107,7 +99,8 @@ pub(crate) enum HostCenterEvent {
     CloseRequested,
 }
 
-struct HostRollback {
+#[derive(Clone, Debug)]
+pub(crate) struct HostRollback {
     profiles: Vec<ConnectionProfile>,
     recent_connection_ids: Vec<String>,
     host_metadata: HashMap<String, HostMetadata>,
@@ -117,6 +110,27 @@ struct HostRollback {
     profile_index: usize,
     managed_profile_index: usize,
     host_bulk_selection: HashSet<String>,
+}
+
+#[cfg(test)]
+impl HostRollback {
+    pub(crate) fn tagged(tag: &str) -> Self {
+        Self {
+            profiles: Vec::new(),
+            recent_connection_ids: vec![tag.into()],
+            host_metadata: HashMap::new(),
+            host_groups: Vec::new(),
+            host_health: HashMap::new(),
+            orphaned_ssh_hosts: HashSet::new(),
+            profile_index: 0,
+            managed_profile_index: 0,
+            host_bulk_selection: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn tag(&self) -> Option<&str> {
+        self.recent_connection_ids.first().map(String::as_str)
+    }
 }
 
 pub(crate) struct HostCenter {
@@ -153,7 +167,6 @@ pub(crate) struct HostCenter {
     pub(crate) remote_search: Entity<TextInput>,
     pub(crate) i18n: I18n,
     focus: FocusHandle,
-    rollback: Option<HostRollback>,
 }
 
 impl EventEmitter<HostCenterEvent> for HostCenter {}
@@ -290,7 +303,6 @@ impl HostCenter {
             remote_search,
             i18n,
             focus,
-            rollback: None,
         };
         let host = cx.weak_entity();
         for field in [
@@ -430,14 +442,16 @@ impl HostCenter {
         });
     }
 
-    pub(crate) fn commit_persist(&mut self) {
-        self.rollback = None;
-    }
-
-    pub(crate) fn rollback_persist(&mut self) {
-        if let Some(snapshot) = self.rollback.take() {
-            self.apply_rollback(snapshot);
-        }
+    pub(crate) fn apply_rollback(&mut self, snapshot: HostRollback) {
+        self.profiles = snapshot.profiles;
+        self.recent_connection_ids = snapshot.recent_connection_ids;
+        self.host_metadata = snapshot.host_metadata;
+        self.host_groups = snapshot.host_groups;
+        self.host_health = snapshot.host_health;
+        self.orphaned_ssh_hosts = snapshot.orphaned_ssh_hosts;
+        self.profile_index = snapshot.profile_index;
+        self.managed_profile_index = snapshot.managed_profile_index;
+        self.host_bulk_selection = snapshot.host_bulk_selection;
     }
 
     fn snapshot(&self) -> HostRollback {
@@ -454,31 +468,21 @@ impl HostCenter {
         }
     }
 
-    fn apply_rollback(&mut self, snapshot: HostRollback) {
-        self.profiles = snapshot.profiles;
-        self.recent_connection_ids = snapshot.recent_connection_ids;
-        self.host_metadata = snapshot.host_metadata;
-        self.host_groups = snapshot.host_groups;
-        self.host_health = snapshot.host_health;
-        self.orphaned_ssh_hosts = snapshot.orphaned_ssh_hosts;
-        self.profile_index = snapshot.profile_index;
-        self.managed_profile_index = snapshot.managed_profile_index;
-        self.host_bulk_selection = snapshot.host_bulk_selection;
-    }
-
-    fn begin_mutation(&mut self) {
-        self.rollback = Some(self.snapshot());
+    fn begin_mutation(&self) -> HostRollback {
+        self.snapshot()
     }
 
     fn persist_best_effort(&mut self, cx: &mut Context<Self>) {
-        cx.emit(HostCenterEvent::PersistBestEffort(self.persist_state()));
+        cx.emit(HostCenterEvent::PersistBestEffort);
     }
 
-    fn persist_revertible(&mut self, error: FailureKind, cx: &mut Context<Self>) {
-        cx.emit(HostCenterEvent::PersistRevertible {
-            state: self.persist_state(),
-            error,
-        });
+    fn persist_revertible(
+        &mut self,
+        rollback: HostRollback,
+        error: FailureKind,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(HostCenterEvent::PersistRevertible { rollback, error });
     }
 
     fn fail(&self, kind: FailureKind, detail: impl std::fmt::Display, cx: &mut Context<Self>) {
@@ -595,10 +599,10 @@ impl HostCenter {
             return;
         };
         let id = profile.id().to_owned();
-        self.begin_mutation();
+        let rollback = self.begin_mutation();
         let metadata = self.host_metadata.entry(id).or_default();
         metadata.favorite = !metadata.favorite;
-        self.persist_revertible(FailureKind::UpdateFavorites, cx);
+        self.persist_revertible(rollback, FailureKind::UpdateFavorites, cx);
         cx.notify();
     }
 
@@ -621,11 +625,11 @@ impl HostCenter {
         if self.host_bulk_selection.is_empty() {
             return;
         }
-        self.begin_mutation();
+        let rollback = self.begin_mutation();
         for id in self.host_bulk_selection.clone() {
             self.host_metadata.entry(id).or_default().favorite = favorite;
         }
-        self.persist_revertible(FailureKind::UpdateFavorites, cx);
+        self.persist_revertible(rollback, FailureKind::UpdateFavorites, cx);
         cx.notify();
     }
 
@@ -645,7 +649,7 @@ impl HostCenter {
             cx.notify();
             return;
         }
-        self.begin_mutation();
+        let rollback = self.begin_mutation();
         for id in self.host_bulk_selection.clone() {
             let metadata = self.host_metadata.entry(id).or_default();
             if let Some(group) = &group {
@@ -670,7 +674,7 @@ impl HostCenter {
             self.host_groups.push(group);
             self.host_groups.sort_by_key(|group| group.to_lowercase());
         }
-        self.persist_revertible(FailureKind::ApplyOrganization, cx);
+        self.persist_revertible(rollback, FailureKind::ApplyOrganization, cx);
         cx.notify();
     }
 
@@ -703,7 +707,7 @@ impl HostCenter {
         for id in &selected {
             self.cancel_host_check(id, cx);
         }
-        self.begin_mutation();
+        let rollback = self.begin_mutation();
         let removed_ids = self
             .profiles
             .iter()
@@ -760,7 +764,7 @@ impl HostCenter {
             .position(|profile| profile.id() == managed_id)
             .unwrap_or(self.profile_index);
         self.host_bulk_selection.clear();
-        self.persist_revertible(FailureKind::RemoveHosts, cx);
+        self.persist_revertible(rollback, FailureKind::RemoveHosts, cx);
         cx.notify();
     }
 
@@ -996,7 +1000,7 @@ impl HostCenter {
         }
         let removed_id = self.profiles[index].id().to_owned();
         self.cancel_host_check(&removed_id, cx);
-        self.begin_mutation();
+        let rollback = self.begin_mutation();
         let removed = self.profiles.remove(index);
         self.recent_connection_ids.retain(|id| id != removed.id());
         self.host_metadata.remove(&removed_id);
@@ -1007,7 +1011,7 @@ impl HostCenter {
             self.profile_index -= 1;
         }
         self.managed_profile_index = self.managed_profile_index.min(self.profiles.len() - 1);
-        self.persist_revertible(FailureKind::RemoveHost, cx);
+        self.persist_revertible(rollback, FailureKind::RemoveHost, cx);
         cx.notify();
     }
 
@@ -1021,7 +1025,7 @@ impl HostCenter {
         let Some(form) = self.form else {
             return;
         };
-        self.begin_mutation();
+        let rollback = self.begin_mutation();
         let index = match form {
             RemoteForm::Create => {
                 self.profiles.push(draft);
@@ -1048,7 +1052,7 @@ impl HostCenter {
                     ..
                 } = draft
                 else {
-                    self.rollback_persist();
+                    self.apply_rollback(rollback);
                     return;
                 };
                 let id = self.profiles[index].id().to_owned();
@@ -1086,7 +1090,7 @@ impl HostCenter {
                 index
             }
             RemoteForm::Edit(_) => {
-                self.rollback_persist();
+                self.apply_rollback(rollback);
                 return;
             }
         };
@@ -1101,7 +1105,7 @@ impl HostCenter {
         }
         self.managed_profile_index = index;
         cx.emit(HostCenterEvent::HostSaved {
-            state: self.persist_state(),
+            rollback,
             index,
             then: if connect {
                 HostSaveThen::Connect
