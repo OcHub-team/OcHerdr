@@ -3,7 +3,11 @@
 //! Render applies these properties onto GPUI elements (`id` + `role` required).
 //! Tests call the same mapping so chrome/terminal announcements cannot drift.
 
-use ocherdr_core::{HierarchySnapshot, PaneInfo, Selection, SessionSummary};
+use std::collections::HashSet;
+
+use ocherdr_core::{
+    AgentStatus, HierarchySnapshot, PaneInfo, Selection, SessionSummary, TabInfo, WorkspaceInfo,
+};
 use ochub_ui::gpui::{Div, Role, Stateful, Toggled, prelude::*};
 
 use super::EventStreamState;
@@ -31,11 +35,38 @@ pub struct ControlA11y {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ListA11y {
+pub struct SessionRow {
+    pub index: usize,
+    pub running: bool,
+    pub a11y: ControlA11y,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkspaceRow {
+    pub number: usize,
+    pub agent_status: AgentStatus,
+    pub a11y: ControlA11y,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentRow {
+    pub pane_id: String,
+    pub agent_status: AgentStatus,
+    pub a11y: ControlA11y,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabRow {
+    pub number: usize,
+    pub a11y: ControlA11y,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListA11y<T> {
     pub id: &'static str,
     pub role: Role,
     pub name: String,
-    pub items: Vec<ControlA11y>,
+    pub items: Vec<T>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,10 +102,10 @@ pub struct ChromeA11y {
     pub sidebar: RegionA11y,
     pub main: RegionA11y,
     pub status: RegionA11y,
-    pub connections: ListA11y,
-    pub workspaces: ListA11y,
-    pub agents: ListA11y,
-    pub tabs: ListA11y,
+    pub connections: ListA11y<SessionRow>,
+    pub workspaces: ListA11y<WorkspaceRow>,
+    pub agents: ListA11y<AgentRow>,
+    pub tabs: ListA11y<TabRow>,
     pub toolbar: ToolbarA11y,
     pub new_workspace: ControlA11y,
     pub status_profile: ControlA11y,
@@ -111,80 +142,26 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
         id: "connections-list",
         role: Role::List,
         name: i18n.text(k::TERMINAL_SESSIONS).to_owned(),
-        items: input
-            .sessions
-            .iter()
-            .enumerate()
-            .map(|(index, session)| {
-                let name = if session.default {
-                    i18n.text(k::COMMON_DEFAULT).to_owned()
-                } else {
-                    session.display_name().to_owned()
-                };
-                ControlA11y {
-                    id: if session.default {
-                        "default".into()
-                    } else {
-                        session.name.clone()
-                    },
-                    // Button maps to AXButton on macOS; ListItem is dropped from the AX tree.
-                    role: Role::Button,
-                    name,
-                    selected: Some(input.session_index == Some(index)),
-                    toggled: None,
-                    tab_stop: false,
-                }
-            })
-            .collect(),
+        items: connection_rows(input.sessions, input.session_index, i18n),
     };
-
-    let mut workspaces = Vec::new();
-    let mut tabs = Vec::new();
-    let mut agents = Vec::new();
-    if let Some(snapshot) = input.snapshot {
-        for workspace in &snapshot.workspaces {
-            workspaces.push(ControlA11y {
-                id: workspace.workspace_id.clone(),
-                role: Role::Button,
-                name: workspace.label.clone(),
-                selected: Some(
-                    input.selection.workspace_id.as_deref()
-                        == Some(workspace.workspace_id.as_str()),
-                ),
-                toggled: None,
-                tab_stop: false,
-            });
-        }
-        if let Some(workspace_id) = input.selection.workspace_id.as_deref() {
-            for tab in snapshot.tabs_for(workspace_id) {
-                tabs.push(ControlA11y {
-                    id: tab.tab_id.clone(),
-                    role: Role::Tab,
-                    name: tab.label.clone(),
-                    selected: Some(input.selection.tab_id.as_deref() == Some(tab.tab_id.as_str())),
-                    toggled: None,
-                    tab_stop: false,
-                });
-            }
-        }
-        let mut seen_agents = std::collections::HashSet::new();
-        for pane in &snapshot.panes {
-            let Some(agent_name) = pane.display_agent.as_deref().or(pane.agent.as_deref()) else {
-                continue;
-            };
-            if !seen_agents.insert(agent_name.to_owned()) {
-                continue;
-            }
-            agents.push(ControlA11y {
-                id: agent_name.to_owned(),
-                role: Role::Button,
-                name: format!("{} · {}", agent_name, i18n.agent_status(pane.agent_status)),
-                selected: Some(input.selection.pane_id.as_deref() == Some(pane.pane_id.as_str())),
-                toggled: None,
-                tab_stop: false,
-            });
-        }
-    }
+    let (workspaces, agents, tabs) = if let Some(snapshot) = input.snapshot {
+        let workspaces = workspace_rows(
+            &snapshot.workspaces,
+            input.selection.workspace_id.as_deref(),
+        );
+        let agents = agent_rows(&snapshot.panes, input.selection.pane_id.as_deref(), i18n);
+        let tabs = if let Some(workspace_id) = input.selection.workspace_id.as_deref() {
+            tab_rows(
+                snapshot.tabs_for(workspace_id),
+                input.selection.tab_id.as_deref(),
+            )
+        } else {
+            Vec::new()
+        };
+        (workspaces, agents, tabs)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
 
     let status_text = status_value(&input);
     ChromeA11y {
@@ -309,7 +286,7 @@ pub fn apply_region(element: Stateful<Div>, region: &RegionA11y) -> Stateful<Div
         .tab_stop(false)
 }
 
-pub fn apply_list(element: Stateful<Div>, list: &ListA11y) -> Stateful<Div> {
+pub fn apply_list<T>(element: Stateful<Div>, list: &ListA11y<T>) -> Stateful<Div> {
     element.role(list.role).aria_label(list.name.clone())
 }
 
@@ -319,6 +296,101 @@ pub fn apply_dialog(
     title: impl Into<ochub_ui::gpui::SharedString>,
 ) -> Stateful<Div> {
     element.id(id).role(Role::Dialog).aria_label(title)
+}
+
+fn connection_rows(
+    sessions: &[SessionSummary],
+    session_index: Option<usize>,
+    i18n: I18n,
+) -> Vec<SessionRow> {
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            let (id, name) = if session.default {
+                ("default".into(), i18n.text(k::COMMON_DEFAULT).to_owned())
+            } else {
+                (session.name.clone(), session.display_name().to_owned())
+            };
+            SessionRow {
+                index,
+                running: session.running,
+                a11y: list_control(id, Role::Button, name, session_index == Some(index)),
+            }
+        })
+        .collect()
+}
+
+fn workspace_rows(workspaces: &[WorkspaceInfo], selected_id: Option<&str>) -> Vec<WorkspaceRow> {
+    workspaces
+        .iter()
+        .map(|workspace| WorkspaceRow {
+            number: workspace.number,
+            agent_status: workspace.agent_status,
+            a11y: list_control(
+                workspace.workspace_id.clone(),
+                Role::Button,
+                workspace.label.clone(),
+                selected_id == Some(workspace.workspace_id.as_str()),
+            ),
+        })
+        .collect()
+}
+
+fn agent_rows(panes: &[PaneInfo], selected_pane_id: Option<&str>, i18n: I18n) -> Vec<AgentRow> {
+    let mut seen_agents = HashSet::new();
+    let mut items = Vec::new();
+    for pane in panes {
+        let Some(agent_name) = pane.display_agent.as_deref().or(pane.agent.as_deref()) else {
+            continue;
+        };
+        if !seen_agents.insert(agent_name) {
+            continue;
+        }
+        items.push(AgentRow {
+            pane_id: pane.pane_id.clone(),
+            agent_status: pane.agent_status,
+            a11y: list_control(
+                agent_name.to_owned(),
+                Role::Button,
+                format!("{} · {}", agent_name, i18n.agent_status(pane.agent_status)),
+                selected_pane_id == Some(pane.pane_id.as_str()),
+            ),
+        });
+    }
+    items
+}
+
+fn tab_rows<'a>(
+    tabs: impl IntoIterator<Item = &'a TabInfo>,
+    selected_tab_id: Option<&str>,
+) -> Vec<TabRow> {
+    let mut items: Vec<TabRow> = tabs
+        .into_iter()
+        .map(|tab| TabRow {
+            number: tab.number,
+            a11y: list_control(
+                tab.tab_id.clone(),
+                Role::Tab,
+                tab.label.clone(),
+                selected_tab_id == Some(tab.tab_id.as_str()),
+            ),
+        })
+        .collect();
+    items.sort_by_key(|row| row.number);
+    items
+}
+
+// ListItem is dropped from the macOS AX tree; Button and Tab survive as AXButton/AXTab.
+fn list_control(id: String, role: Role, name: String, selected: bool) -> ControlA11y {
+    ControlA11y {
+        id,
+        role,
+        name,
+        selected: Some(selected),
+        toggled: None,
+        tab_stop: false,
+    }
 }
 
 fn silent_button(id: &str, name: String) -> ControlA11y {
@@ -568,11 +640,26 @@ mod tests {
         }
     }
 
-    fn item<'a>(list: &'a ListA11y, id: &str) -> &'a ControlA11y {
-        list.items
-            .iter()
-            .find(|item| item.id == id)
-            .unwrap_or_else(|| panic!("missing control {id}"))
+    #[test]
+    fn workspace_rows_carry_a11y_from_the_same_workspace() {
+        assert!(workspace_rows(&[], None).is_empty());
+        assert!(workspace_rows(&[], Some("w1")).is_empty());
+
+        let workspaces = vec![
+            workspace("w1", 1, "schedule review", true, "t1"),
+            workspace("w2", 2, "code", false, "t3"),
+            workspace("w3", 3, "notes", false, "t4"),
+        ];
+        let rows = workspace_rows(&workspaces, Some("w2"));
+        assert_eq!(rows.len(), workspaces.len());
+        for (row, workspace) in rows.iter().zip(&workspaces) {
+            assert_eq!(row.a11y.id, workspace.workspace_id);
+            assert_eq!(row.a11y.name, workspace.label);
+        }
+        assert_eq!(
+            rows.iter().map(|row| row.a11y.selected).collect::<Vec<_>>(),
+            vec![Some(false), Some(true), Some(false)]
+        );
     }
 
     #[test]
@@ -650,23 +737,28 @@ mod tests {
 
         assert_eq!(chrome.connections.role, Role::List);
         assert_eq!(chrome.connections.name, "SESSIONS");
-        let default = item(&chrome.connections, "default");
-        assert_eq!(default.role, Role::Button);
-        assert!(!default.tab_stop);
-        assert_eq!(default.name, "Default");
-        assert_eq!(default.selected, Some(true));
-        let other = item(&chrome.connections, "other");
-        assert_eq!(other.name, "other");
-        assert_eq!(other.selected, Some(false));
+        let default = &chrome.connections.items[0];
+        assert_eq!(default.a11y.role, Role::Button);
+        assert!(!default.a11y.tab_stop);
+        assert_eq!(default.a11y.id, "default");
+        assert_eq!(default.a11y.name, "Default");
+        assert_eq!(default.a11y.selected, Some(true));
+        let other = &chrome.connections.items[1];
+        assert_eq!(other.a11y.id, "other");
+        assert_eq!(other.a11y.name, "other");
+        assert_eq!(other.a11y.selected, Some(false));
 
         assert_eq!(chrome.workspaces.role, Role::List);
         assert_eq!(chrome.workspaces.name, "WORKSPACES");
-        let current = item(&chrome.workspaces, "w1");
-        assert_eq!(current.role, Role::Button);
-        assert!(!current.tab_stop);
-        assert_eq!(current.name, "schedule review");
-        assert_eq!(current.selected, Some(true));
-        assert_eq!(item(&chrome.workspaces, "w2").selected, Some(false));
+        assert_eq!(chrome.workspaces.items.len(), snapshot.workspaces.len());
+        let current = &chrome.workspaces.items[0];
+        assert_eq!(current.a11y.role, Role::Button);
+        assert!(!current.a11y.tab_stop);
+        assert_eq!(current.a11y.id, "w1");
+        assert_eq!(current.a11y.name, "schedule review");
+        assert_eq!(current.a11y.selected, Some(true));
+        assert_eq!(chrome.workspaces.items[1].a11y.id, "w2");
+        assert_eq!(chrome.workspaces.items[1].a11y.selected, Some(false));
 
         assert_eq!(chrome.tabs.role, Role::TabList);
         assert_eq!(chrome.tabs.name, "Tabs");
@@ -675,21 +767,25 @@ mod tests {
             2,
             "tabs from the selected workspace only"
         );
-        let tab = item(&chrome.tabs, "t1");
-        assert_eq!(tab.role, Role::Tab);
-        assert_eq!(tab.name, "1");
-        assert_eq!(tab.selected, Some(true));
-        assert_eq!(item(&chrome.tabs, "t2").name, "logs");
-        assert_eq!(item(&chrome.tabs, "t2").selected, Some(false));
+        let tab = &chrome.tabs.items[0];
+        assert_eq!(tab.a11y.role, Role::Tab);
+        assert_eq!(tab.a11y.id, "t1");
+        assert_eq!(tab.a11y.name, "1");
+        assert_eq!(tab.a11y.selected, Some(true));
+        assert_eq!(chrome.tabs.items[1].a11y.id, "t2");
+        assert_eq!(chrome.tabs.items[1].a11y.name, "logs");
+        assert_eq!(chrome.tabs.items[1].a11y.selected, Some(false));
 
-        let grok = item(&chrome.agents, "grok");
-        assert_eq!(grok.role, Role::Button);
-        assert!(!grok.tab_stop);
-        assert_eq!(grok.name, "grok · idle");
-        assert_eq!(grok.selected, Some(true));
-        let codex = item(&chrome.agents, "codex");
-        assert_eq!(codex.name, "codex · working");
-        assert_eq!(codex.selected, Some(false));
+        let grok = &chrome.agents.items[0];
+        assert_eq!(grok.a11y.role, Role::Button);
+        assert!(!grok.a11y.tab_stop);
+        assert_eq!(grok.a11y.id, "grok");
+        assert_eq!(grok.a11y.name, "grok · idle");
+        assert_eq!(grok.a11y.selected, Some(true));
+        let codex = &chrome.agents.items[1];
+        assert_eq!(codex.a11y.id, "codex");
+        assert_eq!(codex.a11y.name, "codex · working");
+        assert_eq!(codex.a11y.selected, Some(false));
 
         for action in chrome.toolbar.actions() {
             assert_eq!(action.role, Role::Button);
@@ -717,9 +813,10 @@ mod tests {
             .connections
             .items
             .iter()
-            .chain(&chrome.workspaces.items)
-            .chain(&chrome.agents.items)
-            .chain(&chrome.tabs.items)
+            .map(|row| &row.a11y)
+            .chain(chrome.workspaces.items.iter().map(|row| &row.a11y))
+            .chain(chrome.agents.items.iter().map(|row| &row.a11y))
+            .chain(chrome.tabs.items.iter().map(|row| &row.a11y))
         {
             assert_ne!(control.role, Role::GenericContainer);
             assert!(
@@ -757,7 +854,9 @@ mod tests {
         assert_eq!(chrome.status_value, "No Herdr session");
         assert_eq!(chrome.status_profile.name, "This Mac");
         assert_eq!(chrome.status_message.name, "No Herdr session");
+        assert!(chrome.connections.items.is_empty());
         assert!(chrome.workspaces.items.is_empty());
+        assert!(chrome.agents.items.is_empty());
         assert!(chrome.tabs.items.is_empty());
     }
 

@@ -1,22 +1,25 @@
 use super::super::*;
 use crate::a11y::{
-    apply_control, apply_list, apply_region, event_stream_lost_copy, event_stream_status_copy,
-    pane_a11y,
+    ChromeA11y, apply_control, apply_list, apply_region, event_stream_lost_copy,
+    event_stream_status_copy, pane_a11y,
 };
 
 impl OcHerdrView {
-    pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar(
+        &mut self,
+        chrome: &ChromeA11y,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let i18n = self.i18n;
-        let chrome = self.chrome_a11y();
-        let session_rows = self
-            .sessions
+        let session_rows = chrome
+            .connections
+            .items
             .iter()
-            .enumerate()
-            .zip(chrome.connections.items.iter())
-            .map(|((index, session), control)| {
-                let selected = control.selected == Some(true);
-                let running = session.running;
-                apply_control(div().id(("session", index)), control)
+            .map(|row| {
+                let index = row.index;
+                let selected = row.a11y.selected == Some(true);
+                let running = row.running;
+                apply_control(div().id(("session", index)), &row.a11y)
                     .flex()
                     .items_center()
                     .gap_2()
@@ -43,120 +46,85 @@ impl OcHerdrView {
                             .flex_1()
                             .truncate()
                             .text_sm()
-                            .child(control.name.clone()),
+                            .child(row.a11y.name.clone()),
                     )
                     .into_any_element()
             })
             .collect::<Vec<_>>();
 
-        let mut hierarchy = Vec::new();
-        let mut agent_rows = Vec::new();
-        let mut seen_agents = HashSet::new();
-        if let Some(snapshot) = &self.snapshot {
-            for workspace in &snapshot.workspaces {
-                let workspace_id = workspace.workspace_id.clone();
+        let hierarchy = chrome
+            .workspaces
+            .items
+            .iter()
+            .map(|row| {
+                let workspace_id = row.a11y.id.clone();
                 let workspace_target = HierarchyTarget::Workspace {
-                    id: workspace.workspace_id.clone(),
-                    label: workspace.label.clone(),
+                    id: row.a11y.id.clone(),
+                    label: row.a11y.name.clone(),
                 };
-                let selected = self.selection.workspace_id.as_deref() == Some(&workspace_id);
-                let control = chrome
-                    .workspaces
-                    .items
-                    .iter()
-                    .find(|item| item.id == workspace_id)
-                    .cloned()
-                    .unwrap_or_else(|| crate::a11y::ControlA11y {
-                        id: workspace_id.clone(),
-                        role: ochub_ui::gpui::Role::Button,
-                        name: workspace.label.clone(),
-                        selected: Some(selected),
-                        toggled: None,
-                        tab_stop: false,
-                    });
-                hierarchy.push(
-                    tree_row(
-                        ("workspace", workspace.number),
-                        &control,
-                        12.,
-                        IconName::Folder,
-                        selected,
-                        status_color(workspace.agent_status),
-                    )
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.select_workspace(workspace_id.clone(), cx)
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event, window, cx| {
-                            this.open_context_menu(workspace_target.clone(), event, window, cx)
-                        }),
-                    )
-                    .into_any_element(),
-                );
-            }
-            for pane in &snapshot.panes {
-                let Some(agent_name) = pane.display_agent.as_deref().or(pane.agent.as_deref())
-                else {
-                    continue;
-                };
-                if !seen_agents.insert(agent_name.to_owned()) {
-                    continue;
-                }
-                let pane_id = pane.pane_id.clone();
-                let status = pane.agent_status;
-                let control = chrome
-                    .agents
-                    .items
-                    .iter()
-                    .find(|item| item.id == agent_name)
-                    .cloned();
-                let row = if let Some(control) = control {
-                    apply_control(
-                        div().id(ochub_ui::gpui::ElementId::Name(
-                            format!("agent-{pane_id}").into(),
-                        )),
-                        &control,
-                    )
-                } else {
+                let selected = row.a11y.selected == Some(true);
+                tree_row(
+                    ("workspace", row.number),
+                    &row.a11y,
+                    12.,
+                    IconName::Folder,
+                    selected,
+                    status_color(row.agent_status),
+                )
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.select_workspace(workspace_id.clone(), cx)
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event, window, cx| {
+                        this.open_context_menu(workspace_target.clone(), event, window, cx)
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        let agent_rows = chrome
+            .agents
+            .items
+            .iter()
+            .map(|row| {
+                let pane_id = row.pane_id.clone();
+                let status = row.agent_status;
+                apply_control(
+                    div().id(ochub_ui::gpui::ElementId::Name(
+                        format!("agent-{pane_id}").into(),
+                    )),
+                    &row.a11y,
+                )
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(30.))
+                .px_3()
+                .rounded(px(CORNER_COMPACT))
+                .hover(|style| style.bg(theme::surface_hover()))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_pane(pane_id.clone(), window, cx)
+                }))
+                .child(status_dot(status_color(status)))
+                .child(
                     div()
-                        .id(ochub_ui::gpui::ElementId::Name(
-                            format!("agent-{pane_id}").into(),
-                        ))
-                        .role(ochub_ui::gpui::Role::Button)
-                        .aria_label(agent_name.to_owned())
-                        .tab_stop(false)
-                };
-                agent_rows.push(
-                    row.flex()
-                        .items_center()
-                        .gap_2()
-                        .h(px(30.))
-                        .px_3()
-                        .rounded(px(CORNER_COMPACT))
-                        .hover(|style| style.bg(theme::surface_hover()))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select_pane(pane_id.clone(), window, cx)
-                        }))
-                        .child(status_dot(status_color(status)))
-                        .child(
-                            div()
-                                .flex_1()
-                                .truncate()
-                                .text_sm()
-                                .child(agent_name.to_owned()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::muted())
-                                .child(i18n.agent_status(status)),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .child(row.a11y.id.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(i18n.agent_status(status)),
+                )
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
 
         apply_region(div().id(chrome.sidebar.id), &chrome.sidebar)
             .flex()
@@ -271,42 +239,29 @@ impl OcHerdrView {
             )
     }
 
-    pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_tab_bar(
+        &mut self,
+        chrome: &ChromeA11y,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let i18n = self.i18n;
-        let chrome = self.chrome_a11y();
-        let mut tabs = Vec::new();
-        if let (Some(snapshot), Some(workspace_id)) =
-            (&self.snapshot, self.selection.workspace_id.as_deref())
-        {
-            let mut workspace_tabs = snapshot.tabs_for(workspace_id).cloned().collect::<Vec<_>>();
-            workspace_tabs.sort_by_key(|tab| tab.number);
-            let tab_count = workspace_tabs.len();
-            for (index, tab) in workspace_tabs.into_iter().enumerate() {
-                let shortcut = tab_key_equivalent(index, tab_count);
-                let tab_id = tab.tab_id.clone();
-                let tab_target = HierarchyTarget::Tab {
-                    id: tab.tab_id.clone(),
-                    label: tab.label.clone(),
-                };
-                let close_target = tab_target.clone();
-                let selected = self.selection.tab_id.as_deref() == Some(&tab_id);
-                let control = chrome
-                    .tabs
-                    .items
-                    .iter()
-                    .find(|item| item.id == tab_id)
-                    .cloned();
-                let tab_row = if let Some(control) = control.as_ref() {
-                    apply_control(div().id(("main-tab", tab.number)), control)
-                } else {
-                    div()
-                        .id(("main-tab", tab.number))
-                        .role(ochub_ui::gpui::Role::Tab)
-                        .aria_label(tab.label.clone())
-                        .aria_selected(selected)
-                };
-                tabs.push(
-                    tab_row
+        let tab_count = chrome.tabs.items.len();
+        let tabs =
+            chrome
+                .tabs
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let shortcut = tab_key_equivalent(index, tab_count);
+                    let tab_id = row.a11y.id.clone();
+                    let tab_target = HierarchyTarget::Tab {
+                        id: row.a11y.id.clone(),
+                        label: row.a11y.name.clone(),
+                    };
+                    let close_target = tab_target.clone();
+                    let selected = row.a11y.selected == Some(true);
+                    apply_control(div().id(("main-tab", row.number)), &row.a11y)
                         .flex()
                         .items_center()
                         .flex_none()
@@ -360,9 +315,15 @@ impl OcHerdrView {
                             },
                             13.,
                         ))
-                        .child(div().flex_1().min_w_0().truncate().child(tab.label.clone()))
-                        .when_some(shortcut, |row, shortcut| {
-                            row.child(
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(row.a11y.name.clone()),
+                        )
+                        .when_some(shortcut, |tab_row, shortcut| {
+                            tab_row.child(
                                 div()
                                     .flex_none()
                                     .text_xs()
@@ -374,10 +335,10 @@ impl OcHerdrView {
                                     .child(shortcut),
                             )
                         })
-                        .when(selected, |row| {
-                            row.child(
+                        .when(selected, |tab_row| {
+                            tab_row.child(
                                 icon_only_button_tone(
-                                    ("close-tab", tab.number),
+                                    ("close-tab", row.number),
                                     i18n.text(k::TERMINAL_CLOSE_TAB),
                                     IconName::Close,
                                     ButtonTone::Ghost,
@@ -392,10 +353,9 @@ impl OcHerdrView {
                                 )),
                             )
                         })
-                        .into_any_element(),
-                );
-            }
-        }
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
         let pane_id_right = self.selection.pane_id.clone();
         let pane_id_down = self.selection.pane_id.clone();
         let pane_id_zoom = self.selection.pane_id.clone();
@@ -568,9 +528,12 @@ impl OcHerdrView {
             ).mr_3().on_click(cx.listener(|this, _, _window, cx| this.open_node_manager(cx))))
     }
 
-    pub(super) fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_status_bar(
+        &mut self,
+        chrome: &ChromeA11y,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let i18n = self.i18n;
-        let chrome = self.chrome_a11y();
         let profile = self.current_profile();
         let profile_icon = if matches!(profile, ConnectionProfile::Local { .. }) {
             IconName::Desktop

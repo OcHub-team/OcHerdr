@@ -15,7 +15,7 @@ impl Render for OcHerdrView {
             .min_w_0()
             .h_full()
             .bg(theme::surface().alpha(0.))
-            .child(self.render_tab_bar(cx))
+            .child(self.render_tab_bar(&chrome, cx))
             .child(self.render_terminal(window, cx));
         let workspace_body = div()
             .flex()
@@ -23,7 +23,7 @@ impl Render for OcHerdrView {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(&chrome, cx))
             .child(main)
             .into_any_element();
         let body = if self.overlay.host_center() {
@@ -49,7 +49,7 @@ impl Render for OcHerdrView {
             }))
             .child(body);
         if !self.overlay.host_center() {
-            root = root.child(self.render_status_bar(cx));
+            root = root.child(self.render_status_bar(&chrome, cx));
         }
         match self.overlay.clone() {
             Overlay::None | Overlay::NodeManager | Overlay::RemoteForm(_) => {}
