@@ -22,12 +22,13 @@ bincode protocol.
    sibling panes. Release and terminate every bridge when focus or connection changes.
 7. Feed decoded ANSI bytes into Ghostty's `manualMirror` surface. Ghostty owns VT
    state, shaping, glyph/image rendering, and produces a leased BGRA IOSurface.
-8. Wrap that IOSurface as a CoreVideo pixel buffer without copying it. GPUI samples
-   the native frame in its Metal pass and releases the Ghostty frame token only after
-   the command buffer completes.
-9. Carry Ghostty's Display-P3 metadata with the frame. GPUI converts P3 to sRGB in
-   the fragment shader while preserving premultiplied alpha, and Ghostty follows the
-   application's effective light/dark appearance.
+8. Wrap that IOSurface as a CoreVideo pixel buffer without copying it and without
+   attaching color-space metadata (`CVPixelBuffer::from_io_surface(..., None)`).
+   GPUI samples the BGRA frame as sRGB (`surface()` defaults to sRGB; the
+   Display-P3 fragment conversion in GPUI is unused) and releases the Ghostty
+   frame token only after the command buffer completes. GhosttyKit labels leased
+   Metal frames as Display P3, but OcHerdr does not forward that tag.
+9. Ghostty follows the application's effective light/dark appearance.
 
 ## SSH policy
 

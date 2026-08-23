@@ -18,9 +18,11 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use core_foundation::array::CFArray;
 use core_foundation::base::{CFRelease, TCFType as _};
 use core_foundation::data::CFData;
 use core_foundation::string::CFString;
+use core_foundation::url::CFURL;
 use core_video::pixel_buffer::CVPixelBuffer;
 use io_surface::{IOSurface, IOSurfaceRef};
 use thiserror::Error;
@@ -64,6 +66,22 @@ pub enum SurfaceMouseButton {
     Middle,
 }
 
+/// Same family Ghostty embeds as the default Latin face. Configured
+/// `font-family-bold` entries are discovered *before* that embedded Bold
+/// (SharedGridSet.collection at 3da10da).
+const JETBRAINS_MONO: &str = "JetBrains Mono";
+
+/// macOS CJK families with a bold trait (Semibold / W6 / Bold). Order is the
+/// fallback used when no preferred language tag selects a script.
+const CJK_FALLBACK_FAMILIES: &[&str] = &[
+    "PingFang SC",
+    "PingFang TC",
+    "Hiragino Sans",
+    "Apple SD Gothic Neo",
+];
+
+const CT_FONT_MANAGER_SCOPE_PROCESS: u32 = 1;
+
 /// Colors and type settings for the embedded Ghostty surface.
 /// Color values are `0xRRGGBB`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -101,9 +119,7 @@ impl TerminalPalette {
         for (index, color) in self.ansi.iter().copied().enumerate() {
             let _ = writeln!(out, "palette = {index}={}", hex_color(color));
         }
-        if !self.font_family.trim().is_empty() {
-            let _ = writeln!(out, "font-family = {}", ghostty_quoted(&self.font_family));
-        }
+        write_font_families(&mut out, self.font_family.trim());
         let _ = writeln!(out, "font-size = {}", self.font_size.clamp(8, 32));
         if !self.ligatures {
             let _ = writeln!(out, "font-feature = -calt");
@@ -121,6 +137,160 @@ impl TerminalPalette {
         }
         out
     }
+}
+
+fn write_font_families(out: &mut String, primary: &str) {
+    let tags = preferred_language_tags();
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let cjk = cjk_families_for_languages(&tags);
+    if primary.is_empty() {
+        ensure_jetbrains_mono_bold_registered();
+        if !jetbrains_mono_family_available() {
+            // CJK faces include Latin. Without a JetBrains Mono bold head they
+            // would become Latin bold (CodepointResolver.getIndex walks the
+            // bold collection in insertion order).
+            return;
+        }
+    }
+    write_font_families_with(out, primary, &cjk);
+}
+
+fn write_font_families_with(out: &mut String, primary: &str, cjk: &[&str]) {
+    if primary.is_empty() {
+        // CodepointResolver.getIndex (3da10da): look up the requested style
+        // first; missing bold CJK recurses to regular; only the regular
+        // branch runs discoverFallback. CJK bold therefore needs a bold CJK
+        // face already on the bold list.
+        //
+        // SharedGridSet.collection discovers configured font-family-bold
+        // *before* completeStyles and *before* the embedded JetBrains Mono
+        // Bold (fallback=true). PingFang/Hiragino include Latin, so they
+        // cannot be first: Latin 'A' would resolve to a proportional CJK
+        // face. Anchor with JetBrains Mono so Latin bold stays in the same
+        // family as the embedded regular face, then append locale-sorted
+        // CJK. Do not set font-family (regular) here — that list stays
+        // empty until Ghostty appends embedded JetBrains Mono.
+        let _ = writeln!(out, "font-family-bold = {}", ghostty_quoted(JETBRAINS_MONO));
+        for family in cjk {
+            if *family == JETBRAINS_MONO {
+                continue;
+            }
+            let _ = writeln!(out, "font-family-bold = {}", ghostty_quoted(family));
+        }
+        return;
+    }
+    let _ = writeln!(out, "font-family = {}", ghostty_quoted(primary));
+    let _ = writeln!(out, "font-family-bold = {}", ghostty_quoted(primary));
+    for family in cjk {
+        if *family == primary {
+            continue;
+        }
+        let _ = writeln!(out, "font-family = {}", ghostty_quoted(family));
+        let _ = writeln!(out, "font-family-bold = {}", ghostty_quoted(family));
+    }
+}
+
+fn ensure_jetbrains_mono_bold_registered() {
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        let bytes: &[u8] = include_bytes!("../fonts/JetBrainsMono-Bold.ttf");
+        let path = std::env::temp_dir().join("ocherdr-jetbrains-mono-bold.ttf");
+        if std::fs::write(&path, bytes).is_err() {
+            return;
+        }
+        let Some(url) = CFURL::from_path(&path, false) else {
+            return;
+        };
+        unsafe {
+            CTFontManagerRegisterFontsForURL(
+                url.as_concrete_TypeRef().cast(),
+                CT_FONT_MANAGER_SCOPE_PROCESS,
+                std::ptr::null_mut(),
+            );
+        }
+    });
+}
+
+fn jetbrains_mono_family_available() -> bool {
+    unsafe {
+        let name = CFString::new(JETBRAINS_MONO);
+        let font = CTFontCreateWithName(name.as_concrete_TypeRef().cast(), 12.0, std::ptr::null());
+        if font.is_null() {
+            return false;
+        }
+        let family_ref = CTFontCopyFamilyName(font);
+        CFRelease(font);
+        if family_ref.is_null() {
+            return false;
+        }
+        let family = CFString::wrap_under_create_rule(family_ref.cast());
+        family == JETBRAINS_MONO
+    }
+}
+
+fn cjk_families_for_languages(tags: &[&str]) -> Vec<&'static str> {
+    let mut families = Vec::new();
+    for tag in tags {
+        let Some(family) = cjk_family_for_language(tag) else {
+            continue;
+        };
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    for family in CJK_FALLBACK_FAMILIES {
+        if !families.contains(family) {
+            families.push(*family);
+        }
+    }
+    families
+}
+
+fn cjk_family_for_language(tag: &str) -> Option<&'static str> {
+    let tag = tag.to_ascii_lowercase();
+    if tag == "ja" || tag.starts_with("ja-") {
+        return Some("Hiragino Sans");
+    }
+    if tag == "ko" || tag.starts_with("ko-") {
+        return Some("Apple SD Gothic Neo");
+    }
+    if tag.contains("hant")
+        || tag.starts_with("zh-tw")
+        || tag.starts_with("zh-hk")
+        || tag.starts_with("zh-mo")
+    {
+        return Some("PingFang TC");
+    }
+    if tag == "zh" || tag.starts_with("zh-") {
+        return Some("PingFang SC");
+    }
+    None
+}
+
+fn preferred_language_tags() -> Vec<String> {
+    unsafe {
+        let array_ref = CFLocaleCopyPreferredLanguages();
+        if array_ref.is_null() {
+            return Vec::new();
+        }
+        let array = CFArray::<CFString>::wrap_under_create_rule(array_ref.cast());
+        array
+            .iter()
+            .map(|tag| tag.to_string())
+            .filter(|tag| !tag.is_empty())
+            .collect()
+    }
+}
+
+unsafe extern "C" {
+    fn CFLocaleCopyPreferredLanguages() -> *const c_void;
+    fn CTFontManagerRegisterFontsForURL(
+        font_url: *const c_void,
+        scope: u32,
+        error: *mut *mut c_void,
+    ) -> u8;
+    fn CTFontCreateWithName(name: *const c_void, size: f64, matrix: *const c_void) -> *mut c_void;
+    fn CTFontCopyFamilyName(font: *mut c_void) -> *mut c_void;
 }
 
 fn ghostty_quoted(value: &str) -> String {
@@ -775,11 +945,6 @@ impl Terminal {
         (x, y, width, height)
     }
 
-    pub fn mouse_captured(&self) -> bool {
-        // SAFETY: the surface is live and queried on GPUI's application thread.
-        unsafe { ffi::ghostty_surface_mouse_captured(self.raw()) }
-    }
-
     pub fn mouse_pos(&self, x: f64, y: f64, modifiers: KeyModifiers) {
         // SAFETY: the surface is live and called on GPUI's application thread.
         unsafe {
@@ -829,17 +994,6 @@ impl Terminal {
         Some(take_ghostty_text(self.raw(), &mut result))
     }
 
-    pub fn set_selection_endpoint(&self, col: u16, row: u16, extending: bool) -> bool {
-        // SAFETY: the surface is live and called on GPUI's application thread.
-        let ok = unsafe {
-            ffi::ghostty_surface_set_selection_endpoint_viewport(self.raw(), col, row, extending)
-        };
-        if ok {
-            self.refresh();
-        }
-        ok
-    }
-
     pub fn select_all_visible(&self) -> bool {
         let size = self.surface_size();
         if size.rows == 0 {
@@ -855,48 +1009,20 @@ impl Terminal {
         ok
     }
 
-    pub fn begin_text_selection(
-        &self,
-        x: f64,
-        y: f64,
-        modifiers: KeyModifiers,
-        click_count: usize,
-        scale_factor: f64,
-    ) {
+    pub fn begin_text_selection(&self, x: f64, y: f64, modifiers: KeyModifiers) {
         self.mouse_pos(x, y, modifiers);
-        let captured = self.mouse_button(true, SurfaceMouseButton::Left, modifiers);
-        if captured || click_count > 1 {
-            self.refresh();
-            return;
-        }
-        let (col, row) = cell_at_surface_point(x, y, self.surface_size(), scale_factor);
-        let _ = self.set_selection_endpoint(col, row, false);
+        let _ = self.mouse_button(true, SurfaceMouseButton::Left, modifiers);
+        self.refresh();
     }
 
-    pub fn update_text_selection(
-        &self,
-        x: f64,
-        y: f64,
-        modifiers: KeyModifiers,
-        scale_factor: f64,
-    ) {
+    pub fn update_text_selection(&self, x: f64, y: f64, modifiers: KeyModifiers) {
         self.mouse_pos(x, y, modifiers);
-        if self.mouse_captured() {
-            self.refresh();
-            return;
-        }
-        let (col, row) = cell_at_surface_point(x, y, self.surface_size(), scale_factor);
-        let _ = self.set_selection_endpoint(col, row, true);
+        self.refresh();
     }
 
-    pub fn end_text_selection(
-        &self,
-        point: Option<(f64, f64)>,
-        modifiers: KeyModifiers,
-        scale_factor: f64,
-    ) {
+    pub fn end_text_selection(&self, point: Option<(f64, f64)>, modifiers: KeyModifiers) {
         if let Some((x, y)) = point {
-            self.update_text_selection(x, y, modifiers, scale_factor);
+            self.update_text_selection(x, y, modifiers);
         }
         let _ = self.mouse_button(false, SurfaceMouseButton::Left, modifiers);
         self.refresh();
@@ -1000,19 +1126,6 @@ fn take_ghostty_text(raw: ffi::ghostty_surface_t, result: &mut ffi::ghostty_text
         unsafe { ffi::ghostty_surface_free_text(raw, result) };
     }
     text
-}
-
-pub fn cell_at_surface_point(x: f64, y: f64, size: SurfaceSize, scale_factor: f64) -> (u16, u16) {
-    let scale = scale_factor.max(1.0);
-    let cell_w = f64::from(size.cell_width_px.max(1)) / scale;
-    let cell_h = f64::from(size.cell_height_px.max(1)) / scale;
-    let col = (x / cell_w)
-        .floor()
-        .clamp(0.0, f64::from(size.columns.saturating_sub(1))) as u16;
-    let row = (y / cell_h)
-        .floor()
-        .clamp(0.0, f64::from(size.rows.saturating_sub(1))) as u16;
-    (col, row)
 }
 
 fn ghostty_modifiers(modifiers: KeyModifiers) -> ffi::ghostty_input_mods_e {
@@ -1145,25 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn cell_at_surface_point_uses_unscaled_view_coordinates() {
-        let size = SurfaceSize {
-            columns: 80,
-            rows: 24,
-            width_px: 1600,
-            height_px: 768,
-            cell_width_px: 20,
-            cell_height_px: 32,
-        };
-        assert_eq!(cell_at_surface_point(0.0, 0.0, size, 2.0), (0, 0));
-        assert_eq!(cell_at_surface_point(10.0, 16.0, size, 2.0), (1, 1));
-        assert_eq!(
-            cell_at_surface_point(10_000.0, 10_000.0, size, 2.0),
-            (79, 23)
-        );
-        assert_eq!(cell_at_surface_point(-4.0, -4.0, size, 2.0), (0, 0));
-    }
-
-    #[test]
     fn palette_config_uses_light_background_and_ansi_slots() {
         let palette = TerminalPalette {
             dark: false,
@@ -1188,6 +1282,8 @@ mod tests {
         assert!(config.contains("palette = 0=#5C5F77"));
         assert!(config.contains("palette = 15=#4C4F69"));
         assert!(config.contains("font-family = \"SF Mono\""));
+        assert!(config.contains("font-family-bold = \"SF Mono\""));
+        assert!(config.contains("font-family-bold = \"PingFang SC\""));
         assert!(config.contains("font-size = 14"));
         assert!(config.contains("font-feature = -calt"));
         assert!(config.contains("font-thicken = true"));
@@ -1202,10 +1298,71 @@ mod tests {
             ..palette.clone()
         };
         let builtin_config = builtin.config_text();
-        assert!(!builtin_config.contains("font-family"));
+        assert!(
+            !builtin_config.contains("font-family = "),
+            "{builtin_config}"
+        );
+        assert!(builtin_config.contains("font-family-bold = \"JetBrains Mono\""));
+        assert!(builtin_config.contains("font-family-bold = \"PingFang SC\""));
+        assert!(!builtin_config.contains("Menlo"));
+        let jbm = builtin_config
+            .find("font-family-bold = \"JetBrains Mono\"")
+            .unwrap();
+        let cjk = builtin_config
+            .find("font-family-bold = \"PingFang SC\"")
+            .unwrap();
+        assert!(jbm < cjk);
         assert!(!builtin_config.contains("font-thicken"));
         assert!(!builtin_config.contains("adjust-cell-width"));
         assert_ne!(palette.signature(), builtin.signature());
+    }
+
+    #[test]
+    fn default_ghostty_config_anchors_latin_bold_before_cjk() {
+        let mut out = String::new();
+        write_font_families_with(&mut out, "", &["PingFang SC", "Hiragino Sans"]);
+        assert!(
+            !out.contains("font-family = "),
+            "regular list stays empty so embedded JetBrains Mono remains Latin regular\n{out}"
+        );
+        let jbm = out.find("font-family-bold = \"JetBrains Mono\"").unwrap();
+        let cjk = out.find("font-family-bold = \"PingFang SC\"").unwrap();
+        assert!(jbm < cjk);
+        assert!(!out.contains("Menlo"));
+    }
+
+    #[test]
+    fn cjk_fallback_order_follows_preferred_language_tags() {
+        assert_eq!(
+            cjk_families_for_languages(&["zh-Hant-TW"])[0],
+            "PingFang TC"
+        );
+        assert_eq!(cjk_families_for_languages(&["ja-JP"])[0], "Hiragino Sans");
+        assert_eq!(
+            cjk_families_for_languages(&["ko-KR"])[0],
+            "Apple SD Gothic Neo"
+        );
+        assert_eq!(
+            cjk_families_for_languages(&["zh-Hans-CN"])[0],
+            "PingFang SC"
+        );
+        assert_eq!(cjk_families_for_languages(&["en-US"])[0], "PingFang SC");
+    }
+
+    #[test]
+    fn ghostty_config_puts_the_primary_bold_face_ahead_of_cjk_fallbacks() {
+        let mut config = String::new();
+        write_font_families_with(
+            &mut config,
+            "Menlo",
+            &cjk_families_for_languages(&["ja-JP"]),
+        );
+        let primary_bold = config.find("font-family-bold = \"Menlo\"").unwrap();
+        let cjk_bold = config.find("font-family-bold = \"Hiragino Sans\"").unwrap();
+        assert!(primary_bold < cjk_bold);
+        let primary = config.find("font-family = \"Menlo\"").unwrap();
+        let cjk = config.find("font-family = \"Hiragino Sans\"").unwrap();
+        assert!(primary < cjk);
     }
 
     #[test]

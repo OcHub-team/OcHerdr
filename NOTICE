@@ -16,6 +16,11 @@ Copyright Ghostty contributors
 MIT
 https://github.com/OcHub-team/ghostty/tree/ocherdr/ghosttykit
 
+JetBrains Mono (Bold TTF bundled for in-process CoreText registration)
+Copyright 2020 The JetBrains Mono Project Authors
+SIL Open Font License 1.1
+https://github.com/JetBrains/JetBrainsMono
+
 Herdr is not linked into OcHerdr. OcHerdr interoperates with a separately installed
 Herdr executable through its public CLI and socket APIs. Herdr is Apache-2.0 licensed.
 
