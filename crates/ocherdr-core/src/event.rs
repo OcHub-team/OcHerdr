@@ -1,8 +1,10 @@
 //! Typed Herdr event payloads and incremental snapshot updates.
 
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use serde::Deserialize;
 
-use super::{HierarchySnapshot, PaneInfo, PaneLayout, TabInfo, WorkspaceInfo};
+use super::{AgentStatus, HierarchySnapshot, PaneInfo, PaneLayout, TabInfo, WorkspaceInfo};
 
 /// Outcome of applying one Herdr event to a [`HierarchySnapshot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,12 +97,127 @@ pub enum HerdrEvent {
         pane_id: String,
         #[serde(default)]
         agent: Option<String>,
+        #[serde(default)]
+        released: bool,
+        #[serde(default)]
+        final_status: Option<AgentStatus>,
+    },
+    PaneAgentStatusChanged {
+        pane_id: String,
+        workspace_id: String,
+        agent_status: AgentStatus,
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        display_agent: Option<String>,
+        #[serde(default)]
+        state_labels: HashMap<String, String>,
     },
     LayoutUpdated {
         layout: PaneLayout,
     },
     #[serde(other)]
     Unknown,
+}
+
+/// True when the live per-pane agent-status subscription no longer covers
+/// the snapshot's pane set. Compare the parsed ids; do not enumerate the
+/// operations that might have changed them.
+pub fn agent_status_stream_should_rebuild(
+    subscribed: &HashSet<String>,
+    snapshot: &HierarchySnapshot,
+) -> bool {
+    *subscribed != snapshot.pane_ids()
+}
+
+/// After a failed subscribe, restore `previous` when this attempt is still
+/// the current target so the next `agent_status_stream_should_rebuild`
+/// check retries.
+pub fn event_panes_after_failed_subscribe(
+    current: &HashSet<String>,
+    attempted: &HashSet<String>,
+    previous: &HashSet<String>,
+) -> HashSet<String> {
+    if current == attempted {
+        previous.clone()
+    } else {
+        current.clone()
+    }
+}
+
+/// After the live per-pane stream dies, forget the subscribed pane set so
+/// the next `agent_status_stream_should_rebuild` check reconnects. Empty,
+/// so an empty snapshot does not rebuild in a loop. Does not drop an
+/// in-flight subscribe→snapshot handoff; those events still belong on
+/// the snapshot that was requested at subscribe.
+pub fn agent_status_panes_after_stream_closed() -> HashSet<String> {
+    HashSet::new()
+}
+
+/// Newest-preserving cap for the subscribe→snapshot handoff buffer.
+pub const AGENT_STATUS_HANDOFF_LIMIT: usize = 128;
+
+/// Status events held until the post-subscribe snapshot is installed.
+#[derive(Debug)]
+pub struct AgentStatusHandoff<T> {
+    pending: VecDeque<T>,
+    resync_after: bool,
+}
+
+impl<T> AgentStatusHandoff<T> {
+    pub fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            resync_after: false,
+        }
+    }
+
+    pub fn push(&mut self, incoming: impl IntoIterator<Item = T>, limit: usize) -> bool {
+        agent_status_handoff_push(&mut self.pending, incoming, limit)
+    }
+
+    /// A payload the live path would resync on. Replay first, then resync.
+    pub fn note_payload_error(&mut self) {
+        self.resync_after = true;
+    }
+
+    /// Drain the buffer for replay (or flush on snapshot failure) and
+    /// whether a follow-up resync is still required.
+    pub fn into_release(self) -> (Vec<T>, bool) {
+        (self.pending.into_iter().collect(), self.resync_after)
+    }
+}
+
+impl<T> Default for AgentStatusHandoff<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Push `incoming` onto `pending`, dropping the oldest when over `limit`.
+/// Returns whether any oldest events were discarded to stay in bound.
+pub fn agent_status_handoff_push<T>(
+    pending: &mut VecDeque<T>,
+    incoming: impl IntoIterator<Item = T>,
+    limit: usize,
+) -> bool {
+    let mut overflowed = false;
+    for item in incoming {
+        if pending.len() >= limit {
+            pending.pop_front();
+            overflowed = true;
+        }
+        pending.push_back(item);
+    }
+    overflowed
+}
+
+/// Take the buffered events so they can be applied after the snapshot
+/// installs, or flushed onto the existing snapshot if that fetch fails.
+pub fn agent_status_handoff_take<T>(pending: &mut VecDeque<T>) -> Vec<T> {
+    pending.drain(..).collect()
 }
 
 impl HierarchySnapshot {
@@ -207,16 +324,27 @@ impl HierarchySnapshot {
                 );
             }
             HerdrEvent::PaneUpdated { pane } => {
-                if replace_by_id(
-                    &mut self.panes,
-                    &pane.pane_id,
-                    |item| &item.pane_id,
-                    pane.clone(),
-                )
-                .is_some()
-                {
+                let Some(existing) = self
+                    .panes
+                    .iter_mut()
+                    .find(|item| item.pane_id == pane.pane_id)
+                else {
                     return SnapshotUpdate::Resync;
-                }
+                };
+                // Agent lifecycle fields are owned by PaneAgentStatusChanged /
+                // PaneAgentDetected (and the initial snapshot / PaneCreated).
+                // pane.updated's last event can carry a stale Working.
+                let agent_status = existing.agent_status;
+                let agent = existing.agent.clone();
+                let title = existing.title.clone();
+                let display_agent = existing.display_agent.clone();
+                let state_labels = existing.state_labels.clone();
+                *existing = pane.clone();
+                existing.agent_status = agent_status;
+                existing.agent = agent;
+                existing.title = title;
+                existing.display_agent = display_agent;
+                existing.state_labels = state_labels;
             }
             HerdrEvent::PaneClosed {
                 pane_id,
@@ -254,11 +382,60 @@ impl HierarchySnapshot {
                     pane.focused = &pane.pane_id == pane_id;
                 }
             }
-            HerdrEvent::PaneAgentDetected { pane_id, agent, .. } => {
+            HerdrEvent::PaneAgentDetected {
+                pane_id,
+                agent,
+                released,
+                final_status,
+                ..
+            } => {
                 let Some(pane) = self.panes.iter_mut().find(|pane| &pane.pane_id == pane_id) else {
                     return SnapshotUpdate::Resync;
                 };
+                if *released {
+                    // Payload still names the old agent; identity is gone.
+                    pane.agent = None;
+                    pane.display_agent = None;
+                    pane.title = None;
+                    pane.state_labels.clear();
+                    if let Some(status) = final_status {
+                        pane.agent_status = *status;
+                    }
+                } else {
+                    pane.agent.clone_from(agent);
+                }
+            }
+            HerdrEvent::PaneAgentStatusChanged {
+                pane_id,
+                agent_status,
+                agent,
+                title,
+                display_agent,
+                state_labels,
+                ..
+            } => {
+                let Some(pane) = self.panes.iter_mut().find(|pane| &pane.pane_id == pane_id) else {
+                    return SnapshotUpdate::Resync;
+                };
+                // Partial defense only. The session subscription and the
+                // per-pane status subscription are independent sockets;
+                // Herdr does not merge them into one ordered stream. A name
+                // mismatch means the two have diverged; resync rather than
+                // guess.
+                //
+                // This cannot tell two grok instances apart on the same pane.
+                // Same-kind restart plus cross-subscription reordering can
+                // still apply a stale status. A complete fix needs Herdr to
+                // expose a globally sequenced aggregate subscription and a
+                // snapshot barrier.
+                if agent.as_deref() != pane.agent.as_deref() {
+                    return SnapshotUpdate::Resync;
+                }
+                pane.agent_status = *agent_status;
                 pane.agent.clone_from(agent);
+                pane.title.clone_from(title);
+                pane.display_agent.clone_from(display_agent);
+                pane.state_labels.clone_from(state_labels);
             }
             HerdrEvent::LayoutUpdated { layout } => {
                 if let Some(existing) = self.layouts.iter_mut().find(|existing| {
@@ -325,7 +502,7 @@ fn upsert_by_id<T>(items: &mut Vec<T>, id: &str, item_id: impl Fn(&T) -> &str, i
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     use super::*;
     use crate::{AgentStatus, LayoutPane, LayoutRect};
@@ -795,22 +972,53 @@ mod tests {
     }
 
     #[test]
-    fn pane_updated_replaces_the_pane_by_id() {
+    fn pane_updated_does_not_overwrite_agent_status_but_still_updates_other_fields() {
         let mut snapshot = HierarchySnapshot {
             panes: vec![pane("p1", "w1", "t1", true)],
             ..Default::default()
         };
-        let mut updated = pane("p1", "w1", "t1", true);
-        updated.revision = 9;
+        snapshot.panes[0].agent_status = AgentStatus::Done;
+        snapshot.panes[0].agent = Some("grok".into());
+        snapshot.panes[0].display_agent = Some("grok".into());
+        snapshot.panes[0].title = Some("old-title".into());
+        snapshot.panes[0].terminal_title = Some("old-term".into());
+        snapshot.panes[0].cwd = Some("/old".into());
+        snapshot.panes[0].revision = 1;
+        snapshot.panes[0]
+            .state_labels
+            .insert("model".into(), "grok".into());
+
+        let mut updated = snapshot.panes[0].clone();
         updated.agent_status = AgentStatus::Working;
-        updated.terminal_title = Some("claude".into());
+        updated.agent = Some("claude".into());
+        updated.display_agent = Some("claude".into());
+        updated.title = Some("new-title".into());
+        updated.terminal_title = Some("new-term".into());
+        updated.cwd = Some("/new".into());
+        updated.revision = 9;
+        updated.state_labels.insert("model".into(), "claude".into());
+
         assert_eq!(
-            snapshot.apply(&HerdrEvent::PaneUpdated {
-                pane: updated.clone()
-            }),
+            snapshot.apply(&HerdrEvent::PaneUpdated { pane: updated }),
             SnapshotUpdate::Applied
         );
-        assert_eq!(snapshot.panes, vec![updated]);
+        assert_eq!(snapshot.panes[0].agent_status, AgentStatus::Done);
+        assert_eq!(snapshot.panes[0].agent.as_deref(), Some("grok"));
+        assert_eq!(snapshot.panes[0].display_agent.as_deref(), Some("grok"));
+        assert_eq!(
+            snapshot.panes[0]
+                .state_labels
+                .get("model")
+                .map(String::as_str),
+            Some("grok")
+        );
+        assert_eq!(snapshot.panes[0].title.as_deref(), Some("old-title"));
+        assert_eq!(
+            snapshot.panes[0].terminal_title.as_deref(),
+            Some("new-term")
+        );
+        assert_eq!(snapshot.panes[0].cwd.as_deref(), Some("/new"));
+        assert_eq!(snapshot.panes[0].revision, 9);
     }
 
     #[test]
@@ -968,10 +1176,316 @@ mod tests {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 agent: Some("claude".into()),
+                released: false,
+                final_status: None,
             }),
             SnapshotUpdate::Applied
         );
         assert_eq!(snapshot.panes[0].agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn pane_agent_detected_release_clears_presentation_and_applies_final_status() {
+        let event: HerdrEvent = serde_json::from_str(
+            r#"{"type":"pane_agent_detected","agent":"t21-rel","final_status":"unknown","pane_id":"wC:p6","released":true,"workspace_id":"wC"}"#,
+        )
+        .unwrap();
+        let HerdrEvent::PaneAgentDetected {
+            released,
+            final_status,
+            agent,
+            ..
+        } = event
+        else {
+            panic!("expected pane_agent_detected");
+        };
+        assert!(released);
+        assert_eq!(final_status, Some(AgentStatus::Unknown));
+        assert_eq!(agent.as_deref(), Some("t21-rel"));
+
+        let mut snapshot = HierarchySnapshot {
+            panes: vec![pane("p1", "w1", "t1", true)],
+            ..Default::default()
+        };
+        snapshot.panes[0].agent = Some("t21-rel".into());
+        snapshot.panes[0].display_agent = Some("t21-rel".into());
+        snapshot.panes[0].title = Some("still working".into());
+        snapshot.panes[0].agent_status = AgentStatus::Idle;
+        snapshot.panes[0]
+            .state_labels
+            .insert("model".into(), "t21".into());
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneAgentDetected {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                agent: Some("t21-rel".into()),
+                released: true,
+                final_status: Some(AgentStatus::Unknown),
+            }),
+            SnapshotUpdate::Applied
+        );
+        assert_eq!(snapshot.panes[0].agent, None);
+        assert_eq!(snapshot.panes[0].display_agent, None);
+        assert_eq!(snapshot.panes[0].title, None);
+        assert!(snapshot.panes[0].state_labels.is_empty());
+        assert_eq!(snapshot.panes[0].agent_status, AgentStatus::Unknown);
+    }
+
+    fn released_pane(agent: &str, status: AgentStatus) -> HierarchySnapshot {
+        let mut snapshot = HierarchySnapshot {
+            panes: vec![pane("p1", "w1", "t1", true)],
+            ..Default::default()
+        };
+        snapshot.panes[0].agent = Some(agent.into());
+        snapshot.panes[0].display_agent = Some(agent.into());
+        snapshot.panes[0].title = Some("still working".into());
+        snapshot.panes[0].agent_status = AgentStatus::Idle;
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneAgentDetected {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                agent: Some(agent.into()),
+                released: true,
+                final_status: Some(status),
+            }),
+            SnapshotUpdate::Applied
+        );
+        snapshot
+    }
+
+    fn status_event(agent: &str, status: AgentStatus) -> HerdrEvent {
+        HerdrEvent::PaneAgentStatusChanged {
+            pane_id: "p1".into(),
+            workspace_id: "w1".into(),
+            agent_status: status,
+            agent: Some(agent.into()),
+            title: Some("still working".into()),
+            display_agent: Some(agent.into()),
+            state_labels: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn status_after_release_does_not_restore_the_old_agent_name() {
+        let mut snapshot = released_pane("grok", AgentStatus::Unknown);
+        assert_eq!(
+            snapshot.apply(&status_event("grok", AgentStatus::Unknown)),
+            SnapshotUpdate::Resync
+        );
+        assert_eq!(snapshot.panes[0].agent, None);
+        assert_eq!(snapshot.panes[0].display_agent, None);
+        assert_eq!(snapshot.panes[0].title, None);
+        assert_eq!(snapshot.panes[0].agent_status, AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn status_for_a_different_agent_resyncs_instead_of_applying() {
+        let mut snapshot = HierarchySnapshot {
+            panes: vec![pane("p1", "w1", "t1", true)],
+            ..Default::default()
+        };
+        snapshot.panes[0].agent = Some("grok".into());
+        snapshot.panes[0].agent_status = AgentStatus::Idle;
+        assert_eq!(
+            snapshot.apply(&status_event("claude", AgentStatus::Working)),
+            SnapshotUpdate::Resync
+        );
+        assert_eq!(snapshot.panes[0].agent.as_deref(), Some("grok"));
+        assert_eq!(snapshot.panes[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn same_kind_agent_restarting_on_the_same_pane_takes_the_new_generation() {
+        let mut snapshot = released_pane("grok", AgentStatus::Unknown);
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneAgentDetected {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                agent: Some("grok".into()),
+                released: false,
+                final_status: None,
+            }),
+            SnapshotUpdate::Applied
+        );
+        assert_eq!(
+            snapshot.apply(&status_event("grok", AgentStatus::Working)),
+            SnapshotUpdate::Applied
+        );
+        assert_eq!(snapshot.panes[0].agent.as_deref(), Some("grok"));
+        assert_eq!(snapshot.panes[0].agent_status, AgentStatus::Working);
+        assert_eq!(snapshot.panes[0].display_agent.as_deref(), Some("grok"));
+    }
+
+    #[test]
+    fn pane_agent_status_changed_moves_working_to_done_and_updates_presentation() {
+        let mut snapshot = HierarchySnapshot {
+            panes: vec![pane("p1", "w1", "t1", true), pane("p2", "w1", "t1", false)],
+            ..Default::default()
+        };
+        snapshot.panes[0].agent_status = AgentStatus::Working;
+        snapshot.panes[0].agent = Some("grok".into());
+        snapshot.panes[1].agent_status = AgentStatus::Working;
+        snapshot.panes[1].display_agent = Some("sibling".into());
+        snapshot.panes[1].title = Some("keep-me".into());
+        let mut state_labels = HashMap::new();
+        state_labels.insert("model".into(), "grok".into());
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p1".into(),
+                workspace_id: "w1".into(),
+                agent_status: AgentStatus::Done,
+                agent: Some("grok".into()),
+                title: Some("finished".into()),
+                display_agent: Some("grok".into()),
+                state_labels: state_labels.clone(),
+            }),
+            SnapshotUpdate::Applied
+        );
+        assert_eq!(snapshot.panes[0].agent_status, AgentStatus::Done);
+        assert_eq!(snapshot.panes[0].agent.as_deref(), Some("grok"));
+        assert_eq!(snapshot.panes[0].title.as_deref(), Some("finished"));
+        assert_eq!(snapshot.panes[0].display_agent.as_deref(), Some("grok"));
+        assert_eq!(snapshot.panes[0].state_labels, state_labels);
+        assert_eq!(snapshot.panes[1].agent_status, AgentStatus::Working);
+        assert_eq!(snapshot.panes[1].display_agent.as_deref(), Some("sibling"));
+        assert_eq!(snapshot.panes[1].title.as_deref(), Some("keep-me"));
+    }
+
+    #[test]
+    fn pane_agent_status_changed_resyncs_when_the_pane_is_missing() {
+        let mut snapshot = HierarchySnapshot::default();
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p1".into(),
+                workspace_id: "w1".into(),
+                agent_status: AgentStatus::Done,
+                agent: None,
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+            }),
+            SnapshotUpdate::Resync
+        );
+    }
+
+    #[test]
+    fn agent_status_stream_rebuilds_only_when_the_pane_set_changes() {
+        let snapshot = cascade_snapshot();
+        let same = snapshot.pane_ids();
+        assert!(!agent_status_stream_should_rebuild(&same, &snapshot));
+        let mut extra = same.clone();
+        extra.insert("p-new".into());
+        assert!(agent_status_stream_should_rebuild(&extra, &snapshot));
+        assert!(agent_status_stream_should_rebuild(
+            &HashSet::new(),
+            &snapshot
+        ));
+        let empty = HierarchySnapshot::default();
+        assert!(!agent_status_stream_should_rebuild(&HashSet::new(), &empty));
+    }
+
+    #[test]
+    fn a_failed_subscribe_rolls_back_so_the_next_ensure_still_rebuilds() {
+        let previous: HashSet<String> = ["p1".into()].into_iter().collect();
+        let attempted: HashSet<String> = ["p1".into(), "p2".into()].into_iter().collect();
+        let rolled_back = event_panes_after_failed_subscribe(&attempted, &attempted, &previous);
+        assert_eq!(rolled_back, previous);
+        let mut snapshot = cascade_snapshot();
+        snapshot.panes.push(pane("p-new", "w1", "t1", false));
+        assert!(agent_status_stream_should_rebuild(&rolled_back, &snapshot));
+
+        let superseded: HashSet<String> = ["p1".into(), "p2".into(), "p3".into()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            event_panes_after_failed_subscribe(&superseded, &attempted, &previous),
+            superseded
+        );
+    }
+
+    #[test]
+    fn a_dead_agent_status_stream_forgets_its_panes_so_the_next_ensure_rebuilds() {
+        let snapshot = cascade_snapshot();
+        let live = snapshot.pane_ids();
+        assert!(!agent_status_stream_should_rebuild(&live, &snapshot));
+        let forgotten = agent_status_panes_after_stream_closed();
+        assert!(agent_status_stream_should_rebuild(&forgotten, &snapshot));
+        let empty = HierarchySnapshot::default();
+        assert!(!agent_status_stream_should_rebuild(&forgotten, &empty));
+    }
+
+    #[test]
+    fn handoff_replays_buffered_status_after_the_snapshot_is_installed() {
+        let mut pending = VecDeque::new();
+        assert!(!agent_status_handoff_push(
+            &mut pending,
+            [status_event("grok", AgentStatus::Done)],
+            AGENT_STATUS_HANDOFF_LIMIT,
+        ));
+
+        let mut installed = HierarchySnapshot {
+            panes: vec![pane("p1", "w1", "t1", true)],
+            ..Default::default()
+        };
+        installed.panes[0].agent = Some("grok".into());
+        installed.panes[0].agent_status = AgentStatus::Working;
+        for event in agent_status_handoff_take(&mut pending) {
+            assert_eq!(installed.apply(&event), SnapshotUpdate::Applied);
+        }
+        assert_eq!(installed.panes[0].agent_status, AgentStatus::Done);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn handoff_buffer_keeps_the_newest_events_when_over_limit() {
+        let mut pending = VecDeque::new();
+        assert!(agent_status_handoff_push(
+            &mut pending,
+            [
+                status_event("grok", AgentStatus::Working),
+                status_event("grok", AgentStatus::Idle),
+                status_event("grok", AgentStatus::Done),
+            ],
+            2,
+        ));
+        let replayed = agent_status_handoff_take(&mut pending);
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0], status_event("grok", AgentStatus::Idle));
+        assert_eq!(replayed[1], status_event("grok", AgentStatus::Done));
+    }
+
+    #[test]
+    fn handoff_snapshot_failure_still_applies_the_buffered_events() {
+        let mut snapshot = HierarchySnapshot {
+            panes: vec![pane("p1", "w1", "t1", true)],
+            ..Default::default()
+        };
+        snapshot.panes[0].agent = Some("grok".into());
+        snapshot.panes[0].agent_status = AgentStatus::Working;
+        let mut pending = VecDeque::new();
+        agent_status_handoff_push(
+            &mut pending,
+            [status_event("grok", AgentStatus::Done)],
+            AGENT_STATUS_HANDOFF_LIMIT,
+        );
+        for event in agent_status_handoff_take(&mut pending) {
+            assert_eq!(snapshot.apply(&event), SnapshotUpdate::Applied);
+        }
+        assert_eq!(snapshot.panes[0].agent_status, AgentStatus::Done);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn handoff_payload_error_requests_resync_after_release() {
+        let mut handoff = AgentStatusHandoff::new();
+        handoff.push(
+            [status_event("grok", AgentStatus::Done)],
+            AGENT_STATUS_HANDOFF_LIMIT,
+        );
+        handoff.note_payload_error();
+        let (events, resync_after) = handoff.into_release();
+        assert_eq!(events, vec![status_event("grok", AgentStatus::Done)]);
+        assert!(resync_after);
     }
 
     #[test]
@@ -1015,6 +1529,20 @@ mod tests {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 agent: Some("claude".into()),
+                released: false,
+                final_status: None,
+            }),
+            SnapshotUpdate::Resync
+        );
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p1".into(),
+                workspace_id: "w1".into(),
+                agent_status: AgentStatus::Done,
+                agent: None,
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
             }),
             SnapshotUpdate::Resync
         );

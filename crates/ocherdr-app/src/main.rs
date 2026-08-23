@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
-    AgentStatus, ConnectionProfile, HerdrEvent, HierarchySnapshot, PaneInfo, Selection,
-    SessionSummary, SnapshotUpdate, SplitDirection,
+    AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent, HierarchySnapshot, PaneInfo,
+    Selection, SessionSummary, SnapshotUpdate, SplitDirection,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -626,8 +626,16 @@ struct OcHerdrView {
     session_index: Option<usize>,
     connection: Option<SessionConnection>,
     event_stream: EventStreamState,
-    /// Dropping this cancels the event await loop.
+    /// Dropping this cancels the session-wide event await loop.
     event_listen: Option<Task<()>>,
+    /// Dropping this cancels the per-pane agent-status await loop.
+    agent_status_listen: Option<Task<()>>,
+    /// In-flight agent-status subscribe that will replace `agent_status_listen`.
+    agent_status_rebuild: Option<Task<()>>,
+    /// Pane ids the current (or in-flight) agent-status subscribe was built for.
+    agent_status_panes: HashSet<String>,
+    /// Status events held until the post-subscribe snapshot is installed.
+    agent_status_handoff: Option<AgentStatusHandoff<HerdrEvent>>,
     snapshot: Option<HierarchySnapshot>,
     selection: Selection,
     operation: Option<SharedString>,

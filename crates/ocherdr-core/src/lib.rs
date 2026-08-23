@@ -3,13 +3,17 @@
 //! Herdr remains authoritative. This crate only keeps the latest public API
 //! snapshot and the user's current GUI selection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 pub mod event;
-pub use event::{HerdrEvent, SnapshotUpdate};
+pub use event::{
+    AGENT_STATUS_HANDOFF_LIMIT, AgentStatusHandoff, HerdrEvent, SnapshotUpdate,
+    agent_status_handoff_push, agent_status_handoff_take, agent_status_panes_after_stream_closed,
+    agent_status_stream_should_rebuild, event_panes_after_failed_subscribe,
+};
 
 pub const MINIMUM_HERDR_VERSION: &str = "0.8.1";
 
@@ -271,6 +275,10 @@ impl HierarchySnapshot {
 
     pub fn pane(&self, pane_id: &str) -> Option<&PaneInfo> {
         self.panes.iter().find(|pane| pane.pane_id == pane_id)
+    }
+
+    pub fn pane_ids(&self) -> HashSet<String> {
+        self.panes.iter().map(|pane| pane.pane_id.clone()).collect()
     }
 }
 

@@ -4,6 +4,7 @@
 //! State travels over Herdr's public NDJSON socket; terminal bytes travel through
 //! `herdr terminal session observe/control`.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -18,7 +19,8 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use futures::channel::mpsc::{self as futures_mpsc, UnboundedReceiver};
 use ocherdr_core::{
-    ConnectionProfile, HerdrEvent, HierarchySnapshot, MINIMUM_HERDR_VERSION, SessionSummary,
+    AgentStatus, ConnectionProfile, HerdrEvent, HierarchySnapshot, MINIMUM_HERDR_VERSION,
+    SessionSummary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -452,7 +454,7 @@ impl SessionConnection {
     }
 
     pub fn subscribe_background(&self) -> Result<EventSubscription> {
-        Ok(EventSubscription::spawn(self.subscribe()?))
+        subscribe_events(&self.socket_path)
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -650,17 +652,26 @@ pub struct EventStream {
 
 impl EventStream {
     fn connect(socket_path: &Path) -> Result<Self> {
+        Self::connect_with_subscriptions(socket_path, session_subscriptions(), "ocherdr-events")
+    }
+
+    fn connect_agent_status(socket_path: &Path, pane_ids: &[String]) -> Result<Self> {
+        Self::connect_with_subscriptions(
+            socket_path,
+            agent_status_subscriptions(pane_ids),
+            "ocherdr-agent-status",
+        )
+    }
+
+    fn connect_with_subscriptions(
+        socket_path: &Path,
+        subscriptions: Vec<Value>,
+        id_prefix: &str,
+    ) -> Result<Self> {
         let mut stream = UnixStream::connect(socket_path)?;
         stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
         stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
-        let id = format!(
-            "ocherdr-events-{}",
-            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let subscriptions = EVENT_SUBSCRIPTIONS
-            .iter()
-            .map(|kind| json!({ "type": kind }))
-            .collect::<Vec<_>>();
+        let id = format!("{id_prefix}-{}", REQUEST_ID.fetch_add(1, Ordering::Relaxed));
         write_socket_json(
             &mut stream,
             &json!({
@@ -720,7 +731,78 @@ fn parse_event_line(line: &str) -> Result<HerdrEvent> {
     let Some(data) = value.get("data") else {
         return Err(HerdrError::Protocol("event is missing `data`".into()));
     };
+    // Parameterized subscriptions use a different envelope: `event` is a dotted
+    // name and `data` has no `type` tag.
+    if value.get("event").and_then(Value::as_str) == Some("pane.agent_status_changed") {
+        return parse_agent_status_changed(data);
+    }
     Ok(serde_json::from_value(data.clone())?)
+}
+
+fn parse_agent_status_changed(data: &Value) -> Result<HerdrEvent> {
+    #[derive(Deserialize)]
+    struct Payload {
+        pane_id: String,
+        workspace_id: String,
+        agent_status: AgentStatus,
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        display_agent: Option<String>,
+        #[serde(default)]
+        state_labels: HashMap<String, String>,
+    }
+    let payload: Payload = serde_json::from_value(data.clone())?;
+    Ok(HerdrEvent::PaneAgentStatusChanged {
+        pane_id: payload.pane_id,
+        workspace_id: payload.workspace_id,
+        agent_status: payload.agent_status,
+        agent: payload.agent,
+        title: payload.title,
+        display_agent: payload.display_agent,
+        state_labels: payload.state_labels,
+    })
+}
+
+/// Session-wide EventHub types. Herdr starts these at sequence 0 and
+/// replays retained history. OcHerdr subscribes once at connect and
+/// never rebuilds this list.
+fn session_subscriptions() -> Vec<Value> {
+    EVENT_SUBSCRIPTIONS
+        .iter()
+        .map(|kind| json!({ "type": kind }))
+        .collect()
+}
+
+/// Parameterized `pane.agent_status_changed`. Herdr starts these at
+/// `current_sequence`, so a rebuild does not replay retained status
+/// history.
+fn agent_status_subscriptions(pane_ids: &[String]) -> Vec<Value> {
+    pane_ids
+        .iter()
+        .map(|pane_id| {
+            json!({
+                "type": "pane.agent_status_changed",
+                "pane_id": pane_id,
+            })
+        })
+        .collect()
+}
+
+pub fn subscribe_events(socket_path: &Path) -> Result<EventSubscription> {
+    Ok(EventSubscription::spawn(EventStream::connect(socket_path)?))
+}
+
+pub fn subscribe_agent_status(
+    socket_path: &Path,
+    pane_ids: &[String],
+) -> Result<EventSubscription> {
+    Ok(EventSubscription::spawn(EventStream::connect_agent_status(
+        socket_path,
+        pane_ids,
+    )?))
 }
 
 pub struct EventSubscription {
@@ -1529,6 +1611,69 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_event_lines_use_the_dotted_envelope_without_a_data_type() {
+        let working = parse_event_line(
+            r#"{"data":{"agent":"t21-probe","agent_status":"working","pane_id":"wC:p4","workspace_id":"wC"},"event":"pane.agent_status_changed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            working,
+            HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "wC:p4".into(),
+                workspace_id: "wC".into(),
+                agent_status: AgentStatus::Working,
+                agent: Some("t21-probe".into()),
+                title: None,
+                display_agent: None,
+                state_labels: Default::default(),
+            }
+        );
+
+        let done = parse_event_line(
+            r#"{"data":{"agent":"t21-probe","agent_status":"done","pane_id":"wC:p4","title":"t21 title","workspace_id":"wC"},"event":"pane.agent_status_changed"}"#,
+        )
+        .unwrap();
+        let HerdrEvent::PaneAgentStatusChanged {
+            agent_status,
+            title,
+            ..
+        } = done
+        else {
+            panic!("expected pane agent status changed");
+        };
+        assert_eq!(agent_status, AgentStatus::Done);
+        assert_eq!(title.as_deref(), Some("t21 title"));
+    }
+
+    #[test]
+    fn session_subscriptions_are_the_session_wide_eventhub_list() {
+        let subscriptions = session_subscriptions();
+        assert_eq!(subscriptions.len(), EVENT_SUBSCRIPTIONS.len());
+        assert_eq!(subscriptions[0], json!({"type": EVENT_SUBSCRIPTIONS[0]}));
+        assert!(
+            !subscriptions
+                .iter()
+                .any(|value| value.get("pane_id").is_some())
+        );
+        assert!(EVENT_SUBSCRIPTIONS.contains(&"pane.agent_detected"));
+        assert!(!EVENT_SUBSCRIPTIONS.contains(&"pane.agent_status_changed"));
+    }
+
+    #[test]
+    fn agent_status_subscriptions_are_parameterized_and_separate_from_the_session_list() {
+        // Herdr starts parameterized pane.agent_status_changed at
+        // current_sequence; session-wide Event types replay from 0.
+        let subscriptions = agent_status_subscriptions(&["wC:p1".into(), "wC:p4".into()]);
+        assert_eq!(
+            subscriptions,
+            vec![
+                json!({"type": "pane.agent_status_changed", "pane_id": "wC:p1"}),
+                json!({"type": "pane.agent_status_changed", "pane_id": "wC:p4"}),
+            ]
+        );
+    }
+
+    #[test]
     fn unknown_event_types_are_unknown_and_broken_payloads_error() {
         assert_eq!(
             parse_event_line(
@@ -1577,6 +1722,89 @@ mod tests {
             Err(error) => panic!("expected invalid_request, got {error:?}"),
             Ok(_) => panic!("rejected subscribe must return Err"),
         }
+    }
+
+    #[test]
+    fn session_subscribe_sends_only_session_wide_types() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let socket_path = directory.path().join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            request_tx.send(line).unwrap();
+            let mut payload = serde_json::to_vec(&json!({
+                "id": "",
+                "error": {
+                    "code": "captured",
+                    "message": "request captured"
+                }
+            }))
+            .unwrap();
+            payload.push(b'\n');
+            stream.write_all(&payload).unwrap();
+            stream.flush().unwrap();
+        });
+        match EventStream::connect(&socket_path) {
+            Err(HerdrError::Api { code, .. }) => assert_eq!(code, "captured"),
+            Err(error) => panic!("expected captured request, got {error:?}"),
+            Ok(_) => panic!("subscribe was supposed to be rejected after capture"),
+        }
+        let request: Value = serde_json::from_str(&request_rx.recv().unwrap()).unwrap();
+        assert_eq!(request["method"], "events.subscribe");
+        let subscriptions = request["params"]["subscriptions"].as_array().unwrap();
+        assert_eq!(subscriptions.len(), EVENT_SUBSCRIPTIONS.len());
+        assert_eq!(subscriptions[0], json!({"type": EVENT_SUBSCRIPTIONS[0]}));
+        assert!(
+            !subscriptions
+                .iter()
+                .any(|value| value["type"] == "pane.agent_status_changed")
+        );
+    }
+
+    #[test]
+    fn agent_status_subscribe_sends_only_parameterized_pane_entries() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let socket_path = directory.path().join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            request_tx.send(line).unwrap();
+            let mut payload = serde_json::to_vec(&json!({
+                "id": "",
+                "error": {
+                    "code": "captured",
+                    "message": "request captured"
+                }
+            }))
+            .unwrap();
+            payload.push(b'\n');
+            stream.write_all(&payload).unwrap();
+            stream.flush().unwrap();
+        });
+        match EventStream::connect_agent_status(&socket_path, &["p1".into(), "p2".into()]) {
+            Err(HerdrError::Api { code, .. }) => assert_eq!(code, "captured"),
+            Err(error) => panic!("expected captured request, got {error:?}"),
+            Ok(_) => panic!("subscribe was supposed to be rejected after capture"),
+        }
+        let request: Value = serde_json::from_str(&request_rx.recv().unwrap()).unwrap();
+        assert_eq!(request["method"], "events.subscribe");
+        assert_eq!(
+            request["params"]["subscriptions"],
+            json!([
+                {"type": "pane.agent_status_changed", "pane_id": "p1"},
+                {"type": "pane.agent_status_changed", "pane_id": "p2"},
+            ])
+        );
     }
 
     #[test]

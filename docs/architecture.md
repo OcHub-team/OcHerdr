@@ -52,3 +52,45 @@ Terminal input follows the reverse path: GPUI key or committed-text events enter
 Ghostty's native input encoder, and its exact output bytes are base64-encoded into
 Herdr's public `terminal.input` command. This preserves application-cursor mode,
 bracketed paste, modifier protocols, and other terminal modes.
+
+## Agent status events
+
+OcHerdr opens two independent `events.subscribe` connections.
+
+The session-wide EventHub types are subscribed once at connect and never
+rebuilt. Herdr starts those at sequence 0 and, after the subscribe ACK,
+replays retained history. There is no replay-complete marker and no
+snapshot watermark, so OcHerdr cannot tell replayed history from live
+events. A historical `pane.agent_detected` release then detect can land
+*after* the post-connect snapshot and leave a pane as agent=X,
+status=Unknown, presentation empty. An authoritative snapshot taken
+after EventHub replay has drained would correct that. The client
+limitation is that it cannot tell when replay has drained, so it
+cannot wait for that snapshot.
+
+The per-pane `pane.agent_status_changed` subscription is rebuilt when the
+snapshot pane set changes. Herdr starts those parameterized entries at the
+hub's current sequence, so a rebuild does not replay status history.
+
+Herdr does not merge the two connections into a globally ordered stream:
+detect/release on the session subscription and status on the per-pane
+subscription can arrive out of order.
+
+OcHerdr therefore treats a name mismatch between a status event and the pane's
+current agent as `Resync`. That catches cross-subscription reordering of
+*different* agents. It cannot distinguish two instances of the same kind
+(`grok` then another `grok` in the same pane). In that case a stale status
+event can apply to the new generation and stay until the next status event
+or a resync; it is not necessarily brief.
+
+Known limitation (session replay vs snapshot): OcHerdr cannot close this
+race itself. Herdr needs to provide either a replay-complete / barrier
+event after EventHub history is sent, or a monotonic sequence on every
+event with `session.snapshot` atomically returning the matching EventHub
+watermark, so the client can ignore history that belongs before the
+snapshot it just installed. OcHerdr does not invent a local barrier.
+
+A complete fix for cross-stream reordering still needs Herdr to provide a
+globally sequenced aggregate subscription and a snapshot barrier. Until
+then the same-kind restart race is an accepted limitation; OcHerdr does
+not add local generation tracking for it.

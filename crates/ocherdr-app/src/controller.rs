@@ -1,9 +1,14 @@
+use std::collections::HashSet;
 use std::task::Poll;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::future::{self, Either, poll_fn};
 use futures::pin_mut;
-use ocherdr_herdr::{TerminalFrame, next_batch};
+use ocherdr_core::{
+    AGENT_STATUS_HANDOFF_LIMIT, AgentStatusHandoff, agent_status_panes_after_stream_closed,
+    agent_status_stream_should_rebuild, event_panes_after_failed_subscribe,
+};
+use ocherdr_herdr::{TerminalFrame, next_batch, subscribe_agent_status};
 
 use ochub_ui::notifications::NotificationHost;
 
@@ -38,6 +43,10 @@ impl OcHerdrView {
             connection: None,
             event_stream: EventStreamState::Idle,
             event_listen: None,
+            agent_status_listen: None,
+            agent_status_rebuild: None,
+            agent_status_panes: HashSet::new(),
+            agent_status_handoff: None,
             snapshot: None,
             selection: Selection {
                 connection_id: "local".into(),
@@ -116,6 +125,10 @@ impl OcHerdrView {
         self.event_epoch = self.event_epoch.wrapping_add(1);
         self.event_listen = None;
         self.event_stream = EventStreamState::Idle;
+        self.agent_status_listen = None;
+        self.agent_status_rebuild = None;
+        self.agent_status_panes.clear();
+        self.agent_status_handoff = None;
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
         let epoch = self.load_epoch;
@@ -180,8 +193,10 @@ impl OcHerdrView {
                             LoadedEvents::Live(subscription) => {
                                 this.event_stream = EventStreamState::Live;
                                 this.event_listen = Some(Self::listen_events(subscription, cx));
+                                this.resync_snapshot(this.event_epoch, cx);
                             }
                         }
+                        this.ensure_agent_status_stream(cx);
                     }
                     Err(error) => {
                         this.sessions.clear();
@@ -189,6 +204,10 @@ impl OcHerdrView {
                         this.connection = None;
                         this.event_stream = EventStreamState::Idle;
                         this.event_listen = None;
+                        this.agent_status_listen = None;
+                        this.agent_status_rebuild = None;
+                        this.agent_status_panes.clear();
+                        this.agent_status_handoff = None;
                         this.snapshot = None;
                         this.session_panes = None;
                         this.notify_failure(FailureKind::DiscoverSessions, error, cx);
@@ -214,6 +233,10 @@ impl OcHerdrView {
         self.connection = None;
         self.event_stream = EventStreamState::Idle;
         self.event_listen = None;
+        self.agent_status_listen = None;
+        self.agent_status_rebuild = None;
+        self.agent_status_panes.clear();
+        self.agent_status_handoff = None;
         self.snapshot = None;
         self.session_panes = None;
         self.reload(None, cx);
@@ -536,7 +559,181 @@ impl OcHerdrView {
             self.event_stream = stream;
             cx.notify();
         }
+        self.ensure_agent_status_stream(cx);
         effects.reschedule
+    }
+
+    fn listen_agent_status(mut events: EventSubscription, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let batch = events.next_batch().await;
+                let keep = this
+                    .update(cx, |this, cx| this.apply_agent_status_batch(batch, cx))
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn apply_agent_status_batch(
+        &mut self,
+        batch: Option<Vec<std::result::Result<HerdrEvent, HerdrError>>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let action = match batch {
+            None => {
+                self.agent_status_panes = agent_status_panes_after_stream_closed();
+                return false;
+            }
+            Some(items) => {
+                if let Some(handoff) = self.agent_status_handoff.as_mut() {
+                    let mut fatal = None;
+                    let mut payload_error = None;
+                    let mut events = Vec::new();
+                    for item in items {
+                        match item {
+                            Ok(event) => events.push(event),
+                            Err(err) if err.is_event_payload_error() => {
+                                handoff.note_payload_error();
+                                payload_error = Some(err);
+                            }
+                            Err(err) => {
+                                fatal = Some(err);
+                                break;
+                            }
+                        }
+                    }
+                    handoff.push(events, AGENT_STATUS_HANDOFF_LIMIT);
+                    if let Some(error) = payload_error {
+                        self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
+                    }
+                    if let Some(error) = fatal {
+                        self.agent_status_panes = agent_status_panes_after_stream_closed();
+                        self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
+                        return false;
+                    }
+                    return true;
+                }
+                let Some(snapshot) = self.snapshot.as_mut() else {
+                    return false;
+                };
+                let mut items = items.into_iter();
+                apply_event_stream(snapshot, &mut self.selection, || match items.next() {
+                    Some(Ok(event)) => Ok(Some(event)),
+                    Some(Err(err)) => Err(err),
+                    None => Ok(None),
+                })
+            }
+        };
+        if let EventPollAction::Disconnect(detail) = &action {
+            self.agent_status_panes = agent_status_panes_after_stream_closed();
+            self.notify_failure(FailureKind::ApplyLiveUpdate, detail, cx);
+            return false;
+        }
+        let effects = effects_for(&action);
+        if let Some(error) = effects.error {
+            self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
+        }
+        if effects.resync {
+            self.resync_snapshot(self.event_epoch, cx);
+        }
+        if effects.notify {
+            cx.notify();
+        }
+        effects.reschedule
+    }
+
+    fn ensure_agent_status_stream(&mut self, cx: &mut Context<Self>) {
+        let panes = {
+            let (Some(snapshot), Some(_)) = (&self.snapshot, &self.connection) else {
+                self.agent_status_listen = None;
+                self.agent_status_rebuild = None;
+                self.agent_status_panes.clear();
+                self.agent_status_handoff = None;
+                return;
+            };
+            if !agent_status_stream_should_rebuild(&self.agent_status_panes, snapshot) {
+                return;
+            }
+            snapshot_pane_ids(snapshot)
+        };
+        self.rebuild_agent_status_stream(panes, cx);
+    }
+
+    fn release_agent_status_handoff(&mut self, cx: &mut Context<Self>) {
+        let Some(handoff) = self.agent_status_handoff.take() else {
+            return;
+        };
+        let (events, resync_after) = handoff.into_release();
+        let mut resync = resync_after;
+        if !events.is_empty()
+            && let Some(snapshot) = self.snapshot.as_mut()
+        {
+            let mut events = events.into_iter();
+            let action = apply_event_stream(snapshot, &mut self.selection, || Ok(events.next()));
+            let effects = effects_for(&action);
+            if let Some(error) = effects.error {
+                self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
+            }
+            if effects.notify {
+                cx.notify();
+            }
+            resync |= effects.resync;
+        }
+        if resync {
+            self.resync_snapshot(self.event_epoch, cx);
+        }
+    }
+
+    fn rebuild_agent_status_stream(&mut self, panes: HashSet<String>, cx: &mut Context<Self>) {
+        let previous = self.agent_status_panes.clone();
+        self.agent_status_rebuild = None;
+        self.agent_status_panes.clone_from(&panes);
+        if panes.is_empty() {
+            self.agent_status_listen = None;
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            self.agent_status_panes = previous;
+            return;
+        };
+        let socket = connection.socket_path().to_owned();
+        let epoch = self.event_epoch;
+        let pane_list: Vec<String> = panes.iter().cloned().collect();
+        self.agent_status_rebuild = Some(cx.spawn(async move |this, cx| {
+            let subscribed = cx
+                .background_spawn(async move { subscribe_agent_status(&socket, &pane_list) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.event_epoch != epoch {
+                    return;
+                }
+                match subscribed {
+                    Ok(subscription) => {
+                        if this.agent_status_panes != panes {
+                            return;
+                        }
+                        if this.agent_status_handoff.is_none() {
+                            this.agent_status_handoff = Some(AgentStatusHandoff::new());
+                        }
+                        this.agent_status_listen =
+                            Some(Self::listen_agent_status(subscription, cx));
+                        this.resync_snapshot(epoch, cx);
+                    }
+                    Err(error) => {
+                        this.agent_status_panes = event_panes_after_failed_subscribe(
+                            &this.agent_status_panes,
+                            &panes,
+                            &previous,
+                        );
+                        this.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
+                    }
+                }
+            })
+            .ok();
+        }));
     }
 
     pub(super) fn resync_snapshot(&mut self, epoch: u64, cx: &mut Context<Self>) {
@@ -604,6 +801,10 @@ impl OcHerdrView {
                 if this.snapshot_refresh_pending {
                     this.resync_snapshot(epoch, cx);
                 }
+                if snapshot_handoff_should_release(this.snapshot_refreshing) {
+                    this.release_agent_status_handoff(cx);
+                }
+                this.ensure_agent_status_stream(cx);
             })
             .ok();
         })
@@ -2140,11 +2341,7 @@ impl OcHerdrView {
 }
 
 fn snapshot_pane_ids(snapshot: &HierarchySnapshot) -> HashSet<String> {
-    snapshot
-        .panes
-        .iter()
-        .map(|pane| pane.pane_id.clone())
-        .collect()
+    snapshot.pane_ids()
 }
 
 fn session_terminals_need_rebuild(
@@ -2256,6 +2453,10 @@ fn is_expected_terminal_exit(error: &HerdrError) -> bool {
 
 fn snapshot_refresh_should_queue(refreshing: bool) -> bool {
     refreshing
+}
+
+fn snapshot_handoff_should_release(refreshing: bool) -> bool {
+    !refreshing
 }
 
 // pane.rename emits nothing. pane.close can delete the parent tab and
@@ -3215,6 +3416,12 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_handoff_releases_only_when_no_refresh_is_in_flight() {
+        assert!(snapshot_handoff_should_release(false));
+        assert!(!snapshot_handoff_should_release(true));
+    }
+
+    #[test]
     fn invoke_resyncs_only_commands_that_do_not_emit_events() {
         assert!(command_needs_snapshot_resync("pane.rename"));
         assert!(command_needs_snapshot_resync("pane.close"));
@@ -3332,7 +3539,6 @@ mod tests {
         snapshot.panes[0].revision = 1;
         let mut updated = snapshot.panes[0].clone();
         updated.revision = 9;
-        updated.agent_status = AgentStatus::Working;
         let mut events = vec![
             Ok(Some(HerdrEvent::PaneUpdated {
                 pane: updated.clone(),
