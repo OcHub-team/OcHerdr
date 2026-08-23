@@ -2,8 +2,8 @@ use super::super::*;
 use ochub_ui::layout::{group, row, row_label, section_header};
 use ochub_ui::scrollbar::{VerticalScrollbar, contain_vertical_scroll};
 
-impl OcHerdrView {
-    pub(super) fn render_node_manager(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+impl HostCenter {
+    pub(crate) fn render_node_manager(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
         let indexes = self.filtered_profile_indexes(cx);
         let count = indexes.len();
@@ -28,7 +28,7 @@ impl OcHerdrView {
                 }
             }),
         );
-        let detail = if matches!(self.overlay, Overlay::RemoteForm(_)) {
+        let detail = if self.form().is_some() {
             self.render_remote_form(cx).into_any_element()
         } else if self.host_bulk_mode {
             self.render_bulk_inspector(cx).into_any_element()
@@ -65,9 +65,7 @@ impl OcHerdrView {
                             ButtonTone::Ghost,
                             ButtonSize::Sm,
                         )
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.close_node_manager(window, cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
                     )
                     .child(
                         div()
@@ -432,8 +430,8 @@ impl OcHerdrView {
             return div().into_any_element();
         };
         let i18n = self.i18n;
-        let selected = index == self.managed_profile_index
-            && !matches!(self.overlay, Overlay::RemoteForm(RemoteForm::Create));
+        let selected =
+            index == self.managed_profile_index && !matches!(self.form(), Some(RemoteForm::Create));
         let active = index == self.profile_index;
         let metadata = self
             .host_metadata
@@ -454,7 +452,7 @@ impl OcHerdrView {
             .tab_stop(false)
             .aria_label(format!(
                 "{} · {} · {status_text}",
-                self.host_display_label(index),
+                self.display_label(index),
                 profile_endpoint(&profile)
             ))
             .aria_selected(if self.host_bulk_mode {
@@ -527,7 +525,7 @@ impl OcHerdrView {
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme::text())
-                                    .child(self.host_display_label(index)),
+                                    .child(self.display_label(index)),
                             )
                             .when(active, |row| {
                                 row.child(host_pill(i18n.text(k::COMMON_CURRENT)))
@@ -676,7 +674,7 @@ impl OcHerdrView {
                                             .text_lg()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme::text())
-                                            .child(self.host_display_label(index)),
+                                            .child(self.display_label(index)),
                                     )
                                     .when(active, |header| {
                                         header.child(host_pill(i18n.text(k::COMMON_CURRENT)))
@@ -825,7 +823,7 @@ impl OcHerdrView {
                             ButtonSize::Md,
                         )
                         .on_click(cx.listener(
-                            move |this, _, _window, cx| this.request_choose_node(index, cx),
+                            move |this, _, _window, cx| this.select_live_profile(index, cx),
                         )),
                     ),
             )
@@ -860,7 +858,7 @@ impl OcHerdrView {
             pieces.push(i18n.checked_ago(unix_timestamp().saturating_sub(cached.checked_at)));
             facts = pieces.join(" · ");
         }
-        let checking = matches!(health, Some(HostHealthView::Checking));
+        let checking = matches!(health, Some(HostHealthView::Checking { .. }));
         div()
             .flex()
             .flex_col()
@@ -906,9 +904,9 @@ impl OcHerdrView {
 
     fn render_remote_form(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
-        let creating = matches!(self.overlay, Overlay::RemoteForm(RemoteForm::Create));
-        let index = match &self.overlay {
-            Overlay::RemoteForm(RemoteForm::Edit(index)) => Some(*index),
+        let creating = matches!(self.form(), Some(RemoteForm::Create));
+        let index = match self.form() {
+            Some(RemoteForm::Edit(index)) => Some(index),
             _ => None,
         };
         let source = index
@@ -1271,16 +1269,25 @@ impl OcHerdrView {
                 .on_click(cx.listener(|this, _, _window, cx| this.request_bulk_remove(cx))),
             )
     }
+}
 
+impl OcHerdrView {
     pub(super) fn render_host_switcher(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
+        let entries = {
+            let center = self.host_center.read(cx);
+            center
+                .switcher_entries()
+                .into_iter()
+                .filter_map(|index| {
+                    let profile = center.profiles().get(index).cloned()?;
+                    let label = center.display_label(index);
+                    Some((index, profile, label, index == self.profile_index))
+                })
+                .collect::<Vec<_>>()
+        };
         let mut items = Vec::new();
-        for index in self.host_switcher_entries() {
-            let Some(profile) = self.profiles.get(index).cloned() else {
-                continue;
-            };
-            let active = index == self.profile_index;
-            let label = self.host_display_label(index);
+        for (index, profile, label, active) in entries {
             items.push(
                 div()
                     .id(("switch-host", index))
@@ -1463,7 +1470,9 @@ fn host_health_summary(
     i18n: I18n,
 ) -> (ochub_ui::gpui::Rgba, &'static str) {
     match health {
-        Some(HostHealthView::Checking) => (theme::yellow(), i18n.text(k::HOSTS_HEALTH_CHECKING)),
+        Some(HostHealthView::Checking { .. }) => {
+            (theme::yellow(), i18n.text(k::HOSTS_HEALTH_CHECKING))
+        }
         Some(HostHealthView::Checked { cached, .. }) => match cached.status {
             HostHealthStatus::Ready => (theme::green(), i18n.text(k::HOSTS_HEALTH_READY)),
             HostHealthStatus::SshOnly => {
@@ -1504,7 +1513,7 @@ fn health_surface(health: Option<&HostHealthView>) -> ochub_ui::gpui::Rgba {
             HostHealthStatus::Unreachable | HostHealthStatus::Failed => theme::red_soft(),
             _ => theme::yellow_soft(),
         },
-        Some(HostHealthView::Checking) => theme::yellow_soft(),
+        Some(HostHealthView::Checking { .. }) => theme::yellow_soft(),
         None => theme::inset(),
     }
 }

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,9 +11,9 @@ use ocherdr_core::{
     SessionSummary, SnapshotUpdate, SplitDirection,
 };
 use ocherdr_herdr::{
-    EventSubscription, HerdrError, HostHealthCheck, HostHealthStatus, SessionConnection,
-    TerminalCommand, TerminalMode, TerminalSession, attach_command, check_host, discover_sessions,
-    open_system_terminal, request_socket, ssh_host_aliases, ssh_login_command,
+    EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
+    TerminalMode, TerminalSession, attach_command, discover_sessions, open_system_terminal,
+    request_socket,
 };
 use ocherdr_terminal::{KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
 use ochub_ui::components::{
@@ -23,15 +23,15 @@ use ochub_ui::components::{
 };
 use ochub_ui::gpui::{
     App, AppContext, AssetSource, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Task, TitlebarOptions,
-    UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds, WindowOptions, canvas, div,
-    point, prelude::*, px, relative, size, surface,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Task, TitlebarOptions, UTF16Selection, WeakEntity, Window,
+    WindowAppearance, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, relative,
+    size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
-use ochub_ui::text_input::{TextInput, TextInputEvent};
+use ochub_ui::text_input::TextInput;
 use ochub_ui::{assets, theme};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,11 +39,13 @@ use serde_json::{Value, json};
 mod a11y;
 mod controller;
 mod fonts;
+mod host_center;
 mod i18n;
 mod ime;
 mod notify;
 mod ui;
 
+use host_center::{HostCenter, HostCenterEvent, HostSaveThen};
 use i18n::{I18n, Language, k};
 
 const SIDEBAR_WIDTH: f32 = 252.;
@@ -367,7 +369,10 @@ struct CachedHostHealth {
 
 #[derive(Clone, Debug)]
 enum HostHealthView {
-    Checking,
+    Checking {
+        /// Last completed result, restored if the probe is cancelled.
+        previous: Option<Box<HostHealthView>>,
+    },
     Checked {
         cached: CachedHostHealth,
         detail: String,
@@ -417,38 +422,13 @@ struct OcHerdrView {
     overlay: Overlay,
     open_select: Option<SharedString>,
     appearance_scroll: ScrollHandle,
-    host_nav_scroll: ScrollHandle,
-    host_inspector_scroll: ScrollHandle,
-    host_form_scroll: ScrollHandle,
-    host_list_state: ListState,
-    host_list_revision: HostListRevision,
-    managed_profile_index: usize,
-    remote_advanced_open: bool,
-    recent_connection_ids: Vec<String>,
-    host_metadata: HashMap<String, HostMetadata>,
-    host_groups: Vec<String>,
-    host_health: HashMap<String, HostHealthView>,
-    host_filter: HostFilter,
-    host_check_epoch: u64,
-    host_check_queue: VecDeque<(u64, String, ConnectionProfile)>,
-    host_checks_running: usize,
-    host_bulk_mode: bool,
-    host_bulk_selection: HashSet<String>,
-    orphaned_ssh_hosts: HashSet<String>,
     prefix_pending: bool,
     text_drag_pane: Option<String>,
     ime_marked: Option<String>,
-    remote_label: Entity<TextInput>,
-    remote_destination: Entity<TextInput>,
-    remote_port: Entity<TextInput>,
-    remote_identity_file: Entity<TextInput>,
-    remote_herdr_path: Entity<TextInput>,
-    remote_group: Entity<TextInput>,
-    remote_tags: Entity<TextInput>,
-    remote_search: Entity<TextInput>,
     rename_input: Entity<TextInput>,
     appearance: AppearanceSettings,
     i18n: I18n,
+    host_center: Entity<HostCenter>,
 }
 
 #[derive(Clone, Debug)]
@@ -668,7 +648,7 @@ fn host_fits_filter(
         HostFilter::Attention => {
             orphaned.contains(profile.id())
                 || health.get(profile.id()).is_some_and(|health| match health {
-                    HostHealthView::Checking => false,
+                    HostHealthView::Checking { .. } => false,
                     HostHealthView::Checked { cached, .. } => {
                         cached.status != HostHealthStatus::Ready
                     }
@@ -796,43 +776,17 @@ fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
-fn save_settings(
-    profiles: &[ConnectionProfile],
-    recent_connection_ids: &[String],
-    host_metadata: &HashMap<String, HostMetadata>,
-    host_groups: &[String],
-    host_health: &HashMap<String, HostHealthView>,
-    appearance: &AppearanceSettings,
-    language: Language,
-) -> std::result::Result<(), String> {
-    let connections = profiles
-        .iter()
-        .filter(|profile| is_saved_profile(profile))
-        .cloned()
-        .collect();
-    let settings = Settings {
-        connections,
-        recent_connection_ids: recent_connection_ids.to_vec(),
-        host_metadata: host_metadata.clone(),
-        host_groups: host_groups.to_vec(),
-        host_health: host_health
-            .iter()
-            .filter_map(|(id, health)| match health {
-                HostHealthView::Checking => None,
-                HostHealthView::Checked { cached, .. } => Some((id.clone(), cached.clone())),
-            })
-            .collect(),
-        appearance: appearance.clone(),
-        language,
-    };
-    let path =
-        settings_path().ok_or_else(|| "Application Support directory is unavailable".to_owned())?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Settings path has no parent directory".to_owned())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let bytes = serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
-    fs::write(path, bytes).map_err(|error| error.to_string())
+fn bind_enter_submit<T: 'static>(
+    input: &Entity<TextInput>,
+    host: WeakEntity<T>,
+    cx: &mut Context<T>,
+    on_enter: impl Fn(&mut T, &mut Window, &mut Context<T>) + 'static,
+) {
+    input.update(cx, move |input, _| {
+        input.set_on_enter(move |window, cx| {
+            host.update(cx, |this, cx| on_enter(this, window, cx)).ok();
+        });
+    });
 }
 
 fn main() {

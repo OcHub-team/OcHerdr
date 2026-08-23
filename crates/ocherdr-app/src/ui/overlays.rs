@@ -122,7 +122,7 @@ impl OcHerdrView {
 
     pub(super) fn render_bulk_remove(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
-        let count = self.host_bulk_selection.len();
+        let count = self.host_center.read(cx).bulk_selection_len();
         let cancel = button(
             "cancel-bulk-remove",
             i18n.text(k::COMMON_CANCEL),

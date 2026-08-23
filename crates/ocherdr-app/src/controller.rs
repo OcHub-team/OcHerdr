@@ -13,96 +13,14 @@ use crate::notify::{FailureKind, FailureNotice, command_notification, notificati
 impl OcHerdrView {
     pub(super) fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
         let i18n = I18n::new(settings.language);
-        let host_metadata = settings.host_metadata;
-        let mut profiles = vec![ConnectionProfile::default()];
-        profiles.extend(settings.connections);
-        let saved_destinations = profiles
-            .iter()
-            .filter_map(|profile| match profile {
-                ConnectionProfile::Ssh { destination, .. } => Some(destination.clone()),
-                ConnectionProfile::Local { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        profiles.extend(
-            ssh_host_aliases()
-                .into_iter()
-                .filter(|host| !saved_destinations.contains(host))
-                .map(|host| {
-                    let id = format!("ssh-config:{host}");
-                    let metadata = host_metadata.get(&id).cloned().unwrap_or_default();
-                    ConnectionProfile::Ssh {
-                        id,
-                        label: metadata.display_name.unwrap_or_else(|| host.clone()),
-                        destination: host,
-                        port: metadata.port_override,
-                        identity_file: metadata.identity_file_override,
-                        herdr_path: metadata
-                            .herdr_path_override
-                            .unwrap_or_else(|| "herdr".into()),
-                    }
-                }),
-        );
-        let mut orphaned_ssh_hosts = HashSet::new();
-        for (id, metadata) in &host_metadata {
-            let Some(alias) = id.strip_prefix("ssh-config:") else {
-                continue;
-            };
-            if profiles.iter().any(|profile| profile.id() == id)
-                || saved_destinations
-                    .iter()
-                    .any(|destination| destination == alias)
-            {
-                continue;
-            }
-            profiles.push(ConnectionProfile::Ssh {
-                id: id.clone(),
-                label: metadata
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| alias.to_owned()),
-                destination: alias.to_owned(),
-                port: metadata.port_override,
-                identity_file: metadata.identity_file_override.clone(),
-                herdr_path: metadata
-                    .herdr_path_override
-                    .clone()
-                    .unwrap_or_else(|| "herdr".into()),
-            });
-            orphaned_ssh_hosts.insert(id.clone());
-        }
-        let remote_search = cx.new(|cx| {
-            TextInput::new(cx, i18n.text(k::HOSTS_SEARCH_PLACEHOLDER))
-                .search_field()
-                .compact()
-        });
-        cx.subscribe(&remote_search, |this, _input, _: &TextInputEvent, cx| {
-            this.ensure_managed_profile_visible(cx);
+        let appearance = settings.appearance.clone();
+        let focus = cx.focus_handle();
+        let host_center = cx.new(|cx| HostCenter::new(settings, i18n, focus.clone(), cx));
+        let profiles = host_center.read(cx).profiles().to_vec();
+        cx.subscribe(&host_center, |this, _center, event, cx| {
+            this.handle_host_center_event(event.clone(), cx);
         })
         .detach();
-        let known_ids = profiles
-            .iter()
-            .map(|profile| profile.id().to_owned())
-            .collect::<HashSet<_>>();
-        let recent_connection_ids = settings
-            .recent_connection_ids
-            .into_iter()
-            .filter_map(|id| normalize_recent_host_id(&id, &profiles))
-            .filter(|id| known_ids.contains(id))
-            .collect::<Vec<_>>();
-        let host_health = settings
-            .host_health
-            .into_iter()
-            .filter(|(id, _)| known_ids.contains(id))
-            .map(|(id, cached)| {
-                (
-                    id,
-                    HostHealthView::Checked {
-                        cached,
-                        detail: String::new(),
-                    },
-                )
-            })
-            .collect();
         let mut view = Self {
             profiles,
             profile_index: 0,
@@ -118,7 +36,7 @@ impl OcHerdrView {
             },
             operation: None,
             notifications: cx.new(|_| NotificationHost::new()),
-            focus: cx.focus_handle(),
+            focus,
             load_epoch: 0,
             event_epoch: 0,
             snapshot_refreshing: false,
@@ -127,60 +45,18 @@ impl OcHerdrView {
             overlay: Overlay::None,
             open_select: None,
             appearance_scroll: ScrollHandle::new(),
-            host_nav_scroll: ScrollHandle::new(),
-            host_inspector_scroll: ScrollHandle::new(),
-            host_form_scroll: ScrollHandle::new(),
-            host_list_state: ListState::new(0, ListAlignment::Top, px(192.)),
-            host_list_revision: HostListRevision::default(),
-            managed_profile_index: 0,
-            remote_advanced_open: false,
-            recent_connection_ids,
-            host_metadata,
-            host_groups: settings.host_groups,
-            host_health,
-            host_filter: HostFilter::All,
-            host_check_epoch: 0,
-            host_check_queue: VecDeque::new(),
-            host_checks_running: 0,
-            host_bulk_mode: false,
-            host_bulk_selection: HashSet::new(),
-            orphaned_ssh_hosts,
             prefix_pending: false,
             text_drag_pane: None,
             ime_marked: None,
-            remote_label: cx
-                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_LABEL))),
-            remote_destination: cx
-                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_DESTINATION))),
-            remote_port: cx.new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_PORT))),
-            remote_identity_file: cx
-                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_IDENTITY))),
-            remote_herdr_path: cx.new(|cx| TextInput::new(cx, "herdr").with_content("herdr")),
-            remote_group: cx
-                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_GROUP))),
-            remote_tags: cx.new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_TAGS))),
-            remote_search,
             rename_input: cx.new(|cx| TextInput::new(cx, i18n.text(k::COMMON_NAME))),
-            appearance: settings.appearance,
+            appearance,
             i18n,
+            host_center,
         };
         let host = cx.weak_entity();
-        bind_enter_submit(&view.rename_input, host.clone(), cx, |this, window, cx| {
+        bind_enter_submit(&view.rename_input, host, cx, |this, window, cx| {
             this.submit_rename(window, cx);
         });
-        for field in [
-            &view.remote_label,
-            &view.remote_destination,
-            &view.remote_port,
-            &view.remote_identity_file,
-            &view.remote_herdr_path,
-            &view.remote_group,
-            &view.remote_tags,
-        ] {
-            bind_enter_submit(field, host.clone(), cx, |this, _window, cx| {
-                this.save_remote(false, cx);
-            });
-        }
         view.reload(None, cx);
         view
     }
@@ -316,7 +192,9 @@ impl OcHerdrView {
             return;
         }
         self.profile_index = index;
-        self.remember_current_host();
+        self.host_center
+            .update(cx, |center, _| center.set_profile_index(index));
+        self.remember_current_host(cx);
         self.sessions.clear();
         self.session_index = None;
         self.connection = None;
@@ -327,23 +205,138 @@ impl OcHerdrView {
         self.reload(None, cx);
     }
 
-    fn remember_current_host(&mut self) {
+    fn remember_current_host(&mut self, cx: &mut Context<Self>) {
         if let Some(profile) = self.profiles.get(self.profile_index) {
-            remember_recent(&mut self.recent_connection_ids, profile.id());
-            let _ = self.persist_settings();
+            let id = profile.id().to_owned();
+            self.host_center
+                .update(cx, |center, cx| center.remember_host(&id, cx));
         }
     }
 
-    fn persist_settings(&self) -> std::result::Result<(), String> {
-        save_settings(
-            &self.profiles,
-            &self.recent_connection_ids,
-            &self.host_metadata,
-            &self.host_groups,
-            &self.host_health,
+    fn persist_settings(&self, cx: &App) -> std::result::Result<(), String> {
+        crate::host_center::persist_assembled_settings(
+            &self.host_center.read(cx).persist_state(),
             &self.appearance,
             self.i18n.preference(),
         )
+    }
+
+    fn handle_host_center_event(&mut self, event: HostCenterEvent, cx: &mut Context<Self>) {
+        match event {
+            HostCenterEvent::PersistBestEffort(state) => {
+                let _ = self.write_host_settings(&state);
+                self.adopt_profiles(state.profiles, cx);
+            }
+            HostCenterEvent::PersistRevertible { state, error } => {
+                match self.write_host_settings(&state) {
+                    Ok(()) => {
+                        self.host_center
+                            .update(cx, |center, _| center.commit_persist());
+                        self.adopt_profiles(state.profiles, cx);
+                    }
+                    Err(detail) => {
+                        self.host_center
+                            .update(cx, |center, _| center.rollback_persist());
+                        self.notify_failure(error, detail, cx);
+                    }
+                }
+            }
+            HostCenterEvent::HostSaved { state, index, then } => {
+                match self.write_host_settings(&state) {
+                    Ok(()) => {
+                        self.host_center.update(cx, |center, cx| {
+                            center.commit_persist();
+                            center.invalidate_probe_for_saved_host(index, cx);
+                        });
+                        self.adopt_profiles(state.profiles, cx);
+                        self.set_overlay(Overlay::NodeManager, cx);
+                        if then == HostSaveThen::Connect {
+                            self.request_choose_node(index, cx);
+                        }
+                    }
+                    Err(detail) => {
+                        self.host_center
+                            .update(cx, |center, _| center.rollback_persist());
+                        self.notify_failure(FailureKind::SaveHost, detail, cx);
+                    }
+                }
+            }
+            HostCenterEvent::CatalogChanged(profiles) => {
+                self.adopt_profiles(profiles, cx);
+            }
+            HostCenterEvent::ProfileSelected(index) => {
+                self.request_choose_node(index, cx);
+            }
+            HostCenterEvent::OpenCreateForm => {
+                self.set_overlay(Overlay::RemoteForm(RemoteForm::Create), cx);
+            }
+            HostCenterEvent::OpenEditForm(index) => {
+                self.set_overlay(Overlay::RemoteForm(RemoteForm::Edit(index)), cx);
+            }
+            HostCenterEvent::DismissForm => {
+                self.set_overlay(Overlay::NodeManager, cx);
+            }
+            HostCenterEvent::ConfirmRemoveProfile(index) => {
+                self.set_overlay(Overlay::ConfirmRemoveProfile(index), cx);
+            }
+            HostCenterEvent::ConfirmBulkRemove => {
+                self.set_overlay(Overlay::ConfirmBulkRemove, cx);
+            }
+            HostCenterEvent::Failed { kind, detail } => {
+                self.notify_failure(kind, detail, cx);
+            }
+            HostCenterEvent::CloseRequested => {
+                self.set_overlay(Overlay::None, cx);
+            }
+        }
+    }
+
+    fn write_host_settings(
+        &self,
+        state: &crate::host_center::HostPersistState,
+    ) -> std::result::Result<(), String> {
+        crate::host_center::persist_assembled_settings(
+            state,
+            &self.appearance,
+            self.i18n.preference(),
+        )
+    }
+
+    fn adopt_profiles(&mut self, profiles: Vec<ConnectionProfile>, cx: &mut Context<Self>) {
+        let current_id = self
+            .profiles
+            .get(self.profile_index)
+            .map(|profile| profile.id().to_owned());
+        let lost_current = current_id
+            .as_deref()
+            .is_some_and(|id| !profiles.iter().any(|profile| profile.id() == id));
+        self.profiles = profiles;
+        self.profile_index = current_id
+            .as_deref()
+            .and_then(|id| self.profiles.iter().position(|profile| profile.id() == id))
+            .unwrap_or(0);
+        let profile_index = self.profile_index;
+        self.host_center
+            .update(cx, |center, _| center.set_profile_index(profile_index));
+        if lost_current {
+            self.reload(None, cx);
+        }
+    }
+
+    fn set_overlay(&mut self, overlay: Overlay, cx: &mut Context<Self>) {
+        let leaving_host_center = self.overlay.host_center() && !overlay.host_center();
+        let form = match overlay {
+            Overlay::RemoteForm(form) => Some(form),
+            _ => None,
+        };
+        self.overlay = overlay;
+        self.host_center.update(cx, |center, _| {
+            center.set_form(form);
+            if leaving_host_center {
+                center.dismiss();
+            }
+        });
+        cx.notify();
     }
 
     pub(super) fn pane(&self, pane_id: &str) -> Option<&PaneRuntime> {
@@ -516,514 +509,37 @@ impl OcHerdrView {
         .detach();
     }
 
-    pub(super) fn open_add_remote(&mut self, cx: &mut Context<Self>) {
-        self.overlay = Overlay::RemoteForm(RemoteForm::Create);
-        self.remote_advanced_open = false;
-        self.clear_remote_form(cx);
-        cx.notify();
-    }
-
     pub(super) fn open_node_manager(&mut self, cx: &mut Context<Self>) {
-        self.overlay = Overlay::NodeManager;
-        self.managed_profile_index = self.profile_index;
-        self.host_filter = HostFilter::All;
-        self.host_bulk_mode = false;
-        self.host_bulk_selection.clear();
-        self.refresh_common_host_health(cx);
-        cx.notify();
-    }
-
-    pub(super) fn close_node_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.overlay = Overlay::None;
-        self.host_bulk_mode = false;
-        self.host_bulk_selection.clear();
-        self.focus.focus(window, cx);
-        cx.notify();
+        let profile_index = self.profile_index;
+        self.set_overlay(Overlay::NodeManager, cx);
+        self.host_center
+            .update(cx, |center, cx| center.open(profile_index, cx));
     }
 
     pub(super) fn open_appearance(&mut self, cx: &mut Context<Self>) {
         self.open_select = None;
-        self.overlay = Overlay::Appearance;
-        cx.notify();
+        self.set_overlay(Overlay::Appearance, cx);
     }
 
     pub(super) fn close_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_select = None;
-        self.overlay = Overlay::None;
+        self.set_overlay(Overlay::None, cx);
         self.focus.focus(window, cx);
-        cx.notify();
-    }
-
-    pub(super) fn select_managed_profile(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.profiles.len() {
-            if self.host_bulk_mode && index != 0 {
-                let id = self.profiles[index].id().to_owned();
-                if !self.host_bulk_selection.insert(id.clone()) {
-                    self.host_bulk_selection.remove(&id);
-                }
-                cx.notify();
-                return;
-            }
-            self.managed_profile_index = index;
-            if matches!(self.overlay, Overlay::RemoteForm(_)) {
-                self.overlay = Overlay::NodeManager;
-            }
-            cx.notify();
-        }
-    }
-
-    pub(super) fn open_edit_remote(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(profile) = self.profiles.get(index).cloned() else {
-            return;
-        };
-        if matches!(profile, ConnectionProfile::Local { .. }) {
-            self.notify_failure(
-                FailureKind::CannotEditThisMac,
-                self.i18n.text(k::NOTIFY_DETAIL_CANNOT_EDIT_THIS_MAC),
-                cx,
-            );
-            cx.notify();
-            return;
-        }
-        self.managed_profile_index = index;
-        self.overlay = Overlay::RemoteForm(RemoteForm::Edit(index));
-        self.fill_remote_form(&profile, cx);
-        cx.notify();
-    }
-
-    pub(super) fn set_host_filter(&mut self, filter: HostFilter, cx: &mut Context<Self>) {
-        self.host_filter = filter;
-        if matches!(self.overlay, Overlay::RemoteForm(_)) {
-            self.overlay = Overlay::NodeManager;
-        }
-        if let Some(index) = self.filtered_profile_indexes(cx).first().copied() {
-            self.managed_profile_index = index;
-        }
-        cx.notify();
-    }
-
-    pub(super) fn toggle_host_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(profile) = self.profiles.get(index) else {
-            return;
-        };
-        let id = profile.id().to_owned();
-        let favorite = {
-            let metadata = self.host_metadata.entry(id.clone()).or_default();
-            metadata.favorite = !metadata.favorite;
-            metadata.favorite
-        };
-        if let Err(error) = self.persist_settings() {
-            self.host_metadata.entry(id).or_default().favorite = !favorite;
-            self.notify_failure(FailureKind::UpdateFavorites, error, cx);
-        }
-        cx.notify();
-    }
-
-    pub(super) fn toggle_host_bulk_mode(&mut self, cx: &mut Context<Self>) {
-        self.host_bulk_mode = !self.host_bulk_mode;
-        self.host_bulk_selection.clear();
-        if matches!(self.overlay, Overlay::RemoteForm(_)) {
-            self.overlay = Overlay::NodeManager;
-        }
-        if self.host_bulk_mode {
-            self.remote_group
-                .update(cx, |input, cx| input.set_content("", cx));
-            self.remote_tags
-                .update(cx, |input, cx| input.set_content("", cx));
-        }
-        cx.notify();
-    }
-
-    pub(super) fn bulk_set_favorite(&mut self, favorite: bool, cx: &mut Context<Self>) {
-        if self.host_bulk_selection.is_empty() {
-            return;
-        }
-        let original_metadata = self.host_metadata.clone();
-        for id in &self.host_bulk_selection {
-            self.host_metadata.entry(id.clone()).or_default().favorite = favorite;
-        }
-        if let Err(error) = self.persist_settings() {
-            self.host_metadata = original_metadata;
-            self.notify_failure(FailureKind::UpdateFavorites, error, cx);
-        }
-        cx.notify();
-    }
-
-    pub(super) fn bulk_apply_organization(&mut self, cx: &mut Context<Self>) {
-        if self.host_bulk_selection.is_empty() {
-            return;
-        }
-        let group = self.remote_group.read(cx).content().trim().to_owned();
-        let group = (!group.is_empty()).then_some(group);
-        let tags = parse_host_tags(&self.remote_tags.read(cx).content());
-        if group.is_none() && tags.is_empty() {
-            self.notify_failure(
-                FailureKind::NeedGroupOrTag,
-                self.i18n.text(k::NOTIFY_DETAIL_NEED_GROUP_OR_TAG),
-                cx,
-            );
-            cx.notify();
-            return;
-        }
-        let original_metadata = self.host_metadata.clone();
-        let original_groups = self.host_groups.clone();
-        for id in &self.host_bulk_selection {
-            let metadata = self.host_metadata.entry(id.clone()).or_default();
-            if let Some(group) = &group {
-                metadata.group = Some(group.clone());
-            }
-            for tag in &tags {
-                if !metadata
-                    .tags
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(tag))
-                {
-                    metadata.tags.push(tag.clone());
-                }
-            }
-        }
-        if let Some(group) = group
-            && !self
-                .host_groups
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&group))
-        {
-            self.host_groups.push(group);
-            self.host_groups.sort_by_key(|group| group.to_lowercase());
-        }
-        if let Err(error) = self.persist_settings() {
-            self.host_metadata = original_metadata;
-            self.host_groups = original_groups;
-            self.notify_failure(FailureKind::ApplyOrganization, error, cx);
-        }
-        cx.notify();
-    }
-
-    pub(super) fn request_bulk_remove(&mut self, cx: &mut Context<Self>) {
-        if self.host_bulk_selection.is_empty() {
-            return;
-        }
-        let active_id = self.current_profile().id().to_owned();
-        if self.host_bulk_selection.contains(&active_id) {
-            self.notify_failure(
-                FailureKind::CannotRemoveActiveHost,
-                self.i18n.text(k::NOTIFY_DETAIL_CANNOT_REMOVE_ACTIVE),
-                cx,
-            );
-            cx.notify();
-            return;
-        }
-        self.overlay = Overlay::ConfirmBulkRemove;
-        cx.notify();
     }
 
     pub(super) fn cancel_bulk_remove(&mut self, cx: &mut Context<Self>) {
         if matches!(self.overlay, Overlay::ConfirmBulkRemove) {
-            self.overlay = Overlay::NodeManager;
+            self.set_overlay(Overlay::NodeManager, cx);
         }
-        cx.notify();
     }
 
     pub(super) fn confirm_bulk_remove(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.overlay, Overlay::ConfirmBulkRemove) {
             return;
         }
-        self.overlay = Overlay::NodeManager;
-        let selected = self.host_bulk_selection.clone();
-        let original_profiles = self.profiles.clone();
-        let original_recents = self.recent_connection_ids.clone();
-        let original_metadata = self.host_metadata.clone();
-        let original_health = self.host_health.clone();
-        let original_orphans = self.orphaned_ssh_hosts.clone();
-        let current_id = self.current_profile().id().to_owned();
-        let managed_id = self
-            .profiles
-            .get(self.managed_profile_index)
-            .map(|profile| profile.id().to_owned())
-            .unwrap_or_else(|| current_id.clone());
-
-        let removed_ids = self
-            .profiles
-            .iter()
-            .filter(|profile| {
-                selected.contains(profile.id())
-                    && (is_saved_profile(profile) || self.orphaned_ssh_hosts.contains(profile.id()))
-            })
-            .map(|profile| profile.id().to_owned())
-            .collect::<HashSet<_>>();
-        self.profiles
-            .retain(|profile| !removed_ids.contains(profile.id()));
-        for profile in &mut self.profiles {
-            if !selected.contains(profile.id())
-                || connection_source(profile) != ConnectionSource::SshConfig
-            {
-                continue;
-            }
-            let ConnectionProfile::Ssh {
-                id,
-                label,
-                destination,
-                port,
-                identity_file,
-                herdr_path,
-            } = profile
-            else {
-                continue;
-            };
-            let alias = id
-                .strip_prefix("ssh-config:")
-                .unwrap_or(destination)
-                .to_owned();
-            *label = alias.clone();
-            *destination = alias;
-            *port = None;
-            *identity_file = None;
-            *herdr_path = "herdr".into();
-        }
-        for id in &selected {
-            self.host_metadata.remove(id);
-            self.host_health.remove(id);
-        }
-        self.orphaned_ssh_hosts.retain(|id| !selected.contains(id));
-        self.recent_connection_ids
-            .retain(|id| !removed_ids.contains(id));
-
-        if let Err(error) = self.persist_settings() {
-            self.profiles = original_profiles;
-            self.recent_connection_ids = original_recents;
-            self.host_metadata = original_metadata;
-            self.host_health = original_health;
-            self.orphaned_ssh_hosts = original_orphans;
-            self.notify_failure(FailureKind::RemoveHosts, error, cx);
-            cx.notify();
-            return;
-        }
-        self.profile_index = self
-            .profiles
-            .iter()
-            .position(|profile| profile.id() == current_id)
-            .unwrap_or(0);
-        self.managed_profile_index = self
-            .profiles
-            .iter()
-            .position(|profile| profile.id() == managed_id)
-            .unwrap_or(self.profile_index);
-        self.host_bulk_selection.clear();
-        cx.notify();
-    }
-
-    pub(super) fn filtered_profile_indexes(&self, cx: &App) -> Vec<usize> {
-        visible_host_indices(
-            &HostCatalog {
-                profiles: &self.profiles,
-                metadata: &self.host_metadata,
-                recent_ids: &self.recent_connection_ids,
-                orphaned: &self.orphaned_ssh_hosts,
-                health: &self.host_health,
-            },
-            &self.host_filter,
-            self.remote_search.read(cx).content().as_ref(),
-            self.profile_index,
-            self.i18n,
-        )
-    }
-
-    pub(super) fn host_display_label(&self, index: usize) -> String {
-        let Some(profile) = self.profiles.get(index) else {
-            return String::new();
-        };
-        host_display_label_for(profile, self.host_metadata.get(profile.id()), self.i18n)
-    }
-
-    pub(super) fn test_managed_host(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(profile) = self.profiles.get(index).cloned() else {
-            return;
-        };
-        let id = profile.id().to_owned();
-        self.host_check_queue
-            .retain(|(_, queued_id, _)| queued_id != &id);
-        self.host_health
-            .insert(id.clone(), HostHealthView::Checking);
-        self.host_check_queue
-            .push_back((self.host_check_epoch, id, profile));
-        self.pump_host_checks(cx);
-        cx.notify();
-    }
-
-    pub(super) fn open_managed_host_in_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(command) = self.profiles.get(index).and_then(ssh_login_command) else {
-            return;
-        };
-        if let Err(error) = open_system_terminal(&command) {
-            self.notify_failure(FailureKind::OpenTerminal, error, cx);
-        }
-        cx.notify();
-    }
-
-    pub(super) fn refresh_common_host_health(&mut self, cx: &mut Context<Self>) {
-        self.reload_ssh_config_hosts();
-        self.host_check_epoch = self.host_check_epoch.wrapping_add(1);
-        self.host_check_queue.clear();
-        let mut ids = Vec::new();
-        if let Some(profile) = self.profiles.get(self.profile_index) {
-            ids.push(profile.id().to_owned());
-        }
-        ids.extend(
-            self.profiles
-                .iter()
-                .filter(|profile| {
-                    self.host_metadata
-                        .get(profile.id())
-                        .is_some_and(|metadata| metadata.favorite)
-                })
-                .map(|profile| profile.id().to_owned()),
-        );
-        ids.extend(self.recent_connection_ids.iter().take(8).cloned());
-        let mut seen = HashSet::new();
-        for id in ids {
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let Some(profile) = self
-                .profiles
-                .iter()
-                .find(|profile| profile.id() == id)
-                .cloned()
-            else {
-                continue;
-            };
-            self.host_health
-                .insert(id.clone(), HostHealthView::Checking);
-            self.host_check_queue
-                .push_back((self.host_check_epoch, id, profile));
-        }
-        self.pump_host_checks(cx);
-        cx.notify();
-    }
-
-    fn reload_ssh_config_hosts(&mut self) {
-        let current_id = self
-            .profiles
-            .get(self.profile_index)
-            .map(|profile| profile.id().to_owned())
-            .unwrap_or_else(|| "local".into());
-        let managed_id = self
-            .profiles
-            .get(self.managed_profile_index)
-            .map(|profile| profile.id().to_owned())
-            .unwrap_or_else(|| current_id.clone());
-        let old_config = self
-            .profiles
-            .iter()
-            .filter(|profile| connection_source(profile) == ConnectionSource::SshConfig)
-            .map(|profile| (profile.id().to_owned(), profile.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut profiles = self
-            .profiles
-            .iter()
-            .filter(|profile| connection_source(profile) != ConnectionSource::SshConfig)
-            .cloned()
-            .collect::<Vec<_>>();
-        let saved_destinations = profiles
-            .iter()
-            .filter_map(ssh_destination)
-            .map(str::to_owned)
-            .collect::<HashSet<_>>();
-        let aliases = ssh_host_aliases();
-        let mut discovered_ids = HashSet::new();
-        for alias in aliases {
-            if saved_destinations.contains(&alias) {
-                continue;
-            }
-            let id = format!("ssh-config:{alias}");
-            discovered_ids.insert(id.clone());
-            let metadata = self.host_metadata.get(&id).cloned().unwrap_or_default();
-            profiles.push(ConnectionProfile::Ssh {
-                id,
-                label: metadata.display_name.unwrap_or_else(|| alias.clone()),
-                destination: alias,
-                port: metadata.port_override,
-                identity_file: metadata.identity_file_override,
-                herdr_path: metadata
-                    .herdr_path_override
-                    .unwrap_or_else(|| "herdr".into()),
-            });
-        }
-        self.orphaned_ssh_hosts.clear();
-        for (id, profile) in old_config {
-            if discovered_ids.contains(&id) {
-                continue;
-            }
-            if self.host_metadata.contains_key(&id) || id == current_id {
-                self.orphaned_ssh_hosts.insert(id);
-                profiles.push(profile);
-            }
-        }
-        self.profiles = profiles;
-        self.profile_index = self
-            .profiles
-            .iter()
-            .position(|profile| profile.id() == current_id)
-            .unwrap_or(0);
-        self.managed_profile_index = self
-            .profiles
-            .iter()
-            .position(|profile| profile.id() == managed_id)
-            .unwrap_or(self.profile_index);
-    }
-
-    fn pump_host_checks(&mut self, cx: &mut Context<Self>) {
-        while self.host_checks_running < 3 {
-            let Some((epoch, id, profile)) = self.host_check_queue.pop_front() else {
-                break;
-            };
-            self.host_checks_running += 1;
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_spawn(async move { check_host(&profile) })
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.host_checks_running = this.host_checks_running.saturating_sub(1);
-                    if this.host_check_epoch == epoch {
-                        this.store_host_health(id, result);
-                        let _ = this.persist_settings();
-                    }
-                    this.pump_host_checks(cx);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
-    }
-
-    fn store_host_health(&mut self, id: String, result: HostHealthCheck) {
-        let cached = CachedHostHealth {
-            status: result.status,
-            checked_at: unix_timestamp(),
-            herdr_version: result.herdr_version,
-            session_count: result.session_count,
-            latency_ms: result.latency_ms,
-        };
-        self.host_health.insert(
-            id,
-            HostHealthView::Checked {
-                cached,
-                detail: result.detail,
-            },
-        );
-    }
-
-    pub(super) fn ensure_managed_profile_visible(&mut self, cx: &mut Context<Self>) {
-        let indexes = self.filtered_profile_indexes(cx);
-        if indexes.contains(&self.managed_profile_index) {
-            cx.notify();
-            return;
-        }
-        if let Some(index) = indexes.first().copied() {
-            self.managed_profile_index = index;
-        }
-        cx.notify();
+        self.set_overlay(Overlay::NodeManager, cx);
+        self.host_center
+            .update(cx, |center, cx| center.confirm_bulk_remove(cx));
     }
 
     pub(super) fn request_choose_node(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1031,11 +547,13 @@ impl OcHerdrView {
             return;
         }
         if switch_requires_confirm(self.profile_index, index, self.live_herdr_session()) {
-            self.overlay = Overlay::ConfirmSwitchProfile {
-                index,
-                from_hosts: self.overlay.host_center(),
-            };
-            cx.notify();
+            self.set_overlay(
+                Overlay::ConfirmSwitchProfile {
+                    index,
+                    from_hosts: self.overlay.host_center(),
+                },
+                cx,
+            );
             return;
         }
         self.apply_profile(index, cx);
@@ -1047,13 +565,15 @@ impl OcHerdrView {
             _ => None,
         };
         if let Some(from_hosts) = from_hosts {
-            self.overlay = if from_hosts {
-                Overlay::NodeManager
-            } else {
-                Overlay::None
-            };
+            self.set_overlay(
+                if from_hosts {
+                    Overlay::NodeManager
+                } else {
+                    Overlay::None
+                },
+                cx,
+            );
         }
-        cx.notify();
     }
 
     pub(super) fn confirm_switch_profile(&mut self, cx: &mut Context<Self>) {
@@ -1064,30 +584,26 @@ impl OcHerdrView {
     }
 
     pub(super) fn toggle_host_switcher(&mut self, cx: &mut Context<Self>) {
-        self.overlay = if matches!(self.overlay, Overlay::HostSwitcher) {
-            Overlay::None
-        } else {
-            Overlay::HostSwitcher
-        };
-        cx.notify();
+        self.set_overlay(
+            if matches!(self.overlay, Overlay::HostSwitcher) {
+                Overlay::None
+            } else {
+                Overlay::HostSwitcher
+            },
+            cx,
+        );
     }
 
     pub(super) fn close_host_switcher(&mut self, cx: &mut Context<Self>) {
         if matches!(self.overlay, Overlay::HostSwitcher) {
-            self.overlay = Overlay::None;
-            cx.notify();
+            self.set_overlay(Overlay::None, cx);
         }
     }
 
-    pub(super) fn toggle_remote_advanced(&mut self, cx: &mut Context<Self>) {
-        self.remote_advanced_open = !self.remote_advanced_open;
-        cx.notify();
-    }
-
     fn apply_profile(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.overlay = Overlay::None;
+        self.set_overlay(Overlay::None, cx);
         if index == self.profile_index {
-            self.remember_current_host();
+            self.remember_current_host(cx);
             self.reload(None, cx);
             cx.notify();
             return;
@@ -1116,7 +632,7 @@ impl OcHerdrView {
         if let Some(error) = palette_error {
             self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }
-        if let Err(error) = self.persist_settings() {
+        if let Err(error) = self.persist_settings(cx) {
             self.notify_failure(FailureKind::SaveAppearance, error, cx);
         }
         cx.refresh_windows();
@@ -1221,111 +737,45 @@ impl OcHerdrView {
     pub(super) fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
         self.i18n.set_preference(language);
         theme::reload_registry();
-        self.remote_search.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text(k::HOSTS_SEARCH_PLACEHOLDER), cx)
-        });
-        self.remote_label.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_LABEL), cx)
-        });
-        self.remote_destination.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_DESTINATION), cx)
-        });
-        self.remote_port.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_PORT), cx)
-        });
-        self.remote_identity_file.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_IDENTITY), cx)
-        });
-        self.remote_group.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_GROUP), cx)
-        });
-        self.remote_tags.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_TAGS), cx)
-        });
+        let i18n = self.i18n;
+        self.host_center
+            .update(cx, |center, cx| center.apply_language(i18n, cx));
         self.rename_input.update(cx, |input, cx| {
             input.set_placeholder(self.i18n.text(k::COMMON_NAME), cx)
         });
-        if let Err(error) = self.persist_settings() {
+        if let Err(error) = self.persist_settings(cx) {
             self.notify_failure(FailureKind::SaveLanguage, error, cx);
         }
         cx.notify();
     }
 
-    pub(super) fn request_remove_node(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index == self.profile_index {
-            self.notify_failure(
-                FailureKind::CannotRemoveActiveHost,
-                self.i18n.text(k::NOTIFY_DETAIL_CANNOT_REMOVE_ACTIVE),
-                cx,
-            );
-            cx.notify();
-            return;
-        }
-        if self.profiles.get(index).is_some_and(is_saved_profile) {
-            self.overlay = Overlay::ConfirmRemoveProfile(index);
-            cx.notify();
-        }
-    }
-
     pub(super) fn cancel_remove_node(&mut self, cx: &mut Context<Self>) {
         if matches!(self.overlay, Overlay::ConfirmRemoveProfile(_)) {
-            self.overlay = Overlay::NodeManager;
+            self.set_overlay(Overlay::NodeManager, cx);
         }
-        cx.notify();
     }
 
     pub(super) fn confirm_remove_node(&mut self, cx: &mut Context<Self>) {
         let &Overlay::ConfirmRemoveProfile(index) = &self.overlay else {
             return;
         };
-        self.overlay = Overlay::NodeManager;
-        if index == 0 || index >= self.profiles.len() {
-            return;
-        }
-        let removed = self.profiles.remove(index);
-        let removed_id = removed.id().to_owned();
-        self.recent_connection_ids.retain(|id| id != removed.id());
-        let removed_metadata = self.host_metadata.remove(&removed_id);
-        let removed_health = self.host_health.remove(&removed_id);
-        if let Err(error) = self.persist_settings() {
-            self.profiles.insert(index, removed);
-            if let Some(metadata) = removed_metadata {
-                self.host_metadata.insert(removed_id.clone(), metadata);
-            }
-            if let Some(health) = removed_health {
-                self.host_health.insert(removed_id, health);
-            }
-            self.notify_failure(FailureKind::RemoveHost, error, cx);
-            cx.notify();
-            return;
-        }
-        if index == self.profile_index {
-            self.profile_index = 0;
-            self.reload(None, cx);
-        } else {
-            if index < self.profile_index {
-                self.profile_index -= 1;
-            }
-            cx.notify();
-        }
-        self.managed_profile_index = self.managed_profile_index.min(self.profiles.len() - 1);
+        self.set_overlay(Overlay::NodeManager, cx);
+        self.host_center
+            .update(cx, |center, cx| center.confirm_remove_node(index, cx));
     }
 
     pub(super) fn close_add_remote(&mut self, cx: &mut Context<Self>) {
-        self.overlay = Overlay::NodeManager;
-        cx.notify();
+        self.set_overlay(Overlay::NodeManager, cx);
     }
 
     pub(super) fn request_close(&mut self, target: HierarchyTarget, cx: &mut Context<Self>) {
-        self.overlay = Overlay::ConfirmClose(target);
-        cx.notify();
+        self.set_overlay(Overlay::ConfirmClose(target), cx);
     }
 
     pub(super) fn cancel_close(&mut self, cx: &mut Context<Self>) {
         if matches!(self.overlay, Overlay::ConfirmClose(_)) {
-            self.overlay = Overlay::None;
+            self.set_overlay(Overlay::None, cx);
         }
-        cx.notify();
     }
 
     pub(super) fn handle_overlay_key(
@@ -1352,9 +802,8 @@ impl OcHerdrView {
             (Overlay::HostSwitcher, false) => self.close_host_switcher(cx),
             (Overlay::Appearance, false) => self.close_appearance(window, cx),
             (Overlay::ContextMenu(_) | Overlay::NodeManager, false) => {
-                self.overlay = Overlay::None;
+                self.set_overlay(Overlay::None, cx);
                 self.focus.focus(window, cx);
-                cx.notify();
             }
             _ => return false,
         }
@@ -1367,7 +816,7 @@ impl OcHerdrView {
             return;
         };
         let target = target.clone();
-        self.overlay = Overlay::None;
+        self.set_overlay(Overlay::None, cx);
         match target {
             HierarchyTarget::Workspace { id, .. } => {
                 self.invoke("workspace.close", json!({ "workspace_id": id }), cx)
@@ -1389,24 +838,25 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) {
         let viewport = window.viewport_size();
-        self.overlay = Overlay::ContextMenu(HierarchyContextMenu {
-            target,
-            x: f32::from(event.position.x)
-                .min((f32::from(viewport.width) - 220.).max(8.))
-                .max(8.),
-            y: f32::from(event.position.y)
-                .min((f32::from(viewport.height) - 260.).max(8.))
-                .max(8.),
-        });
+        self.set_overlay(
+            Overlay::ContextMenu(HierarchyContextMenu {
+                target,
+                x: f32::from(event.position.x)
+                    .min((f32::from(viewport.width) - 220.).max(8.))
+                    .max(8.),
+                y: f32::from(event.position.y)
+                    .min((f32::from(viewport.height) - 260.).max(8.))
+                    .max(8.),
+            }),
+            cx,
+        );
         cx.stop_propagation();
-        cx.notify();
     }
 
     pub(super) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
         if matches!(self.overlay, Overlay::ContextMenu(_)) {
-            self.overlay = Overlay::None;
+            self.set_overlay(Overlay::None, cx);
         }
-        cx.notify();
     }
 
     pub(super) fn open_rename(
@@ -1418,20 +868,18 @@ impl OcHerdrView {
         let label = target.label().to_owned();
         self.rename_input
             .update(cx, |input, cx| input.set_content(label, cx));
-        self.overlay = Overlay::Rename(target);
+        self.set_overlay(Overlay::Rename(target), cx);
         self.rename_input
             .read(cx)
             .focus_handle(cx)
             .focus(window, cx);
-        cx.notify();
     }
 
     pub(super) fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.overlay, Overlay::Rename(_)) {
-            self.overlay = Overlay::None;
+            self.set_overlay(Overlay::None, cx);
         }
         self.focus.focus(window, cx);
-        cx.notify();
     }
 
     pub(super) fn submit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1449,7 +897,7 @@ impl OcHerdrView {
             cx.notify();
             return;
         }
-        self.overlay = Overlay::None;
+        self.set_overlay(Overlay::None, cx);
         match target {
             HierarchyTarget::Workspace { id, .. } => {
                 self.invoke(
@@ -1470,275 +918,6 @@ impl OcHerdrView {
             }
         }
         self.focus.focus(window, cx);
-    }
-
-    pub(super) fn save_remote(&mut self, connect: bool, cx: &mut Context<Self>) {
-        let Some(draft) = self.parse_remote_draft(cx) else {
-            return;
-        };
-        let group = self.remote_group.read(cx).content().trim().to_owned();
-        let group = (!group.is_empty()).then_some(group);
-        let tags = parse_host_tags(&self.remote_tags.read(cx).content());
-        let original_profiles = self.profiles.clone();
-        let original_metadata = self.host_metadata.clone();
-        let original_groups = self.host_groups.clone();
-        let form = match &self.overlay {
-            Overlay::RemoteForm(form) => *form,
-            _ => return,
-        };
-        let index = match form {
-            RemoteForm::Create => {
-                self.profiles.push(draft);
-                let index = self.profiles.len() - 1;
-                let id = self.profiles[index].id().to_owned();
-                self.host_metadata.insert(
-                    id,
-                    HostMetadata {
-                        group: group.clone(),
-                        tags: tags.clone(),
-                        ..HostMetadata::default()
-                    },
-                );
-                index
-            }
-            RemoteForm::Edit(index) if index < self.profiles.len() => {
-                let source = connection_source(&self.profiles[index]);
-                let ConnectionProfile::Ssh {
-                    label: new_label,
-                    destination: new_destination,
-                    port: new_port,
-                    identity_file: new_identity,
-                    herdr_path: new_herdr,
-                    ..
-                } = draft
-                else {
-                    return;
-                };
-                let id = self.profiles[index].id().to_owned();
-                let metadata = self.host_metadata.entry(id).or_default();
-                metadata.group = group.clone();
-                metadata.tags = tags.clone();
-                if source == ConnectionSource::SshConfig {
-                    metadata.display_name = Some(new_label.clone()).filter(|label| {
-                        label != ssh_destination(&self.profiles[index]).unwrap_or_default()
-                    });
-                    metadata.port_override = new_port;
-                    metadata.identity_file_override = new_identity.clone();
-                    metadata.herdr_path_override =
-                        (new_herdr != "herdr").then_some(new_herdr.clone());
-                }
-                match &mut self.profiles[index] {
-                    ConnectionProfile::Ssh {
-                        label,
-                        destination,
-                        port,
-                        identity_file,
-                        herdr_path,
-                        ..
-                    } => {
-                        *label = new_label;
-                        if source == ConnectionSource::Saved {
-                            *destination = new_destination;
-                        }
-                        *port = new_port;
-                        *identity_file = new_identity;
-                        *herdr_path = new_herdr;
-                    }
-                    ConnectionProfile::Local { .. } => unreachable!(),
-                }
-                index
-            }
-            RemoteForm::Edit(_) => return,
-        };
-        if let Some(group) = &group
-            && !self
-                .host_groups
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(group))
-        {
-            self.host_groups.push(group.clone());
-            self.host_groups.sort_by_key(|group| group.to_lowercase());
-        }
-        if let Err(error) = self.persist_settings() {
-            self.profiles = original_profiles;
-            self.host_metadata = original_metadata;
-            self.host_groups = original_groups;
-            self.notify_failure(FailureKind::SaveHost, error, cx);
-            cx.notify();
-            return;
-        }
-        self.managed_profile_index = index;
-        self.overlay = Overlay::NodeManager;
-        if connect {
-            self.request_choose_node(index, cx);
-            return;
-        }
-        cx.notify();
-    }
-
-    fn parse_remote_draft(&mut self, cx: &mut Context<Self>) -> Option<ConnectionProfile> {
-        let destination = self.remote_destination.read(cx).content().trim().to_owned();
-        if destination.is_empty() {
-            self.notify_failure(
-                FailureKind::SshDestinationRequired,
-                self.i18n.text(k::NOTIFY_DETAIL_SSH_DESTINATION),
-                cx,
-            );
-            cx.notify();
-            return None;
-        }
-        let label = self.remote_label.read(cx).content().trim().to_owned();
-        let port_text = self.remote_port.read(cx).content().trim().to_owned();
-        let identity_file = self
-            .remote_identity_file
-            .read(cx)
-            .content()
-            .trim()
-            .to_owned();
-        let herdr_path = self.remote_herdr_path.read(cx).content().trim().to_owned();
-        let port = if port_text.is_empty() {
-            None
-        } else {
-            match port_text.parse::<u16>() {
-                Ok(port) if port > 0 => Some(port),
-                _ => {
-                    self.notify_failure(
-                        FailureKind::SshPortInvalid,
-                        self.i18n.text(k::NOTIFY_DETAIL_SSH_PORT),
-                        cx,
-                    );
-                    cx.notify();
-                    return None;
-                }
-            }
-        };
-        let id = match &self.overlay {
-            Overlay::RemoteForm(RemoteForm::Edit(index)) => self
-                .profiles
-                .get(*index)
-                .map(|profile| profile.id().to_owned())
-                .unwrap_or_else(|| format!("manual-{}", next_manual_profile_id(&self.profiles))),
-            _ => format!("manual-{}", next_manual_profile_id(&self.profiles)),
-        };
-        Some(ConnectionProfile::Ssh {
-            id,
-            label: if label.is_empty() {
-                destination.clone()
-            } else {
-                label
-            },
-            destination,
-            port,
-            identity_file: (!identity_file.is_empty()).then(|| PathBuf::from(identity_file)),
-            herdr_path: if herdr_path.is_empty() {
-                "herdr".into()
-            } else {
-                herdr_path
-            },
-        })
-    }
-
-    fn clear_remote_form(&mut self, cx: &mut Context<Self>) {
-        self.remote_label
-            .update(cx, |input, cx| input.set_content("", cx));
-        self.remote_destination
-            .update(cx, |input, cx| input.set_content("", cx));
-        self.remote_port
-            .update(cx, |input, cx| input.set_content("", cx));
-        self.remote_identity_file
-            .update(cx, |input, cx| input.set_content("", cx));
-        self.remote_herdr_path
-            .update(cx, |input, cx| input.set_content("herdr", cx));
-        self.remote_group
-            .update(cx, |input, cx| input.set_content("", cx));
-        self.remote_tags
-            .update(cx, |input, cx| input.set_content("", cx));
-    }
-
-    fn fill_remote_form(&mut self, profile: &ConnectionProfile, cx: &mut Context<Self>) {
-        let metadata = self
-            .host_metadata
-            .get(profile.id())
-            .cloned()
-            .unwrap_or_default();
-        self.remote_group.update(cx, |input, cx| {
-            input.set_content(metadata.group.clone().unwrap_or_default(), cx)
-        });
-        self.remote_tags.update(cx, |input, cx| {
-            input.set_content(metadata.tags.join(", "), cx)
-        });
-        match profile {
-            ConnectionProfile::Local { herdr_path } => {
-                let label = self.i18n.text(k::HOSTS_SOURCE_THIS_MAC).to_owned();
-                self.remote_label
-                    .update(cx, |input, cx| input.set_content(label, cx));
-                self.remote_destination
-                    .update(cx, |input, cx| input.set_content("", cx));
-                self.remote_port
-                    .update(cx, |input, cx| input.set_content("", cx));
-                self.remote_identity_file
-                    .update(cx, |input, cx| input.set_content("", cx));
-                self.remote_herdr_path
-                    .update(cx, |input, cx| input.set_content(herdr_path.clone(), cx));
-                self.remote_advanced_open = herdr_path != "herdr";
-            }
-            ConnectionProfile::Ssh {
-                label,
-                destination,
-                port,
-                identity_file,
-                herdr_path,
-                ..
-            } => {
-                self.remote_label
-                    .update(cx, |input, cx| input.set_content(label.clone(), cx));
-                self.remote_destination
-                    .update(cx, |input, cx| input.set_content(destination.clone(), cx));
-                self.remote_port.update(cx, |input, cx| {
-                    input.set_content(port.map(|port| port.to_string()).unwrap_or_default(), cx)
-                });
-                self.remote_identity_file.update(cx, |input, cx| {
-                    input.set_content(
-                        identity_file
-                            .as_ref()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_default(),
-                        cx,
-                    )
-                });
-                self.remote_herdr_path
-                    .update(cx, |input, cx| input.set_content(herdr_path.clone(), cx));
-                self.remote_advanced_open =
-                    port.is_some() || identity_file.is_some() || herdr_path != "herdr";
-            }
-        }
-    }
-
-    pub(super) fn host_switcher_entries(&self) -> Vec<usize> {
-        let mut entries = Vec::new();
-        let mut seen = HashSet::new();
-        let push = |index: usize, entries: &mut Vec<usize>, seen: &mut HashSet<usize>| {
-            if seen.insert(index) {
-                entries.push(index);
-            }
-        };
-        push(0, &mut entries, &mut seen);
-        for (index, profile) in self.profiles.iter().enumerate() {
-            if self
-                .host_metadata
-                .get(profile.id())
-                .is_some_and(|metadata| metadata.favorite)
-            {
-                push(index, &mut entries, &mut seen);
-            }
-        }
-        for id in &self.recent_connection_ids {
-            if let Some(index) = self.profiles.iter().position(|profile| profile.id() == id) {
-                push(index, &mut entries, &mut seen);
-            }
-        }
-        entries.truncate(8);
-        entries
     }
 
     pub(super) fn select_session(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2407,7 +1586,7 @@ impl OcHerdrView {
         if modifiers.control && !modifiers.platform && !modifiers.alt && key == "b" {
             self.prefix_pending = true;
             if matches!(self.overlay, Overlay::ContextMenu(_)) {
-                self.overlay = Overlay::None;
+                self.set_overlay(Overlay::None, cx);
             }
             cx.notify();
             return true;
@@ -2425,14 +1604,12 @@ impl OcHerdrView {
                 self.overlay,
                 Overlay::ContextMenu(_) | Overlay::NodeManager | Overlay::HostSwitcher
             ) {
-                self.overlay = Overlay::None;
+                self.set_overlay(Overlay::None, cx);
                 self.focus.focus(window, cx);
-                cx.notify();
                 return true;
             }
             if matches!(self.overlay, Overlay::ConfirmClose(_)) {
-                self.overlay = Overlay::None;
-                cx.notify();
+                self.set_overlay(Overlay::None, cx);
                 return true;
             }
         }
@@ -3402,19 +2579,6 @@ fn overlay_confirm_or_cancel(event: &KeyDownEvent) -> Option<bool> {
         "escape" => Some(false),
         _ => None,
     }
-}
-
-fn bind_enter_submit(
-    input: &Entity<TextInput>,
-    host: WeakEntity<OcHerdrView>,
-    cx: &mut Context<OcHerdrView>,
-    on_enter: impl Fn(&mut OcHerdrView, &mut Window, &mut Context<OcHerdrView>) + 'static,
-) {
-    input.update(cx, move |input, _| {
-        input.set_on_enter(move |window, cx| {
-            host.update(cx, |this, cx| on_enter(this, window, cx)).ok();
-        });
-    });
 }
 
 fn tab_index_from_keystroke(key: &str, key_char: Option<&str>) -> Option<usize> {

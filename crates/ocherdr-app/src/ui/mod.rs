@@ -27,7 +27,7 @@ impl Render for OcHerdrView {
             .child(main)
             .into_any_element();
         let body = if self.overlay.host_center() {
-            self.render_node_manager(cx).into_any_element()
+            self.host_center.clone().into_any_element()
         } else {
             workspace_body
         };
