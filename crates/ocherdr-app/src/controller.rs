@@ -495,7 +495,7 @@ impl OcHerdrView {
                     return false;
                 };
                 let mut items = items.into_iter();
-                poll_event_stream(snapshot, || match items.next() {
+                apply_event_stream(snapshot, &mut self.selection, || match items.next() {
                     Some(Ok(event)) => Ok(Some(event)),
                     Some(Err(err)) => Err(err),
                     None => Ok(None),
@@ -512,7 +512,6 @@ impl OcHerdrView {
         if effects.apply_local
             && let Some(snapshot) = &self.snapshot
         {
-            self.selection.reconcile(snapshot);
             let closed_stream = self.session_panes.as_ref().is_some_and(|session| {
                 session
                     .panes
@@ -2027,24 +2026,17 @@ impl OcHerdrView {
         self.operation = Some(self.i18n.running_operation(method).into());
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move {
-                    request_socket(&socket, method, params)?;
-                    let result = request_socket(&socket, "session.snapshot", json!({}))?;
-                    let snapshot = result.get("snapshot").cloned().ok_or_else(|| {
-                        HerdrError::Protocol("snapshot result is missing `snapshot`".into())
-                    })?;
-                    Ok::<HierarchySnapshot, HerdrError>(serde_json::from_value(snapshot)?)
-                })
+                .background_spawn(
+                    async move { request_socket(&socket, method, params).map(|_| ()) },
+                )
                 .await;
             this.update(cx, |this, cx| {
                 this.operation = None;
                 match result {
-                    Ok(snapshot) => {
-                        this.snapshot = Some(snapshot);
-                        if let Some(snapshot) = &this.snapshot {
-                            this.selection.reconcile(snapshot);
+                    Ok(()) => {
+                        if command_needs_snapshot_resync(method) {
+                            this.resync_snapshot(this.event_epoch, cx);
                         }
-                        this.ensure_session_terminals(cx);
                     }
                     Err(error) => this.notify_command_failure(method, error, cx),
                 }
@@ -2266,6 +2258,12 @@ fn snapshot_refresh_should_queue(refreshing: bool) -> bool {
     refreshing
 }
 
+// pane.rename emits nothing. pane.close can delete the parent tab and
+// reshuffle focus / tab numbers without emitting tab.closed.
+fn command_needs_snapshot_resync(method: &str) -> bool {
+    matches!(method, "pane.rename" | "pane.close")
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum EventPollAction {
     /// Replace Live with Lost. A dead stream has nothing left to poll.
@@ -2326,6 +2324,18 @@ impl EventPollAction {
             Self::Idle | Self::Applied | Self::Resync { .. } => None,
         }
     }
+}
+
+fn apply_event_stream(
+    snapshot: &mut HierarchySnapshot,
+    selection: &mut Selection,
+    next: impl FnMut() -> std::result::Result<Option<HerdrEvent>, HerdrError>,
+) -> EventPollAction {
+    let action = poll_event_stream(snapshot, next);
+    if effects_for(&action).apply_local {
+        selection.reconcile(snapshot);
+    }
+    action
 }
 
 fn poll_event_stream(
@@ -3205,6 +3215,28 @@ mod tests {
     }
 
     #[test]
+    fn invoke_resyncs_only_commands_that_do_not_emit_events() {
+        assert!(command_needs_snapshot_resync("pane.rename"));
+        assert!(command_needs_snapshot_resync("pane.close"));
+        for method in [
+            "workspace.create",
+            "workspace.close",
+            "workspace.rename",
+            "tab.create",
+            "tab.close",
+            "tab.rename",
+            "pane.split",
+            "pane.zoom",
+            "pane.focus_direction",
+        ] {
+            assert!(
+                !command_needs_snapshot_resync(method),
+                "{method} is pushed back as an event and must not reload the snapshot"
+            );
+        }
+    }
+
+    #[test]
     fn a_rejected_subscription_is_lost_instead_of_idle() {
         let loaded = LoadedEvents::from_subscribe(Err(HerdrError::Api {
             code: "unknown_type".into(),
@@ -3252,6 +3284,46 @@ mod tests {
         assert_eq!(action, EventPollAction::Idle);
         assert!(effects_for(&action).reschedule);
         assert!(action.event_stream().is_none());
+    }
+
+    #[test]
+    fn closing_the_selected_last_tab_resyncs_instead_of_selecting_the_first_remaining_tab() {
+        let mut snapshot = two_tab_snapshot();
+        snapshot.tabs.push(test_tab("t-c", 3, "gamma"));
+        snapshot.panes.push(test_pane("p-c", "t-c"));
+        snapshot.focused_workspace_id = Some("w".into());
+        snapshot.focused_tab_id = Some("t-c".into());
+        snapshot.focused_pane_id = Some("p-c".into());
+        snapshot.workspaces.push(ocherdr_core::WorkspaceInfo {
+            workspace_id: "w".into(),
+            number: 1,
+            label: "one".into(),
+            focused: true,
+            pane_count: 3,
+            tab_count: 3,
+            active_tab_id: "t-c".into(),
+            agent_status: AgentStatus::Idle,
+            tokens: HashMap::new(),
+            worktree: None,
+        });
+        let mut selection = Selection {
+            connection_id: "local".into(),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-c".into()),
+            pane_id: Some("p-c".into()),
+            session_name: None,
+        };
+        let mut events = vec![
+            Ok(Some(HerdrEvent::PaneClosed {
+                workspace_id: "w".into(),
+                pane_id: "p-c".into(),
+            })),
+            Ok(None),
+        ]
+        .into_iter();
+        let action = apply_event_stream(&mut snapshot, &mut selection, || events.next().unwrap());
+        assert_eq!(selection.tab_id.as_deref(), Some("t-c"));
+        assert_eq!(action, EventPollAction::Resync { error: None });
     }
 
     #[test]

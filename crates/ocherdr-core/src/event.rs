@@ -107,16 +107,23 @@ impl HierarchySnapshot {
     pub fn apply(&mut self, event: &HerdrEvent) -> SnapshotUpdate {
         match event {
             HerdrEvent::WorkspaceCreated { workspace } => {
-                self.workspaces.push(workspace.clone());
-            }
-            HerdrEvent::WorkspaceUpdated { workspace }
-            | HerdrEvent::WorkspaceMetadataUpdated { workspace } => {
-                if !replace_by_id(
+                upsert_by_id(
                     &mut self.workspaces,
                     &workspace.workspace_id,
                     |item| &item.workspace_id,
                     workspace.clone(),
-                ) {
+                );
+            }
+            HerdrEvent::WorkspaceUpdated { workspace }
+            | HerdrEvent::WorkspaceMetadataUpdated { workspace } => {
+                if replace_by_id(
+                    &mut self.workspaces,
+                    &workspace.workspace_id,
+                    |item| &item.workspace_id,
+                    workspace.clone(),
+                )
+                .is_some()
+                {
                     return SnapshotUpdate::Resync;
                 }
             }
@@ -153,13 +160,25 @@ impl HierarchySnapshot {
                 self.workspaces.clone_from(workspaces);
             }
             HerdrEvent::TabCreated { tab } => {
-                self.tabs.push(tab.clone());
+                upsert_by_id(
+                    &mut self.tabs,
+                    &tab.tab_id,
+                    |item| &item.tab_id,
+                    tab.clone(),
+                );
             }
-            HerdrEvent::TabClosed { tab_id, .. } => {
+            HerdrEvent::TabClosed {
+                workspace_id,
+                tab_id,
+            } => {
+                let tab_was_focused = self.focused_tab_id.as_deref() == Some(tab_id.as_str());
                 self.tabs.retain(|tab| &tab.tab_id != tab_id);
                 self.panes.retain(|pane| &pane.tab_id != tab_id);
                 self.layouts.retain(|layout| &layout.tab_id != tab_id);
                 self.forget_missing_focus();
+                if self.tab_close_needs_resync(workspace_id, tab_was_focused) {
+                    return SnapshotUpdate::Resync;
+                }
             }
             HerdrEvent::TabRenamed { tab_id, label, .. } => {
                 let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.tab_id == tab_id) else {
@@ -180,21 +199,54 @@ impl HierarchySnapshot {
                 self.tabs.extend(tabs.iter().cloned());
             }
             HerdrEvent::PaneCreated { pane } => {
-                self.panes.push(pane.clone());
-            }
-            HerdrEvent::PaneUpdated { pane } => {
-                if !replace_by_id(
+                upsert_by_id(
                     &mut self.panes,
                     &pane.pane_id,
                     |item| &item.pane_id,
                     pane.clone(),
-                ) {
+                );
+            }
+            HerdrEvent::PaneUpdated { pane } => {
+                if replace_by_id(
+                    &mut self.panes,
+                    &pane.pane_id,
+                    |item| &item.pane_id,
+                    pane.clone(),
+                )
+                .is_some()
+                {
                     return SnapshotUpdate::Resync;
                 }
             }
-            HerdrEvent::PaneClosed { pane_id, .. } | HerdrEvent::PaneExited { pane_id, .. } => {
+            HerdrEvent::PaneClosed {
+                pane_id,
+                workspace_id,
+            }
+            | HerdrEvent::PaneExited {
+                pane_id,
+                workspace_id,
+            } => {
+                let tab_id = self
+                    .panes
+                    .iter()
+                    .find(|pane| &pane.pane_id == pane_id)
+                    .map(|pane| pane.tab_id.clone());
                 self.panes.retain(|pane| &pane.pane_id != pane_id);
-                self.forget_missing_focus();
+                // Herdr deletes the tab when its last pane closes, but only emits
+                // pane.closed / pane.exited — not tab.closed.
+                if let Some(tab_id) = tab_id
+                    && !self.panes.iter().any(|pane| pane.tab_id == tab_id)
+                {
+                    let tab_was_focused = self.focused_tab_id.as_deref() == Some(tab_id.as_str());
+                    self.tabs.retain(|tab| tab.tab_id != tab_id);
+                    self.layouts.retain(|layout| layout.tab_id != tab_id);
+                    self.forget_missing_focus();
+                    if self.tab_close_needs_resync(workspace_id, tab_was_focused) {
+                        return SnapshotUpdate::Resync;
+                    }
+                } else {
+                    self.forget_missing_focus();
+                }
             }
             HerdrEvent::PaneFocused { pane_id, .. } => {
                 self.focused_pane_id = Some(pane_id.clone());
@@ -246,6 +298,10 @@ impl HierarchySnapshot {
             self.focused_pane_id = None;
         }
     }
+
+    fn tab_close_needs_resync(&self, workspace_id: &str, tab_was_focused: bool) -> bool {
+        tab_was_focused || !self.tabs.iter().any(|tab| tab.workspace_id == workspace_id)
+    }
 }
 
 fn replace_by_id<T>(
@@ -253,12 +309,18 @@ fn replace_by_id<T>(
     id: &str,
     item_id: impl Fn(&T) -> &str,
     replacement: T,
-) -> bool {
+) -> Option<T> {
     let Some(existing) = items.iter_mut().find(|item| item_id(item) == id) else {
-        return false;
+        return Some(replacement);
     };
     *existing = replacement;
-    true
+    None
+}
+
+fn upsert_by_id<T>(items: &mut Vec<T>, id: &str, item_id: impl Fn(&T) -> &str, item: T) {
+    if let Some(item) = replace_by_id(items, id, item_id, item) {
+        items.push(item);
+    }
 }
 
 #[cfg(test)]
@@ -371,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_created_appends_the_workspace() {
+    fn workspace_created_upserts_the_workspace_by_id() {
         let mut snapshot = HierarchySnapshot::default();
         let created = workspace("w2", "two", false);
         assert_eq!(
@@ -380,7 +442,18 @@ mod tests {
             }),
             SnapshotUpdate::Applied
         );
-        assert_eq!(snapshot.workspaces, vec![created]);
+        assert_eq!(snapshot.workspaces, vec![created.clone()]);
+
+        let mut updated = created;
+        updated.label = "two-prime".into();
+        updated.pane_count = 3;
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::WorkspaceCreated {
+                workspace: updated.clone()
+            }),
+            SnapshotUpdate::Applied
+        );
+        assert_eq!(snapshot.workspaces, vec![updated]);
     }
 
     #[test]
@@ -559,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_created_appends_the_tab() {
+    fn tab_created_upserts_the_tab_by_id() {
         let mut snapshot = HierarchySnapshot::default();
         let created = tab("t1", "w1", "shell", true);
         assert_eq!(
@@ -568,7 +641,18 @@ mod tests {
             }),
             SnapshotUpdate::Applied
         );
-        assert_eq!(snapshot.tabs, vec![created]);
+        assert_eq!(snapshot.tabs, vec![created.clone()]);
+
+        let mut updated = created;
+        updated.label = "renamed".into();
+        updated.focused = false;
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::TabCreated {
+                tab: updated.clone()
+            }),
+            SnapshotUpdate::Applied
+        );
+        assert_eq!(snapshot.tabs, vec![updated]);
     }
 
     #[test]
@@ -578,7 +662,7 @@ mod tests {
         assert_eq!(
             snapshot.apply(&HerdrEvent::TabClosed {
                 workspace_id: "w1".into(),
-                tab_id: "t1".into(),
+                tab_id: "t2".into(),
             }),
             SnapshotUpdate::Applied
         );
@@ -588,7 +672,7 @@ mod tests {
                 .iter()
                 .map(|item| item.tab_id.as_str())
                 .collect::<Vec<_>>(),
-            ["t2"]
+            ["t1"]
         );
         assert_eq!(
             snapshot
@@ -596,7 +680,7 @@ mod tests {
                 .iter()
                 .map(|item| item.pane_id.as_str())
                 .collect::<Vec<_>>(),
-            ["p3"]
+            ["p1", "p2"]
         );
         assert_eq!(
             snapshot
@@ -604,11 +688,11 @@ mod tests {
                 .iter()
                 .map(|item| item.tab_id.as_str())
                 .collect::<Vec<_>>(),
-            ["t2"]
+            ["t1"]
         );
         assert_eq!(snapshot.workspaces[0].workspace_id, "w1");
-        assert_eq!(snapshot.focused_tab_id, None);
-        assert_eq!(snapshot.focused_pane_id, None);
+        assert_eq!(snapshot.focused_tab_id.as_deref(), Some("t1"));
+        assert_eq!(snapshot.focused_pane_id.as_deref(), Some("p1"));
         assert_eq!(snapshot.focused_workspace_id.as_deref(), Some("w1"));
     }
 
@@ -687,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_created_appends_the_pane() {
+    fn pane_created_upserts_the_pane_by_id() {
         let mut snapshot = HierarchySnapshot::default();
         let created = pane("p2", "w1", "t1", false);
         assert_eq!(
@@ -696,7 +780,18 @@ mod tests {
             }),
             SnapshotUpdate::Applied
         );
-        assert_eq!(snapshot.panes, vec![created]);
+        assert_eq!(snapshot.panes, vec![created.clone()]);
+
+        let mut updated = created;
+        updated.revision = 4;
+        updated.focused = true;
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneCreated {
+                pane: updated.clone()
+            }),
+            SnapshotUpdate::Applied
+        );
+        assert_eq!(snapshot.panes, vec![updated]);
     }
 
     #[test]
@@ -744,9 +839,46 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_only_pane_in_a_tab_does_not_leave_an_empty_tab() {
+        let mut snapshot = cascade_snapshot();
+        snapshot.layouts.push(layout("w1", "t2", "p3"));
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneClosed {
+                workspace_id: "w1".into(),
+                pane_id: "p3".into(),
+            }),
+            SnapshotUpdate::Applied
+        );
+        assert_eq!(
+            snapshot
+                .tabs
+                .iter()
+                .map(|item| item.tab_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t1"]
+        );
+        assert_eq!(
+            snapshot
+                .panes
+                .iter()
+                .map(|item| item.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["p1", "p2"]
+        );
+        assert_eq!(
+            snapshot
+                .layouts
+                .iter()
+                .map(|item| item.tab_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t1"]
+        );
+    }
+
+    #[test]
     fn pane_exited_removes_the_pane() {
         let mut snapshot = HierarchySnapshot {
-            panes: vec![pane("p1", "w1", "t1", true)],
+            panes: vec![pane("p1", "w1", "t1", true), pane("p2", "w1", "t1", false)],
             ..Default::default()
         };
         assert_eq!(
@@ -756,7 +888,54 @@ mod tests {
             }),
             SnapshotUpdate::Applied
         );
-        assert!(snapshot.panes.is_empty());
+        assert_eq!(
+            snapshot
+                .panes
+                .iter()
+                .map(|item| item.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["p2"]
+        );
+    }
+
+    #[test]
+    fn exiting_the_last_pane_of_a_workspace_resyncs_instead_of_guessing_whether_to_delete_it() {
+        let mut snapshot = HierarchySnapshot {
+            focused_workspace_id: Some("w2".into()),
+            focused_tab_id: Some("t9".into()),
+            focused_pane_id: Some("p9".into()),
+            workspaces: vec![workspace("w1", "one", false), workspace("w2", "two", true)],
+            tabs: vec![
+                tab("t1", "w1", "alpha", false),
+                tab("t9", "w2", "other", true),
+            ],
+            panes: vec![pane("p1", "w1", "t1", false), pane("p9", "w2", "t9", true)],
+            layouts: vec![layout("w1", "t1", "p1"), layout("w2", "t9", "p9")],
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot.apply(&HerdrEvent::PaneExited {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+            }),
+            SnapshotUpdate::Resync
+        );
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .map(|item| item.workspace_id.as_str())
+                .collect::<Vec<_>>(),
+            ["w1", "w2"]
+        );
+        assert_eq!(
+            snapshot
+                .tabs
+                .iter()
+                .map(|item| item.tab_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t9"]
+        );
     }
 
     #[test]
