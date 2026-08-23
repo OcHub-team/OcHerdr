@@ -1059,6 +1059,9 @@ fn main() {
         .run(|cx: &mut App| {
             let settings = load_settings();
             I18n::install(settings.language);
+            if let Some(directory) = dirs::config_dir() {
+                theme::set_themes_dir(directory.join("OcHerdr/themes"));
+            }
             ochub_ui::install(cx);
             install_appearance(&settings.appearance, cx.window_appearance());
             cx.on_window_closed(|cx, _window_id| {

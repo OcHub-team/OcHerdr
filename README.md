@@ -100,8 +100,8 @@ to open Herdr settings in Terminal.
 
 GhosttyKit is pinned and checksum-verified by `scripts/bootstrap-ghosttykit.sh`. GPUI
 is pinned to OcHerdr's leased-BGRA surface extension in the OcHub-team Zed fork. The
-surface path keeps Ghostty's frame lease alive through Metal completion and converts
-its premultiplied Display-P3 output into GPUI's sRGB target on the GPU.
+surface path keeps Ghostty's frame lease alive through Metal completion and samples
+the leased BGRA IOSurface as sRGB.
 
 ## License
 

@@ -2061,7 +2061,7 @@ impl OcHerdrView {
         {
             runtime
                 .terminal
-                .end_text_selection(None, KeyModifiers::default(), 1.0);
+                .end_text_selection(None, KeyModifiers::default());
         }
         self.select_pane(pane_id.clone(), window, cx);
         let Some(runtime) = self.pane(&pane_id) else {
@@ -2072,7 +2072,6 @@ impl OcHerdrView {
             self.text_drag_pane = None;
             return;
         }
-        let scale = f64::from(window.scale_factor());
         let Some(surface) = map_mouse_to_surface(
             mouse,
             runtime.body_bounds,
@@ -2085,13 +2084,9 @@ impl OcHerdrView {
         let modifiers = gpui_key_modifiers(event.modifiers);
         self.text_drag_pane = Some(pane_id.clone());
         if let Some(runtime) = self.pane_mut(&pane_id) {
-            runtime.terminal.begin_text_selection(
-                surface.0,
-                surface.1,
-                modifiers,
-                event.click_count,
-                scale,
-            );
+            runtime
+                .terminal
+                .begin_text_selection(surface.0, surface.1, modifiers);
             flush_pane_surface(runtime);
         }
         cx.stop_propagation();
@@ -2110,7 +2105,6 @@ impl OcHerdrView {
         let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
-        let scale = f64::from(window.scale_factor());
         let Some(surface) = map_mouse_to_surface(
             mouse_point(event.position),
             runtime.body_bounds,
@@ -2123,7 +2117,7 @@ impl OcHerdrView {
         if let Some(runtime) = self.pane_mut(&pane_id) {
             runtime
                 .terminal
-                .update_text_selection(surface.0, surface.1, modifiers, scale);
+                .update_text_selection(surface.0, surface.1, modifiers);
             flush_pane_surface(runtime);
         }
         cx.stop_propagation();
@@ -2140,7 +2134,6 @@ impl OcHerdrView {
             return;
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
-        let scale = f64::from(window.scale_factor());
         if let Some(runtime) = self.pane_mut(&pane_id) {
             let point = map_mouse_to_surface(
                 mouse_point(event.position),
@@ -2148,7 +2141,7 @@ impl OcHerdrView {
                 runtime.pixel_size,
                 window.scale_factor(),
             );
-            runtime.terminal.end_text_selection(point, modifiers, scale);
+            runtime.terminal.end_text_selection(point, modifiers);
             flush_pane_surface(runtime);
             copy_terminal_selection(runtime, cx);
         }
@@ -2698,12 +2691,133 @@ fn wheel_scroll_lines(delta: ScrollDelta, line_height: f32, leftover: &mut f32) 
 }
 
 fn current_terminal_palette(appearance: &AppearanceSettings) -> TerminalPalette {
-    terminal_palette_from_theme(theme::current(), theme::is_dark(), &appearance.font)
+    let family = theme::find_family(&appearance.theme_family);
+    terminal_palette_from_theme(
+        theme::current(),
+        theme::is_dark(),
+        family.as_ref(),
+        &appearance.font,
+    )
+}
+
+/// 16-color terminal palettes, not UI tokens. UI red/green are muted for chrome;
+/// `ls`, diffs, and agent CLIs need distinct bright slots.
+const OCHUB_DARK_ANSI: [u32; 16] = [
+    0x2C2D28, 0xB54C48, 0x2F7A4C, 0xB08A32, 0x355EA8, 0x6A56A8, 0x1F7F78, 0xB8B7AE, 0x6E6F64,
+    0xFF8A82, 0x6FD496, 0xF0C46A, 0x7DB0FF, 0xC4A8FF, 0x5ED4C8, 0xF4F3EA,
+];
+const OCHUB_LIGHT_ANSI: [u32; 16] = [
+    0x3A3A34, 0x9A322C, 0x1A5C34, 0x7A5008, 0x1A4AB0, 0x4C3C90, 0x085C54, 0x8A8982, 0x6B6A64,
+    0xD4564C, 0x2D9A58, 0xC48A18, 0x4A82EE, 0x8B70D8, 0x1AA89A, 0xD0CFC6,
+];
+const EMBER_DARK_ANSI: [u32; 16] = [
+    0x2A1E16, 0xB44A38, 0x4A7A32, 0xB07A24, 0x3A5A98, 0x8A5A9A, 0x2A7A6A, 0xC8B8A4, 0x7A5A42,
+    0xF07058, 0x88C058, 0xE8B040, 0x6A8AD8, 0xC890E0, 0x58C8B0, 0xF7EEE5,
+];
+const EMBER_LIGHT_ANSI: [u32; 16] = [
+    0x3A2A1C, 0x9A3028, 0x2A5C28, 0x7A5008, 0x2A4890, 0x5C3878, 0x0A5C50, 0x8A7A68, 0x6B5A48,
+    0xD45640, 0x3A9A48, 0xC48A18, 0x4A72D0, 0x8B68C0, 0x1A9888, 0xE8D8C8,
+];
+
+fn terminal_ansi(
+    family: Option<&theme::ThemeFamily>,
+    theme: &theme::Theme,
+    dark: bool,
+) -> [u32; 16] {
+    match family {
+        // Missing theme: UI already falls back to OcHub chrome; keep the
+        // hand-tuned OcHub table instead of deriving from whatever tokens
+        // `theme::current()` happens to hold.
+        None => ochub_ansi(dark),
+        Some(family) if family.id == theme::DEFAULT_THEME_FAMILY => ochub_ansi(dark),
+        Some(family) if family.id == theme::EMBER_THEME_FAMILY => ember_ansi(dark),
+        Some(_) => ansi_from_theme(theme, dark),
+    }
+}
+
+fn ochub_ansi(dark: bool) -> [u32; 16] {
+    if dark {
+        OCHUB_DARK_ANSI
+    } else {
+        OCHUB_LIGHT_ANSI
+    }
+}
+
+fn ember_ansi(dark: bool) -> [u32; 16] {
+    if dark {
+        EMBER_DARK_ANSI
+    } else {
+        EMBER_LIGHT_ANSI
+    }
+}
+
+fn ansi_from_theme(theme: &theme::Theme, dark: bool) -> [u32; 16] {
+    let (black, bright_black) = split_gray_pair(theme.bg.0, theme.text.0, dark);
+    let (red, bright_red) = split_pair(theme.red.0, dark);
+    let (green, bright_green) = split_pair(theme.green.0, dark);
+    let (yellow, bright_yellow) = split_pair(theme.yellow.0, dark);
+    let (blue, bright_blue) = split_pair(theme.accent.0, dark);
+    let (magenta, bright_magenta) = split_pair(theme.mauve.0, dark);
+    let (cyan, bright_cyan) = split_pair(theme.teal.0, dark);
+    let (white, bright_white) = split_pair(theme.subtext.0, dark);
+    [
+        black,
+        red,
+        green,
+        yellow,
+        blue,
+        magenta,
+        cyan,
+        white,
+        bright_black,
+        bright_red,
+        bright_green,
+        bright_yellow,
+        bright_blue,
+        bright_magenta,
+        bright_cyan,
+        bright_white,
+    ]
+}
+
+fn split_gray_pair(bg: u32, text: u32, dark: bool) -> (u32, u32) {
+    let toward_text = if dark { 22 } else { 28 };
+    split_pair(mix_rgb(bg, text, toward_text), dark)
+}
+
+fn split_pair(color: u32, dark: bool) -> (u32, u32) {
+    let dim = mix_rgb(color, 0x000000, if dark { 28 } else { 16 });
+    let bright = mix_rgb(color, 0xFFFFFF, if dark { 16 } else { 28 });
+    if ansi_luma(bright) > ansi_luma(dim) && dim != bright {
+        return (dim, bright);
+    }
+    let bright = mix_rgb(dim, 0xFFFFFF, 42);
+    if ansi_luma(bright) > ansi_luma(dim) && dim != bright {
+        return (dim, bright);
+    }
+    (mix_rgb(bright, 0x000000, 36), bright)
+}
+
+fn mix_rgb(from: u32, to: u32, percent: u32) -> u32 {
+    let percent = percent.min(100) as i32;
+    let mix = |from: u32, to: u32| {
+        let from = from as i32;
+        let to = to as i32;
+        (from + (to - from) * percent / 100).clamp(0, 255) as u32
+    };
+    (mix((from >> 16) & 0xff, (to >> 16) & 0xff) << 16)
+        | (mix((from >> 8) & 0xff, (to >> 8) & 0xff) << 8)
+        | mix(from & 0xff, to & 0xff)
+}
+
+fn ansi_luma(color: u32) -> u32 {
+    299 * ((color >> 16) & 0xff) + 587 * ((color >> 8) & 0xff) + 114 * (color & 0xff)
 }
 
 fn terminal_palette_from_theme(
     theme: ochub_ui::theme::Theme,
     dark: bool,
+    family: Option<&theme::ThemeFamily>,
     font: &TerminalFontSettings,
 ) -> TerminalPalette {
     TerminalPalette {
@@ -2712,24 +2826,7 @@ fn terminal_palette_from_theme(
         foreground: theme.text.0,
         cursor: theme.accent.0,
         selection: theme.selection.0,
-        ansi: [
-            theme.overlay.0,
-            theme.red.0,
-            theme.green.0,
-            theme.yellow.0,
-            theme.accent.0,
-            theme.mauve.0,
-            theme.teal.0,
-            theme.subtext.0,
-            theme.muted.0,
-            theme.red.0,
-            theme.green.0,
-            theme.yellow.0,
-            theme.accent.0,
-            theme.mauve.0,
-            theme.teal.0,
-            theme.text.0,
-        ],
+        ansi: terminal_ansi(family, &theme, dark),
         font_family: font.family.clone(),
         font_size: font.size.value(),
         ligatures: font.ligatures,
@@ -3628,8 +3725,8 @@ mod tests {
     fn terminal_palette_follows_the_gui_light_and_dark_theme() {
         let family = ochub_ui::theme::ochub_family();
         let font = TerminalFontSettings::default();
-        let light = terminal_palette_from_theme(family.light, false, &font);
-        let dark = terminal_palette_from_theme(family.dark, true, &font);
+        let light = terminal_palette_from_theme(family.light, false, Some(&family), &font);
+        let dark = terminal_palette_from_theme(family.dark, true, Some(&family), &font);
         assert!(!light.dark);
         assert!(dark.dark);
         assert_eq!(light.background, family.light.bg.0);
@@ -3655,13 +3752,85 @@ mod tests {
             cell_width_percent: CellWidthChoice::Tight,
             cell_height_percent: CellHeightChoice::Relaxed,
         };
-        let left = terminal_palette_from_theme(family.light, false, &default);
-        let right = terminal_palette_from_theme(family.light, false, &menlo);
+        let left = terminal_palette_from_theme(family.light, false, Some(&family), &default);
+        let right = terminal_palette_from_theme(family.light, false, Some(&family), &menlo);
         assert_eq!(right.font_family, "Menlo");
         assert_eq!(right.font_size, 16);
         assert!(!right.ligatures);
         assert!(right.thicken);
         assert_ne!(left.signature(), right.signature());
+    }
+
+    #[test]
+    fn terminal_ansi_bright_slots_are_distinct_and_lighter_than_normal() {
+        let ochub = ochub_ui::theme::ochub_family();
+        let ember = ochub_ui::theme::ember_family();
+        let custom = custom_theme_family("scarlet");
+        for (label, family, palette, dark) in [
+            ("ochub-dark", Some(&ochub), ochub.dark, true),
+            ("ochub-light", Some(&ochub), ochub.light, false),
+            ("ember-dark", Some(&ember), ember.dark, true),
+            ("ember-light", Some(&ember), ember.light, false),
+            ("custom-dark", Some(&custom), custom.dark, true),
+            ("missing-dark", None, ochub.dark, true),
+        ] {
+            let ansi = terminal_ansi(family, &palette, dark);
+            let unique: HashSet<u32> = ansi.iter().copied().collect();
+            assert_eq!(unique.len(), 16, "{label}");
+            for slot in 0..8 {
+                assert_ne!(ansi[slot], ansi[slot + 8], "{label} slot {slot}");
+                assert!(
+                    ansi_luma(ansi[slot + 8]) > ansi_luma(ansi[slot]),
+                    "{label} slot {slot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn switching_theme_family_changes_the_terminal_ansi_palette() {
+        let font = TerminalFontSettings::default();
+        let ochub = ochub_ui::theme::ochub_family();
+        let ember = ochub_ui::theme::ember_family();
+        let ochub_dark = terminal_palette_from_theme(ochub.dark, true, Some(&ochub), &font);
+        let ember_dark = terminal_palette_from_theme(ember.dark, true, Some(&ember), &font);
+        assert_ne!(ochub_dark.ansi, ember_dark.ansi);
+        assert_eq!(ochub_dark.background, ochub.dark.bg.0);
+        assert_eq!(ember_dark.background, ember.dark.bg.0);
+        assert_eq!(ochub_dark.foreground, ochub.dark.text.0);
+        assert_eq!(ember_dark.cursor, ember.dark.accent.0);
+    }
+
+    #[test]
+    fn a_valid_custom_theme_family_gets_its_own_ansi_palette() {
+        let ochub = ochub_ui::theme::ochub_family();
+        let custom = custom_theme_family("scarlet");
+        let ochub_ansi = terminal_ansi(Some(&ochub), &ochub.dark, true);
+        let custom_ansi = terminal_ansi(Some(&custom), &custom.dark, true);
+        let missing_ansi = terminal_ansi(None, &ochub.dark, true);
+        assert_eq!(ochub_ansi, OCHUB_DARK_ANSI);
+        assert_eq!(missing_ansi, OCHUB_DARK_ANSI);
+        assert_ne!(custom_ansi, ochub_ansi);
+        assert_ne!(custom_ansi, missing_ansi);
+    }
+
+    fn custom_theme_family(id: &str) -> theme::ThemeFamily {
+        let mut dark = theme::OCHUB_DARK;
+        dark.red = theme::ThemeColor::new(0xE23D48);
+        dark.green = theme::ThemeColor::new(0x2FBF71);
+        dark.yellow = theme::ThemeColor::new(0xF0C400);
+        dark.accent = theme::ThemeColor::new(0x3D8BFF);
+        dark.mauve = theme::ThemeColor::new(0xC45CFF);
+        dark.teal = theme::ThemeColor::new(0x1EC8B8);
+        theme::ThemeFamily {
+            schema_version: theme::THEME_SCHEMA_VERSION,
+            id: id.into(),
+            name: id.into(),
+            author: String::new(),
+            description: String::new(),
+            light: theme::OCHUB_LIGHT,
+            dark,
+        }
     }
 
     #[test]
