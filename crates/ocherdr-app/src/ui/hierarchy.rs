@@ -151,7 +151,7 @@ impl OcHerdrView {
                             div()
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(i18n.text(status.label())),
+                                .child(i18n.agent_status(status)),
                         )
                         .into_any_element(),
                 );
@@ -197,14 +197,20 @@ impl OcHerdrView {
                     .overflow_scroll()
                     .px_2()
                     .pb_3()
-                    .child(section_label("connections-heading", i18n.text("SESSIONS")))
+                    .child(section_label(
+                        "connections-heading",
+                        i18n.text(k::TERMINAL_SESSIONS),
+                    ))
                     .child(
                         apply_list(div().id(chrome.connections.id), &chrome.connections)
                             .flex()
                             .flex_col()
                             .children(session_rows),
                     )
-                    .child(section_label("workspaces-heading", i18n.text("WORKSPACES")))
+                    .child(section_label(
+                        "workspaces-heading",
+                        i18n.text(k::TERMINAL_WORKSPACES),
+                    ))
                     .child(
                         apply_list(div().id(chrome.workspaces.id), &chrome.workspaces)
                             .flex()
@@ -228,7 +234,7 @@ impl OcHerdrView {
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _window, cx| this.create_workspace(cx)))
                             .child(icon(IconName::Add, theme::muted(), 12.))
-                            .child(i18n.text("new")),
+                            .child(i18n.text(k::TERMINAL_NEW_WORKSPACE_SHORT)),
                     ),
             )
             .child(
@@ -251,8 +257,8 @@ impl OcHerdrView {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::muted())
-                            .child(i18n.text("AGENTS"))
-                            .child(i18n.text("STATUS")),
+                            .child(i18n.text(k::TERMINAL_AGENTS))
+                            .child(i18n.text(k::TERMINAL_STATUS)),
                     )
                     .child(
                         apply_list(div().id(chrome.agents.id), &chrome.agents)
@@ -372,7 +378,7 @@ impl OcHerdrView {
                             row.child(
                                 icon_only_button_tone(
                                     ("close-tab", tab.number),
-                                    i18n.text("Close tab"),
+                                    i18n.text(k::TERMINAL_CLOSE_TAB),
                                     IconName::Close,
                                     ButtonTone::Ghost,
                                     ButtonSize::Sm,
@@ -430,7 +436,7 @@ impl OcHerdrView {
                 .on_click(cx.listener(|this, _, _window, cx| this.create_tab(cx))),
             )
             .child(div().flex_1())
-            .child(div().id("pane-actions").role(ochub_ui::gpui::Role::Toolbar).aria_label(i18n.text("Pane actions")).flex().items_center().gap_1().px_2()
+            .child(div().id("pane-actions").role(ochub_ui::gpui::Role::Toolbar).aria_label(i18n.text(k::TERMINAL_PANE_ACTIONS)).flex().items_center().gap_1().px_2()
             .child(
                 apply_control(
                     icon_only_button_tone(
@@ -573,37 +579,34 @@ impl OcHerdrView {
         };
         let profile_label = profile_display_label(&profile, i18n);
         let switcher_open = matches!(self.overlay, Overlay::HostSwitcher);
-        let status =
-            if self.prefix_pending {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(CORNER_COMPACT))
-                            .bg(theme::accent_fill())
-                            .text_color(theme::accent_text())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(i18n.text("PREFIX")),
-                    )
-                    .child(i18n.text(
-                        "C new tab · ⇧N new workspace · S settings in Terminal · 1–9 switch tab",
-                    ))
-                    .into_any_element()
-            } else if let Some(operation) = &self.operation {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(spinner(theme::muted(), 11.))
-                    .child(operation.clone())
-                    .into_any_element()
-            } else if let EventStreamState::Lost(reason) = &self.event_stream {
-                let message = event_stream_lost_copy(i18n);
-                div()
+        let status = if self.prefix_pending {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(CORNER_COMPACT))
+                        .bg(theme::accent_fill())
+                        .text_color(theme::accent_text())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(i18n.text(k::TERMINAL_PREFIX)),
+                )
+                .child(i18n.text(k::TERMINAL_PREFIX_HINT))
+                .into_any_element()
+        } else if let Some(operation) = &self.operation {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(spinner(theme::muted(), 11.))
+                .child(operation.clone())
+                .into_any_element()
+        } else if let EventStreamState::Lost(reason) = &self.event_stream {
+            let message = event_stream_lost_copy(i18n);
+            div()
                 .id((
                     ochub_ui::gpui::ElementId::from("reconnect-live-updates"),
                     reason.clone(),
@@ -620,23 +623,23 @@ impl OcHerdrView {
                 .child(status_dot(theme::red()))
                 .child(message)
                 .into_any_element()
-            } else if let Some(snapshot) = &self.snapshot {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_dot(theme::green()))
-                    .child(event_stream_status_copy(i18n, &self.event_stream, snapshot))
-                    .into_any_element()
-            } else {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_dot(theme::muted()))
-                    .child(i18n.text("No Herdr session"))
-                    .into_any_element()
-            };
+        } else if let Some(snapshot) = &self.snapshot {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(status_dot(theme::green()))
+                .child(event_stream_status_copy(i18n, &self.event_stream, snapshot))
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(status_dot(theme::muted()))
+                .child(i18n.text(k::TERMINAL_NO_SESSION))
+                .into_any_element()
+        };
         apply_region(div().id(chrome.status.id), &chrome.status)
             .flex()
             .items_center()
@@ -688,7 +691,7 @@ impl OcHerdrView {
         let Some(snapshot) = self.snapshot.clone() else {
             let cta = button(
                 "retry-empty",
-                i18n.text("Refresh"),
+                i18n.text(k::COMMON_REFRESH),
                 ButtonTone::Primary,
                 ButtonSize::Sm,
             )
@@ -698,7 +701,7 @@ impl OcHerdrView {
                 .id("empty-terminals")
                 .role(ochub_ui::gpui::Role::Button)
                 .tab_stop(false)
-                .aria_label(i18n.text("No running Herdr session"))
+                .aria_label(i18n.text(k::TERMINAL_NO_RUNNING_SESSION))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -706,8 +709,8 @@ impl OcHerdrView {
                 .bg(theme::content_background())
                 .child(empty_state(
                     IconName::Terminal,
-                    i18n.text("No running Herdr session"),
-                    i18n.text("Start Herdr locally or open Remote in the top-right."),
+                    i18n.text(k::TERMINAL_NO_RUNNING_SESSION),
+                    i18n.text(k::TERMINAL_NO_RUNNING_SESSION_BODY),
                     Some(cta),
                 ))
                 .into_any_element();
@@ -717,15 +720,15 @@ impl OcHerdrView {
                 .id("empty-tabs")
                 .role(ochub_ui::gpui::Role::Button)
                 .tab_stop(false)
-                .aria_label(i18n.text("This session has no tabs"))
+                .aria_label(i18n.text(k::TERMINAL_NO_TABS))
                 .flex()
                 .flex_1()
                 .items_center()
                 .justify_center()
                 .child(empty_state(
                     IconName::Layers,
-                    i18n.text("This session has no tabs"),
-                    i18n.text("Create a workspace to open the first terminal."),
+                    i18n.text(k::TERMINAL_NO_TABS),
+                    i18n.text(k::TERMINAL_NO_TABS_BODY),
                     None,
                 ))
                 .into_any_element();
@@ -1003,7 +1006,7 @@ fn render_pane(
                         div()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(i18n.text("Waiting for terminal frame…")),
+                            .child(i18n.text(k::TERMINAL_WAITING)),
                     )
                 }),
         )

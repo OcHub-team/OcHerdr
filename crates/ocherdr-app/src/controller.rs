@@ -71,7 +71,7 @@ impl OcHerdrView {
             orphaned_ssh_hosts.insert(id.clone());
         }
         let remote_search = cx.new(|cx| {
-            TextInput::new(cx, i18n.text("Search hosts"))
+            TextInput::new(cx, i18n.text(k::HOSTS_SEARCH_PLACEHOLDER))
                 .search_field()
                 .compact()
         });
@@ -148,17 +148,19 @@ impl OcHerdrView {
             prefix_pending: false,
             text_drag_pane: None,
             ime_marked: None,
-            remote_label: cx.new(|cx| TextInput::new(cx, i18n.text("Production"))),
+            remote_label: cx
+                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_LABEL))),
             remote_destination: cx
-                .new(|cx| TextInput::new(cx, i18n.text("user@example.com or SSH alias"))),
-            remote_port: cx.new(|cx| TextInput::new(cx, i18n.text("22 (optional)"))),
+                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_DESTINATION))),
+            remote_port: cx.new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_PORT))),
             remote_identity_file: cx
-                .new(|cx| TextInput::new(cx, i18n.text("~/.ssh/id_ed25519 (optional)"))),
+                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_IDENTITY))),
             remote_herdr_path: cx.new(|cx| TextInput::new(cx, "herdr").with_content("herdr")),
-            remote_group: cx.new(|cx| TextInput::new(cx, i18n.text("Optional group"))),
-            remote_tags: cx.new(|cx| TextInput::new(cx, i18n.text("Comma-separated tags"))),
+            remote_group: cx
+                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_GROUP))),
+            remote_tags: cx.new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_TAGS))),
             remote_search,
-            rename_input: cx.new(|cx| TextInput::new(cx, i18n.text("Name"))),
+            rename_input: cx.new(|cx| TextInput::new(cx, i18n.text(k::COMMON_NAME))),
             appearance: settings.appearance,
             i18n,
         };
@@ -228,7 +230,7 @@ impl OcHerdrView {
         self.snapshot_refresh_pending = false;
         let epoch = self.load_epoch;
         let profile = self.current_profile();
-        self.operation = Some(self.i18n.text("Discovering Herdr sessions…").into());
+        self.operation = Some(self.i18n.text(k::NOTIFY_DISCOVERING).into());
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
@@ -577,7 +579,7 @@ impl OcHerdrView {
         if matches!(profile, ConnectionProfile::Local { .. }) {
             self.notify_failure(
                 FailureKind::CannotEditThisMac,
-                self.i18n.text("This Mac cannot be edited."),
+                self.i18n.text(k::NOTIFY_DETAIL_CANNOT_EDIT_THIS_MAC),
                 cx,
             );
             cx.notify();
@@ -657,7 +659,7 @@ impl OcHerdrView {
         if group.is_none() && tags.is_empty() {
             self.notify_failure(
                 FailureKind::NeedGroupOrTag,
-                self.i18n.text("Enter a group or at least one tag."),
+                self.i18n.text(k::NOTIFY_DETAIL_NEED_GROUP_OR_TAG),
                 cx,
             );
             cx.notify();
@@ -705,8 +707,7 @@ impl OcHerdrView {
         if self.host_bulk_selection.contains(&active_id) {
             self.notify_failure(
                 FailureKind::CannotRemoveActiveHost,
-                self.i18n
-                    .text("Switch hosts before removing the active host."),
+                self.i18n.text(k::NOTIFY_DETAIL_CANNOT_REMOVE_ACTIVE),
                 cx,
             );
             cx.notify();
@@ -1221,28 +1222,28 @@ impl OcHerdrView {
         self.i18n.set_preference(language);
         theme::reload_registry();
         self.remote_search.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text("Search hosts"), cx)
+            input.set_placeholder(self.i18n.text(k::HOSTS_SEARCH_PLACEHOLDER), cx)
         });
         self.remote_label.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text("Production"), cx)
+            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_LABEL), cx)
         });
         self.remote_destination.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text("user@example.com or SSH alias"), cx)
+            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_DESTINATION), cx)
         });
         self.remote_port.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text("22 (optional)"), cx)
+            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_PORT), cx)
         });
         self.remote_identity_file.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text("~/.ssh/id_ed25519 (optional)"), cx)
+            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_IDENTITY), cx)
         });
         self.remote_group.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text("Optional group"), cx)
+            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_GROUP), cx)
         });
         self.remote_tags.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text("Comma-separated tags"), cx)
+            input.set_placeholder(self.i18n.text(k::HOSTS_FORM_PLACEHOLDER_TAGS), cx)
         });
         self.rename_input.update(cx, |input, cx| {
-            input.set_placeholder(self.i18n.text("Name"), cx)
+            input.set_placeholder(self.i18n.text(k::COMMON_NAME), cx)
         });
         if let Err(error) = self.persist_settings() {
             self.notify_failure(FailureKind::SaveLanguage, error, cx);
@@ -1254,8 +1255,7 @@ impl OcHerdrView {
         if index == self.profile_index {
             self.notify_failure(
                 FailureKind::CannotRemoveActiveHost,
-                self.i18n
-                    .text("Switch hosts before removing the active host."),
+                self.i18n.text(k::NOTIFY_DETAIL_CANNOT_REMOVE_ACTIVE),
                 cx,
             );
             cx.notify();
@@ -1443,7 +1443,7 @@ impl OcHerdrView {
         if label.is_empty() && !matches!(target, HierarchyTarget::Pane { .. }) {
             self.notify_failure(
                 FailureKind::EmptyWorkspaceOrTabName,
-                self.i18n.text("Workspace and tab names cannot be empty."),
+                self.i18n.text(k::NOTIFY_DETAIL_EMPTY_NAME),
                 cx,
             );
             cx.notify();
@@ -1581,7 +1581,7 @@ impl OcHerdrView {
         if destination.is_empty() {
             self.notify_failure(
                 FailureKind::SshDestinationRequired,
-                self.i18n.text("SSH destination is required."),
+                self.i18n.text(k::NOTIFY_DETAIL_SSH_DESTINATION),
                 cx,
             );
             cx.notify();
@@ -1604,7 +1604,7 @@ impl OcHerdrView {
                 _ => {
                     self.notify_failure(
                         FailureKind::SshPortInvalid,
-                        self.i18n.text("SSH port must be a number from 1 to 65535."),
+                        self.i18n.text(k::NOTIFY_DETAIL_SSH_PORT),
                         cx,
                     );
                     cx.notify();
@@ -1669,7 +1669,7 @@ impl OcHerdrView {
         });
         match profile {
             ConnectionProfile::Local { herdr_path } => {
-                let label = self.i18n.text("This Mac").to_owned();
+                let label = self.i18n.text(k::HOSTS_SOURCE_THIS_MAC).to_owned();
                 self.remote_label
                     .update(cx, |input, cx| input.set_content(label, cx));
                 self.remote_destination
@@ -1760,7 +1760,7 @@ impl OcHerdrView {
         let Some(session) = self.current_session() else {
             self.notify_failure(
                 FailureKind::NoSessionSelected,
-                self.i18n.text("No Herdr session is selected."),
+                self.i18n.text(k::NOTIFY_DETAIL_NO_SESSION),
                 cx,
             );
             cx.notify();

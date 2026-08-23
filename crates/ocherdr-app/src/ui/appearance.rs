@@ -19,7 +19,8 @@ impl OcHerdrView {
                 family.light
             };
             let description = if family.description.is_empty() {
-                i18n.text("Light and dark variants").to_owned()
+                i18n.text(k::APPEARANCE_THEME_FALLBACK_DESCRIPTION)
+                    .to_owned()
             } else {
                 family.description.clone()
             };
@@ -107,12 +108,12 @@ impl OcHerdrView {
 
         let language = select_row(
             "language",
-            i18n.text("Language"),
-            Some(i18n.text("Choose the language used by OcHerdr.").into()),
+            i18n.text(k::COMMON_LANGUAGE_LABEL),
+            Some(i18n.text(k::COMMON_LANGUAGE_DESCRIPTION).into()),
             &[
-                i18n.text("System"),
-                i18n.text("English"),
-                i18n.text("Simplified Chinese"),
+                i18n.text(k::COMMON_SYSTEM),
+                i18n.text(k::COMMON_LANGUAGE_ENGLISH),
+                i18n.text(k::COMMON_LANGUAGE_SIMPLIFIED_CHINESE),
             ],
             self.i18n.preference().index(),
             self.select_row_state("language"),
@@ -122,9 +123,13 @@ impl OcHerdrView {
         );
         let mode = select_row(
             "appearance-mode",
-            i18n.text("Appearance"),
-            Some(i18n.text("Follow macOS or pin a variant.").into()),
-            &[i18n.text("System"), i18n.text("Light"), i18n.text("Dark")],
+            i18n.text(k::APPEARANCE_TITLE),
+            Some(i18n.text(k::APPEARANCE_MODE_DESCRIPTION).into()),
+            &[
+                i18n.text(k::COMMON_SYSTEM),
+                i18n.text(k::APPEARANCE_MODE_LIGHT),
+                i18n.text(k::APPEARANCE_MODE_DARK),
+            ],
             self.appearance.mode.index(),
             self.select_row_state("appearance-mode"),
             appearance_select(cx, "appearance-mode", |this, index, window, cx| {
@@ -138,12 +143,13 @@ impl OcHerdrView {
         );
         let backdrop = select_row(
             "appearance-backdrop",
-            i18n.text("Window background"),
-            Some(
-                i18n.text("Clear keeps true transparency; Blur uses the native macOS backdrop.")
-                    .into(),
-            ),
-            &[i18n.text("Opaque"), i18n.text("Clear"), i18n.text("Blur")],
+            i18n.text(k::APPEARANCE_BACKDROP_LABEL),
+            Some(i18n.text(k::APPEARANCE_BACKDROP_DESCRIPTION).into()),
+            &[
+                i18n.text(k::APPEARANCE_BACKDROP_OPAQUE),
+                i18n.text(k::APPEARANCE_BACKDROP_CLEAR),
+                i18n.text(k::APPEARANCE_BACKDROP_BLUR),
+            ],
             self.appearance.backdrop.index(),
             self.select_row_state("appearance-backdrop"),
             appearance_select(cx, "appearance-backdrop", |this, index, window, cx| {
@@ -162,11 +168,8 @@ impl OcHerdrView {
             .unwrap_or(1);
         let opacity = select_row(
             "appearance-opacity",
-            i18n.text("Background opacity"),
-            Some(
-                i18n.text("Applied to terminal and shell surfaces when transparency is enabled.")
-                    .into(),
-            ),
+            i18n.text(k::APPEARANCE_OPACITY_LABEL),
+            Some(i18n.text(k::APPEARANCE_OPACITY_DESCRIPTION).into()),
             &["100%", "92%", "84%", "72%"],
             opacity_index,
             self.select_row_state("appearance-opacity"),
@@ -183,8 +186,8 @@ impl OcHerdrView {
             .unwrap_or(2);
         let font_size = select_row(
             "appearance-font-size",
-            i18n.text("Size"),
-            Some(i18n.text("Point size used by the terminal grid.").into()),
+            i18n.text(k::APPEARANCE_FONT_SIZE_LABEL),
+            Some(i18n.text(k::APPEARANCE_FONT_SIZE_DESCRIPTION).into()),
             &size_refs,
             size_index,
             self.select_row_state("appearance-font-size"),
@@ -198,8 +201,8 @@ impl OcHerdrView {
         });
         let ligatures = switch_row(
             "appearance-ligatures",
-            i18n.text("Ligatures"),
-            Some(i18n.text("Programming ligatures such as => and !=.").into()),
+            i18n.text(k::APPEARANCE_FONT_LIGATURES_LABEL),
+            Some(i18n.text(k::APPEARANCE_FONT_LIGATURES_DESCRIPTION).into()),
             self.appearance.font.ligatures,
             false,
             move |window, cx| ligatures_listener(&(), window, cx),
@@ -209,8 +212,8 @@ impl OcHerdrView {
         });
         let thicken = switch_row(
             "appearance-thicken",
-            i18n.text("Thicken"),
-            Some(i18n.text("Draw a heavier stroke. macOS only.").into()),
+            i18n.text(k::APPEARANCE_FONT_THICKEN_LABEL),
+            Some(i18n.text(k::APPEARANCE_FONT_THICKEN_DESCRIPTION).into()),
             self.appearance.font.thicken,
             false,
             move |window, cx| thicken_listener(&(), window, cx),
@@ -221,12 +224,13 @@ impl OcHerdrView {
             .unwrap_or(1);
         let cell_width = select_row(
             "appearance-cell-width",
-            i18n.text("Cell width"),
-            Some(
-                i18n.text("Tighten or loosen the terminal cell width.")
-                    .into(),
-            ),
-            &[i18n.text("Tight"), i18n.text("Default"), i18n.text("Wide")],
+            i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_LABEL),
+            Some(i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_DESCRIPTION).into()),
+            &[
+                i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_TIGHT),
+                i18n.text(k::COMMON_DEFAULT),
+                i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_WIDE),
+            ],
             width_index,
             self.select_row_state("appearance-cell-width"),
             appearance_select(cx, "appearance-cell-width", |this, index, window, cx| {
@@ -240,16 +244,13 @@ impl OcHerdrView {
             .unwrap_or(1);
         let cell_height = select_row(
             "appearance-cell-height",
-            i18n.text("Cell height"),
-            Some(
-                i18n.text("Change the vertical space of each terminal row.")
-                    .into(),
-            ),
+            i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_LABEL),
+            Some(i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_DESCRIPTION).into()),
             &[
-                i18n.text("Compact"),
-                i18n.text("Default"),
-                i18n.text("Relaxed"),
-                i18n.text("Loose"),
+                i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_COMPACT),
+                i18n.text(k::COMMON_DEFAULT),
+                i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_RELAXED),
+                i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_LOOSE),
             ],
             height_index,
             self.select_row_state("appearance-cell-height"),
@@ -261,113 +262,107 @@ impl OcHerdrView {
 
         let done = button(
             "close-appearance-footer",
-            i18n.text("Done"),
+            i18n.text(k::COMMON_DONE),
             ButtonTone::Primary,
             ButtonSize::Md,
         )
         .on_click(cx.listener(|this, _, window, cx| this.close_appearance(window, cx)))
         .into_any_element();
         let appearance_scroll = self.appearance_scroll.clone();
-        let card = apply_dialog(modal_card(), "appearance-dialog", i18n.text("Appearance"))
-            .w(px(720.))
-            .h(px(640.))
-            .rounded(px(CORNER_MODAL))
-            .child(
-                modal_header(i18n.text("Appearance")).child(
-                    icon_only_button_tone(
-                        "close-appearance",
-                        i18n.text("Close"),
-                        IconName::Close,
-                        ButtonTone::Ghost,
-                        ButtonSize::Sm,
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| this.close_appearance(window, cx))),
-                ),
-            )
-            .child(
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id("appearance-scroll")
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&appearance_scroll)
-                            .on_scroll_wheel(contain_vertical_scroll(appearance_scroll.clone()))
-                            .gap_5()
-                            .px_5()
-                            .py_5()
-                            .child(group(vec![language.into_any_element()]))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_3()
-                                    .child(section_header(
-                                        i18n.text("Theme"),
-                                        Some(
-                                            i18n.text(
-                                                "Choose a color family. Each family includes light and dark variants.",
-                                            )
-                                            .into(),
-                                        ),
-                                    ))
-                                    .child(
-                                        div()
-                                            .id("appearance-theme-list")
-                                            .role(ochub_ui::gpui::Role::List)
-                                            .aria_label(i18n.text("Theme"))
-                                            .grid()
-                                            .grid_cols(2)
-                                            .gap_2()
-                                            .children(family_rows),
-                                    ),
-                            )
-                            .child(group(vec![
-                                mode.into_any_element(),
-                                backdrop.into_any_element(),
-                                opacity.into_any_element(),
-                            ]))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_3()
-                                    .child(section_header(
-                                        i18n.text("Terminal type"),
-                                        Some(
-                                            i18n.text(
-                                                "Choose the font used by embedded terminals. Ghostty default is JetBrains Mono.",
-                                            )
-                                            .into(),
-                                        ),
-                                    ))
-                                    .child(self.render_font_family_list(cx)),
-                            )
-                            .child(group(vec![
-                                font_size.into_any_element(),
-                                ligatures.into_any_element(),
-                                thicken.into_any_element(),
-                                cell_width.into_any_element(),
-                                cell_height.into_any_element(),
-                            ])),
-                    )
-                    .child(VerticalScrollbar::new(
-                        ochub_ui::gpui::ElementId::Name("appearance-scroll-scrollbar".into()),
-                        appearance_scroll,
-                    )),
-            )
-            .child(modal_footer(vec![done]));
+        let card = apply_dialog(
+            modal_card(),
+            "appearance-dialog",
+            i18n.text(k::APPEARANCE_TITLE),
+        )
+        .w(px(720.))
+        .h(px(640.))
+        .rounded(px(CORNER_MODAL))
+        .child(
+            modal_header(i18n.text(k::APPEARANCE_TITLE)).child(
+                icon_only_button_tone(
+                    "close-appearance",
+                    i18n.text(k::COMMON_CLOSE),
+                    IconName::Close,
+                    ButtonTone::Ghost,
+                    ButtonSize::Sm,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.close_appearance(window, cx))),
+            ),
+        )
+        .child(
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("appearance-scroll")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&appearance_scroll)
+                        .on_scroll_wheel(contain_vertical_scroll(appearance_scroll.clone()))
+                        .gap_5()
+                        .px_5()
+                        .py_5()
+                        .child(group(vec![language.into_any_element()]))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(section_header(
+                                    i18n.text(k::APPEARANCE_THEME_LABEL),
+                                    Some(i18n.text(k::APPEARANCE_THEME_DESCRIPTION).into()),
+                                ))
+                                .child(
+                                    div()
+                                        .id("appearance-theme-list")
+                                        .role(ochub_ui::gpui::Role::List)
+                                        .aria_label(i18n.text(k::APPEARANCE_THEME_LABEL))
+                                        .grid()
+                                        .grid_cols(2)
+                                        .gap_2()
+                                        .children(family_rows),
+                                ),
+                        )
+                        .child(group(vec![
+                            mode.into_any_element(),
+                            backdrop.into_any_element(),
+                            opacity.into_any_element(),
+                        ]))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(section_header(
+                                    i18n.text(k::APPEARANCE_FONT_LABEL),
+                                    Some(i18n.text(k::APPEARANCE_FONT_DESCRIPTION).into()),
+                                ))
+                                .child(self.render_font_family_list(cx)),
+                        )
+                        .child(group(vec![
+                            font_size.into_any_element(),
+                            ligatures.into_any_element(),
+                            thicken.into_any_element(),
+                            cell_width.into_any_element(),
+                            cell_height.into_any_element(),
+                        ])),
+                )
+                .child(VerticalScrollbar::new(
+                    ochub_ui::gpui::ElementId::Name("appearance-scroll-scrollbar".into()),
+                    appearance_scroll,
+                )),
+        )
+        .child(modal_footer(vec![done]));
         modal_overlay(card).top_0().left_0()
     }
 
@@ -380,7 +375,7 @@ impl OcHerdrView {
         let selected_family = self.appearance.font.family.clone();
         let mut families = vec![(
             String::new(),
-            i18n.text("JetBrains Mono (Ghostty)").to_owned(),
+            i18n.text(k::APPEARANCE_FONT_JETBRAINS).to_owned(),
         )];
         for family in crate::fonts::monospace_families() {
             if family != "JetBrains Mono" {
@@ -453,7 +448,7 @@ impl OcHerdrView {
         div()
             .id("appearance-font-list")
             .role(ochub_ui::gpui::Role::List)
-            .aria_label(i18n.text("Terminal type"))
+            .aria_label(i18n.text(k::APPEARANCE_FONT_LABEL))
             .flex()
             .flex_col()
             .gap_1()

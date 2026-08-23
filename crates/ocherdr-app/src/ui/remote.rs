@@ -20,9 +20,8 @@ impl OcHerdrView {
                         .into_any_element(),
                     None => empty_state(
                         IconName::Search,
-                        this.i18n.text("No matching hosts"),
-                        this.i18n
-                            .text("Adjust the search or choose another filter."),
+                        this.i18n.text(k::HOSTS_SEARCH_EMPTY_TITLE),
+                        this.i18n.text(k::HOSTS_SEARCH_EMPTY_BODY),
                         None,
                     )
                     .into_any_element(),
@@ -40,7 +39,7 @@ impl OcHerdrView {
         div()
             .id("host-center")
             .role(ochub_ui::gpui::Role::Region)
-            .aria_label(i18n.text("Host center"))
+            .aria_label(i18n.text(k::HOSTS_CENTER_TITLE))
             .flex()
             .flex_col()
             .flex_1()
@@ -61,7 +60,7 @@ impl OcHerdrView {
                     .child(
                         icon_only_button_tone(
                             "close-host-center",
-                            i18n.text("Back to workspace"),
+                            i18n.text(k::HOSTS_CENTER_BACK),
                             IconName::ChevronLeft,
                             ButtonTone::Ghost,
                             ButtonSize::Sm,
@@ -80,13 +79,13 @@ impl OcHerdrView {
                                     .text_base()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::text())
-                                    .child(i18n.text("Host center")),
+                                    .child(i18n.text(k::HOSTS_CENTER_TITLE)),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(theme::muted())
-                                    .child(i18n.text("Connections, organization, and diagnostics")),
+                                    .child(i18n.text(k::HOSTS_CENTER_SUBTITLE)),
                             ),
                     )
                     .child(div().flex_1())
@@ -94,7 +93,7 @@ impl OcHerdrView {
                     .child(
                         icon_button_tone(
                             "refresh-common-hosts",
-                            i18n.text("Refresh"),
+                            i18n.text(k::COMMON_REFRESH),
                             IconName::Refresh,
                             ButtonTone::Neutral,
                             ButtonSize::Sm,
@@ -107,9 +106,9 @@ impl OcHerdrView {
                         button(
                             "toggle-host-selection",
                             if self.host_bulk_mode {
-                                i18n.text("Done")
+                                i18n.text(k::COMMON_DONE)
                             } else {
-                                i18n.text("Select")
+                                i18n.text(k::COMMON_SELECT)
                             },
                             if self.host_bulk_mode {
                                 ButtonTone::Primary
@@ -125,7 +124,7 @@ impl OcHerdrView {
                     .child(
                         icon_button_tone(
                             "add-managed-node",
-                            i18n.text("New host"),
+                            i18n.text(k::HOSTS_NEW),
                             IconName::Add,
                             ButtonTone::Primary,
                             ButtonSize::Sm,
@@ -162,13 +161,13 @@ impl OcHerdrView {
                                     .text_xs()
                                     .text_color(theme::muted())
                                     .child(self.host_filter_title())
-                                    .child(format!("{count} {}", i18n.text("hosts"))),
+                                    .child(format!("{count} {}", i18n.text(k::HOSTS_COUNT_SUFFIX))),
                             )
                             .child(
                                 div()
                                     .id("host-center-list")
                                     .role(ochub_ui::gpui::Role::List)
-                                    .aria_label(i18n.text("Hosts"))
+                                    .aria_label(i18n.text(k::HOSTS_TITLE))
                                     .relative()
                                     .flex()
                                     .flex_col()
@@ -211,35 +210,35 @@ impl OcHerdrView {
         let mut items = vec![
             self.host_nav_item(
                 "host-filter-all",
-                i18n.text("All hosts"),
+                i18n.text(k::HOSTS_FILTERS_ALL),
                 HostFilter::All,
                 self.host_filter_count(&HostFilter::All),
                 cx,
             ),
             self.host_nav_item(
                 "host-filter-favorites",
-                i18n.text("Favorites"),
+                i18n.text(k::HOSTS_FILTERS_FAVORITES),
                 HostFilter::Favorites,
                 self.host_filter_count(&HostFilter::Favorites),
                 cx,
             ),
             self.host_nav_item(
                 "host-filter-recent",
-                i18n.text("Recent"),
+                i18n.text(k::HOSTS_FILTERS_RECENT),
                 HostFilter::Recent,
                 self.host_filter_count(&HostFilter::Recent),
                 cx,
             ),
             self.host_nav_item(
                 "host-filter-attention",
-                i18n.text("Needs attention"),
+                i18n.text(k::HOSTS_FILTERS_ATTENTION),
                 HostFilter::Attention,
                 self.host_filter_count(&HostFilter::Attention),
                 cx,
             ),
         ];
 
-        items.push(host_nav_heading(i18n.text("Groups")));
+        items.push(host_nav_heading(i18n.text(k::HOSTS_NAV_GROUPS)));
         for (index, group) in self.host_groups.iter().enumerate() {
             let filter = HostFilter::Group(group.clone());
             items.push(self.host_nav_item(
@@ -259,7 +258,7 @@ impl OcHerdrView {
         tags.sort_by_key(|tag| tag.to_lowercase());
         tags.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
         if !tags.is_empty() {
-            items.push(host_nav_heading(i18n.text("Tags")));
+            items.push(host_nav_heading(i18n.text(k::HOSTS_TAGS)));
             for (index, tag) in tags.into_iter().enumerate() {
                 let filter = HostFilter::Tag(tag.clone());
                 items.push(self.host_nav_item(
@@ -272,16 +271,16 @@ impl OcHerdrView {
             }
         }
 
-        items.push(host_nav_heading(i18n.text("Sources")));
+        items.push(host_nav_heading(i18n.text(k::HOSTS_NAV_SOURCES)));
         for (id, label, source) in [
             (
                 "host-filter-saved",
-                i18n.text("Saved in OcHerdr"),
+                i18n.text(k::HOSTS_SOURCE_SAVED),
                 ConnectionSource::Saved,
             ),
             (
                 "host-filter-ssh-config",
-                i18n.text("SSH config"),
+                i18n.text(k::HOSTS_SOURCE_SSH_CONFIG),
                 ConnectionSource::SshConfig,
             ),
         ] {
@@ -310,7 +309,7 @@ impl OcHerdrView {
                 div()
                     .id("host-center-navigation")
                     .role(ochub_ui::gpui::Role::Navigation)
-                    .aria_label(i18n.text("Host filters"))
+                    .aria_label(i18n.text(k::HOSTS_FILTERS_ARIA))
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -419,10 +418,10 @@ impl OcHerdrView {
     fn host_filter_title(&self) -> SharedString {
         let i18n = self.i18n;
         match &self.host_filter {
-            HostFilter::All => i18n.text("All hosts").into(),
-            HostFilter::Favorites => i18n.text("Favorites").into(),
-            HostFilter::Recent => i18n.text("Recent").into(),
-            HostFilter::Attention => i18n.text("Needs attention").into(),
+            HostFilter::All => i18n.text(k::HOSTS_FILTERS_ALL).into(),
+            HostFilter::Favorites => i18n.text(k::HOSTS_FILTERS_FAVORITES).into(),
+            HostFilter::Recent => i18n.text(k::HOSTS_FILTERS_RECENT).into(),
+            HostFilter::Attention => i18n.text(k::HOSTS_FILTERS_ATTENTION).into(),
             HostFilter::Source(source) => source.label(i18n).into(),
             HostFilter::Group(group) | HostFilter::Tag(group) => group.clone().into(),
         }
@@ -530,7 +529,9 @@ impl OcHerdrView {
                                     .text_color(theme::text())
                                     .child(self.host_display_label(index)),
                             )
-                            .when(active, |row| row.child(host_pill(i18n.text("Current")))),
+                            .when(active, |row| {
+                                row.child(host_pill(i18n.text(k::COMMON_CURRENT)))
+                            }),
                     )
                     .child(
                         div()
@@ -566,9 +567,9 @@ impl OcHerdrView {
                         .role(ochub_ui::gpui::Role::Button)
                         .tab_stop(false)
                         .aria_label(if favorite {
-                            i18n.text("Remove from favorites")
+                            i18n.text(k::HOSTS_FAVORITE_REMOVE)
                         } else {
-                            i18n.text("Add to favorites")
+                            i18n.text(k::HOSTS_FAVORITE_ADD)
                         })
                         .flex()
                         .items_center()
@@ -600,8 +601,8 @@ impl OcHerdrView {
         let Some(profile) = self.profiles.get(self.managed_profile_index).cloned() else {
             return empty_state(
                 IconName::Globe,
-                i18n.text("Select a host"),
-                i18n.text("Choose a host to inspect its connection and health."),
+                i18n.text(k::HOSTS_SELECT_PROMPT_TITLE),
+                i18n.text(k::HOSTS_SELECT_PROMPT_BODY),
                 None,
             );
         };
@@ -617,16 +618,17 @@ impl OcHerdrView {
         let group_name = metadata
             .group
             .clone()
-            .unwrap_or_else(|| i18n.text("Ungrouped").to_owned());
+            .unwrap_or_else(|| i18n.text(k::HOSTS_UNGROUPED).to_owned());
         let tags = if metadata.tags.is_empty() {
-            i18n.text("No tags").to_owned()
+            i18n.text(k::HOSTS_NO_TAGS).to_owned()
         } else {
             metadata.tags.join(" · ")
         };
         let (identity, herdr_path) = match &profile {
-            ConnectionProfile::Local { herdr_path } => {
-                (i18n.text("System default").to_owned(), herdr_path.clone())
-            }
+            ConnectionProfile::Local { herdr_path } => (
+                i18n.text(k::HOSTS_SYSTEM_DEFAULT).to_owned(),
+                herdr_path.clone(),
+            ),
             ConnectionProfile::Ssh {
                 identity_file,
                 herdr_path,
@@ -635,7 +637,7 @@ impl OcHerdrView {
                 identity_file
                     .as_ref()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| i18n.text("SSH config or agent").into()),
+                    .unwrap_or_else(|| i18n.text(k::HOSTS_SSH_CONFIG_OR_AGENT).into()),
                 herdr_path.clone(),
             ),
         };
@@ -677,7 +679,7 @@ impl OcHerdrView {
                                             .child(self.host_display_label(index)),
                                     )
                                     .when(active, |header| {
-                                        header.child(host_pill(i18n.text("Current")))
+                                        header.child(host_pill(i18n.text(k::COMMON_CURRENT)))
                                     }),
                             )
                             .child(
@@ -693,9 +695,9 @@ impl OcHerdrView {
                             button(
                                 "favorite-selected-host",
                                 if favorite {
-                                    i18n.text("Favorited")
+                                    i18n.text(k::HOSTS_FAVORITED)
                                 } else {
-                                    i18n.text("Favorite")
+                                    i18n.text(k::HOSTS_FAVORITE)
                                 },
                                 ButtonTone::Ghost,
                                 ButtonSize::Sm,
@@ -709,7 +711,7 @@ impl OcHerdrView {
                         header.child(
                             icon_button_tone(
                                 "edit-selected-host",
-                                i18n.text("Edit"),
+                                i18n.text(k::COMMON_EDIT),
                                 IconName::Pencil,
                                 ButtonTone::Neutral,
                                 ButtonSize::Sm,
@@ -750,10 +752,10 @@ impl OcHerdrView {
                                     .flex()
                                     .flex_col()
                                     .gap_3()
-                                    .child(section_header(i18n.text("Organization"), None))
+                                    .child(section_header(i18n.text(k::HOSTS_ORGANIZATION), None))
                                     .child(group(vec![
-                                        inspector_row(i18n.text("Group"), group_name),
-                                        inspector_row(i18n.text("Tags"), tags),
+                                        inspector_row(i18n.text(k::HOSTS_GROUP), group_name),
+                                        inspector_row(i18n.text(k::HOSTS_TAGS), tags),
                                     ])),
                             )
                             .child(
@@ -761,14 +763,17 @@ impl OcHerdrView {
                                     .flex()
                                     .flex_col()
                                     .gap_3()
-                                    .child(section_header(i18n.text("Connection"), None))
+                                    .child(section_header(i18n.text(k::HOSTS_CONNECTION), None))
                                     .child(group(vec![
                                         inspector_row(
-                                            i18n.text("Source"),
+                                            i18n.text(k::COMMON_SOURCE),
                                             source.description(i18n).to_owned(),
                                         ),
-                                        inspector_row(i18n.text("Identity"), identity),
-                                        inspector_row(i18n.text("Herdr command"), herdr_path),
+                                        inspector_row(i18n.text(k::HOSTS_IDENTITY), identity),
+                                        inspector_row(
+                                            i18n.text(k::HOSTS_HERDR_COMMAND),
+                                            herdr_path,
+                                        ),
                                     ])),
                             ),
                     )
@@ -791,13 +796,13 @@ impl OcHerdrView {
                             .flex_1()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(i18n.text("OpenSSH remains the source of keys and trust.")),
+                            .child(i18n.text(k::HOSTS_OPENSSH_TRUST)),
                     )
                     .when(matches!(profile, ConnectionProfile::Ssh { .. }), |footer| {
                         footer.child(
                             button(
                                 "open-host-terminal",
-                                i18n.text("Open in Terminal"),
+                                i18n.text(k::HOSTS_OPEN_IN_TERMINAL),
                                 ButtonTone::Neutral,
                                 ButtonSize::Sm,
                             )
@@ -812,9 +817,9 @@ impl OcHerdrView {
                         button(
                             "connect-managed-host",
                             if active {
-                                i18n.text("Reconnect")
+                                i18n.text(k::HOSTS_RECONNECT)
                             } else {
-                                i18n.text("Connect")
+                                i18n.text(k::HOSTS_CONNECT)
                             },
                             ButtonTone::Primary,
                             ButtonSize::Md,
@@ -834,7 +839,7 @@ impl OcHerdrView {
     ) -> ochub_ui::gpui::AnyElement {
         let i18n = self.i18n;
         let (color, label) = host_health_summary(health, i18n);
-        let mut detail = i18n.text("Run a check to verify SSH and Herdr.").to_owned();
+        let mut detail = i18n.text(k::HOSTS_HEALTH_GUIDANCE_UNCHECKED).to_owned();
         let mut facts = String::new();
         if let Some(HostHealthView::Checked {
             cached,
@@ -850,7 +855,7 @@ impl OcHerdrView {
                 pieces.push(version.clone());
             }
             if let Some(count) = cached.session_count {
-                pieces.push(format!("{count} {}", i18n.text("sessions")));
+                pieces.push(format!("{count} {}", i18n.text(k::HOSTS_SESSIONS_SUFFIX)));
             }
             pieces.push(i18n.checked_ago(unix_timestamp().saturating_sub(cached.checked_at)));
             facts = pieces.join(" · ");
@@ -882,7 +887,7 @@ impl OcHerdrView {
                     } else {
                         button(
                             "test-selected-host",
-                            i18n.text("Test connection"),
+                            i18n.text(k::HOSTS_TEST_CONNECTION),
                             ButtonTone::Neutral,
                             ButtonSize::Sm,
                         )
@@ -934,25 +939,23 @@ impl OcHerdrView {
                             .gap_1()
                             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(
                                 if creating {
-                                    i18n.text("New host")
+                                    i18n.text(k::HOSTS_NEW)
                                 } else {
-                                    i18n.text("Edit host")
+                                    i18n.text(k::HOSTS_EDIT)
                                 },
                             ))
                             .child(div().text_xs().text_color(theme::muted()).child(
                                 if source == ConnectionSource::SshConfig {
-                                    i18n.text(
-                                        "SSH config stays read-only; these are local overrides.",
-                                    )
+                                    i18n.text(k::HOSTS_FORM_SSH_READONLY)
                                 } else {
-                                    i18n.text("Connection changes apply the next time you connect.")
+                                    i18n.text(k::HOSTS_FORM_CHANGES_NEXT_CONNECT)
                                 },
                             )),
                     )
                     .child(
                         icon_only_button_tone(
                             "close-host-form",
-                            i18n.text("Keep current values"),
+                            i18n.text(k::HOSTS_FORM_KEEP_CURRENT),
                             IconName::Close,
                             ButtonTone::Ghost,
                             ButtonSize::Sm,
@@ -984,16 +987,16 @@ impl OcHerdrView {
                             .px_6()
                             .py_5()
                             .child(field(
-                                i18n.text("Name"),
+                                i18n.text(k::COMMON_NAME),
                                 false,
-                                Some(i18n.text("Name shown in OcHerdr.").into()),
+                                Some(i18n.text(k::HOSTS_FORM_NAME_DESCRIPTION).into()),
                                 self.remote_label.clone(),
                             ))
                             .child(if source == ConnectionSource::SshConfig {
                                 field(
-                                    i18n.text("Destination"),
+                                    i18n.text(k::HOSTS_FORM_DESTINATION),
                                     false,
-                                    Some(i18n.text("Managed by ~/.ssh/config").into()),
+                                    Some(i18n.text(k::HOSTS_FORM_DESTINATION_SSH_MANAGED).into()),
                                     readonly_field_control(
                                         self.profiles
                                             .get(index.unwrap_or_default())
@@ -1004,12 +1007,9 @@ impl OcHerdrView {
                                 .into_any_element()
                             } else {
                                 field(
-                                    i18n.text("Destination"),
+                                    i18n.text(k::HOSTS_FORM_DESTINATION),
                                     true,
-                                    Some(
-                                        i18n.text("SSH alias or user@host from ~/.ssh/config.")
-                                            .into(),
-                                    ),
+                                    Some(i18n.text(k::HOSTS_FORM_DESTINATION_DESCRIPTION).into()),
                                     self.remote_destination.clone(),
                                 )
                                 .into_any_element()
@@ -1018,25 +1018,16 @@ impl OcHerdrView {
                                 div()
                                     .flex()
                                     .gap_3()
-                                    .child(
-                                        div().flex_1().min_w_0().child(field(
-                                            i18n.text("Group"),
-                                            false,
-                                            Some(
-                                                i18n.text(
-                                                    "One group provides the primary location.",
-                                                )
-                                                .into(),
-                                            ),
-                                            self.remote_group.clone(),
-                                        )),
-                                    )
                                     .child(div().flex_1().min_w_0().child(field(
-                                        i18n.text("Tags"),
+                                        i18n.text(k::HOSTS_GROUP),
                                         false,
-                                        Some(
-                                            i18n.text("Separate multiple tags with commas.").into(),
-                                        ),
+                                        Some(i18n.text(k::HOSTS_FORM_GROUP_DESCRIPTION).into()),
+                                        self.remote_group.clone(),
+                                    )))
+                                    .child(div().flex_1().min_w_0().child(field(
+                                        i18n.text(k::HOSTS_TAGS),
+                                        false,
+                                        Some(i18n.text(k::HOSTS_FORM_TAGS_DESCRIPTION).into()),
                                         self.remote_tags.clone(),
                                     ))),
                             )
@@ -1045,7 +1036,7 @@ impl OcHerdrView {
                                     .id("remote-advanced-toggle")
                                     .role(ochub_ui::gpui::Role::Button)
                                     .tab_stop(false)
-                                    .aria_label(i18n.text("Advanced"))
+                                    .aria_label(i18n.text(k::COMMON_ADVANCED))
                                     .flex()
                                     .items_center()
                                     .gap_2()
@@ -1065,7 +1056,7 @@ impl OcHerdrView {
                                         theme::muted(),
                                         13.,
                                     ))
-                                    .child(i18n.text("Advanced connection overrides")),
+                                    .child(i18n.text(k::HOSTS_FORM_ADVANCED_OVERRIDES)),
                             )
                             .when(self.remote_advanced_open, |form| {
                                 form.child(
@@ -1074,24 +1065,33 @@ impl OcHerdrView {
                                         .items_start()
                                         .gap_3()
                                         .child(div().flex_1().min_w_0().child(field(
-                                            i18n.text("Port"),
+                                            i18n.text(k::HOSTS_FORM_PORT),
                                             false,
-                                            Some(i18n.text("Uses SSH config when empty.").into()),
+                                            Some(i18n.text(k::HOSTS_FORM_PORT_DESCRIPTION).into()),
                                             self.remote_port.clone(),
-                                        )))
-                                        .child(div().flex_1().min_w_0().child(field(
-                                            i18n.text("Herdr command"),
-                                            false,
-                                            Some(i18n.text("Remote command or path.").into()),
-                                            self.remote_herdr_path.clone(),
                                         )))
                                         .child(
                                             div().flex_1().min_w_0().child(field(
-                                                i18n.text("Identity file"),
+                                                i18n.text(k::HOSTS_HERDR_COMMAND),
                                                 false,
                                                 Some(
-                                                    i18n.text("SSH agent still works when empty.")
-                                                        .into(),
+                                                    i18n.text(
+                                                        k::HOSTS_FORM_HERDR_COMMAND_DESCRIPTION,
+                                                    )
+                                                    .into(),
+                                                ),
+                                                self.remote_herdr_path.clone(),
+                                            )),
+                                        )
+                                        .child(
+                                            div().flex_1().min_w_0().child(field(
+                                                i18n.text(k::HOSTS_FORM_IDENTITY_FILE),
+                                                false,
+                                                Some(
+                                                    i18n.text(
+                                                        k::HOSTS_FORM_IDENTITY_FILE_DESCRIPTION,
+                                                    )
+                                                    .into(),
                                                 ),
                                                 self.remote_identity_file.clone(),
                                             )),
@@ -1121,7 +1121,7 @@ impl OcHerdrView {
                             footer.child(
                                 icon_button_tone(
                                     "remove-managed-host",
-                                    i18n.text("Remove saved host"),
+                                    i18n.text(k::HOSTS_FORM_REMOVE_SAVED),
                                     IconName::Trash,
                                     ButtonTone::Ghost,
                                     ButtonSize::Sm,
@@ -1136,7 +1136,7 @@ impl OcHerdrView {
                     .child(
                         button(
                             "cancel-host-form",
-                            i18n.text("Keep current values"),
+                            i18n.text(k::HOSTS_FORM_KEEP_CURRENT),
                             ButtonTone::Neutral,
                             ButtonSize::Sm,
                         )
@@ -1145,7 +1145,7 @@ impl OcHerdrView {
                     .child(
                         button(
                             "save-host-form",
-                            i18n.text("Save"),
+                            i18n.text(k::COMMON_SAVE),
                             ButtonTone::Neutral,
                             ButtonSize::Sm,
                         )
@@ -1155,9 +1155,9 @@ impl OcHerdrView {
                         button(
                             "save-connect-host-form",
                             if active {
-                                i18n.text("Save & reconnect")
+                                i18n.text(k::HOSTS_FORM_SAVE_RECONNECT)
                             } else {
-                                i18n.text("Save & connect")
+                                i18n.text(k::HOSTS_FORM_SAVE_CONNECT)
                             },
                             ButtonTone::Primary,
                             ButtonSize::Sm,
@@ -1199,13 +1199,11 @@ impl OcHerdrView {
                     .max_w(px(420.))
                     .text_sm()
                     .text_color(theme::muted())
-                    .child(i18n.text(
-                        "Choose hosts in the list, then apply a lightweight organization action.",
-                    )),
+                    .child(i18n.text(k::HOSTS_BULK_PROMPT)),
             )
             .child(div().w_full().max_w(px(520.)).child(group(vec![
                         field(
-                            i18n.text("Group"),
+                            i18n.text(k::HOSTS_GROUP),
                             false,
                             None,
                             self.remote_group.clone(),
@@ -1214,7 +1212,7 @@ impl OcHerdrView {
                         .py_3()
                         .into_any_element(),
                         field(
-                            i18n.text("Tags"),
+                            i18n.text(k::HOSTS_TAGS),
                             false,
                             None,
                             self.remote_tags.clone(),
@@ -1231,7 +1229,7 @@ impl OcHerdrView {
                     .child(
                         button(
                             "bulk-organize-hosts",
-                            i18n.text("Apply organization"),
+                            i18n.text(k::HOSTS_BULK_APPLY),
                             ButtonTone::Primary,
                             ButtonSize::Sm,
                         )
@@ -1242,7 +1240,7 @@ impl OcHerdrView {
                     .child(
                         button(
                             "bulk-favorite-hosts",
-                            i18n.text("Add to favorites"),
+                            i18n.text(k::HOSTS_FAVORITE_ADD),
                             ButtonTone::Neutral,
                             ButtonSize::Sm,
                         )
@@ -1253,7 +1251,7 @@ impl OcHerdrView {
                     .child(
                         button(
                             "bulk-unfavorite-hosts",
-                            i18n.text("Remove from favorites"),
+                            i18n.text(k::HOSTS_FAVORITE_REMOVE),
                             ButtonTone::Ghost,
                             ButtonSize::Sm,
                         )
@@ -1265,7 +1263,7 @@ impl OcHerdrView {
             .child(
                 icon_button_tone(
                     "bulk-remove-host-data",
-                    i18n.text("Remove local data…"),
+                    i18n.text(k::HOSTS_BULK_REMOVE_ELLIPSIS),
                     IconName::Trash,
                     ButtonTone::Ghost,
                     ButtonSize::Sm,
@@ -1326,7 +1324,7 @@ impl OcHerdrView {
                 .id("switch-host-manage")
                 .role(ochub_ui::gpui::Role::Button)
                 .tab_stop(false)
-                .aria_label(i18n.text("Manage hosts"))
+                .aria_label(i18n.text(k::HOSTS_MANAGE))
                 .flex()
                 .items_center()
                 .h(px(32.))
@@ -1338,7 +1336,7 @@ impl OcHerdrView {
                 .hover(|style| style.bg(theme::surface_hover()).text_color(theme::text()))
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, _window, cx| this.open_node_manager(cx)))
-                .child(i18n.text("Manage hosts…"))
+                .child(i18n.text(k::HOSTS_MANAGE_ELLIPSIS))
                 .into_any_element(),
         );
         div()
@@ -1373,7 +1371,7 @@ impl OcHerdrView {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::muted())
-                            .child(i18n.text("Switch host")),
+                            .child(i18n.text(k::HOSTS_SWITCH)),
                     )
                     .children(items),
             )
@@ -1465,37 +1463,37 @@ fn host_health_summary(
     i18n: I18n,
 ) -> (ochub_ui::gpui::Rgba, &'static str) {
     match health {
-        Some(HostHealthView::Checking) => (theme::yellow(), i18n.text("Checking…")),
+        Some(HostHealthView::Checking) => (theme::yellow(), i18n.text(k::HOSTS_HEALTH_CHECKING)),
         Some(HostHealthView::Checked { cached, .. }) => match cached.status {
-            HostHealthStatus::Ready => (theme::green(), i18n.text("Ready")),
-            HostHealthStatus::SshOnly => (theme::yellow(), i18n.text("Herdr not ready")),
+            HostHealthStatus::Ready => (theme::green(), i18n.text(k::HOSTS_HEALTH_READY)),
+            HostHealthStatus::SshOnly => {
+                (theme::yellow(), i18n.text(k::HOSTS_HEALTH_HERDR_NOT_READY))
+            }
             HostHealthStatus::UnsupportedHerdr => {
-                (theme::yellow(), i18n.text("Herdr update required"))
+                (theme::yellow(), i18n.text(k::HOSTS_HEALTH_UPDATE_REQUIRED))
             }
             HostHealthStatus::AuthenticationRequired => {
-                (theme::yellow(), i18n.text("Authentication required"))
+                (theme::yellow(), i18n.text(k::HOSTS_HEALTH_AUTH_REQUIRED))
             }
             HostHealthStatus::HostKeyRequired => {
-                (theme::yellow(), i18n.text("Host key needs attention"))
+                (theme::yellow(), i18n.text(k::HOSTS_HEALTH_HOST_KEY))
             }
-            HostHealthStatus::Unreachable => (theme::red(), i18n.text("Unreachable")),
-            HostHealthStatus::Failed => (theme::red(), i18n.text("Check failed")),
+            HostHealthStatus::Unreachable => (theme::red(), i18n.text(k::HOSTS_HEALTH_UNREACHABLE)),
+            HostHealthStatus::Failed => (theme::red(), i18n.text(k::HOSTS_HEALTH_FAILED)),
         },
-        None => (theme::muted(), i18n.text("Not checked")),
+        None => (theme::muted(), i18n.text(k::HOSTS_HEALTH_NOT_CHECKED)),
     }
 }
 
 fn host_health_guidance(status: HostHealthStatus, i18n: I18n) -> &'static str {
     i18n.text(match status {
-        HostHealthStatus::Ready => "SSH and Herdr are ready.",
-        HostHealthStatus::SshOnly => "SSH works, but Herdr could not be found on this host.",
-        HostHealthStatus::UnsupportedHerdr => "Update Herdr or configure a newer executable path.",
-        HostHealthStatus::AuthenticationRequired => {
-            "Open Terminal to complete authentication, then check again."
-        }
-        HostHealthStatus::HostKeyRequired => "Open Terminal to review and enroll this host key.",
-        HostHealthStatus::Unreachable => "Check the alias, network, VPN, and SSH port.",
-        HostHealthStatus::Failed => "Review the SSH error, adjust the host, and try again.",
+        HostHealthStatus::Ready => k::HOSTS_HEALTH_GUIDANCE_READY,
+        HostHealthStatus::SshOnly => k::HOSTS_HEALTH_GUIDANCE_SSH_ONLY,
+        HostHealthStatus::UnsupportedHerdr => k::HOSTS_HEALTH_GUIDANCE_UNSUPPORTED,
+        HostHealthStatus::AuthenticationRequired => k::HOSTS_HEALTH_GUIDANCE_AUTH,
+        HostHealthStatus::HostKeyRequired => k::HOSTS_HEALTH_GUIDANCE_HOST_KEY,
+        HostHealthStatus::Unreachable => k::HOSTS_HEALTH_GUIDANCE_UNREACHABLE,
+        HostHealthStatus::Failed => k::HOSTS_HEALTH_GUIDANCE_FAILED,
     })
 }
 

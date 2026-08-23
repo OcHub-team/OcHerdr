@@ -9,7 +9,7 @@ use ochub_ui::gpui::{Div, Role, Stateful, Toggled, prelude::*};
 use super::EventStreamState;
 use super::OcHerdrView;
 use super::Overlay;
-use super::i18n::I18n;
+use super::i18n::{I18n, k};
 use super::profile_display_label;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,14 +110,14 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
     let connections = ListA11y {
         id: "connections-list",
         role: Role::List,
-        name: i18n.text("SESSIONS").to_owned(),
+        name: i18n.text(k::TERMINAL_SESSIONS).to_owned(),
         items: input
             .sessions
             .iter()
             .enumerate()
             .map(|(index, session)| {
                 let name = if session.default {
-                    i18n.text("Default").to_owned()
+                    i18n.text(k::COMMON_DEFAULT).to_owned()
                 } else {
                     session.display_name().to_owned()
                 };
@@ -178,7 +178,7 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
             agents.push(ControlA11y {
                 id: agent_name.to_owned(),
                 role: Role::Button,
-                name: format!("{} · {}", agent_name, i18n.text(pane.agent_status.label())),
+                name: format!("{} · {}", agent_name, i18n.agent_status(pane.agent_status)),
                 selected: Some(input.selection.pane_id.as_deref() == Some(pane.pane_id.as_str())),
                 toggled: None,
                 tab_stop: false,
@@ -192,58 +192,62 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
             id: "sidebar",
             // Toolbar survives macOS AX; Navigation/Main/Status collapse to AXGroup and are dropped.
             role: Role::Toolbar,
-            name: i18n.text("Spaces").to_owned(),
+            name: i18n.text(k::TERMINAL_SPACES).to_owned(),
         },
         main: RegionA11y {
             id: "main",
             role: Role::Toolbar,
-            name: i18n.text("Terminal").to_owned(),
+            name: i18n.text(k::TERMINAL_REGION).to_owned(),
         },
         status: RegionA11y {
             id: "status-bar",
             role: Role::Toolbar,
-            name: i18n.text("Status bar").to_owned(),
+            name: i18n.text(k::TERMINAL_STATUS_BAR).to_owned(),
         },
         connections,
         workspaces: ListA11y {
             id: "workspaces-list",
             role: Role::List,
-            name: i18n.text("WORKSPACES").to_owned(),
+            name: i18n.text(k::TERMINAL_WORKSPACES).to_owned(),
             items: workspaces,
         },
         agents: ListA11y {
             id: "agents-list",
             role: Role::List,
-            name: i18n.text("AGENTS").to_owned(),
+            name: i18n.text(k::TERMINAL_AGENTS).to_owned(),
             items: agents,
         },
         tabs: ListA11y {
             id: "tab-list",
             role: Role::TabList,
-            name: i18n.text("Tabs").to_owned(),
+            name: i18n.text(k::TERMINAL_TABS).to_owned(),
             items: tabs,
         },
         toolbar: ToolbarA11y {
-            new_tab: toolbar_button("new-tab", i18n.text("New tab")),
-            split_right: toolbar_button("split-right", i18n.text("Split pane right")),
-            split_down: toolbar_button("split-down", i18n.text("Split pane down")),
-            zoom: toolbar_button("zoom-pane", i18n.text("Zoom pane")),
-            close_pane: toolbar_button("close-pane", i18n.text("Close pane")),
+            new_tab: toolbar_button("new-tab", i18n.text(k::TERMINAL_NEW_TAB)),
+            split_right: toolbar_button("split-right", i18n.text(k::TERMINAL_SPLIT_PANE_RIGHT)),
+            split_down: toolbar_button("split-down", i18n.text(k::TERMINAL_SPLIT_PANE_DOWN)),
+            zoom: toolbar_button("zoom-pane", i18n.text(k::TERMINAL_ZOOM_PANE)),
+            close_pane: toolbar_button("close-pane", i18n.text(k::TERMINAL_CLOSE_PANE)),
             appearance: toolbar_toggle(
                 "open-appearance",
-                i18n.text("Appearance"),
+                i18n.text(k::APPEARANCE_TITLE),
                 input.appearance_open,
             ),
             herdr_settings: toolbar_button(
                 "open-herdr-settings",
-                i18n.text("Open Herdr settings in Terminal"),
+                i18n.text(k::TERMINAL_SETTINGS_IN_TERMINAL),
             ),
-            remote: toolbar_toggle("manage-nodes", i18n.text("Hosts"), input.node_manager_open),
+            remote: toolbar_toggle(
+                "manage-nodes",
+                i18n.text(k::HOSTS_TITLE),
+                input.node_manager_open,
+            ),
         },
         new_workspace: ControlA11y {
             id: "new-workspace".into(),
             role: Role::Button,
-            name: i18n.text("New workspace").to_owned(),
+            name: i18n.text(k::TERMINAL_NEW_WORKSPACE).to_owned(),
             selected: None,
             toggled: None,
             tab_stop: true,
@@ -272,11 +276,11 @@ pub fn pane_a11y(
 
 pub fn terminal_a11y_value(screen_text: Option<&str>, waiting: bool, i18n: I18n) -> String {
     if waiting {
-        return i18n.text("Waiting for terminal frame…").to_owned();
+        return i18n.text(k::TERMINAL_WAITING).to_owned();
     }
     match screen_text {
         Some(text) if !text.trim().is_empty() => text.to_owned(),
-        _ => i18n.text("Empty terminal").to_owned(),
+        _ => i18n.text(k::TERMINAL_EMPTY).to_owned(),
     }
 }
 
@@ -355,8 +359,8 @@ fn status_value(input: &ChromeA11yInput<'_>) -> String {
     if input.prefix_pending {
         format!(
             "{} · {}",
-            i18n.text("PREFIX"),
-            i18n.text("C new tab · ⇧N new workspace · S settings in Terminal · 1–9 switch tab")
+            i18n.text(k::TERMINAL_PREFIX),
+            i18n.text(k::TERMINAL_PREFIX_HINT)
         )
     } else if let Some(operation) = input.operation {
         operation.to_owned()
@@ -365,13 +369,12 @@ fn status_value(input: &ChromeA11yInput<'_>) -> String {
     } else if let Some(snapshot) = input.snapshot {
         event_stream_status_copy(i18n, input.event_stream, snapshot)
     } else {
-        i18n.text("No Herdr session").to_owned()
+        i18n.text(k::TERMINAL_NO_SESSION).to_owned()
     }
 }
 
 pub(crate) fn event_stream_lost_copy(i18n: I18n) -> String {
-    i18n.text("Live updates disconnected — click to reconnect")
-        .to_owned()
+    i18n.text(k::TERMINAL_LIVE_DISCONNECTED).to_owned()
 }
 
 pub(crate) fn event_stream_status_copy(

@@ -25,3 +25,6 @@ sys-locale.workspace = true
 [[bin]]
 name = "ocherdr"
 path = "src/main.rs"
+
+[build-dependencies]
+toml = "1.1"

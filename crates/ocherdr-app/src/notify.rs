@@ -1,6 +1,6 @@
 use ochub_ui::notifications::{NotificationLevel, NotificationRequest};
 
-use crate::i18n::I18n;
+use crate::i18n::{I18n, Key, k};
 
 /// What the user tried to do, used as the toast title.
 ///
@@ -64,32 +64,32 @@ impl FailureKind {
         }
     }
 
-    fn title_key(self) -> &'static str {
+    fn title_key(self) -> Key {
         match self {
-            Self::DiscoverSessions => "Could not discover Herdr sessions",
-            Self::RefreshSnapshot => "Could not refresh the session",
-            Self::ApplyLiveUpdate => "Could not apply a live update",
-            Self::UpdateFavorites => "Could not update favorites",
-            Self::ApplyOrganization => "Could not apply organization",
-            Self::RemoveHosts => "Could not remove hosts",
-            Self::SaveAppearance => "Could not save appearance",
-            Self::SaveLanguage => "Could not save language",
-            Self::RemoveHost => "Could not remove host",
-            Self::SaveHost => "Could not save host",
-            Self::OpenTerminal => "Could not open Terminal",
-            Self::ApplyPalette => "Could not apply the terminal theme",
-            Self::SpawnTerminal => "Could not open a terminal pane",
-            Self::ResizeTerminal => "Could not resize the terminal",
-            Self::RenderTerminal => "Could not render the terminal",
-            Self::TerminalStream => "Terminal stream failed",
-            Self::TerminalRuntime => "Terminal runtime failed",
-            Self::CannotEditThisMac => "Cannot edit this Mac",
-            Self::NeedGroupOrTag => "Cannot apply organization",
-            Self::CannotRemoveActiveHost => "Cannot remove host",
-            Self::EmptyWorkspaceOrTabName => "Cannot rename",
-            Self::SshDestinationRequired => "Invalid SSH destination",
-            Self::SshPortInvalid => "Invalid SSH port",
-            Self::NoSessionSelected => "Cannot open Terminal",
+            Self::DiscoverSessions => k::NOTIFY_DISCOVER_SESSIONS,
+            Self::RefreshSnapshot => k::NOTIFY_REFRESH_SESSION,
+            Self::ApplyLiveUpdate => k::NOTIFY_APPLY_LIVE_UPDATE,
+            Self::UpdateFavorites => k::NOTIFY_UPDATE_FAVORITES,
+            Self::ApplyOrganization => k::NOTIFY_APPLY_ORGANIZATION,
+            Self::RemoveHosts => k::NOTIFY_REMOVE_HOSTS,
+            Self::SaveAppearance => k::NOTIFY_SAVE_APPEARANCE,
+            Self::SaveLanguage => k::NOTIFY_SAVE_LANGUAGE,
+            Self::RemoveHost => k::NOTIFY_REMOVE_HOST,
+            Self::SaveHost => k::NOTIFY_SAVE_HOST,
+            Self::OpenTerminal => k::NOTIFY_OPEN_TERMINAL,
+            Self::ApplyPalette => k::NOTIFY_APPLY_PALETTE,
+            Self::SpawnTerminal => k::NOTIFY_SPAWN_TERMINAL,
+            Self::ResizeTerminal => k::NOTIFY_RESIZE_TERMINAL,
+            Self::RenderTerminal => k::NOTIFY_RENDER_TERMINAL,
+            Self::TerminalStream => k::NOTIFY_TERMINAL_STREAM,
+            Self::TerminalRuntime => k::NOTIFY_TERMINAL_RUNTIME,
+            Self::CannotEditThisMac => k::NOTIFY_CANNOT_EDIT_THIS_MAC,
+            Self::NeedGroupOrTag => k::NOTIFY_CANNOT_APPLY_ORGANIZATION,
+            Self::CannotRemoveActiveHost => k::NOTIFY_CANNOT_REMOVE_HOST,
+            Self::EmptyWorkspaceOrTabName => k::NOTIFY_CANNOT_RENAME,
+            Self::SshDestinationRequired => k::NOTIFY_INVALID_SSH_DESTINATION,
+            Self::SshPortInvalid => k::NOTIFY_INVALID_SSH_PORT,
+            Self::NoSessionSelected => k::NOTIFY_CANNOT_OPEN_TERMINAL,
         }
     }
 }
@@ -115,20 +115,20 @@ pub(crate) fn notification_for(kind: FailureKind, detail: &str, i18n: I18n) -> F
     }
 }
 
-fn command_title_key(method: &str) -> &'static str {
+fn command_title_key(method: &str) -> Key {
     match method {
-        "workspace.create" => "Could not create a workspace",
-        "workspace.close" => "Could not close the workspace",
-        "workspace.rename" => "Could not rename the workspace",
-        "tab.create" => "Could not create a tab",
-        "tab.close" => "Could not close the tab",
-        "tab.rename" => "Could not rename the tab",
-        "pane.close" => "Could not close the pane",
-        "pane.rename" => "Could not rename the pane",
-        "pane.split" => "Could not split the pane",
-        "pane.zoom" => "Could not zoom the pane",
-        "pane.focus_direction" => "Could not move pane focus",
-        _ => "Could not run the Herdr command",
+        "workspace.create" => k::NOTIFY_WORKSPACE_CREATE,
+        "workspace.close" => k::NOTIFY_WORKSPACE_CLOSE,
+        "workspace.rename" => k::NOTIFY_WORKSPACE_RENAME,
+        "tab.create" => k::NOTIFY_TAB_CREATE,
+        "tab.close" => k::NOTIFY_TAB_CLOSE,
+        "tab.rename" => k::NOTIFY_TAB_RENAME,
+        "pane.close" => k::NOTIFY_PANE_CLOSE,
+        "pane.rename" => k::NOTIFY_PANE_RENAME,
+        "pane.split" => k::NOTIFY_PANE_SPLIT,
+        "pane.zoom" => k::NOTIFY_PANE_ZOOM,
+        "pane.focus_direction" => k::NOTIFY_PANE_FOCUS,
+        _ => k::NOTIFY_HERDR_COMMAND,
     }
 }
 

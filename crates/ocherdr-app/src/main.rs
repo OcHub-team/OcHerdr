@@ -44,7 +44,7 @@ mod ime;
 mod notify;
 mod ui;
 
-use i18n::{I18n, Language};
+use i18n::{I18n, Language, k};
 
 const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;
@@ -161,11 +161,11 @@ impl HierarchyTarget {
         }
     }
 
-    fn kind_label(&self) -> &'static str {
+    fn kind_key(&self) -> i18n::Key {
         match self {
-            Self::Workspace { .. } => "workspace",
-            Self::Tab { .. } => "tab",
-            Self::Pane { .. } => "pane",
+            Self::Workspace { .. } => k::COMMON_KIND_WORKSPACE,
+            Self::Tab { .. } => k::COMMON_KIND_TAB,
+            Self::Pane { .. } => k::COMMON_KIND_PANE,
         }
     }
 }
@@ -502,17 +502,17 @@ enum ConnectionSource {
 impl ConnectionSource {
     fn label(self, i18n: I18n) -> &'static str {
         i18n.text(match self {
-            Self::ThisMac => "This Mac",
-            Self::Saved => "Saved",
-            Self::SshConfig => "SSH config",
+            Self::ThisMac => k::HOSTS_SOURCE_THIS_MAC,
+            Self::Saved => k::HOSTS_SOURCE_SAVED_SHORT,
+            Self::SshConfig => k::HOSTS_SOURCE_SSH_CONFIG,
         })
     }
 
     fn description(self, i18n: I18n) -> &'static str {
         i18n.text(match self {
-            Self::ThisMac => "Herdr on this computer",
-            Self::Saved => "Saved in OcHerdr",
-            Self::SshConfig => "Read-only from ~/.ssh/config",
+            Self::ThisMac => k::HOSTS_SOURCE_THIS_MAC_DESCRIPTION,
+            Self::Saved => k::HOSTS_SOURCE_SAVED,
+            Self::SshConfig => k::HOSTS_SOURCE_SSH_CONFIG_READONLY,
         })
     }
 }
@@ -596,7 +596,7 @@ fn next_manual_profile_id(profiles: &[ConnectionProfile]) -> u64 {
 
 fn profile_display_label(profile: &ConnectionProfile, i18n: I18n) -> String {
     if matches!(profile, ConnectionProfile::Local { .. }) {
-        i18n.text("This Mac").to_owned()
+        i18n.text(k::HOSTS_SOURCE_THIS_MAC).to_owned()
     } else {
         profile.label().to_owned()
     }

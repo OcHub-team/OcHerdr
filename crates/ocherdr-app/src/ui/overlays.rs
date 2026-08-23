@@ -13,10 +13,10 @@ impl OcHerdrView {
             .profiles
             .get(index)
             .map(|profile| profile_display_label(profile, i18n))
-            .unwrap_or_else(|| i18n.text("this host").to_owned());
+            .unwrap_or_else(|| i18n.text(k::HOSTS_SWITCH_THIS_HOST).to_owned());
         let cancel = button(
             "cancel-switch-host",
-            i18n.text("Cancel"),
+            i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
@@ -24,7 +24,7 @@ impl OcHerdrView {
         .into_any_element();
         let confirm = button(
             "confirm-switch-host",
-            i18n.text("Switch"),
+            i18n.text(k::COMMON_SWITCH),
             ButtonTone::Primary,
             ButtonSize::Sm,
         )
@@ -34,9 +34,9 @@ impl OcHerdrView {
             apply_dialog(
                 modal_card(),
                 "switch-host-dialog",
-                i18n.text("Switch host?"),
+                i18n.text(k::HOSTS_SWITCH_TITLE),
             )
-            .child(modal_header(i18n.text("Switch host?")))
+            .child(modal_header(i18n.text(k::HOSTS_SWITCH_TITLE)))
             .child(
                 modal_body()
                     .child(
@@ -49,9 +49,7 @@ impl OcHerdrView {
                         div()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(i18n.text(
-                                "OcHerdr will leave the current Herdr session and attach to the other machine.",
-                            )),
+                            .child(i18n.text(k::HOSTS_SWITCH_DETAIL)),
                     ),
             )
             .child(modal_footer(vec![cancel, confirm])),
@@ -73,11 +71,11 @@ impl OcHerdrView {
             .profiles
             .get(index)
             .map(ConnectionProfile::label)
-            .unwrap_or(i18n.text("this node"))
+            .unwrap_or(i18n.text(k::HOSTS_REMOVE_THIS_NODE))
             .to_owned();
         let cancel = button(
             "cancel-remove-node",
-            i18n.text("Cancel"),
+            i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
@@ -85,7 +83,7 @@ impl OcHerdrView {
         .into_any_element();
         let remove = button(
             "confirm-remove-node",
-            i18n.text("Remove node"),
+            i18n.text(k::HOSTS_REMOVE_NODE),
             ButtonTone::Danger,
             ButtonSize::Sm,
         )
@@ -95,27 +93,25 @@ impl OcHerdrView {
             apply_dialog(
                 modal_card(),
                 "remove-node-dialog",
-                i18n.text("Remove SSH node?"),
+                i18n.text(k::HOSTS_REMOVE_NODE_TITLE),
             )
-                .child(modal_header(i18n.text("Remove SSH node?")))
-                .child(
-                    modal_body()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme::text())
-                                .child(i18n.remove_node_prompt(&node_name)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::muted())
-                                .child(
-                                    i18n.text("This only removes the saved node profile. SSH keys and ~/.ssh/config are not changed."),
-                                ),
-                        ),
-                )
-                .child(modal_footer(vec![cancel, remove])),
+            .child(modal_header(i18n.text(k::HOSTS_REMOVE_NODE_TITLE)))
+            .child(
+                modal_body()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::text())
+                            .child(i18n.remove_node_prompt(&node_name)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(i18n.text(k::HOSTS_REMOVE_NODE_DETAIL)),
+                    ),
+            )
+            .child(modal_footer(vec![cancel, remove])),
         )
         .top_0()
         .left_0()
@@ -129,7 +125,7 @@ impl OcHerdrView {
         let count = self.host_bulk_selection.len();
         let cancel = button(
             "cancel-bulk-remove",
-            i18n.text("Cancel"),
+            i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
@@ -137,7 +133,7 @@ impl OcHerdrView {
         .into_any_element();
         let remove = button(
             "confirm-bulk-remove",
-            i18n.text("Remove local data"),
+            i18n.text(k::HOSTS_BULK_REMOVE),
             ButtonTone::Danger,
             ButtonSize::Sm,
         )
@@ -147,9 +143,9 @@ impl OcHerdrView {
             apply_dialog(
                 modal_card(),
                 "bulk-remove-hosts-dialog",
-                i18n.text("Remove local host data?"),
+                i18n.text(k::HOSTS_BULK_REMOVE_TITLE),
             )
-            .child(modal_header(i18n.text("Remove local host data?")))
+            .child(modal_header(i18n.text(k::HOSTS_BULK_REMOVE_TITLE)))
             .child(
                 modal_body()
                     .child(
@@ -162,9 +158,7 @@ impl OcHerdrView {
                         div()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(i18n.text(
-                                "Saved hosts will be removed. SSH config entries keep their OpenSSH definitions and lose only OcHerdr metadata and overrides.",
-                            )),
+                            .child(i18n.text(k::HOSTS_BULK_REMOVE_BODY)),
                     ),
             )
             .child(modal_footer(vec![cancel, remove])),
@@ -182,11 +176,11 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let i18n = self.i18n;
-        let kind = target.kind_label();
+        let kind = target.kind_key();
         let label = target.label().to_owned();
         let cancel = button(
             "cancel-close-target",
-            i18n.text("Cancel"),
+            i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
@@ -211,9 +205,12 @@ impl OcHerdrView {
                                 .text_color(theme::text())
                                 .child(i18n.close_prompt(&label)),
                         )
-                        .child(div().text_xs().text_color(theme::muted()).child(
-                            i18n.text("Processes owned by this Herdr hierarchy item may be terminated. Closing a final tab also closes its workspace."),
-                        )),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(i18n.text(k::COMMON_CLOSE_PROCESSES)),
+                        ),
                 )
                 .child(modal_footer(vec![cancel, close])),
         )
@@ -230,11 +227,11 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let i18n = self.i18n;
-        let kind = target.kind_label();
+        let kind = target.kind_key();
         let pane = matches!(target, HierarchyTarget::Pane { .. });
         let cancel = button(
             "cancel-rename",
-            i18n.text("Cancel"),
+            i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
             ButtonSize::Sm,
         )
@@ -242,7 +239,7 @@ impl OcHerdrView {
         .into_any_element();
         let save = button(
             "save-rename",
-            i18n.text("Rename"),
+            i18n.text(k::COMMON_RENAME),
             ButtonTone::Primary,
             ButtonSize::Sm,
         )
@@ -255,13 +252,13 @@ impl OcHerdrView {
                 .child(modal_header(i18n.rename_title(kind)))
                 .child(
                     modal_body().child(field(
-                        i18n.text("Name"),
+                        i18n.text(k::COMMON_NAME),
                         !pane,
                         Some(
                             if pane {
-                                i18n.text("Leave empty to clear the custom pane name.")
+                                i18n.text(k::COMMON_RENAME_PANE_HINT)
                             } else {
-                                i18n.text("Saved directly to the active Herdr session.")
+                                i18n.text(k::COMMON_RENAME_SESSION_HINT)
                             }
                             .into(),
                         ),
@@ -290,7 +287,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "workspace-menu-rename",
-                        i18n.text("Rename"),
+                        i18n.text(k::COMMON_RENAME),
                         Some("⌃B ⇧W"),
                         Some(IconName::Pencil),
                         false,
@@ -304,7 +301,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "workspace-menu-close",
-                        i18n.text("Close"),
+                        i18n.text(k::COMMON_CLOSE),
                         Some("⌃B ⇧D"),
                         Some(IconName::Close),
                         true,
@@ -319,7 +316,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "tab-menu-new",
-                        i18n.text("New tab"),
+                        i18n.text(k::TERMINAL_NEW_TAB),
                         Some("⌘T"),
                         Some(IconName::Add),
                         false,
@@ -334,7 +331,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "tab-menu-rename",
-                        i18n.text("Rename"),
+                        i18n.text(k::COMMON_RENAME),
                         Some("⌃B ⇧T"),
                         Some(IconName::Pencil),
                         false,
@@ -348,7 +345,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "tab-menu-close",
-                        i18n.text("Close"),
+                        i18n.text(k::COMMON_CLOSE),
                         Some("⌃B ⇧X"),
                         Some(IconName::Close),
                         true,
@@ -363,7 +360,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "pane-menu-copy",
-                        i18n.text("Copy"),
+                        i18n.text(k::COMMON_COPY),
                         Some("⌘C"),
                         Some(IconName::Copy),
                         false,
@@ -378,7 +375,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "pane-menu-rename",
-                        i18n.text("Rename pane"),
+                        i18n.text(k::TERMINAL_RENAME_PANE),
                         Some("⌃B ⇧P"),
                         Some(IconName::Pencil),
                         false,
@@ -389,8 +386,16 @@ impl OcHerdrView {
                     .into_any_element(),
                 );
                 for (suffix, label, direction) in [
-                    ("right", i18n.text("Split right"), SplitDirection::Right),
-                    ("down", i18n.text("Split down"), SplitDirection::Down),
+                    (
+                        "right",
+                        i18n.text(k::TERMINAL_SPLIT_RIGHT),
+                        SplitDirection::Right,
+                    ),
+                    (
+                        "down",
+                        i18n.text(k::TERMINAL_SPLIT_DOWN),
+                        SplitDirection::Down,
+                    ),
                 ] {
                     let pane_id = id.clone();
                     items.push(
@@ -418,7 +423,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "pane-menu-zoom",
-                        i18n.text("Zoom"),
+                        i18n.text(k::TERMINAL_ZOOM),
                         None::<&str>,
                         Some(IconName::Eye),
                         false,
@@ -437,7 +442,7 @@ impl OcHerdrView {
                 items.push(
                     context_menu_item(
                         "pane-menu-close",
-                        i18n.text("Close pane"),
+                        i18n.text(k::TERMINAL_CLOSE_PANE),
                         Some("⌘W"),
                         Some(IconName::Close),
                         true,
