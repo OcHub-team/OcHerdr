@@ -631,6 +631,9 @@ pub(crate) const EVENT_SUBSCRIPTIONS: &[&str] = &[
     "workspace.reordered",
     "workspace.closed",
     "workspace.focused",
+    "worktree.created",
+    "worktree.opened",
+    "worktree.removed",
     "tab.created",
     "tab.closed",
     "tab.focused",
@@ -1579,7 +1582,13 @@ mod tests {
 
     #[test]
     fn subscription_list_excludes_types_that_require_pane_id() {
-        assert_eq!(EVENT_SUBSCRIPTIONS.len(), 21);
+        assert_eq!(EVENT_SUBSCRIPTIONS.len(), 24);
+        for kind in ["worktree.created", "worktree.opened", "worktree.removed"] {
+            assert!(
+                EVENT_SUBSCRIPTIONS.contains(&kind),
+                "{kind} must be in the session-wide subscribe list"
+            );
+        }
         for required in PANE_ID_REQUIRED_SUBSCRIPTIONS {
             assert!(
                 !EVENT_SUBSCRIPTIONS.contains(required),

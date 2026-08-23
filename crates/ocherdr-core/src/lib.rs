@@ -139,6 +139,71 @@ pub struct WorkspaceWorktreeInfo {
     pub is_linked_worktree: bool,
 }
 
+impl WorkspaceWorktreeInfo {
+    /// Short sidebar copy: repo name, plus the checkout leaf when a linked
+    /// worktree would otherwise be indistinguishable from its siblings.
+    pub fn affiliation_label(&self) -> String {
+        if self.is_linked_worktree {
+            let leaf = checkout_leaf(&self.checkout_path);
+            if leaf != self.repo_name {
+                return format!("{} · {}", self.repo_name, leaf);
+            }
+        }
+        self.repo_name.clone()
+    }
+}
+
+fn checkout_leaf(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+}
+
+/// Git worktree entry from `worktree.list` / worktree lifecycle events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub path: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    pub is_bare: bool,
+    pub is_detached: bool,
+    pub is_prunable: bool,
+    pub is_linked_worktree: bool,
+    #[serde(default)]
+    pub open_workspace_id: Option<String>,
+    pub label: String,
+}
+
+impl WorktreeInfo {
+    pub fn is_openable(&self) -> bool {
+        !self.is_bare && !self.is_prunable
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.branch
+            .as_deref()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| checkout_leaf(&self.path))
+    }
+}
+
+/// `worktree.list` result, minus the wrapping `type` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeList {
+    pub source: WorktreeSourceInfo,
+    pub worktrees: Vec<WorktreeInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeSourceInfo {
+    pub repo_key: String,
+    pub repo_name: String,
+    pub repo_root: String,
+    pub source_checkout_path: String,
+    #[serde(default)]
+    pub source_workspace_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabInfo {
     pub tab_id: String,
@@ -532,5 +597,67 @@ mod tests {
         assert_eq!(parse_split_path_id("split_1_0"), Some(vec![false]));
         assert_eq!(parse_split_path_id("split_2_01"), Some(vec![false, true]));
         assert_eq!(parse_split_path_id("pane-1"), None);
+    }
+
+    #[test]
+    fn worktree_affiliation_prefers_repo_name_and_linked_checkout_leaf() {
+        let main = WorkspaceWorktreeInfo {
+            repo_key: "/repo/.git".into(),
+            repo_name: "repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: "/repo".into(),
+            is_linked_worktree: false,
+        };
+        assert_eq!(main.affiliation_label(), "repo");
+
+        let linked = WorkspaceWorktreeInfo {
+            checkout_path: "/worktrees/repo/feature".into(),
+            is_linked_worktree: true,
+            ..main.clone()
+        };
+        assert_eq!(linked.affiliation_label(), "repo · feature");
+
+        let linked_named_like_repo = WorkspaceWorktreeInfo {
+            checkout_path: "/tmp/repo".into(),
+            is_linked_worktree: true,
+            ..main
+        };
+        assert_eq!(linked_named_like_repo.affiliation_label(), "repo");
+    }
+
+    #[test]
+    fn worktree_display_name_prefers_branch_and_skips_bare_or_prunable() {
+        let entry = WorktreeInfo {
+            path: "/worktrees/repo/feature".into(),
+            branch: Some("worktree/feature".into()),
+            is_bare: false,
+            is_detached: false,
+            is_prunable: false,
+            is_linked_worktree: true,
+            open_workspace_id: None,
+            label: "repo".into(),
+        };
+        assert!(entry.is_openable());
+        assert_eq!(entry.display_name(), "worktree/feature");
+
+        let detached = WorktreeInfo {
+            branch: None,
+            ..entry.clone()
+        };
+        assert_eq!(detached.display_name(), "feature");
+        assert!(
+            !WorktreeInfo {
+                is_bare: true,
+                ..entry.clone()
+            }
+            .is_openable()
+        );
+        assert!(
+            !WorktreeInfo {
+                is_prunable: true,
+                ..entry
+            }
+            .is_openable()
+        );
     }
 }

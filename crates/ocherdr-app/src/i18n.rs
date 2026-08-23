@@ -151,6 +151,18 @@ impl I18n {
         tf!(self, k::COMMON_CLOSE_PROMPT, label = label)
     }
 
+    pub(crate) fn remove_worktree_prompt(self, label: &str) -> String {
+        tf!(self, k::WORKTREE_REMOVE_PROMPT, label = label)
+    }
+
+    pub(crate) fn force_remove_worktree_prompt(self, label: &str) -> String {
+        tf!(self, k::WORKTREE_REMOVE_FORCE_PROMPT, label = label)
+    }
+
+    pub(crate) fn force_remove_worktree_detail(self, error: &str) -> String {
+        tf!(self, k::WORKTREE_REMOVE_FORCE_BODY, error = error)
+    }
+
     pub(crate) fn rename_title(self, kind: Key) -> String {
         tf!(self, k::COMMON_RENAME_TITLE, kind = self.text(kind))
     }
