@@ -40,6 +40,7 @@
 "notify.save_appearance" = "无法保存外观设置"
 "notify.save_host" = "无法保存主机"
 "notify.save_language" = "无法保存语言设置"
+"notify.set_split_ratio" = "无法调整分割比例"
 "notify.spawn_terminal" = "无法打开终端窗格"
 "notify.tab_close" = "无法关闭标签页"
 "notify.tab_create" = "无法创建标签页"

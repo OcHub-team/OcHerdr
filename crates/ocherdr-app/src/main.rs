@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
-    AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent, HierarchySnapshot, PaneInfo,
-    Selection, SessionSummary, SnapshotUpdate, SplitDirection,
+    AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent, HierarchySnapshot, LayoutRect,
+    LayoutSplit, PaneInfo, Selection, SessionSummary, SnapshotUpdate, SplitDirection,
+    split_ratio_from_drag,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -54,6 +55,8 @@ const HEADER_HEIGHT: f32 = 46.;
 const TAB_PILL_HEIGHT: f32 = 28.;
 const STATUS_BAR_HEIGHT: f32 = 28.;
 const PANE_HEADER_HEIGHT: f32 = 26.;
+const SPLIT_HANDLE_HIT_PX: f32 = 10.;
+const SPLIT_HANDLE_VISUAL_PX: f32 = 4.;
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -651,7 +654,8 @@ struct OcHerdrView {
     open_select: Option<SharedString>,
     appearance_scroll: ScrollHandle,
     prefix_pending: bool,
-    text_drag_pane: Option<String>,
+    surface_drag: SurfaceDrag,
+    terminal_surface_bounds: Option<(f32, f32, f32, f32)>,
     ime_marked: Option<String>,
     rename_input: Entity<TextInput>,
     appearance: AppearanceSettings,
@@ -710,6 +714,38 @@ impl Overlay {
 
 fn key_goes_to_terminal(overlay: &Overlay) -> bool {
     matches!(overlay, Overlay::None)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SurfaceDrag {
+    Idle,
+    Text { pane_id: String },
+    Split(SplitDrag),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SplitDrag {
+    workspace_id: String,
+    tab_id: String,
+    path: Vec<bool>,
+    /// Topology at press. Ratio-derived geometry is omitted so a nested
+    /// ancestor `layout.updated` does not void the gesture.
+    layout: SplitLayoutFingerprint,
+    direction: SplitDirection,
+    rect: LayoutRect,
+    grab_offset: f32,
+    preview_ratio: f32,
+    start_ratio: f32,
+}
+
+/// Split tree shape and which pane sits at each preorder leaf.
+/// Paths and directions only: Herdr recomputes split/pane rects from ratios,
+/// so including those would cancel a nested drag when an ancestor ratio changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SplitLayoutFingerprint {
+    zoomed: bool,
+    splits: Vec<(Vec<bool>, SplitDirection)>,
+    panes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

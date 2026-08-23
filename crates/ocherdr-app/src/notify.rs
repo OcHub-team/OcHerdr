@@ -22,6 +22,7 @@ pub(crate) enum FailureKind {
     ApplyPalette,
     SpawnTerminal,
     ResizeTerminal,
+    SetSplitRatio,
     RenderTerminal,
     TerminalStream,
     TerminalRuntime,
@@ -60,6 +61,7 @@ impl FailureKind {
             | Self::ApplyPalette
             | Self::SpawnTerminal
             | Self::ResizeTerminal
+            | Self::SetSplitRatio
             | Self::RenderTerminal
             | Self::TerminalStream
             | Self::TerminalRuntime => NotificationLevel::Error,
@@ -82,6 +84,7 @@ impl FailureKind {
             Self::ApplyPalette => k::NOTIFY_APPLY_PALETTE,
             Self::SpawnTerminal => k::NOTIFY_SPAWN_TERMINAL,
             Self::ResizeTerminal => k::NOTIFY_RESIZE_TERMINAL,
+            Self::SetSplitRatio => k::NOTIFY_SET_SPLIT_RATIO,
             Self::RenderTerminal => k::NOTIFY_RENDER_TERMINAL,
             Self::TerminalStream => k::NOTIFY_TERMINAL_STREAM,
             Self::TerminalRuntime => k::NOTIFY_TERMINAL_RUNTIME,

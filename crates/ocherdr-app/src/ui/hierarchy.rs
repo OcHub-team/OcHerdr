@@ -760,8 +760,24 @@ impl OcHerdrView {
                     .into_any_element(),
             );
         }
+        let split_handles = layout.as_ref().map(|layout| {
+            layout
+                .splits
+                .iter()
+                .filter_map(|split| {
+                    render_split_handle(split, layout.area, layout.tab_id.clone(), i18n, cx)
+                })
+                .collect::<Vec<_>>()
+        });
+        let split_overlay = match (&self.surface_drag, layout.as_ref()) {
+            (SurfaceDrag::Split(drag), Some(layout)) if drag.tab_id == layout.tab_id => {
+                Some(render_split_drag_overlay(layout.area, drag, cx))
+            }
+            _ => None,
+        };
         let ime_view = cx.entity();
         let ime_focus = self.focus.clone();
+        let surface_view = cx.entity();
         div()
             .id("terminal-surface")
             .relative()
@@ -779,6 +795,10 @@ impl OcHerdrView {
                 MouseButton::Left,
                 cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
             )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
             .flex_1()
             .min_h_0()
             .min_w_0()
@@ -787,7 +807,16 @@ impl OcHerdrView {
             .children(elements)
             .child(
                 canvas(
-                    |_, _, _| (),
+                    move |bounds, _, cx| {
+                        surface_view.update(cx, |this, _cx| {
+                            this.terminal_surface_bounds = Some((
+                                f32::from(bounds.origin.x),
+                                f32::from(bounds.origin.y),
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                            ));
+                        });
+                    },
                     move |bounds, _, window, cx| {
                         window.handle_input(
                             &ime_focus,
@@ -799,6 +828,8 @@ impl OcHerdrView {
                 .absolute()
                 .size_full(),
             )
+            .children(split_handles.into_iter().flatten())
+            .children(split_overlay)
             .into_any_element()
     }
 }
@@ -875,18 +906,180 @@ fn pane_fractions(
     pane_id: &str,
 ) -> Option<(f32, f32, f32, f32)> {
     let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
-    let area = layout.area;
+    rect_fractions(layout.area, pane.rect)
+}
+
+fn rect_fractions(
+    area: ocherdr_core::LayoutRect,
+    rect: ocherdr_core::LayoutRect,
+) -> Option<(f32, f32, f32, f32)> {
     let area_w = f32::from(area.width);
     let area_h = f32::from(area.height);
     if area_w == 0. || area_h == 0. {
         return None;
     }
     Some((
-        (f32::from(pane.rect.x) - f32::from(area.x)) / area_w,
-        (f32::from(pane.rect.y) - f32::from(area.y)) / area_h,
-        f32::from(pane.rect.width) / area_w,
-        f32::from(pane.rect.height) / area_h,
+        (f32::from(rect.x) - f32::from(area.x)) / area_w,
+        (f32::from(rect.y) - f32::from(area.y)) / area_h,
+        f32::from(rect.width) / area_w,
+        f32::from(rect.height) / area_h,
     ))
+}
+
+fn split_line_fraction(
+    area: ocherdr_core::LayoutRect,
+    rect: ocherdr_core::LayoutRect,
+    direction: SplitDirection,
+    ratio: f32,
+) -> Option<f32> {
+    let (x, y, w, h) = rect_fractions(area, rect)?;
+    Some(match direction {
+        SplitDirection::Right => x + w * ratio,
+        SplitDirection::Down => y + h * ratio,
+    })
+}
+
+fn render_split_handle(
+    split: &LayoutSplit,
+    area: ocherdr_core::LayoutRect,
+    tab_id: String,
+    i18n: I18n,
+    cx: &mut Context<OcHerdrView>,
+) -> Option<ochub_ui::gpui::AnyElement> {
+    split.path()?;
+    let (x, y, w, h) = rect_fractions(area, split.rect)?;
+    let line = split_line_fraction(area, split.rect, split.direction, split.ratio)?;
+    let split = split.clone();
+    let label = i18n.text(k::TERMINAL_RESIZE_SPLIT);
+    let group = SharedString::from(format!("split-handle-{}", split.id));
+    // Mouse-only. A tab-reachable splitter would fight terminal key
+    // forwarding. Keyboard resize is the Herdr TUI and `herdr pane resize`.
+    let handle = match split.direction {
+        SplitDirection::Right => div()
+            .id(ochub_ui::gpui::ElementId::Name(
+                format!("split-handle-{}", split.id).into(),
+            ))
+            .group(group.clone())
+            .absolute()
+            .left(relative(line))
+            .top(relative(y))
+            .h(relative(h))
+            .w(px(SPLIT_HANDLE_HIT_PX))
+            .ml(px(-SPLIT_HANDLE_HIT_PX / 2.))
+            .flex()
+            .justify_center()
+            // Empty hit strip; without this GPUI skips the 10px target.
+            .occlude()
+            .cursor_col_resize()
+            .tab_stop(false)
+            .aria_label(label)
+            .child(
+                div()
+                    .w(px(SPLIT_HANDLE_VISUAL_PX))
+                    .h_full()
+                    .group_hover(group, |style| style.bg(theme::accent().alpha(0.45))),
+            ),
+        SplitDirection::Down => div()
+            .id(ochub_ui::gpui::ElementId::Name(
+                format!("split-handle-{}", split.id).into(),
+            ))
+            .group(group.clone())
+            .absolute()
+            .left(relative(x))
+            .top(relative(line))
+            .w(relative(w))
+            .h(px(SPLIT_HANDLE_HIT_PX))
+            .mt(px(-SPLIT_HANDLE_HIT_PX / 2.))
+            .flex()
+            .items_center()
+            .occlude()
+            .cursor_row_resize()
+            .tab_stop(false)
+            .aria_label(label)
+            .child(
+                div()
+                    .h(px(SPLIT_HANDLE_VISUAL_PX))
+                    .w_full()
+                    .group_hover(group, |style| style.bg(theme::accent().alpha(0.45))),
+            ),
+    };
+    Some(
+        handle
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event, _window, cx| {
+                    this.begin_split_drag(tab_id.clone(), split.clone(), event, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, event, window, cx| {
+                this.pane_mouse_move(event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
+            .into_any_element(),
+    )
+}
+
+fn render_split_drag_overlay(
+    area: ocherdr_core::LayoutRect,
+    drag: &SplitDrag,
+    cx: &mut Context<OcHerdrView>,
+) -> ochub_ui::gpui::AnyElement {
+    let overlay = match drag.direction {
+        SplitDirection::Right => div().cursor_col_resize(),
+        SplitDirection::Down => div().cursor_row_resize(),
+    };
+    overlay
+        .id("split-drag-overlay")
+        .absolute()
+        .size_full()
+        .on_mouse_move(cx.listener(|this, event, window, cx| {
+            this.pane_mouse_move(event, window, cx);
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+        )
+        .when_some(split_preview_line(area, drag), |overlay, line| {
+            overlay.child(line)
+        })
+        .into_any_element()
+}
+
+fn split_preview_line(
+    area: ocherdr_core::LayoutRect,
+    drag: &SplitDrag,
+) -> Option<ochub_ui::gpui::Div> {
+    let (x, y, w, h) = rect_fractions(area, drag.rect)?;
+    let line = split_line_fraction(area, drag.rect, drag.direction, drag.preview_ratio)?;
+    Some(match drag.direction {
+        SplitDirection::Right => div()
+            .absolute()
+            .left(relative(line))
+            .top(relative(y))
+            .h(relative(h))
+            .w(px(SPLIT_HANDLE_VISUAL_PX))
+            .ml(px(-SPLIT_HANDLE_VISUAL_PX / 2.))
+            .bg(theme::accent()),
+        SplitDirection::Down => div()
+            .absolute()
+            .left(relative(x))
+            .top(relative(line))
+            .w(relative(w))
+            .h(px(SPLIT_HANDLE_VISUAL_PX))
+            .mt(px(-SPLIT_HANDLE_VISUAL_PX / 2.))
+            .bg(theme::accent()),
+    })
 }
 
 fn render_pane(

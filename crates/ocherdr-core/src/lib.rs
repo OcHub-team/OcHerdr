@@ -218,11 +218,55 @@ pub struct LayoutSplit {
     pub rect: LayoutRect,
 }
 
+impl LayoutSplit {
+    pub fn path(&self) -> Option<Vec<bool>> {
+        parse_split_path_id(&self.id)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
     Right,
     Down,
+}
+
+/// Herdr's `Layout::set_ratio_at` clamps to this range, so a pane cannot be
+/// dragged to zero cells. Preview uses the same bounds so the indicator lands
+/// where the authority will actually put the split.
+pub const SPLIT_RATIO_MIN: f32 = 0.1;
+pub const SPLIT_RATIO_MAX: f32 = 0.9;
+
+/// Split ids in `layout.updated` are `split_{index}_root` or `split_{index}_{01…}`,
+/// encoding the `layout.set_split_ratio` path (`false` = first child).
+pub fn parse_split_path_id(id: &str) -> Option<Vec<bool>> {
+    let rest = id.strip_prefix("split_")?;
+    let (index, path) = rest.split_once('_')?;
+    if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if path == "root" {
+        return Some(Vec::new());
+    }
+    if path.is_empty() {
+        return None;
+    }
+    path.chars()
+        .map(|c| match c {
+            '0' => Some(false),
+            '1' => Some(true),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Map a pointer in the same coordinate space as `rect` to a clamped split ratio.
+pub fn split_ratio_from_drag(direction: SplitDirection, rect: LayoutRect, pointer: f32) -> f32 {
+    let (origin, size) = match direction {
+        SplitDirection::Right => (rect.x, rect.width),
+        SplitDirection::Down => (rect.y, rect.height),
+    };
+    ((pointer - f32::from(origin)) / f32::from(size)).clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -431,5 +475,62 @@ mod tests {
         };
         selection.reconcile(&snapshot);
         assert_eq!(selection.pane_id.as_deref(), Some("p1"));
+    }
+
+    fn layout_rect(x: u16, y: u16, width: u16, height: u16) -> LayoutRect {
+        LayoutRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn dragging_a_right_split_handle_to_the_center_yields_half() {
+        let rect = layout_rect(0, 0, 100, 50);
+        assert_eq!(split_ratio_from_drag(SplitDirection::Right, rect, 50.), 0.5);
+    }
+
+    #[test]
+    fn dragging_a_down_split_handle_to_the_center_yields_half() {
+        let rect = layout_rect(0, 0, 100, 50);
+        assert_eq!(split_ratio_from_drag(SplitDirection::Down, rect, 25.), 0.5);
+    }
+
+    #[test]
+    fn dragging_a_split_handle_to_an_edge_clamps_away_from_zero_and_one() {
+        let rect = layout_rect(0, 0, 100, 50);
+        assert_eq!(
+            split_ratio_from_drag(SplitDirection::Right, rect, 0.),
+            SPLIT_RATIO_MIN
+        );
+        assert_eq!(
+            split_ratio_from_drag(SplitDirection::Right, rect, 100.),
+            SPLIT_RATIO_MAX
+        );
+        assert_eq!(
+            split_ratio_from_drag(SplitDirection::Down, rect, -20.),
+            SPLIT_RATIO_MIN
+        );
+        assert_eq!(
+            split_ratio_from_drag(SplitDirection::Down, rect, 80.),
+            SPLIT_RATIO_MAX
+        );
+    }
+
+    #[test]
+    fn dragging_a_split_handle_measures_ratio_from_the_split_rect_origin() {
+        let rect = layout_rect(20, 10, 80, 40);
+        assert_eq!(split_ratio_from_drag(SplitDirection::Right, rect, 60.), 0.5);
+        assert_eq!(split_ratio_from_drag(SplitDirection::Down, rect, 30.), 0.5);
+    }
+
+    #[test]
+    fn herdr_split_ids_decode_to_the_set_split_ratio_path() {
+        assert_eq!(parse_split_path_id("split_0_root"), Some(vec![]));
+        assert_eq!(parse_split_path_id("split_1_0"), Some(vec![false]));
+        assert_eq!(parse_split_path_id("split_2_01"), Some(vec![false, true]));
+        assert_eq!(parse_split_path_id("pane-1"), None);
     }
 }

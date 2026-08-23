@@ -40,6 +40,7 @@
 "notify.save_appearance" = "Could not save appearance"
 "notify.save_host" = "Could not save host"
 "notify.save_language" = "Could not save language"
+"notify.set_split_ratio" = "Could not resize the split"
 "notify.spawn_terminal" = "Could not open a terminal pane"
 "notify.tab_close" = "Could not close the tab"
 "notify.tab_create" = "Could not create a tab"

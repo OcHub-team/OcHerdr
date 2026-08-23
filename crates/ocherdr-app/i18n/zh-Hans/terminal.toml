@@ -30,6 +30,7 @@
 "terminal.prefix.hint" = "C 新建标签页 · ⇧N 新建工作区 · S 在终端中打开设置 · 1–9 切换标签页"
 "terminal.region" = "终端"
 "terminal.rename_pane" = "重命名窗格"
+"terminal.resize_split" = "调整分割"
 "terminal.sessions" = "会话"
 "terminal.settings_in_terminal" = "在终端中打开 Herdr 设置"
 "terminal.spaces" = "空间"

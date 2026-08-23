@@ -64,7 +64,8 @@ impl OcHerdrView {
             open_select: None,
             appearance_scroll: ScrollHandle::new(),
             prefix_pending: false,
-            text_drag_pane: None,
+            surface_drag: SurfaceDrag::Idle,
+            terminal_surface_bounds: None,
             ime_marked: None,
             rename_input: cx.new(|cx| TextInput::new(cx, i18n.text(k::COMMON_NAME))),
             appearance,
@@ -108,6 +109,10 @@ impl OcHerdrView {
         detail: impl std::fmt::Display,
         cx: &mut Context<Self>,
     ) {
+        if method == "layout.set_split_ratio" {
+            self.notify_failure(FailureKind::SetSplitRatio, detail, cx);
+            return;
+        }
         self.post_notice(
             command_notification(method, &detail.to_string(), self.i18n),
             cx,
@@ -129,6 +134,7 @@ impl OcHerdrView {
         self.agent_status_rebuild = None;
         self.agent_status_panes.clear();
         self.agent_status_handoff = None;
+        self.surface_drag = SurfaceDrag::Idle;
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
         let epoch = self.load_epoch;
@@ -555,6 +561,10 @@ impl OcHerdrView {
         if effects.notify {
             cx.notify();
         }
+        if matches!(action, EventPollAction::Disconnect(_)) {
+            self.cancel_split_drag();
+        }
+        self.reconcile_split_drag(cx);
         if let Some(stream) = action.event_stream() {
             self.event_stream = stream;
             cx.notify();
@@ -682,6 +692,7 @@ impl OcHerdrView {
             }
             resync |= effects.resync;
         }
+        self.reconcile_split_drag(cx);
         if resync {
             self.resync_snapshot(self.event_epoch, cx);
         }
@@ -772,6 +783,7 @@ impl OcHerdrView {
                             .map(snapshot_pane_ids)
                             .unwrap_or_default();
                         this.snapshot = Some(snapshot);
+                        this.reconcile_split_drag(cx);
                         if let Some(snapshot) = &this.snapshot {
                             this.selection.reconcile(snapshot);
                             let closed_stream =
@@ -1240,6 +1252,7 @@ impl OcHerdrView {
             return;
         }
         self.session_index = Some(index);
+        self.cancel_split_drag();
         self.reload(Some(session.name), cx);
     }
 
@@ -1261,6 +1274,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn select_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
+        self.cancel_split_drag();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1282,6 +1296,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn select_tab(&mut self, tab_id: String, cx: &mut Context<Self>) {
+        self.cancel_split_drag();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1311,6 +1326,21 @@ impl OcHerdrView {
                 self.selection.workspace_id.as_deref() != Some(workspace_id)
                     || self.selection.tab_id.as_deref() != Some(tab_id)
             });
+        let leave_split_tab = match (&self.surface_drag, pane_context.as_ref()) {
+            (SurfaceDrag::Split(drag), context) => {
+                let (workspace_id, tab_id) = match context {
+                    Some((workspace_id, tab_id)) => {
+                        (Some(workspace_id.as_str()), Some(tab_id.as_str()))
+                    }
+                    None => (None, None),
+                };
+                split_drag_voided_by_pane(drag, workspace_id, tab_id)
+            }
+            _ => false,
+        };
+        if leave_split_tab {
+            self.cancel_split_drag();
+        }
         if let Some((workspace_id, tab_id)) = pane_context {
             self.selection.workspace_id = Some(workspace_id);
             self.selection.tab_id = Some(tab_id);
@@ -2055,21 +2085,17 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(previous) = self.text_drag_pane.take()
-            && previous != pane_id
-            && let Some(runtime) = self.pane_mut(&previous)
-        {
-            runtime
-                .terminal
-                .end_text_selection(None, KeyModifiers::default());
+        if matches!(self.surface_drag, SurfaceDrag::Split(_)) {
+            return;
         }
+        self.end_text_drag_unless_pane(&pane_id);
         self.select_pane(pane_id.clone(), window, cx);
         let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
         let mouse = mouse_point(event.position);
         if !point_in_rect(mouse, runtime.body_bounds) {
-            self.text_drag_pane = None;
+            self.surface_drag = SurfaceDrag::Idle;
             return;
         }
         let Some(surface) = map_mouse_to_surface(
@@ -2078,11 +2104,13 @@ impl OcHerdrView {
             runtime.pixel_size,
             window.scale_factor(),
         ) else {
-            self.text_drag_pane = None;
+            self.surface_drag = SurfaceDrag::Idle;
             return;
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
-        self.text_drag_pane = Some(pane_id.clone());
+        self.surface_drag = SurfaceDrag::Text {
+            pane_id: pane_id.clone(),
+        };
         if let Some(runtime) = self.pane_mut(&pane_id) {
             runtime
                 .terminal
@@ -2099,9 +2127,14 @@ impl OcHerdrView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pane_id) = self.text_drag_pane.clone() else {
+        if self.update_split_drag(mouse_point(event.position), cx) {
+            cx.stop_propagation();
+            return;
+        }
+        let SurfaceDrag::Text { pane_id } = &self.surface_drag else {
             return;
         };
+        let pane_id = pane_id.clone();
         let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
@@ -2130,7 +2163,13 @@ impl OcHerdrView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pane_id) = self.text_drag_pane.take() else {
+        if self.finish_split_drag(mouse_point(event.position), cx) {
+            cx.stop_propagation();
+            return;
+        }
+        let SurfaceDrag::Text { pane_id } =
+            std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle)
+        else {
             return;
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
@@ -2147,6 +2186,142 @@ impl OcHerdrView {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    pub(super) fn begin_split_drag(
+        &mut self,
+        tab_id: String,
+        split: LayoutSplit,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(surface) = self.terminal_surface_bounds else {
+            cx.stop_propagation();
+            return;
+        };
+        let Some(drag) = self.snapshot.as_ref().and_then(|snapshot| {
+            let layout = snapshot.layout_for(&tab_id)?;
+            split_drag_from_press(tab_id, &split, layout, surface, mouse_point(event.position))
+        }) else {
+            cx.stop_propagation();
+            return;
+        };
+        self.end_text_drag();
+        self.surface_drag = SurfaceDrag::Split(drag);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn end_text_drag_unless_pane(&mut self, pane_id: &str) {
+        let Some(previous) = self.take_text_drag() else {
+            return;
+        };
+        if previous == pane_id {
+            self.surface_drag = SurfaceDrag::Text { pane_id: previous };
+            return;
+        }
+        self.finish_text_drag_on(&previous);
+    }
+
+    fn end_text_drag(&mut self) {
+        if let Some(previous) = self.take_text_drag() {
+            self.finish_text_drag_on(&previous);
+        }
+    }
+
+    fn take_text_drag(&mut self) -> Option<String> {
+        match std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle) {
+            SurfaceDrag::Text { pane_id } => Some(pane_id),
+            other => {
+                self.surface_drag = other;
+                None
+            }
+        }
+    }
+
+    fn finish_text_drag_on(&mut self, pane_id: &str) {
+        if let Some(runtime) = self.pane_mut(pane_id) {
+            runtime
+                .terminal
+                .end_text_selection(None, KeyModifiers::default());
+        }
+    }
+
+    /// Navigation and stream death void the gesture outright. Snapshot
+    /// mutations go through `reconcile_split_drag` so a ratio-only
+    /// `layout.updated` (including our own submit) does not self-cancel.
+    fn cancel_split_drag(&mut self) {
+        if matches!(self.surface_drag, SurfaceDrag::Split(_)) {
+            self.surface_drag = SurfaceDrag::Idle;
+        }
+    }
+
+    fn take_split_drag(&mut self) -> Option<SplitDrag> {
+        match std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle) {
+            SurfaceDrag::Split(drag) => Some(drag),
+            other => {
+                self.surface_drag = other;
+                None
+            }
+        }
+    }
+
+    fn reconcile_split_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.take_split_drag() else {
+            return;
+        };
+        if let SurfaceDrag::Split(drag) = reconcile_split_drag_state(drag, self.snapshot.as_ref()) {
+            self.surface_drag = SurfaceDrag::Split(drag);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn update_split_drag(&mut self, mouse: (f32, f32), cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.take_split_drag() else {
+            return false;
+        };
+        let previous = drag.preview_ratio;
+        let drag = apply_split_drag_pointer(
+            drag,
+            self.snapshot.as_ref(),
+            self.terminal_surface_bounds,
+            mouse,
+        );
+        if (drag.preview_ratio - previous).abs() > f32::EPSILON {
+            cx.notify();
+        }
+        self.surface_drag = SurfaceDrag::Split(drag);
+        true
+    }
+
+    fn finish_split_drag(&mut self, mouse: (f32, f32), cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.take_split_drag() else {
+            return false;
+        };
+        let drag = apply_split_drag_pointer(
+            drag,
+            self.snapshot.as_ref(),
+            self.terminal_surface_bounds,
+            mouse,
+        );
+        cx.notify();
+        let SurfaceDrag::Split(drag) = reconcile_split_drag_state(drag, self.snapshot.as_ref())
+        else {
+            return true;
+        };
+        if (drag.preview_ratio - drag.start_ratio).abs() > f32::EPSILON {
+            self.invoke(
+                "layout.set_split_ratio",
+                json!({
+                    "tab_id": drag.tab_id,
+                    "path": drag.path,
+                    "ratio": drag.preview_ratio,
+                }),
+                cx,
+            );
+        }
+        true
     }
 
     pub(super) fn copy_selection(&mut self, cx: &mut Context<Self>) {
@@ -2566,6 +2741,145 @@ fn poll_event_stream(
 
 fn mouse_point(position: ochub_ui::gpui::Point<ochub_ui::gpui::Pixels>) -> (f32, f32) {
     (f32::from(position.x), f32::from(position.y))
+}
+
+fn pointer_along_split(
+    direction: SplitDirection,
+    area: LayoutRect,
+    surface: (f32, f32, f32, f32),
+    mouse: (f32, f32),
+) -> Option<f32> {
+    let (sx, sy, sw, sh) = surface;
+    if sw <= 0. || sh <= 0. || area.width == 0 || area.height == 0 {
+        return None;
+    }
+    Some(match direction {
+        SplitDirection::Right => f32::from(area.x) + (mouse.0 - sx) / sw * f32::from(area.width),
+        SplitDirection::Down => f32::from(area.y) + (mouse.1 - sy) / sh * f32::from(area.height),
+    })
+}
+
+fn split_axis_line(split: &LayoutSplit) -> f32 {
+    match split.direction {
+        SplitDirection::Right => {
+            f32::from(split.rect.x) + f32::from(split.rect.width) * split.ratio
+        }
+        SplitDirection::Down => {
+            f32::from(split.rect.y) + f32::from(split.rect.height) * split.ratio
+        }
+    }
+}
+
+fn split_drag_from_press(
+    tab_id: String,
+    split: &LayoutSplit,
+    layout: &ocherdr_core::PaneLayout,
+    surface: (f32, f32, f32, f32),
+    mouse: (f32, f32),
+) -> Option<SplitDrag> {
+    let path = split.path()?;
+    let size = match split.direction {
+        SplitDirection::Right => split.rect.width,
+        SplitDirection::Down => split.rect.height,
+    };
+    if size == 0 {
+        return None;
+    }
+    let pointer = pointer_along_split(split.direction, layout.area, surface, mouse)?;
+    Some(SplitDrag {
+        workspace_id: layout.workspace_id.clone(),
+        tab_id,
+        path,
+        layout: split_layout_fingerprint(layout),
+        direction: split.direction,
+        rect: split.rect,
+        grab_offset: split_axis_line(split) - pointer,
+        preview_ratio: split
+            .ratio
+            .clamp(ocherdr_core::SPLIT_RATIO_MIN, ocherdr_core::SPLIT_RATIO_MAX),
+        start_ratio: split.ratio,
+    })
+}
+
+fn split_layout_fingerprint(layout: &ocherdr_core::PaneLayout) -> SplitLayoutFingerprint {
+    SplitLayoutFingerprint {
+        zoomed: layout.zoomed,
+        splits: layout
+            .splits
+            .iter()
+            .filter_map(|split| Some((split.path()?, split.direction)))
+            .collect(),
+        panes: layout
+            .panes
+            .iter()
+            .map(|pane| pane.pane_id.clone())
+            .collect(),
+    }
+}
+
+fn split_drag_survives_layout(drag: &SplitDrag, snapshot: &HierarchySnapshot) -> bool {
+    let Some(layout) = snapshot.layout_for(&drag.tab_id) else {
+        return false;
+    };
+    if split_layout_fingerprint(layout) != drag.layout {
+        return false;
+    }
+    // PaneCreated/PaneClosed update snapshot.panes before layout.updated.
+    let mut live: Vec<&str> = snapshot
+        .panes_for(&drag.tab_id)
+        .map(|pane| pane.pane_id.as_str())
+        .collect();
+    let mut expected: Vec<&str> = drag.layout.panes.iter().map(String::as_str).collect();
+    live.sort();
+    expected.sort();
+    live == expected
+}
+
+fn split_drag_voided_by_pane(
+    drag: &SplitDrag,
+    workspace_id: Option<&str>,
+    tab_id: Option<&str>,
+) -> bool {
+    match (workspace_id, tab_id) {
+        (Some(workspace_id), Some(tab_id)) => {
+            tab_id != drag.tab_id || workspace_id != drag.workspace_id
+        }
+        _ => true,
+    }
+}
+
+fn reconcile_split_drag_state(
+    drag: SplitDrag,
+    snapshot: Option<&HierarchySnapshot>,
+) -> SurfaceDrag {
+    if snapshot.is_some_and(|snapshot| split_drag_survives_layout(&drag, snapshot)) {
+        SurfaceDrag::Split(drag)
+    } else {
+        SurfaceDrag::Idle
+    }
+}
+
+fn apply_split_drag_pointer(
+    mut drag: SplitDrag,
+    snapshot: Option<&HierarchySnapshot>,
+    surface: Option<(f32, f32, f32, f32)>,
+    mouse: (f32, f32),
+) -> SplitDrag {
+    let Some(surface) = surface else {
+        return drag;
+    };
+    let Some(area) = snapshot
+        .and_then(|snapshot| snapshot.layout_for(&drag.tab_id))
+        .map(|layout| layout.area)
+    else {
+        return drag;
+    };
+    let Some(pointer) = pointer_along_split(drag.direction, area, surface, mouse) else {
+        return drag;
+    };
+    drag.preview_ratio =
+        split_ratio_from_drag(drag.direction, drag.rect, pointer + drag.grab_offset);
+    drag
 }
 
 fn gpui_key_modifiers(modifiers: ochub_ui::gpui::Modifiers) -> KeyModifiers {
@@ -3532,6 +3846,7 @@ mod tests {
             "pane.split",
             "pane.zoom",
             "pane.focus_direction",
+            "layout.set_split_ratio",
         ] {
             assert!(
                 !command_needs_snapshot_resync(method),
@@ -4058,5 +4373,313 @@ mod tests {
         let bottom_right = map_mouse_to_surface((1100., 480.), body, (1600, 800), 2.).unwrap();
         assert!((bottom_right.0 - 800.).abs() < 0.01);
         assert!((bottom_right.1 - 400.).abs() < 0.01);
+    }
+
+    #[test]
+    fn pointer_along_split_uses_the_layout_area_origin() {
+        let area = LayoutRect {
+            x: 10,
+            y: 20,
+            width: 80,
+            height: 40,
+        };
+        let surface = (100., 50., 400., 200.);
+        assert_eq!(
+            pointer_along_split(SplitDirection::Right, area, surface, (100., 50.)),
+            Some(10.)
+        );
+        assert_eq!(
+            pointer_along_split(SplitDirection::Right, area, surface, (300., 50.)),
+            Some(50.)
+        );
+        assert_eq!(
+            pointer_along_split(SplitDirection::Down, area, surface, (100., 150.)),
+            Some(40.)
+        );
+    }
+
+    fn split_area() -> LayoutRect {
+        LayoutRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        }
+    }
+
+    fn layout_snapshot(splits: &[(&str, f32)], panes: &[(&str, LayoutRect)]) -> HierarchySnapshot {
+        let area = split_area();
+        HierarchySnapshot {
+            panes: panes.iter().map(|(id, _)| test_pane(id, "t1")).collect(),
+            layouts: vec![ocherdr_core::PaneLayout {
+                workspace_id: "w".into(),
+                tab_id: "t1".into(),
+                zoomed: false,
+                area,
+                focused_pane_id: panes[0].0.into(),
+                panes: panes
+                    .iter()
+                    .map(|(id, rect)| ocherdr_core::LayoutPane {
+                        pane_id: (*id).into(),
+                        focused: false,
+                        rect: *rect,
+                    })
+                    .collect(),
+                splits: splits
+                    .iter()
+                    .map(|(id, ratio)| LayoutSplit {
+                        id: (*id).into(),
+                        direction: SplitDirection::Right,
+                        ratio: *ratio,
+                        rect: area,
+                    })
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn split_drag_on(snapshot: &HierarchySnapshot) -> SplitDrag {
+        split_drag_at(snapshot, 0)
+    }
+
+    fn split_drag_at(snapshot: &HierarchySnapshot, split_index: usize) -> SplitDrag {
+        let layout = &snapshot.layouts[0];
+        let split = &layout.splits[split_index];
+        SplitDrag {
+            workspace_id: layout.workspace_id.clone(),
+            tab_id: layout.tab_id.clone(),
+            path: split.path().expect("test split ids encode a path"),
+            layout: split_layout_fingerprint(layout),
+            direction: split.direction,
+            rect: split.rect,
+            grab_offset: 0.,
+            preview_ratio: split.ratio,
+            start_ratio: split.ratio,
+        }
+    }
+
+    fn nested_layout(root_ratio: f32) -> HierarchySnapshot {
+        let area = split_area();
+        let left_w = (f32::from(area.width) * root_ratio).round() as u16;
+        let right_w = area.width - left_w;
+        let nested = LayoutRect {
+            x: area.x,
+            y: area.y,
+            width: left_w,
+            height: area.height,
+        };
+        let top_h = nested.height / 2;
+        HierarchySnapshot {
+            panes: ["p-top", "p-bot", "p-right"]
+                .into_iter()
+                .map(|id| test_pane(id, "t1"))
+                .collect(),
+            layouts: vec![ocherdr_core::PaneLayout {
+                workspace_id: "w".into(),
+                tab_id: "t1".into(),
+                zoomed: false,
+                area,
+                focused_pane_id: "p-top".into(),
+                panes: vec![
+                    ocherdr_core::LayoutPane {
+                        pane_id: "p-top".into(),
+                        focused: false,
+                        rect: LayoutRect {
+                            x: nested.x,
+                            y: nested.y,
+                            width: left_w,
+                            height: top_h,
+                        },
+                    },
+                    ocherdr_core::LayoutPane {
+                        pane_id: "p-bot".into(),
+                        focused: false,
+                        rect: LayoutRect {
+                            x: nested.x,
+                            y: nested.y + top_h,
+                            width: left_w,
+                            height: nested.height - top_h,
+                        },
+                    },
+                    ocherdr_core::LayoutPane {
+                        pane_id: "p-right".into(),
+                        focused: false,
+                        rect: LayoutRect {
+                            x: nested.x + left_w,
+                            y: area.y,
+                            width: right_w,
+                            height: area.height,
+                        },
+                    },
+                ],
+                splits: vec![
+                    LayoutSplit {
+                        id: "split_0_root".into(),
+                        direction: SplitDirection::Right,
+                        ratio: root_ratio,
+                        rect: area,
+                    },
+                    LayoutSplit {
+                        id: "split_1_0".into(),
+                        direction: SplitDirection::Down,
+                        ratio: 0.5,
+                        rect: nested,
+                    },
+                ],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reconciling_a_split_drag_stays_split_when_only_the_ratio_changes() {
+        let left = LayoutRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let right = LayoutRect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let before = layout_snapshot(
+            &[("split_0_root", 0.5)],
+            &[("p-left", left), ("p-right", right)],
+        );
+        let after = layout_snapshot(
+            &[("split_0_root", 0.7)],
+            &[
+                (
+                    "p-left",
+                    LayoutRect {
+                        x: 0,
+                        y: 0,
+                        width: 70,
+                        height: 50,
+                    },
+                ),
+                (
+                    "p-right",
+                    LayoutRect {
+                        x: 70,
+                        y: 0,
+                        width: 30,
+                        height: 50,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            split_layout_fingerprint(&before.layouts[0]),
+            split_layout_fingerprint(&after.layouts[0])
+        );
+        assert!(matches!(
+            reconcile_split_drag_state(split_drag_on(&before), Some(&after)),
+            SurfaceDrag::Split(_)
+        ));
+    }
+
+    #[test]
+    fn reconciling_a_split_drag_goes_idle_when_a_pane_is_replaced() {
+        let left = LayoutRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let right = LayoutRect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let before = layout_snapshot(
+            &[("split_0_root", 0.5)],
+            &[("p-left", left), ("p-right", right)],
+        );
+        let after = layout_snapshot(
+            &[("split_0_root", 0.5)],
+            &[("p-left", left), ("p-other", right)],
+        );
+        assert!(matches!(
+            reconcile_split_drag_state(split_drag_on(&before), Some(&after)),
+            SurfaceDrag::Idle
+        ));
+    }
+
+    #[test]
+    fn reconciling_a_split_drag_goes_idle_when_a_pane_is_added_before_layout_updated() {
+        let left = LayoutRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let right = LayoutRect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let before = layout_snapshot(
+            &[("split_0_root", 0.5)],
+            &[("p-left", left), ("p-right", right)],
+        );
+        let mut after = before.clone();
+        after.panes.push(test_pane("p-new", "t1"));
+        assert!(matches!(
+            reconcile_split_drag_state(split_drag_on(&before), Some(&after)),
+            SurfaceDrag::Idle
+        ));
+    }
+
+    #[test]
+    fn selecting_a_pane_voids_a_split_drag_only_when_leaving_its_tab_or_workspace() {
+        let left = LayoutRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let right = LayoutRect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let drag = split_drag_on(&layout_snapshot(
+            &[("split_0_root", 0.5)],
+            &[("p-left", left), ("p-right", right)],
+        ));
+        assert!(!split_drag_voided_by_pane(&drag, Some("w"), Some("t1")));
+        assert!(split_drag_voided_by_pane(&drag, Some("w"), Some("t-other")));
+        assert!(split_drag_voided_by_pane(
+            &drag,
+            Some("w-other"),
+            Some("t1")
+        ));
+        assert!(split_drag_voided_by_pane(&drag, None, None));
+    }
+
+    #[test]
+    fn reconciling_a_split_drag_stays_split_when_an_ancestor_ratio_moves_a_nested_rect() {
+        let before = nested_layout(0.5);
+        let after = nested_layout(0.7);
+        assert_ne!(
+            before.layouts[0].splits[1].rect,
+            after.layouts[0].splits[1].rect
+        );
+        assert_eq!(
+            split_layout_fingerprint(&before.layouts[0]),
+            split_layout_fingerprint(&after.layouts[0])
+        );
+        assert!(matches!(
+            reconcile_split_drag_state(split_drag_at(&before, 1), Some(&after)),
+            SurfaceDrag::Split(_)
+        ));
     }
 }
