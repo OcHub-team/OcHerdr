@@ -90,7 +90,7 @@ pub(crate) enum HostCenterEvent {
     OpenCreateForm,
     OpenEditForm(usize),
     DismissForm,
-    ConfirmRemoveProfile(usize),
+    ConfirmRemoveProfile(String),
     ConfirmBulkRemove,
     Failed {
         kind: FailureKind,
@@ -988,14 +988,21 @@ impl HostCenter {
             cx.notify();
             return;
         }
-        if self.profiles.get(index).is_some_and(is_saved_profile) {
-            cx.emit(HostCenterEvent::ConfirmRemoveProfile(index));
+        if let Some(profile) = self.profiles.get(index)
+            && is_saved_profile(profile)
+        {
+            cx.emit(HostCenterEvent::ConfirmRemoveProfile(
+                profile.id().to_owned(),
+            ));
             cx.notify();
         }
     }
 
-    pub(crate) fn confirm_remove_node(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index == 0 || index >= self.profiles.len() {
+    pub(crate) fn confirm_remove_node(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(index) = profile_index_by_id(&self.profiles, id) else {
+            return;
+        };
+        if !is_saved_profile(&self.profiles[index]) {
             return;
         }
         let removed_id = self.profiles[index].id().to_owned();
@@ -1354,14 +1361,14 @@ mod tests {
             theme_family: "distinct-family".into(),
             mode: AppearanceMode::Light,
             backdrop: BackdropMode::Opaque,
-            background_opacity: 77,
+            background_opacity: OpacityChoice::P84,
             font: TerminalFontSettings {
                 family: "Distinct Mono".into(),
-                size: 18,
+                size: FontSizeChoice::Pt18,
                 ligatures: false,
                 thicken: true,
-                cell_width_percent: 10,
-                cell_height_percent: 12,
+                cell_width_percent: CellWidthChoice::Wide,
+                cell_height_percent: CellHeightChoice::Relaxed,
             },
         }
     }

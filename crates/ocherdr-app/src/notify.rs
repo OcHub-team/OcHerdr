@@ -32,6 +32,7 @@ pub(crate) enum FailureKind {
     SshDestinationRequired,
     SshPortInvalid,
     NoSessionSelected,
+    MissingTheme,
 }
 
 impl FailureKind {
@@ -43,7 +44,8 @@ impl FailureKind {
             | Self::EmptyWorkspaceOrTabName
             | Self::SshDestinationRequired
             | Self::SshPortInvalid
-            | Self::NoSessionSelected => NotificationLevel::Warning,
+            | Self::NoSessionSelected
+            | Self::MissingTheme => NotificationLevel::Warning,
             Self::DiscoverSessions
             | Self::RefreshSnapshot
             | Self::ApplyLiveUpdate
@@ -90,6 +92,7 @@ impl FailureKind {
             Self::SshDestinationRequired => k::NOTIFY_INVALID_SSH_DESTINATION,
             Self::SshPortInvalid => k::NOTIFY_INVALID_SSH_PORT,
             Self::NoSessionSelected => k::NOTIFY_CANNOT_OPEN_TERMINAL,
+            Self::MissingTheme => k::NOTIFY_MISSING_THEME,
         }
     }
 }

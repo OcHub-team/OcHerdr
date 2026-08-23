@@ -47,7 +47,7 @@ mod ui;
 
 use host_center::{HostCenter, HostCenterEvent, HostRollback, HostSaveThen};
 use i18n::{I18n, Language, k};
-use notify::FailureKind;
+use notify::{FailureKind, FailureNotice, notification_for};
 
 const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;
@@ -242,8 +242,8 @@ struct AppearanceSettings {
     mode: AppearanceMode,
     #[serde(default)]
     backdrop: BackdropMode,
-    #[serde(default = "default_background_opacity")]
-    background_opacity: u8,
+    #[serde(default)]
+    background_opacity: OpacityChoice,
     #[serde(default)]
     font: TerminalFontSettings,
 }
@@ -254,7 +254,7 @@ impl Default for AppearanceSettings {
             theme_family: default_theme_family(),
             mode: AppearanceMode::Dark,
             backdrop: BackdropMode::Blurred,
-            background_opacity: default_background_opacity(),
+            background_opacity: OpacityChoice::default(),
             font: TerminalFontSettings::default(),
         }
     }
@@ -264,38 +264,27 @@ impl Default for AppearanceSettings {
 struct TerminalFontSettings {
     #[serde(default)]
     family: String,
-    #[serde(default = "default_font_size")]
-    size: u8,
+    #[serde(default)]
+    size: FontSizeChoice,
     #[serde(default = "default_true")]
     ligatures: bool,
     #[serde(default)]
     thicken: bool,
     #[serde(default)]
-    cell_width_percent: i8,
+    cell_width_percent: CellWidthChoice,
     #[serde(default)]
-    cell_height_percent: i8,
+    cell_height_percent: CellHeightChoice,
 }
 
 impl Default for TerminalFontSettings {
     fn default() -> Self {
         Self {
             family: String::new(),
-            size: default_font_size(),
+            size: FontSizeChoice::default(),
             ligatures: true,
             thicken: false,
-            cell_width_percent: 0,
-            cell_height_percent: 0,
-        }
-    }
-}
-
-impl TerminalFontSettings {
-    fn clamped(self) -> Self {
-        Self {
-            size: self.size.clamp(8, 32),
-            cell_width_percent: self.cell_width_percent.clamp(-30, 30),
-            cell_height_percent: self.cell_height_percent.clamp(-30, 40),
-            ..self
+            cell_width_percent: CellWidthChoice::default(),
+            cell_height_percent: CellHeightChoice::default(),
         }
     }
 }
@@ -304,21 +293,251 @@ fn default_theme_family() -> String {
     theme::DEFAULT_THEME_FAMILY.to_owned()
 }
 
-const fn default_background_opacity() -> u8 {
-    92
-}
-
-const fn default_font_size() -> u8 {
-    13
-}
-
 const fn default_true() -> bool {
     true
 }
 
-const FONT_SIZES: [u8; 8] = [11, 12, 13, 14, 15, 16, 18, 20];
-const CELL_WIDTHS: [i8; 3] = [-10, 0, 10];
-const CELL_HEIGHTS: [i8; 4] = [-8, 0, 12, 20];
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OpacityChoice {
+    P100,
+    #[default]
+    P92,
+    P84,
+    P72,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FontSizeChoice {
+    Pt11,
+    Pt12,
+    #[default]
+    Pt13,
+    Pt14,
+    Pt15,
+    Pt16,
+    Pt18,
+    Pt20,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CellWidthChoice {
+    Tight,
+    #[default]
+    Normal,
+    Wide,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CellHeightChoice {
+    Compact,
+    #[default]
+    Normal,
+    Relaxed,
+    Loose,
+}
+
+impl OpacityChoice {
+    const ALL: [Self; 4] = [Self::P100, Self::P92, Self::P84, Self::P72];
+
+    fn nearest(value: u8) -> Self {
+        let mut best = Self::P100;
+        let mut best_diff = best.value().abs_diff(value);
+        for choice in Self::ALL {
+            let diff = choice.value().abs_diff(value);
+            if diff < best_diff {
+                best = choice;
+                best_diff = diff;
+            }
+        }
+        best
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::P100 => 0,
+            Self::P92 => 1,
+            Self::P84 => 2,
+            Self::P72 => 3,
+        }
+    }
+
+    fn value(self) -> u8 {
+        match self {
+            Self::P100 => 100,
+            Self::P92 => 92,
+            Self::P84 => 84,
+            Self::P72 => 72,
+        }
+    }
+}
+
+impl FontSizeChoice {
+    const ALL: [Self; 8] = [
+        Self::Pt11,
+        Self::Pt12,
+        Self::Pt13,
+        Self::Pt14,
+        Self::Pt15,
+        Self::Pt16,
+        Self::Pt18,
+        Self::Pt20,
+    ];
+
+    fn nearest(value: u8) -> Self {
+        let mut best = Self::Pt11;
+        let mut best_diff = best.value().abs_diff(value);
+        for choice in Self::ALL {
+            let diff = choice.value().abs_diff(value);
+            if diff < best_diff {
+                best = choice;
+                best_diff = diff;
+            }
+        }
+        best
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Pt11 => 0,
+            Self::Pt12 => 1,
+            Self::Pt13 => 2,
+            Self::Pt14 => 3,
+            Self::Pt15 => 4,
+            Self::Pt16 => 5,
+            Self::Pt18 => 6,
+            Self::Pt20 => 7,
+        }
+    }
+
+    fn value(self) -> u8 {
+        match self {
+            Self::Pt11 => 11,
+            Self::Pt12 => 12,
+            Self::Pt13 => 13,
+            Self::Pt14 => 14,
+            Self::Pt15 => 15,
+            Self::Pt16 => 16,
+            Self::Pt18 => 18,
+            Self::Pt20 => 20,
+        }
+    }
+}
+
+impl CellWidthChoice {
+    const ALL: [Self; 3] = [Self::Tight, Self::Normal, Self::Wide];
+
+    fn nearest(value: i8) -> Self {
+        let mut best = Self::Tight;
+        let mut best_diff = best.value().abs_diff(value);
+        for choice in Self::ALL {
+            let diff = choice.value().abs_diff(value);
+            if diff < best_diff {
+                best = choice;
+                best_diff = diff;
+            }
+        }
+        best
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Tight => 0,
+            Self::Normal => 1,
+            Self::Wide => 2,
+        }
+    }
+
+    fn value(self) -> i8 {
+        match self {
+            Self::Tight => -10,
+            Self::Normal => 0,
+            Self::Wide => 10,
+        }
+    }
+}
+
+impl CellHeightChoice {
+    const ALL: [Self; 4] = [Self::Compact, Self::Normal, Self::Relaxed, Self::Loose];
+
+    fn nearest(value: i8) -> Self {
+        let mut best = Self::Compact;
+        let mut best_diff = best.value().abs_diff(value);
+        for choice in Self::ALL {
+            let diff = choice.value().abs_diff(value);
+            if diff < best_diff {
+                best = choice;
+                best_diff = diff;
+            }
+        }
+        best
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Compact => 0,
+            Self::Normal => 1,
+            Self::Relaxed => 2,
+            Self::Loose => 3,
+        }
+    }
+
+    fn value(self) -> i8 {
+        match self {
+            Self::Compact => -8,
+            Self::Normal => 0,
+            Self::Relaxed => 12,
+            Self::Loose => 20,
+        }
+    }
+}
+
+impl Serialize for OpacityChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value().serialize(serializer)
+    }
+}
+
+impl Serialize for FontSizeChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value().serialize(serializer)
+    }
+}
+
+impl Serialize for CellWidthChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value().serialize(serializer)
+    }
+}
+
+impl Serialize for CellHeightChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OpacityChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::nearest(u8::deserialize(deserializer)?))
+    }
+}
+
+impl<'de> Deserialize<'de> for FontSizeChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::nearest(u8::deserialize(deserializer)?))
+    }
+}
+
+impl<'de> Deserialize<'de> for CellWidthChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::nearest(i8::deserialize(deserializer)?))
+    }
+}
+
+impl<'de> Deserialize<'de> for CellHeightChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::nearest(i8::deserialize(deserializer)?))
+    }
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Settings {
@@ -460,8 +679,8 @@ enum Overlay {
     ContextMenu(HierarchyContextMenu),
     Rename(HierarchyTarget),
     ConfirmClose(HierarchyTarget),
-    ConfirmRemoveProfile(usize),
-    ConfirmSwitchProfile { index: usize, from_hosts: bool },
+    ConfirmRemoveProfile(String),
+    ConfirmSwitchProfile { id: String, from_hosts: bool },
     ConfirmBulkRemove,
 }
 
@@ -581,6 +800,18 @@ fn parse_host_tags(value: &str) -> Vec<String> {
 
 fn switch_requires_confirm(from: usize, to: usize, live_session: bool) -> bool {
     from != to && live_session
+}
+
+fn profile_index_by_id(profiles: &[ConnectionProfile], id: &str) -> Option<usize> {
+    profiles.iter().position(|profile| profile.id() == id)
+}
+
+fn confirmed_host_index(overlay: &Overlay, profiles: &[ConnectionProfile]) -> Option<usize> {
+    let id = match overlay {
+        Overlay::ConfirmSwitchProfile { id, .. } | Overlay::ConfirmRemoveProfile(id) => id.as_str(),
+        _ => return None,
+    };
+    profile_index_by_id(profiles, id)
 }
 
 fn next_manual_profile_id(profiles: &[ConnectionProfile]) -> u64 {
@@ -757,17 +988,14 @@ fn visible_host_indices(
     indexes
 }
 
-fn install_appearance(
-    appearance: &AppearanceSettings,
-    window_appearance: WindowAppearance,
-) -> String {
+fn install_appearance(appearance: &AppearanceSettings, window_appearance: WindowAppearance) {
     let mut family =
         theme::find_family(&appearance.theme_family).unwrap_or_else(theme::ochub_family);
     let effect = appearance.backdrop.theme_effect();
     let content_opacity = if appearance.backdrop == BackdropMode::Opaque {
         100
     } else {
-        appearance.background_opacity.clamp(40, 100)
+        appearance.background_opacity.value()
     };
     let sidebar_opacity = if appearance.backdrop == BackdropMode::Opaque {
         100
@@ -779,9 +1007,18 @@ fn install_appearance(
         palette.effects.content_opacity = content_opacity;
         palette.effects.sidebar_opacity = sidebar_opacity;
     }
-    let installed_id = family.id.clone();
     theme::install_family(&family, appearance.mode.theme_mode(), window_appearance);
-    installed_id
+}
+
+fn missing_theme_notice(theme_family: &str, i18n: I18n) -> Option<FailureNotice> {
+    if theme::find_family(theme_family).is_some() {
+        return None;
+    }
+    Some(notification_for(
+        FailureKind::MissingTheme,
+        &i18n.missing_theme_detail(theme_family),
+        i18n,
+    ))
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -812,11 +1049,10 @@ fn main() {
     application()
         .with_assets(OcHerdrAssets)
         .run(|cx: &mut App| {
-            let mut settings = load_settings();
+            let settings = load_settings();
             I18n::install(settings.language);
             ochub_ui::install(cx);
-            settings.appearance.theme_family =
-                install_appearance(&settings.appearance, cx.window_appearance());
+            install_appearance(&settings.appearance, cx.window_appearance());
             cx.on_window_closed(|cx, _window_id| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -866,9 +1102,9 @@ mod tests {
         );
         assert_eq!(settings.appearance.mode, AppearanceMode::Dark);
         assert_eq!(settings.appearance.backdrop, BackdropMode::Blurred);
-        assert_eq!(settings.appearance.background_opacity, 92);
+        assert_eq!(settings.appearance.background_opacity.value(), 92);
         assert_eq!(settings.appearance.font, TerminalFontSettings::default());
-        assert_eq!(settings.appearance.font.size, 13);
+        assert_eq!(settings.appearance.font.size.value(), 13);
         assert!(settings.appearance.font.ligatures);
         assert_eq!(settings.language, Language::System);
         assert!(settings.host_metadata.is_empty());
@@ -940,6 +1176,132 @@ mod tests {
         assert!(switch_requires_confirm(1, 2, true));
     }
 
+    fn ssh_host(id: &str, label: &str) -> ConnectionProfile {
+        ConnectionProfile::Ssh {
+            id: id.into(),
+            label: label.into(),
+            destination: label.into(),
+            port: None,
+            identity_file: None,
+            herdr_path: "herdr".into(),
+        }
+    }
+
+    #[test]
+    fn a_host_confirmation_follows_the_host_id_after_the_list_is_reordered() {
+        let alpha = ssh_host("manual-1", "alpha");
+        let beta = ssh_host("manual-2", "beta");
+        let gamma = ssh_host("manual-3", "gamma");
+        let overlay = Overlay::ConfirmSwitchProfile {
+            id: beta.id().to_owned(),
+            from_hosts: false,
+        };
+
+        let original = [alpha.clone(), beta.clone(), gamma.clone()];
+        assert_eq!(confirmed_host_index(&overlay, &original), Some(1));
+
+        let reordered = [gamma.clone(), alpha.clone(), beta.clone()];
+        let index = confirmed_host_index(&overlay, &reordered).expect("host still exists");
+        assert_eq!(reordered[index].id(), "manual-2");
+        assert_ne!(
+            reordered[1].id(),
+            "manual-2",
+            "the old index now points at a different host"
+        );
+
+        let remaining = [gamma, alpha];
+        assert_eq!(
+            confirmed_host_index(
+                &Overlay::ConfirmRemoveProfile(beta.id().to_owned()),
+                &remaining
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn appearance_settings_snap_values_that_are_not_in_the_select_lists() {
+        let appearance: AppearanceSettings = serde_json::from_value(json!({
+            "theme_family": "kept-as-is",
+            "background_opacity": 0,
+            "font": {
+                "size": 17,
+                "cell_width_percent": 50,
+                "cell_height_percent": -3
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(appearance.theme_family, "kept-as-is");
+        assert_eq!(appearance.background_opacity.value(), 72);
+        assert_eq!(appearance.font.size.value(), 16);
+        assert_eq!(appearance.font.cell_width_percent.value(), 10);
+        assert_eq!(appearance.font.cell_height_percent.value(), 0);
+
+        let already_valid: AppearanceSettings = serde_json::from_value(json!({
+            "background_opacity": 92,
+            "font": { "size": 13, "cell_width_percent": 0, "cell_height_percent": 0 }
+        }))
+        .unwrap();
+        assert_eq!(already_valid.background_opacity.value(), 92);
+        assert_eq!(already_valid.font.size.value(), 13);
+        assert_eq!(already_valid.font.cell_width_percent.value(), 0);
+        assert_eq!(already_valid.font.cell_height_percent.value(), 0);
+    }
+
+    /// The select row paints the option at index() as the current one, so a
+    /// variant inserted into ALL without renumbering would silently select a
+    /// neighbour. Exhaustiveness is checked by the compiler; the numbering is not.
+    #[test]
+    fn every_choice_reports_the_index_it_occupies_in_its_option_list() {
+        for (position, choice) in OpacityChoice::ALL.into_iter().enumerate() {
+            assert_eq!(choice.index(), position, "opacity {choice:?}");
+        }
+        for (position, choice) in FontSizeChoice::ALL.into_iter().enumerate() {
+            assert_eq!(choice.index(), position, "font size {choice:?}");
+        }
+        for (position, choice) in CellWidthChoice::ALL.into_iter().enumerate() {
+            assert_eq!(choice.index(), position, "cell width {choice:?}");
+        }
+        for (position, choice) in CellHeightChoice::ALL.into_iter().enumerate() {
+            assert_eq!(choice.index(), position, "cell height {choice:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_theme_family_warns_and_stays_in_settings() {
+        let requested = "vanished-theme";
+        assert!(theme::find_family(requested).is_none());
+        assert!(theme::find_family(theme::DEFAULT_THEME_FAMILY).is_some());
+
+        let english = I18n::new(Language::English);
+        let notice = missing_theme_notice(requested, english).expect("missing theme must warn");
+        assert_eq!(
+            notice.level,
+            ochub_ui::notifications::NotificationLevel::Warning
+        );
+        assert_eq!(notice.title, "Theme not found");
+        assert_eq!(
+            notice.message,
+            "The theme vanished-theme in your settings does not exist. Using the default theme."
+        );
+        assert!(missing_theme_notice(theme::DEFAULT_THEME_FAMILY, english).is_none());
+
+        let chinese = I18n::new(Language::SimplifiedChinese);
+        let zh = missing_theme_notice(requested, chinese).expect("missing theme must warn in zh");
+        assert_eq!(zh.title, "找不到主题");
+        assert_eq!(
+            zh.message,
+            "配置里的主题 vanished-theme 不存在，已使用默认主题。"
+        );
+
+        let appearance = AppearanceSettings {
+            theme_family: requested.into(),
+            ..AppearanceSettings::default()
+        };
+        assert_eq!(appearance.theme_family, requested);
+    }
+
     #[test]
     fn keys_go_to_the_terminal_only_when_no_overlay_is_open() {
         let target = HierarchyTarget::Pane {
@@ -960,13 +1322,13 @@ mod tests {
             }),
             Overlay::Rename(target.clone()),
             Overlay::ConfirmClose(target),
-            Overlay::ConfirmRemoveProfile(0),
+            Overlay::ConfirmRemoveProfile("manual-1".into()),
             Overlay::ConfirmSwitchProfile {
-                index: 0,
+                id: "local".into(),
                 from_hosts: false,
             },
             Overlay::ConfirmSwitchProfile {
-                index: 1,
+                id: "manual-1".into(),
                 from_hosts: true,
             },
             Overlay::ConfirmBulkRemove,

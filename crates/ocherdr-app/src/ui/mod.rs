@@ -64,14 +64,14 @@ impl Render for OcHerdrView {
             Overlay::ContextMenu(menu) => {
                 root = root.child(self.render_context_menu(menu, cx));
             }
-            Overlay::ConfirmSwitchProfile { index, .. } => {
-                root = root.child(self.render_switch_host(index, cx));
+            Overlay::ConfirmSwitchProfile { id, .. } => {
+                root = root.child(self.render_switch_host(&id, cx));
             }
             Overlay::ConfirmBulkRemove => {
                 root = root.child(self.render_bulk_remove(cx));
             }
-            Overlay::ConfirmRemoveProfile(index) => {
-                root = root.child(self.render_remove_node(index, cx));
+            Overlay::ConfirmRemoveProfile(id) => {
+                root = root.child(self.render_remove_node(&id, cx));
             }
             Overlay::ConfirmClose(target) => {
                 root = root.child(self.render_close_target(&target, cx));

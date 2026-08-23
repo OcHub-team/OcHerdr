@@ -69,6 +69,9 @@ impl OcHerdrView {
             this.submit_rename(window, cx);
         });
         view.reload(None, cx);
+        if let Some(notice) = missing_theme_notice(&view.appearance.theme_family, view.i18n) {
+            view.post_notice(notice, cx);
+        }
         view
     }
 
@@ -374,8 +377,8 @@ impl OcHerdrView {
             HostCenterEvent::DismissForm => {
                 self.set_overlay(Overlay::NodeManager, cx);
             }
-            HostCenterEvent::ConfirmRemoveProfile(index) => {
-                self.set_overlay(Overlay::ConfirmRemoveProfile(index), cx);
+            HostCenterEvent::ConfirmRemoveProfile(id) => {
+                self.set_overlay(Overlay::ConfirmRemoveProfile(id), cx);
             }
             HostCenterEvent::ConfirmBulkRemove => {
                 self.set_overlay(Overlay::ConfirmBulkRemove, cx);
@@ -400,13 +403,25 @@ impl OcHerdrView {
         self.profiles = profiles;
         self.profile_index = current_id
             .as_deref()
-            .and_then(|id| self.profiles.iter().position(|profile| profile.id() == id))
+            .and_then(|id| profile_index_by_id(&self.profiles, id))
             .unwrap_or(0);
         let profile_index = self.profile_index;
         self.host_center
             .update(cx, |center, _| center.set_profile_index(profile_index));
         if lost_current {
             self.reload(None, cx);
+        }
+        self.dismiss_stale_host_overlay(cx);
+    }
+
+    fn dismiss_stale_host_overlay(&mut self, cx: &mut Context<Self>) {
+        if confirmed_host_index(&self.overlay, &self.profiles).is_some() {
+            return;
+        }
+        match self.overlay {
+            Overlay::ConfirmSwitchProfile { .. } => self.cancel_switch_profile(cx),
+            Overlay::ConfirmRemoveProfile(_) => self.cancel_remove_node(cx),
+            _ => {}
         }
     }
 
@@ -636,7 +651,7 @@ impl OcHerdrView {
         if switch_requires_confirm(self.profile_index, index, self.live_herdr_session()) {
             self.set_overlay(
                 Overlay::ConfirmSwitchProfile {
-                    index,
+                    id: self.profiles[index].id().to_owned(),
                     from_hosts: self.overlay.host_center(),
                 },
                 cx,
@@ -664,7 +679,11 @@ impl OcHerdrView {
     }
 
     pub(super) fn confirm_switch_profile(&mut self, cx: &mut Context<Self>) {
-        let &Overlay::ConfirmSwitchProfile { index, .. } = &self.overlay else {
+        if !matches!(self.overlay, Overlay::ConfirmSwitchProfile { .. }) {
+            return;
+        }
+        let Some(index) = confirmed_host_index(&self.overlay, &self.profiles) else {
+            self.cancel_switch_profile(cx);
             return;
         };
         self.apply_profile(index, cx);
@@ -699,9 +718,9 @@ impl OcHerdrView {
     }
 
     pub(super) fn apply_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.appearance.background_opacity = self.appearance.background_opacity.clamp(40, 100);
-        self.appearance.font = self.appearance.font.clone().clamped();
-        self.appearance.theme_family = install_appearance(&self.appearance, window.appearance());
+        // Keep the configured family name even when the file is missing, so a
+        // temporarily absent theme can come back on the next launch.
+        install_appearance(&self.appearance, window.appearance());
         theme::apply_window_background(window);
         let palette = current_terminal_palette(&self.appearance);
         let mut palette_error = None;
@@ -756,7 +775,7 @@ impl OcHerdrView {
 
     pub(super) fn set_background_opacity(
         &mut self,
-        opacity: u8,
+        opacity: OpacityChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -774,7 +793,12 @@ impl OcHerdrView {
         self.apply_appearance(window, cx);
     }
 
-    pub(super) fn set_font_size(&mut self, size: u8, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_font_size(
+        &mut self,
+        size: FontSizeChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.appearance.font.size = size;
         self.apply_appearance(window, cx);
     }
@@ -801,7 +825,7 @@ impl OcHerdrView {
 
     pub(super) fn set_cell_width(
         &mut self,
-        percent: i8,
+        percent: CellWidthChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -811,7 +835,7 @@ impl OcHerdrView {
 
     pub(super) fn set_cell_height(
         &mut self,
-        percent: i8,
+        percent: CellHeightChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -839,12 +863,13 @@ impl OcHerdrView {
     }
 
     pub(super) fn confirm_remove_node(&mut self, cx: &mut Context<Self>) {
-        let &Overlay::ConfirmRemoveProfile(index) = &self.overlay else {
+        let Overlay::ConfirmRemoveProfile(id) = &self.overlay else {
             return;
         };
+        let id = id.clone();
         self.set_overlay(Overlay::NodeManager, cx);
         self.host_center
-            .update(cx, |center, cx| center.confirm_remove_node(index, cx));
+            .update(cx, |center, cx| center.confirm_remove_node(&id, cx));
     }
 
     pub(super) fn close_add_remote(&mut self, cx: &mut Context<Self>) {
@@ -2470,7 +2495,6 @@ fn terminal_palette_from_theme(
     dark: bool,
     font: &TerminalFontSettings,
 ) -> TerminalPalette {
-    let font = font.clone().clamped();
     TerminalPalette {
         dark,
         background: theme.bg.0,
@@ -2495,12 +2519,12 @@ fn terminal_palette_from_theme(
             theme.teal.0,
             theme.text.0,
         ],
-        font_family: font.family,
-        font_size: font.size,
+        font_family: font.family.clone(),
+        font_size: font.size.value(),
         ligatures: font.ligatures,
         thicken: font.thicken,
-        cell_width_percent: font.cell_width_percent,
-        cell_height_percent: font.cell_height_percent,
+        cell_width_percent: font.cell_width_percent.value(),
+        cell_height_percent: font.cell_height_percent.value(),
     }
 }
 
@@ -3347,11 +3371,11 @@ mod tests {
         let default = TerminalFontSettings::default();
         let menlo = TerminalFontSettings {
             family: "Menlo".into(),
-            size: 16,
+            size: FontSizeChoice::Pt16,
             ligatures: false,
             thicken: true,
-            cell_width_percent: -10,
-            cell_height_percent: 12,
+            cell_width_percent: CellWidthChoice::Tight,
+            cell_height_percent: CellHeightChoice::Relaxed,
         };
         let left = terminal_palette_from_theme(family.light, false, &default);
         let right = terminal_palette_from_theme(family.light, false, &menlo);

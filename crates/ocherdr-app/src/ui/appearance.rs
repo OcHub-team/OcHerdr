@@ -161,38 +161,35 @@ impl OcHerdrView {
                 this.set_backdrop_mode(backdrop, window, cx);
             }),
         );
-        let opacity_values = [100_u8, 92, 84, 72];
-        let opacity_index = opacity_values
-            .iter()
-            .position(|value| *value == self.appearance.background_opacity)
-            .unwrap_or(1);
         let opacity = select_row(
             "appearance-opacity",
             i18n.text(k::APPEARANCE_OPACITY_LABEL),
             Some(i18n.text(k::APPEARANCE_OPACITY_DESCRIPTION).into()),
             &["100%", "92%", "84%", "72%"],
-            opacity_index,
+            self.appearance.background_opacity.index(),
             self.select_row_state("appearance-opacity"),
             appearance_select(cx, "appearance-opacity", |this, index, window, cx| {
-                let opacity = [100_u8, 92, 84, 72].get(index).copied().unwrap_or(92);
+                // select_row only emits indexes into the ALL we passed it.
+                let Some(&opacity) = OpacityChoice::ALL.get(index) else {
+                    return;
+                };
                 this.set_background_opacity(opacity, window, cx);
             }),
         );
-        let size_labels = FONT_SIZES.map(|size| size.to_string());
+        let size_labels = FontSizeChoice::ALL.map(|size| size.value().to_string());
         let size_refs = size_labels.each_ref().map(String::as_str);
-        let size_index = FONT_SIZES
-            .iter()
-            .position(|size| *size == self.appearance.font.size)
-            .unwrap_or(2);
         let font_size = select_row(
             "appearance-font-size",
             i18n.text(k::APPEARANCE_FONT_SIZE_LABEL),
             Some(i18n.text(k::APPEARANCE_FONT_SIZE_DESCRIPTION).into()),
             &size_refs,
-            size_index,
+            self.appearance.font.size.index(),
             self.select_row_state("appearance-font-size"),
             appearance_select(cx, "appearance-font-size", |this, index, window, cx| {
-                let size = FONT_SIZES.get(index).copied().unwrap_or(13);
+                // select_row only emits indexes into the ALL we passed it.
+                let Some(&size) = FontSizeChoice::ALL.get(index) else {
+                    return;
+                };
                 this.set_font_size(size, window, cx);
             }),
         );
@@ -218,10 +215,6 @@ impl OcHerdrView {
             false,
             move |window, cx| thicken_listener(&(), window, cx),
         );
-        let width_index = CELL_WIDTHS
-            .iter()
-            .position(|value| *value == self.appearance.font.cell_width_percent)
-            .unwrap_or(1);
         let cell_width = select_row(
             "appearance-cell-width",
             i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_LABEL),
@@ -231,17 +224,16 @@ impl OcHerdrView {
                 i18n.text(k::COMMON_DEFAULT),
                 i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_WIDE),
             ],
-            width_index,
+            self.appearance.font.cell_width_percent.index(),
             self.select_row_state("appearance-cell-width"),
             appearance_select(cx, "appearance-cell-width", |this, index, window, cx| {
-                let percent = CELL_WIDTHS.get(index).copied().unwrap_or(0);
+                // select_row only emits indexes into the ALL we passed it.
+                let Some(&percent) = CellWidthChoice::ALL.get(index) else {
+                    return;
+                };
                 this.set_cell_width(percent, window, cx);
             }),
         );
-        let height_index = CELL_HEIGHTS
-            .iter()
-            .position(|value| *value == self.appearance.font.cell_height_percent)
-            .unwrap_or(1);
         let cell_height = select_row(
             "appearance-cell-height",
             i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_LABEL),
@@ -252,10 +244,13 @@ impl OcHerdrView {
                 i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_RELAXED),
                 i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_LOOSE),
             ],
-            height_index,
+            self.appearance.font.cell_height_percent.index(),
             self.select_row_state("appearance-cell-height"),
             appearance_select(cx, "appearance-cell-height", |this, index, window, cx| {
-                let percent = CELL_HEIGHTS.get(index).copied().unwrap_or(0);
+                // select_row only emits indexes into the ALL we passed it.
+                let Some(&percent) = CellHeightChoice::ALL.get(index) else {
+                    return;
+                };
                 this.set_cell_height(percent, window, cx);
             }),
         );

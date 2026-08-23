@@ -4,16 +4,16 @@ use crate::a11y::apply_dialog;
 impl OcHerdrView {
     pub(super) fn render_switch_host(
         &mut self,
-        index: usize,
+        id: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let i18n = self.i18n;
         let current = profile_display_label(&self.current_profile(), i18n);
-        let next = self
-            .profiles
-            .get(index)
-            .map(|profile| profile_display_label(profile, i18n))
-            .unwrap_or_else(|| i18n.text(k::HOSTS_SWITCH_THIS_HOST).to_owned());
+        let Some(next) = profile_index_by_id(&self.profiles, id)
+            .map(|index| profile_display_label(&self.profiles[index], i18n))
+        else {
+            return div().into_any_element();
+        };
         let cancel = button(
             "cancel-switch-host",
             i18n.text(k::COMMON_CANCEL),
@@ -59,20 +59,20 @@ impl OcHerdrView {
         .on_key_down(cx.listener(|this, event, window, cx| {
             this.handle_overlay_key(event, window, cx);
         }))
+        .into_any_element()
     }
 
     pub(super) fn render_remove_node(
         &mut self,
-        index: usize,
+        id: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let i18n = self.i18n;
-        let node_name = self
-            .profiles
-            .get(index)
-            .map(ConnectionProfile::label)
-            .unwrap_or(i18n.text(k::HOSTS_REMOVE_THIS_NODE))
-            .to_owned();
+        let Some(node_name) = profile_index_by_id(&self.profiles, id)
+            .map(|index| self.profiles[index].label().to_owned())
+        else {
+            return div().into_any_element();
+        };
         let cancel = button(
             "cancel-remove-node",
             i18n.text(k::COMMON_CANCEL),
@@ -118,6 +118,7 @@ impl OcHerdrView {
         .on_key_down(cx.listener(|this, event, window, cx| {
             this.handle_overlay_key(event, window, cx);
         }))
+        .into_any_element()
     }
 
     pub(super) fn render_bulk_remove(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

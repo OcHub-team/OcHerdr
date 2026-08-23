@@ -182,6 +182,10 @@ impl I18n {
         tf!(self, k::APPEARANCE_THEME_USE, name = theme_name)
     }
 
+    pub(crate) fn missing_theme_detail(self, name: &str) -> String {
+        tf!(self, k::NOTIFY_DETAIL_MISSING_THEME, name = name)
+    }
+
     pub(crate) fn running_operation(self, method: &str) -> String {
         tf!(self, k::NOTIFY_RUNNING, method = method)
     }
