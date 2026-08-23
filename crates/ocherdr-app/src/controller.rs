@@ -2172,21 +2172,31 @@ impl OcHerdrView {
         keep
     }
 
-    pub(super) fn resize_session_terminals(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let viewport = window.viewport_size();
-        let available_width = (f32::from(viewport.width) - SIDEBAR_WIDTH).max(320.);
-        let available_height =
-            (f32::from(viewport.height) - HEADER_HEIGHT - STATUS_BAR_HEIGHT).max(180.);
-        let scale_factor = f64::from(window.scale_factor());
+    pub(super) fn sync_measured_pane_body(
+        &mut self,
+        pane_id: &str,
+        bounds: Bounds<ochub_ui::gpui::Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let body = (
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        );
+        let scale = window.scale_factor();
+        let width_px = (body.2 * scale).round() as u32;
+        let height_px = (body.3 * scale).round() as u32;
+        let scale_factor = f64::from(scale);
         let palette = current_terminal_palette(&self.appearance);
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
         let mut palette_error = None;
-        let Some(session_panes) = self.session_panes.as_mut() else {
-            return;
-        };
-        for (pane_id, runtime) in &mut session_panes.panes {
+        let mut resized = false;
+        {
+            let Some(runtime) = self.pane_mut(pane_id) else {
+                return;
+            };
+            runtime.body_bounds = body;
             if runtime.palette_signature != palette.signature() {
                 if let Err(error) = runtime.terminal.apply_palette(&palette) {
                     palette_error = Some(error);
@@ -2194,15 +2204,6 @@ impl OcHerdrView {
                 runtime.color_scheme_dark = palette.dark;
                 runtime.palette_signature = palette.signature();
             }
-            let Some(ratio) = pane_layout_ratio(snapshot, pane_id) else {
-                continue;
-            };
-            let (width_px, height_px) = visible_pane_framebuffer_px(
-                available_width,
-                available_height,
-                window.scale_factor(),
-                ratio,
-            );
             if runtime.pixel_size != (width_px, height_px) {
                 runtime.frame_context = runtime.frame_context.wrapping_add(1);
                 let resolved = runtime.terminal.resize_pixels(
@@ -2222,10 +2223,14 @@ impl OcHerdrView {
                 }
                 runtime.size = size;
                 runtime.pixel_size = (width_px, height_px);
+                resized = true;
             }
         }
         if let Some(error) = palette_error {
             self.notify_failure(FailureKind::ApplyPalette, error, cx);
+        }
+        if resized {
+            cx.notify();
         }
     }
 
@@ -2765,12 +2770,6 @@ impl OcHerdrView {
         .detach();
     }
 
-    pub(super) fn store_pane_body_bounds(&mut self, pane_id: &str, geometry: (f32, f32, f32, f32)) {
-        if let Some(runtime) = self.pane_mut(pane_id) {
-            runtime.body_bounds = terminal_body_bounds(geometry);
-        }
-    }
-
     pub(super) fn accepts_ime(&self) -> bool {
         key_goes_to_terminal(&self.overlay) && self.selection.pane_id.is_some()
     }
@@ -2861,40 +2860,6 @@ impl OcHerdrView {
             size: size(px(w.max(1.)), px(h.max(1.))),
         })
     }
-}
-
-fn visible_pane_framebuffer_px(
-    available_width: f32,
-    available_height: f32,
-    scale_factor: f32,
-    ratio: (f32, f32),
-) -> (u32, u32) {
-    let width_px = ((available_width * ratio.0 - 6.).max(1.) * scale_factor).round() as u32;
-    let height_px = ((available_height * ratio.1 - PANE_HEADER_HEIGHT - 6.).max(1.) * scale_factor)
-        .round() as u32;
-    (width_px, height_px)
-}
-
-fn layout_ratio_for_pane(
-    layout: Option<&ocherdr_core::PaneLayout>,
-    pane_id: &str,
-) -> Option<(f32, f32)> {
-    layout.and_then(|layout| {
-        layout
-            .panes
-            .iter()
-            .find(|pane| pane.pane_id == pane_id)
-            .map(|pane| {
-                let width = pane.rect.width.max(1) as f32 / layout.area.width.max(1) as f32;
-                let height = pane.rect.height.max(1) as f32 / layout.area.height.max(1) as f32;
-                (width, height)
-            })
-    })
-}
-
-fn pane_layout_ratio(snapshot: &HierarchySnapshot, pane_id: &str) -> Option<(f32, f32)> {
-    let pane = snapshot.pane(pane_id)?;
-    layout_ratio_for_pane(snapshot.layout_for(&pane.tab_id), pane_id)
 }
 
 fn snapshot_pane_ids(snapshot: &HierarchySnapshot) -> HashSet<String> {
@@ -3125,18 +3090,6 @@ fn gpui_key_modifiers(modifiers: ochub_ui::gpui::Modifiers) -> KeyModifiers {
 
 fn point_in_rect(point: (f32, f32), rect: (f32, f32, f32, f32)) -> bool {
     point.0 >= rect.0 && point.1 >= rect.1 && point.0 < rect.0 + rect.2 && point.1 < rect.1 + rect.3
-}
-
-fn terminal_body_bounds(geometry: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
-    let (left, top, width, height) = geometry;
-    let pane_w = (width - 4.).max(40.);
-    let pane_h = (height - 4.).max(40.);
-    (
-        SIDEBAR_WIDTH + left + 2.,
-        HEADER_HEIGHT + top + 2. + PANE_HEADER_HEIGHT,
-        pane_w,
-        (pane_h - PANE_HEADER_HEIGHT).max(1.),
-    )
 }
 
 struct FittedSurface {
@@ -3640,66 +3593,9 @@ mod tests {
     }
 
     #[test]
-    fn observer_and_takeover_panes_share_the_same_framebuffer_pixel_math() {
-        let half = visible_pane_framebuffer_px(1000., 520., 2., (1., 0.5));
-        let full = visible_pane_framebuffer_px(1000., 520., 2., (1., 1.));
-        assert_eq!(half.0, full.0);
-        assert!(half.1 > 0);
-        assert!(half.1 < full.1);
-        assert!(
-            half.0 > 80 * 8,
-            "pane framebuffer is larger than a default 80-col grid"
-        );
-    }
-
-    #[test]
     fn observe_frames_do_not_replace_the_local_display_grid() {
         assert!(!incoming_frame_should_replace_grid((800, 600)));
         assert!(incoming_frame_should_replace_grid((0, 0)));
-    }
-
-    #[test]
-    fn off_tab_panes_are_not_resized_to_the_visible_tab() {
-        let layout = ocherdr_core::PaneLayout {
-            workspace_id: "w".into(),
-            tab_id: "t".into(),
-            zoomed: false,
-            area: ocherdr_core::LayoutRect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 50,
-            },
-            focused_pane_id: "visible".into(),
-            panes: vec![ocherdr_core::LayoutPane {
-                pane_id: "visible".into(),
-                focused: true,
-                rect: ocherdr_core::LayoutRect {
-                    x: 0,
-                    y: 0,
-                    width: 50,
-                    height: 50,
-                },
-            }],
-            splits: Vec::new(),
-        };
-        assert_eq!(
-            layout_ratio_for_pane(Some(&layout), "visible"),
-            Some((0.5, 1.0))
-        );
-        assert_eq!(layout_ratio_for_pane(Some(&layout), "hidden"), None);
-        assert_eq!(layout_ratio_for_pane(None, "visible"), None);
-    }
-
-    #[test]
-    fn hidden_tab_panes_use_their_own_layout_ratio() {
-        let snapshot = two_tab_snapshot();
-        assert_eq!(pane_layout_ratio(&snapshot, "p-a"), Some((1.0, 1.0)));
-        assert_eq!(pane_layout_ratio(&snapshot, "p-b"), Some((0.5, 1.0)));
-        assert_eq!(
-            layout_ratio_for_pane(snapshot.layout_for("t-a"), "p-b"),
-            None
-        );
     }
 
     #[test]
@@ -4265,11 +4161,14 @@ mod tests {
     }
 
     #[test]
-    fn terminal_body_sits_below_the_pane_header() {
-        let body = terminal_body_bounds((10., 20., 200., 160.));
-        assert!((body.0 - (SIDEBAR_WIDTH + 12.)).abs() < f32::EPSILON);
-        assert!((body.1 - (HEADER_HEIGHT + 22. + PANE_HEADER_HEIGHT)).abs() < f32::EPSILON);
-        assert!((body.2 - 196.).abs() < f32::EPSILON);
-        assert!((body.3 - (156. - PANE_HEADER_HEIGHT)).abs() < f32::EPSILON);
+    fn mouse_to_surface_uses_measured_window_bounds_without_chrome_offsets() {
+        let body = (300., 80., 800., 400.);
+        assert_eq!(
+            map_mouse_to_surface((300., 80.), body, (1600, 800), 2.),
+            Some((0., 0.))
+        );
+        let bottom_right = map_mouse_to_surface((1100., 480.), body, (1600, 800), 2.).unwrap();
+        assert!((bottom_right.0 - 800.).abs() < 0.01);
+        assert!((bottom_right.1 - 400.).abs() < 0.01);
     }
 }

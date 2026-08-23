@@ -687,7 +687,6 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) -> ochub_ui::gpui::AnyElement {
         let i18n = self.i18n;
-        self.resize_session_terminals(window, cx);
         let Some(snapshot) = self.snapshot.clone() else {
             let cta = button(
                 "retry-empty",
@@ -733,39 +732,17 @@ impl OcHerdrView {
                 ))
                 .into_any_element();
         };
-        let viewport = window.viewport_size();
-        let width = (f32::from(viewport.width) - SIDEBAR_WIDTH).max(320.);
-        let height = (f32::from(viewport.height) - HEADER_HEIGHT - STATUS_BAR_HEIGHT).max(180.);
         let layout = snapshot.layout_for(tab_id).cloned();
         let panes = snapshot.panes_for(tab_id).cloned().collect::<Vec<_>>();
+        let view = cx.entity();
         let mut elements = Vec::new();
         for pane in panes {
-            let geometry = layout
+            let fractions = layout
                 .as_ref()
-                .and_then(|layout| {
-                    layout
-                        .panes
-                        .iter()
-                        .find(|item| item.pane_id == pane.pane_id)
-                        .map(|item| {
-                            let area = layout.area;
-                            let left = (item.rect.x.saturating_sub(area.x)) as f32
-                                / area.width.max(1) as f32
-                                * width;
-                            let top = (item.rect.y.saturating_sub(area.y)) as f32
-                                / area.height.max(1) as f32
-                                * height;
-                            let pane_width =
-                                item.rect.width as f32 / area.width.max(1) as f32 * width;
-                            let pane_height =
-                                item.rect.height as f32 / area.height.max(1) as f32 * height;
-                            (left, top, pane_width, pane_height)
-                        })
-                })
-                .unwrap_or((0., 0., width, height));
+                .and_then(|layout| pane_fractions(layout, &pane.pane_id))
+                .unwrap_or((0., 0., 1., 1.));
             let selected = self.selection.pane_id.as_deref() == Some(&pane.pane_id);
             let pane_id = pane.pane_id.clone();
-            self.store_pane_body_bounds(&pane_id, geometry);
             let pane_target = HierarchyTarget::Pane {
                 id: pane.pane_id.clone(),
                 label: pane.display_name().to_owned(),
@@ -784,7 +761,7 @@ impl OcHerdrView {
             let scroll_pane_id = pane_id.clone();
             let mouse_pane_id = pane_id.clone();
             elements.push(
-                render_pane(pane, frame, geometry, a11y, i18n)
+                render_pane(pane, frame, fractions, a11y, i18n, view.clone())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event, window, cx| {
@@ -927,17 +904,38 @@ fn tree_row(
         .child(status_dot(color))
 }
 
+fn pane_fractions(
+    layout: &ocherdr_core::PaneLayout,
+    pane_id: &str,
+) -> Option<(f32, f32, f32, f32)> {
+    let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+    let area = layout.area;
+    let area_w = f32::from(area.width);
+    let area_h = f32::from(area.height);
+    if area_w == 0. || area_h == 0. {
+        return None;
+    }
+    Some((
+        (f32::from(pane.rect.x) - f32::from(area.x)) / area_w,
+        (f32::from(pane.rect.y) - f32::from(area.y)) / area_h,
+        f32::from(pane.rect.width) / area_w,
+        f32::from(pane.rect.height) / area_h,
+    ))
+}
+
 fn render_pane(
     pane: PaneInfo,
     frame: Option<RenderedFrame>,
-    geometry: (f32, f32, f32, f32),
+    fractions: (f32, f32, f32, f32),
     a11y: crate::a11y::PaneA11y,
     i18n: I18n,
+    view: Entity<OcHerdrView>,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
-    let (left, top, width, height) = geometry;
+    let (x, y, w, h) = fractions;
     let pane_name = a11y.name.clone();
     let selected = a11y.selected;
     let waiting_for_frame = frame.is_none();
+    let measure_pane_id = pane.pane_id.clone();
     div()
         .id(ochub_ui::gpui::ElementId::Name(
             format!("terminal-pane-{}", pane.pane_id).into(),
@@ -947,68 +945,95 @@ fn render_pane(
         .aria_selected(selected)
         .aria_value(a11y.value.clone())
         .absolute()
-        .left(px(left + 2.))
-        .top(px(top + 2.))
-        .w(px((width - 4.).max(40.)))
-        .h(px((height - 4.).max(40.)))
+        .left(relative(x))
+        .top(relative(y))
+        .w(relative(w))
+        .h(relative(h))
+        .p(px(2.))
         .flex()
         .flex_col()
-        .overflow_hidden()
-        .border_1()
-        .border_color(if selected {
-            theme::accent()
-        } else {
-            theme::border_strong()
-        })
-        .bg(theme::surface().alpha(0.))
-        .cursor_text()
-        .child(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .h(px(PANE_HEADER_HEIGHT))
-                .px_2()
-                .gap_2()
-                .border_b_1()
-                .border_color(theme::border())
-                .bg(if selected {
-                    theme::selection()
-                } else {
-                    theme::panel()
-                })
-                .text_xs()
-                .text_color(theme::subtext())
-                .child(status_dot(status_color(pane.agent_status)))
-                .child(div().truncate().flex_1().child(pane_name)),
-        )
         .child(
             div()
                 .flex()
-                .items_center()
-                .justify_center()
+                .flex_col()
                 .flex_1()
                 .min_h_0()
-                .w_full()
+                .min_w_0()
                 .overflow_hidden()
-                .bg(theme::current().bg.rgba())
-                .when_some(frame, |container, frame| {
-                    container.child(
-                        surface(frame.pixel_buffer)
-                            .with_frame_lifetime(frame.lifetime)
-                            .object_fit(ObjectFit::Contain)
-                            .w_full()
-                            .h_full(),
-                    )
+                .border_1()
+                .border_color(if selected {
+                    theme::accent()
+                } else {
+                    theme::border_strong()
                 })
-                .when(waiting_for_frame, |container| {
-                    container.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .child(i18n.text(k::TERMINAL_WAITING)),
-                    )
-                }),
+                .bg(theme::surface().alpha(0.))
+                .cursor_text()
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .h(px(PANE_HEADER_HEIGHT))
+                        .px_2()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(theme::border())
+                        .bg(if selected {
+                            theme::selection()
+                        } else {
+                            theme::panel()
+                        })
+                        .text_xs()
+                        .text_color(theme::subtext())
+                        .child(status_dot(status_color(pane.agent_status)))
+                        .child(div().truncate().flex_1().child(pane_name)),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .bg(theme::current().bg.rgba())
+                        .child(
+                            canvas(
+                                move |bounds, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.sync_measured_pane_body(
+                                            &measure_pane_id,
+                                            bounds,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .when_some(frame, |container, frame| {
+                            container.child(
+                                surface(frame.pixel_buffer)
+                                    .with_frame_lifetime(frame.lifetime)
+                                    .object_fit(ObjectFit::Contain)
+                                    .w_full()
+                                    .h_full(),
+                            )
+                        })
+                        .when(waiting_for_frame, |container| {
+                            container.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(i18n.text(k::TERMINAL_WAITING)),
+                            )
+                        }),
+                ),
         )
 }
 
@@ -1024,7 +1049,36 @@ fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::tab_key_equivalent;
+    use super::{pane_fractions, tab_key_equivalent};
+    use ocherdr_core::{LayoutPane, LayoutRect, PaneLayout};
+
+    fn layout_rect(x: u16, y: u16, width: u16, height: u16) -> LayoutRect {
+        LayoutRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn pane_layout(area: LayoutRect, panes: &[(&str, LayoutRect)]) -> PaneLayout {
+        PaneLayout {
+            workspace_id: "w".into(),
+            tab_id: "t".into(),
+            zoomed: false,
+            area,
+            focused_pane_id: panes[0].0.into(),
+            panes: panes
+                .iter()
+                .map(|(id, rect)| LayoutPane {
+                    pane_id: (*id).into(),
+                    focused: false,
+                    rect: *rect,
+                })
+                .collect(),
+            splits: Vec::new(),
+        }
+    }
 
     #[test]
     fn ghostty_style_tab_hints_use_command_glyph() {
@@ -1033,5 +1087,68 @@ mod tests {
         assert_eq!(tab_key_equivalent(1, 2).as_deref(), Some("⌘2"));
         assert_eq!(tab_key_equivalent(8, 9).as_deref(), Some("⌘9"));
         assert_eq!(tab_key_equivalent(9, 10), None);
+    }
+
+    #[test]
+    fn pane_fractions_split_left_and_right_in_half() {
+        let layout = pane_layout(
+            layout_rect(0, 0, 100, 50),
+            &[
+                ("left", layout_rect(0, 0, 50, 50)),
+                ("right", layout_rect(50, 0, 50, 50)),
+            ],
+        );
+        assert_eq!(pane_fractions(&layout, "left"), Some((0.0, 0.0, 0.5, 1.0)));
+        assert_eq!(pane_fractions(&layout, "right"), Some((0.5, 0.0, 0.5, 1.0)));
+    }
+
+    #[test]
+    fn pane_fractions_split_top_and_bottom_in_half() {
+        let layout = pane_layout(
+            layout_rect(0, 0, 100, 80),
+            &[
+                ("top", layout_rect(0, 0, 100, 40)),
+                ("bottom", layout_rect(0, 40, 100, 40)),
+            ],
+        );
+        assert_eq!(pane_fractions(&layout, "top"), Some((0.0, 0.0, 1.0, 0.5)));
+        assert_eq!(
+            pane_fractions(&layout, "bottom"),
+            Some((0.0, 0.5, 1.0, 0.5))
+        );
+    }
+
+    #[test]
+    fn pane_fractions_nested_split_keeps_child_ratios() {
+        let layout = pane_layout(
+            layout_rect(0, 0, 100, 100),
+            &[
+                ("left", layout_rect(0, 0, 50, 100)),
+                ("right-top", layout_rect(50, 0, 50, 50)),
+                ("right-bottom", layout_rect(50, 50, 50, 50)),
+            ],
+        );
+        assert_eq!(pane_fractions(&layout, "left"), Some((0.0, 0.0, 0.5, 1.0)));
+        assert_eq!(
+            pane_fractions(&layout, "right-top"),
+            Some((0.5, 0.0, 0.5, 0.5))
+        );
+        assert_eq!(
+            pane_fractions(&layout, "right-bottom"),
+            Some((0.5, 0.5, 0.5, 0.5))
+        );
+    }
+
+    #[test]
+    fn pane_fractions_are_relative_to_a_non_zero_area_origin() {
+        let layout = pane_layout(
+            layout_rect(10, 20, 80, 40),
+            &[
+                ("left", layout_rect(10, 20, 40, 40)),
+                ("right", layout_rect(50, 20, 40, 40)),
+            ],
+        );
+        assert_eq!(pane_fractions(&layout, "left"), Some((0.0, 0.0, 0.5, 1.0)));
+        assert_eq!(pane_fractions(&layout, "right"), Some((0.5, 0.0, 0.5, 1.0)));
     }
 }

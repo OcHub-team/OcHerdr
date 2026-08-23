@@ -27,7 +27,7 @@ use ochub_ui::gpui::{
     ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Task, TitlebarOptions,
     UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds, WindowOptions, canvas, div,
-    point, prelude::*, px, size, surface,
+    point, prelude::*, px, relative, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
