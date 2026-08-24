@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui_platform::application;
@@ -17,6 +17,7 @@ use ocherdr_herdr::{
     request_socket,
 };
 use ocherdr_terminal::{KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
+use ochub_ui::anim::Transition;
 use ochub_ui::components::{
     ButtonSize, ButtonTone, busy_button, button, context_menu, context_menu_item, disabled_button,
     empty_state, field, field_with_error, icon_button_tone, icon_only_button_tone, modal_body,
@@ -62,6 +63,7 @@ const SPLIT_HANDLE_VISUAL_PX: f32 = 4.;
 const REORDER_SLOP_PX: f32 = 4.;
 const TAB_REORDER_GAP_PX: f32 = 4.;
 const REORDER_ANIMATION: Duration = Duration::from_millis(180);
+const TAB_CLOSE_ANIMATION: Duration = Duration::from_millis(150);
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -78,6 +80,26 @@ impl AssetSource for OcHerdrAssets {
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(assets::list(path))
+    }
+}
+
+struct TabTitleTooltip(SharedString);
+
+impl Render for TabTitleTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(360.))
+            .px_2()
+            .py_1()
+            .rounded(px(CORNER_COMPACT))
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::overlay())
+            .shadow(theme::shadow_popover())
+            .text_sm()
+            .text_color(theme::text())
+            .whitespace_normal()
+            .child(self.0.clone())
     }
 }
 
@@ -690,6 +712,8 @@ struct OcHerdrView {
     appearance_scroll: ScrollHandle,
     appearance_ui: ui::AppearanceUi,
     tab_scroll: ScrollHandle,
+    hovered_tab_id: Option<String>,
+    tab_close_reveals: HashMap<String, Transition>,
     prefix_pending: bool,
     surface_drag: SurfaceDrag,
     pending_reorder: Option<PendingReorder>,

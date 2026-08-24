@@ -18,7 +18,7 @@ impl Render for OcHerdrView {
             .min_w_0()
             .h_full()
             .bg(theme::surface().alpha(0.))
-            .child(self.render_tab_bar(&chrome, cx))
+            .child(self.render_tab_bar(&chrome, window, cx))
             .child(self.render_terminal(window, cx));
         let workspace_body = div()
             .flex()

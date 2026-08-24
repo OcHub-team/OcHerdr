@@ -88,6 +88,8 @@ impl OcHerdrView {
             appearance_scroll: ScrollHandle::new(),
             appearance_ui: Default::default(),
             tab_scroll: ScrollHandle::new(),
+            hovered_tab_id: None,
+            tab_close_reveals: HashMap::new(),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
             pending_reorder: None,
@@ -1516,6 +1518,30 @@ impl OcHerdrView {
         }
         self.ensure_session_terminals(cx);
         cx.notify();
+    }
+
+    pub(super) fn set_tab_hovered(
+        &mut self,
+        tab_id: String,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if hovered {
+            if self.hovered_tab_id.as_deref() == Some(tab_id.as_str()) {
+                false
+            } else {
+                self.hovered_tab_id = Some(tab_id);
+                true
+            }
+        } else if self.hovered_tab_id.as_deref() == Some(tab_id.as_str()) {
+            self.hovered_tab_id = None;
+            true
+        } else {
+            false
+        };
+        if changed {
+            cx.notify();
+        }
     }
 
     pub(super) fn select_pane(

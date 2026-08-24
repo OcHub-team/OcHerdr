@@ -442,6 +442,7 @@ impl OcHerdrView {
     pub(super) fn render_tab_bar(
         &mut self,
         chrome: &ChromeA11y,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let i18n = self.i18n;
@@ -452,6 +453,36 @@ impl OcHerdrView {
             .items
             .iter()
             .map(|row| row.a11y.id.clone())
+            .collect::<Vec<_>>();
+        if self
+            .hovered_tab_id
+            .as_ref()
+            .is_some_and(|hovered| !authoritative_order.contains(hovered))
+        {
+            self.hovered_tab_id = None;
+        }
+        self.tab_close_reveals
+            .retain(|tab_id, _| authoritative_order.contains(tab_id));
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        let close_reveals = authoritative_order
+            .iter()
+            .map(|tab_id| {
+                let target = if self.hovered_tab_id.as_deref() == Some(tab_id.as_str()) {
+                    1.
+                } else {
+                    0.
+                };
+                let reveal = self
+                    .tab_close_reveals
+                    .entry(tab_id.clone())
+                    .or_insert_with(|| Transition::settled(0., TAB_CLOSE_ANIMATION));
+                reveal.retarget(target, now, reduce_motion);
+                if reveal.is_animating(now, reduce_motion) {
+                    window.request_animation_frame();
+                }
+                reveal.value(now, reduce_motion)
+            })
             .collect::<Vec<_>>();
         let drag = match &self.surface_drag {
             SurfaceDrag::Reorder(drag) => Some(drag),
@@ -510,9 +541,15 @@ impl OcHerdrView {
             .enumerate()
             .map(|(index, row)| {
                 let shortcut = tab_key_equivalent(index, tab_count);
+                let close_reveal = close_reveals[index];
                 let tab_id = row.a11y.id.clone();
                 let press_id = tab_id.clone();
                 let measure_id = tab_id.clone();
+                let hover_id = tab_id.clone();
+                let move_hover_id = tab_id.clone();
+                let debug_tab_id = tab_id.clone();
+                let debug_title_id = tab_id.clone();
+                let debug_close_id = tab_id.clone();
                 let measure_view = view.clone();
                 let tab_target = HierarchyTarget::Tab {
                     id: row.a11y.id.clone(),
@@ -542,8 +579,6 @@ impl OcHerdrView {
                     .h(px(TAB_PILL_HEIGHT))
                     .min_w(px(108.))
                     .max_w(px(180.))
-                    .px_3()
-                    .gap_1()
                     .overflow_hidden()
                     .rounded_full()
                     .border_1()
@@ -573,6 +608,10 @@ impl OcHerdrView {
                     .when(tab_count >= 2, |tab| tab.cursor_grab())
                     .when(tab_count < 2, |tab| tab.cursor_pointer())
                     .opacity(if hidden { 0. } else { 1. })
+                    .debug_selector(move || format!("tab-{debug_tab_id}"))
+                    .on_hover(cx.listener(move |this, hovered, _window, cx| {
+                        this.set_tab_hovered(hover_id.clone(), *hovered, cx);
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event, _window, cx| {
@@ -591,7 +630,8 @@ impl OcHerdrView {
                             this.pane_mouse_up(event, window, cx);
                         }),
                     )
-                    .on_mouse_move(cx.listener(|this, event, window, cx| {
+                    .on_mouse_move(cx.listener(move |this, event, window, cx| {
+                        this.set_tab_hovered(move_hover_id.clone(), true, cx);
                         this.pane_mouse_move(event, window, cx);
                     }))
                     .on_mouse_down(
@@ -600,26 +640,32 @@ impl OcHerdrView {
                             this.open_context_menu(tab_target.clone(), event, window, cx)
                         }),
                     )
-                    .child(icon(
-                        IconName::Terminal,
-                        if selected {
-                            theme::accent()
-                        } else {
-                            theme::muted()
-                        },
-                        13.,
-                    ))
                     .child(
                         div()
+                            .id(("tab-title", row.number))
                             .flex_1()
                             .min_w_0()
+                            .px_8()
                             .truncate()
+                            .text_center()
+                            .debug_selector(move || format!("tab-title-{debug_title_id}"))
+                            .tooltip({
+                                let title = row.a11y.name.clone();
+                                move |_window, cx| {
+                                    cx.new(|_| TabTitleTooltip(title.clone().into())).into()
+                                }
+                            })
                             .child(row.a11y.name.clone()),
                     )
                     .when_some(shortcut, |tab_row, shortcut| {
                         tab_row.child(
                             div()
-                                .flex_none()
+                                .absolute()
+                                .right(px(10.))
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
                                 .text_xs()
                                 .text_color(if selected {
                                     theme::text()
@@ -629,27 +675,37 @@ impl OcHerdrView {
                                 .child(shortcut),
                         )
                     })
-                    .when(selected, |tab_row| {
-                        tab_row.child(
-                            icon_only_button_tone(
-                                ("close-tab", row.number),
-                                i18n.text(k::TERMINAL_CLOSE_TAB),
-                                IconName::Close,
-                                ButtonTone::Ghost,
-                                ButtonSize::Sm,
-                            )
-                            .size(px(18.))
-                            .rounded_full()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .on_click(cx.listener(
-                                move |this, _, _window, cx| {
-                                    this.request_close(close_target.clone(), cx)
-                                },
-                            )),
-                        )
-                    });
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(7.))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .opacity(close_reveal)
+                            .when(close_reveal <= f32::EPSILON, |close| close.invisible())
+                            .child(
+                                icon_only_button_tone(
+                                    ("close-tab", row.number),
+                                    i18n.text(k::TERMINAL_CLOSE_TAB),
+                                    IconName::Close,
+                                    ButtonTone::Ghost,
+                                    ButtonSize::Sm,
+                                )
+                                .size(px(18.))
+                                .rounded_full()
+                                .debug_selector(move || format!("close-tab-{debug_close_id}"))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, _window, cx| {
+                                        this.request_close(close_target.clone(), cx)
+                                    },
+                                )),
+                            ),
+                    );
                 let tab = if tab_reorder.is_some() {
                     let animation_name = match motion {
                         Some(ReorderMotion::Dragging) => "reorder-shift",

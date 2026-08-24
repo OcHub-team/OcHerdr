@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{Entity, TestAppContext, VisualTestContext, prelude::*};
 use ocherdr_core::{
@@ -813,6 +813,70 @@ fn overflowing_tab_bar_scrolls_horizontally_with_the_wheel(cx: &mut TestAppConte
         tab_scroll.offset().x < gpui::px(0.),
         "selecting a hidden tab by number must scroll it into view"
     );
+}
+
+#[gpui::test]
+fn tab_hover_reveals_left_close_without_resizing_elastic_tabs(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    view.update(cx, |this, cx| {
+        let mut snapshot = three_tab_snapshot();
+        snapshot.tabs[1].label = "a deliberately long tab title that must be truncated".into();
+        this.snapshot = Some(snapshot);
+        this.selection = Selection {
+            connection_id: "local".into(),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-a".into()),
+            ..Default::default()
+        };
+        cx.notify();
+    });
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(500.)));
+    cx.run_until_parked();
+
+    let alpha_before = cx.debug_bounds("tab-t-a").expect("alpha tab bounds");
+    let long_before = cx.debug_bounds("tab-t-b").expect("long tab bounds");
+    assert_eq!(alpha_before.size.width, gpui::px(108.));
+    assert_eq!(long_before.size.width, gpui::px(180.));
+    assert!(long_before.size.width > alpha_before.size.width);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.hovered_tab_id, None);
+        assert_eq!(
+            this.tab_close_reveals["t-b"].value(Instant::now(), true),
+            0.
+        );
+    });
+
+    cx.simulate_mouse_move(long_before.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let long_after = cx.debug_bounds("tab-t-b").expect("hovered long tab bounds");
+    let title_after = cx
+        .debug_bounds("tab-title-t-b")
+        .expect("centered title bounds");
+    let close_after = cx
+        .debug_bounds("close-tab-t-b")
+        .expect("revealed close bounds");
+    assert_eq!(long_after, long_before, "hover must not reflow the tab");
+    assert_eq!(title_after.center().x, long_after.center().x);
+    assert!(close_after.center().x < long_after.center().x);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.hovered_tab_id.as_deref(), Some("t-b"));
+        assert_eq!(
+            this.tab_close_reveals["t-b"].value(Instant::now(), true),
+            1.
+        );
+    });
+
+    cx.simulate_click(close_after.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(matches!(
+            &this.overlay,
+            crate::Overlay::ConfirmClose(crate::HierarchyTarget::Tab { id, .. }) if id == "t-b"
+        ));
+        assert_eq!(this.selection.tab_id.as_deref(), Some("t-a"));
+    });
 }
 
 #[gpui::test]
