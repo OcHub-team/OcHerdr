@@ -3172,8 +3172,8 @@ impl OcHerdrView {
             return;
         }
         // A drag needs the row it grabbed. Without a measured rect there is no
-        // grab offset and no hover, and inventing one puts the ghost and the
-        // insertion line somewhere the pointer never was.
+        // grab offset and no hover, and inventing one puts the ghost somewhere
+        // the pointer never was.
         let Some(rect) = self.span_for(&list, &source_id) else {
             self.select_reorder_source(&list, source_id, cx);
             return;
@@ -3195,6 +3195,7 @@ impl OcHerdrView {
             origin: pointer,
             pointer,
             grab_offset,
+            source_rect: rect,
         });
         cx.stop_propagation();
         cx.notify();
@@ -3255,7 +3256,7 @@ impl OcHerdrView {
         list: &ReorderList,
         id: String,
         insert_index: usize,
-        settling_tab: Option<PendingTabReorder>,
+        settling: Option<PendingListReorder>,
         cx: &mut Context<Self>,
     ) {
         let (method, params) = match list {
@@ -3271,7 +3272,7 @@ impl OcHerdrView {
         if let Some(request) = self.spawn_invoke(method, params, cx) {
             self.pending_reorder = Some(PendingReorder {
                 _request: request,
-                tab: settling_tab,
+                display: settling,
             });
         }
     }
@@ -3311,7 +3312,7 @@ impl OcHerdrView {
         };
         drag.pointer = mouse;
         // Rows left the layout mid-drag. Keeping the last hover would aim the
-        // insertion line at a position that is no longer on screen.
+        // drop at a position that is no longer on screen.
         let Some(hover) = self.reorder_hover_for(&drag) else {
             cx.notify();
             return true;
@@ -3347,20 +3348,8 @@ impl OcHerdrView {
             if let Some(insert_index) =
                 reorder_insert_index(drag.order.len(), drag.source_index, drag.hover)
             {
-                let settling_tab = match &drag.list {
-                    ReorderList::Tabs { workspace_id } => Some(PendingTabReorder {
-                        workspace_id: workspace_id.clone(),
-                        order: drag.order.clone(),
-                        source_index: drag.source_index,
-                        hover: drag.hover,
-                        released_origin: (
-                            drag.pointer.0 - drag.grab_offset.0,
-                            drag.pointer.1 - drag.grab_offset.1,
-                        ),
-                    }),
-                    ReorderList::Workspaces => None,
-                };
-                self.submit_reorder(&list, source_id.clone(), insert_index, settling_tab, cx);
+                let settling = self.pending_display_for(&drag);
+                self.submit_reorder(&list, source_id.clone(), insert_index, settling, cx);
             }
         }
         self.select_reorder_source(&list, source_id, cx);
@@ -3386,6 +3375,27 @@ impl OcHerdrView {
             ReorderList::Tabs { .. } => drag.pointer.0,
         };
         Some(reorder_hover_along_axis(&spans, pointer))
+    }
+
+    fn pending_display_for(&self, drag: &ReorderDrag) -> Option<PendingListReorder> {
+        let rects = drag
+            .order
+            .iter()
+            .map(|id| self.span_for(&drag.list, id))
+            .collect::<Option<Vec<_>>>()?;
+        Some(PendingListReorder {
+            list: drag.list.clone(),
+            order: drag.order.clone(),
+            source_index: drag.source_index,
+            hover: drag.hover,
+            released_origin: reorder_ghost_origin(
+                drag.pointer,
+                drag.grab_offset,
+                reorder_list_bounds(&rects),
+                (drag.source_rect.2, drag.source_rect.3),
+                reorder_axis(&drag.list),
+            ),
+        })
     }
 
     fn spans_along_axis(&self, list: &ReorderList, order: &[String]) -> Option<Vec<(f32, f32)>> {
@@ -6515,6 +6525,7 @@ mod tests {
             origin: (0., 0.),
             pointer: (0., 0.),
             grab_offset: (0., 0.),
+            source_rect: (0., 0., 0., 0.),
         }
     }
 
