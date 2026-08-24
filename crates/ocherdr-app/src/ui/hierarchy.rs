@@ -54,19 +54,60 @@ impl OcHerdrView {
 
         let view = cx.entity();
         let workspace_count = chrome.workspaces.items.len();
-        let dragging_workspace = match &self.surface_drag {
-            SurfaceDrag::Reorder(drag)
-                if matches!(drag.list, ReorderList::Workspaces) && reorder_past_slop(drag) =>
-            {
-                drag.order.get(drag.source_index).cloned()
-            }
+        let authoritative_order = chrome
+            .workspaces
+            .items
+            .iter()
+            .map(|row| row.a11y.id.clone())
+            .collect::<Vec<_>>();
+        let drag = match &self.surface_drag {
+            SurfaceDrag::Reorder(drag) => Some(drag),
             _ => None,
         };
+        let pending = self
+            .pending_reorder
+            .as_ref()
+            .and_then(|pending| pending.display.as_ref());
+        let projection = reorder_projection(
+            &ReorderList::Workspaces,
+            &authoritative_order,
+            drag,
+            pending,
+        );
+        let workspace_reorder = projection.and_then(|projection| {
+            let rects = authoritative_order
+                .iter()
+                .map(|id| {
+                    self.reorder_metrics
+                        .workspaces
+                        .iter()
+                        .find(|span| &span.id == id)
+                        .map(|span| span.rect)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let offsets = reorder_slot_offsets(
+                projection.source_index,
+                projection.motion,
+                &projection.positions,
+                &projection.previous_positions,
+                &rects,
+                0.,
+                ReorderAxis::Vertical,
+            );
+            Some((
+                projection.source_id,
+                projection.positions,
+                offsets.previous,
+                offsets.current,
+                projection.motion,
+            ))
+        });
         let hierarchy = chrome
             .workspaces
             .items
             .iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(index, row)| {
                 let workspace_id = row.a11y.id.clone();
                 let press_id = workspace_id.clone();
                 let measure_id = workspace_id.clone();
@@ -81,7 +122,62 @@ impl OcHerdrView {
                     .as_ref()
                     .is_some_and(|info| info.is_linked_worktree);
                 let affiliation = row.worktree.as_ref().map(|info| info.affiliation_label());
-                let dimmed = dragging_workspace.as_deref() == Some(workspace_id.as_str());
+                let (hidden, display_position, previous_offset, offset, motion) =
+                    if let Some((source_id, positions, previous_offsets, offsets, motion)) =
+                        &workspace_reorder
+                    {
+                        (
+                            source_id == &workspace_id && *motion == ReorderMotion::Dragging,
+                            positions[index],
+                            previous_offsets[index],
+                            offsets[index],
+                            Some(*motion),
+                        )
+                    } else {
+                        (false, index, (0., 0.), (0., 0.), None)
+                    };
+                let row_el = tree_row(
+                    ("workspace", row.number),
+                    &row.a11y,
+                    12.,
+                    if linked {
+                        IconName::Layers
+                    } else {
+                        IconName::Folder
+                    },
+                    selected,
+                    status_color(row.agent_status),
+                    affiliation.as_deref(),
+                )
+                .when(workspace_count >= 2, |row| row.cursor_grab())
+                .relative()
+                .opacity(if hidden { 0. } else { 1. });
+                let row_el = if workspace_reorder.is_some() {
+                    let animation_name = match motion {
+                        Some(ReorderMotion::Dragging) => "reorder-shift",
+                        Some(ReorderMotion::Settling { .. }) => "reorder-settle",
+                        None => unreachable!("workspace reorder animation requires a motion phase"),
+                    };
+                    row_el
+                        .with_animation(
+                            (
+                                ElementId::named_usize(animation_name, display_position),
+                                workspace_id.clone(),
+                            ),
+                            Animation::new(REORDER_ANIMATION).with_easing(ease_out_quint()),
+                            move |row, delta| {
+                                row.left(px(
+                                    previous_offset.0 + (offset.0 - previous_offset.0) * delta
+                                ))
+                                .top(px(
+                                    previous_offset.1 + (offset.1 - previous_offset.1) * delta
+                                ))
+                            },
+                        )
+                        .into_any_element()
+                } else {
+                    row_el.into_any_element()
+                };
                 div()
                     .id(("workspace-slot", row.number))
                     .relative()
@@ -112,23 +208,7 @@ impl OcHerdrView {
                             this.open_context_menu(workspace_target.clone(), event, window, cx)
                         }),
                     )
-                    .child(
-                        tree_row(
-                            ("workspace", row.number),
-                            &row.a11y,
-                            12.,
-                            if linked {
-                                IconName::Layers
-                            } else {
-                                IconName::Folder
-                            },
-                            selected,
-                            status_color(row.agent_status),
-                            affiliation.as_deref(),
-                        )
-                        .when(workspace_count >= 2, |row| row.cursor_grab())
-                        .opacity(if dimmed { 0.4 } else { 1. }),
-                    )
+                    .child(row_el)
                     .child(
                         canvas(
                             move |bounds, _, cx| {
@@ -376,52 +456,46 @@ impl OcHerdrView {
         let pending = self
             .pending_reorder
             .as_ref()
-            .and_then(|pending| pending.tab.as_ref());
+            .and_then(|pending| pending.display.as_ref());
         let projection = self
             .selection
             .workspace_id
             .as_deref()
             .and_then(|workspace_id| {
-                tab_reorder_projection(workspace_id, &authoritative_order, drag, pending)
+                reorder_projection(
+                    &ReorderList::Tabs {
+                        workspace_id: workspace_id.to_owned(),
+                    },
+                    &authoritative_order,
+                    drag,
+                    pending,
+                )
             });
         let tab_reorder = projection.and_then(|projection| {
-            let spans = authoritative_order
+            let rects = authoritative_order
                 .iter()
-                .map(|id| self.reorder_metrics.tabs.iter().find(|span| &span.id == id))
+                .map(|id| {
+                    self.reorder_metrics
+                        .tabs
+                        .iter()
+                        .find(|span| &span.id == id)
+                        .map(|span| span.rect)
+                })
                 .collect::<Option<Vec<_>>>()?;
-            let shifts_for = |positions: &[usize]| {
-                let mut originals_by_position = vec![0; positions.len()];
-                for (original, position) in positions.iter().copied().enumerate() {
-                    originals_by_position[position] = original;
-                }
-                let mut target_left = spans[0].rect.0;
-                let mut shifts = vec![0.; positions.len()];
-                for original in originals_by_position {
-                    shifts[original] = target_left - spans[original].rect.0;
-                    target_left += spans[original].rect.2 + TAB_REORDER_GAP_PX;
-                }
-                shifts
-            };
-            let shifts = shifts_for(&projection.positions);
-            let mut previous_offsets = shifts_for(&projection.previous_positions)
-                .into_iter()
-                .map(|shift| (shift, 0.))
-                .collect::<Vec<_>>();
-            if let TabReorderMotion::Settling { released_origin } = projection.motion {
-                let source = spans[projection.source_index];
-                previous_offsets[projection.source_index] = (
-                    released_origin.0 - source.rect.0,
-                    released_origin.1 - source.rect.1,
-                );
-            }
+            let offsets = reorder_slot_offsets(
+                projection.source_index,
+                projection.motion,
+                &projection.positions,
+                &projection.previous_positions,
+                &rects,
+                TAB_REORDER_GAP_PX,
+                ReorderAxis::Horizontal,
+            );
             Some((
                 projection.source_id,
                 projection.positions,
-                previous_offsets,
-                shifts
-                    .into_iter()
-                    .map(|shift| (shift, 0.))
-                    .collect::<Vec<_>>(),
+                offsets.previous,
+                offsets.current,
                 projection.motion,
             ))
         });
@@ -447,7 +521,7 @@ impl OcHerdrView {
                         &tab_reorder
                     {
                         (
-                            source_id == &tab_id && *motion == TabReorderMotion::Dragging,
+                            source_id == &tab_id && *motion == ReorderMotion::Dragging,
                             positions[index],
                             previous_offsets[index],
                             offsets[index],
@@ -574,8 +648,8 @@ impl OcHerdrView {
                     });
                 let tab = if tab_reorder.is_some() {
                     let animation_name = match motion {
-                        Some(TabReorderMotion::Dragging) => "tab-reorder-shift",
-                        Some(TabReorderMotion::Settling { .. }) => "tab-reorder-settle",
+                        Some(ReorderMotion::Dragging) => "reorder-shift",
+                        Some(ReorderMotion::Settling { .. }) => "reorder-settle",
                         None => unreachable!("tab reorder animation requires a motion phase"),
                     };
                     tab.with_animation(
@@ -583,7 +657,7 @@ impl OcHerdrView {
                             ElementId::named_usize(animation_name, display_position),
                             tab_id.clone(),
                         ),
-                        Animation::new(TAB_REORDER_ANIMATION).with_easing(ease_out_quint()),
+                        Animation::new(REORDER_ANIMATION).with_easing(ease_out_quint()),
                         move |tab, delta| {
                             tab.left(px(
                                 previous_offset.0 + (offset.0 - previous_offset.0) * delta
@@ -1131,10 +1205,6 @@ impl OcHerdrView {
                 cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
             )
             .when_some(
-                reorder_indicator(&self.reorder_metrics, drag),
-                |overlay, line| overlay.child(line),
-            )
-            .when_some(
                 reorder_ghost(
                     self.snapshot.as_ref(),
                     &self.reorder_metrics,
@@ -1232,12 +1302,29 @@ fn reorder_ghost(
     drag: &ReorderDrag,
     source_id: &str,
 ) -> Option<ochub_ui::gpui::Div> {
-    let span = match drag.list {
-        ReorderList::Workspaces => metrics.workspaces.iter().find(|span| span.id == source_id),
-        ReorderList::Tabs { .. } => metrics.tabs.iter().find(|span| span.id == source_id),
-    }?;
-    let left = px(drag.pointer.0 - drag.grab_offset.0);
-    let top = px(drag.pointer.1 - drag.grab_offset.1);
+    let spans = match drag.list {
+        ReorderList::Workspaces => &metrics.workspaces,
+        ReorderList::Tabs { .. } => &metrics.tabs,
+    };
+    let rects = drag
+        .order
+        .iter()
+        .map(|id| {
+            spans
+                .iter()
+                .find(|span| span.id == *id)
+                .map(|span| span.rect)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (left, top) = reorder_ghost_origin(
+        drag.pointer,
+        drag.grab_offset,
+        reorder_list_bounds(&rects),
+        (drag.source_rect.2, drag.source_rect.3),
+        reorder_axis(&drag.list),
+    );
+    let left = px(left);
+    let top = px(top);
     Some(match &drag.list {
         ReorderList::Workspaces => {
             let workspace = snapshot?
@@ -1252,8 +1339,8 @@ fn reorder_ghost(
                 .absolute()
                 .left(left)
                 .top(top)
-                .w(px(span.rect.2))
-                .h(px(span.rect.3))
+                .w(px(drag.source_rect.2))
+                .h(px(drag.source_rect.3))
                 .opacity(0.85)
                 .flex()
                 .items_center()
@@ -1288,7 +1375,7 @@ fn reorder_ghost(
                 .absolute()
                 .left(left)
                 .top(top)
-                .w(px(span.rect.2.max(108.)))
+                .w(px(drag.source_rect.2.max(108.)))
                 .h(px(TAB_PILL_HEIGHT))
                 .opacity(0.85)
                 .flex()
@@ -1311,46 +1398,6 @@ fn reorder_ghost(
                 )
         }
     })
-}
-
-fn reorder_indicator(metrics: &ReorderMetrics, drag: &ReorderDrag) -> Option<ochub_ui::gpui::Div> {
-    let ReorderList::Workspaces = &drag.list else {
-        return None;
-    };
-    let spans = &metrics.workspaces;
-    let items = drag
-        .order
-        .iter()
-        .filter_map(|id| spans.iter().find(|span| span.id == *id))
-        .collect::<Vec<_>>();
-    if items.len() != drag.order.len() {
-        return None;
-    }
-    let thick = REORDER_INDICATOR_PX;
-    let (x, y, w, h) = match drag.hover {
-        ReorderHover::Item { index, trailing } => {
-            let rect = items.get(index)?.rect;
-            if trailing {
-                (rect.0, rect.1 + rect.3 - thick / 2., rect.2, thick)
-            } else {
-                (rect.0, rect.1 - thick / 2., rect.2, thick)
-            }
-        }
-        ReorderHover::AfterLast => {
-            let rect = items.last()?.rect;
-            (rect.0, rect.1 + rect.3 - thick / 2., rect.2, thick)
-        }
-    };
-    Some(
-        div()
-            .absolute()
-            .left(px(x))
-            .top(px(y))
-            .w(px(w))
-            .h(px(h))
-            .bg(theme::accent())
-            .rounded_full(),
-    )
 }
 
 fn pane_fractions(

@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use crate::host_center::HostCenter;
 use crate::{
     AgentOutputState, AgentPromptPhase, AppearanceSettings, CachedHostHealth, EventStreamState,
-    HostHealthView, I18n, Language, OcHerdrView, PendingTabReorder, ReorderList, Settings,
-    install_appearance, tab_reorder_projection,
+    HostHealthView, I18n, Language, OcHerdrView, PendingListReorder, ReorderList, Settings,
+    install_appearance, reorder_projection,
 };
 
 fn install_app(cx: &mut TestAppContext) {
@@ -1021,30 +1021,25 @@ fn a_rejected_tab_move_returns_the_display_to_authoritative_order(cx: &mut TestA
     cx.run_until_parked();
 
     let order = ["t-a", "t-b"].map(str::to_owned).to_vec();
-    let settling = PendingTabReorder {
+    let list = ReorderList::Tabs {
         workspace_id: "w".into(),
+    };
+    let settling = PendingListReorder {
+        list: list.clone(),
         order: order.clone(),
         source_index: 0,
         hover: ReorderHover::AfterLast,
         released_origin: (520., 18.),
     };
     view.update(cx, |this, cx| {
-        this.submit_reorder(
-            &ReorderList::Tabs {
-                workspace_id: "w".into(),
-            },
-            "t-a".into(),
-            2,
-            Some(settling),
-            cx,
-        );
+        this.submit_reorder(&list, "t-a".into(), 2, Some(settling), cx);
     });
     view.read_with(cx, |this, _| {
         let pending = this
             .pending_reorder
             .as_ref()
-            .and_then(|pending| pending.tab.as_ref());
-        let projection = tab_reorder_projection("w", &order, None, pending)
+            .and_then(|pending| pending.display.as_ref());
+        let projection = reorder_projection(&list, &order, None, pending)
             .expect("the request has not failed yet, so its projection is visible");
         assert_eq!(projection.positions, [1, 0]);
     });
@@ -1075,23 +1070,18 @@ fn a_conflicting_tab_moved_event_replaces_the_pending_projection_with_authority(
     cx.run_until_parked();
 
     let original = ["t-a", "t-b", "t-c"].map(str::to_owned).to_vec();
-    let settling = PendingTabReorder {
+    let list = ReorderList::Tabs {
         workspace_id: "w".into(),
+    };
+    let settling = PendingListReorder {
+        list: list.clone(),
         order: original.clone(),
         source_index: 0,
         hover: ReorderHover::AfterLast,
         released_origin: (520., 18.),
     };
     view.update(cx, |this, cx| {
-        this.submit_reorder(
-            &ReorderList::Tabs {
-                workspace_id: "w".into(),
-            },
-            "t-a".into(),
-            3,
-            Some(settling),
-            cx,
-        );
+        this.submit_reorder(&list, "t-a".into(), 3, Some(settling), cx);
     });
     cx.run_until_parked();
 
@@ -1099,8 +1089,8 @@ fn a_conflicting_tab_moved_event_replaces_the_pending_projection_with_authority(
         let pending = this
             .pending_reorder
             .as_ref()
-            .and_then(|pending| pending.tab.as_ref());
-        let projection = tab_reorder_projection("w", &original, None, pending)
+            .and_then(|pending| pending.display.as_ref());
+        let projection = reorder_projection(&list, &original, None, pending)
             .expect("the accepted move remains pending until a moved event arrives");
         assert_eq!(projection.positions, [2, 0, 1]);
     });
@@ -1142,9 +1132,17 @@ fn a_conflicting_tab_moved_event_replaces_the_pending_projection_with_authority(
         let pending = this
             .pending_reorder
             .as_ref()
-            .and_then(|pending| pending.tab.as_ref());
+            .and_then(|pending| pending.display.as_ref());
         assert!(
-            tab_reorder_projection("w", &authoritative, None, pending).is_none(),
+            reorder_projection(
+                &ReorderList::Tabs {
+                    workspace_id: "w".into(),
+                },
+                &authoritative,
+                None,
+                pending
+            )
+            .is_none(),
             "the renderer must use conflicting authority, not pending [t-b, t-c, t-a]"
         );
         assert!(

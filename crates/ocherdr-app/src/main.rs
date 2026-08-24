@@ -59,9 +59,8 @@ const PANE_HEADER_HEIGHT: f32 = 26.;
 const SPLIT_HANDLE_HIT_PX: f32 = 10.;
 const SPLIT_HANDLE_VISUAL_PX: f32 = 4.;
 const REORDER_SLOP_PX: f32 = 4.;
-const REORDER_INDICATOR_PX: f32 = 2.;
 const TAB_REORDER_GAP_PX: f32 = 4.;
-const TAB_REORDER_ANIMATION: Duration = Duration::from_millis(180);
+const REORDER_ANIMATION: Duration = Duration::from_millis(180);
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -812,18 +811,18 @@ enum SurfaceDrag {
 /// here is what keeps it alive, so dropping this drops the request too.
 struct PendingReorder {
     _request: Task<()>,
-    /// Tabs keep the release-time projection visible until Herdr publishes
-    /// the authoritative order. Workspace reorders remain line-based.
-    tab: Option<PendingTabReorder>,
+    /// Release-time projection kept on screen until Herdr publishes the
+    /// authoritative order. Tabs and workspaces share this settle.
+    display: Option<PendingListReorder>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct PendingTabReorder {
-    workspace_id: String,
+struct PendingListReorder {
+    list: ReorderList,
     order: Vec<String>,
     source_index: usize,
     hover: ReorderHover,
-    /// Window-local origin of the drag ghost at mouse-up. The real tab starts
+    /// Window-local origin of the drag ghost at mouse-up. The real row starts
     /// here and settles into the projected empty slot.
     released_origin: (f32, f32),
 }
@@ -843,6 +842,9 @@ struct ReorderDrag {
     /// Where inside the source row the pointer grabbed it. Measured at press,
     /// so the drag cannot exist before the row has been laid out.
     grab_offset: (f32, f32),
+    /// Slot rect at press. Ghost size stays on this even if the live canvas
+    /// span is rewritten by the squeeze animation.
+    source_rect: (f32, f32, f32, f32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -895,39 +897,149 @@ fn reorder_display_positions(
     positions
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReorderAxis {
+    Horizontal,
+    Vertical,
+}
+
+fn reorder_axis(list: &ReorderList) -> ReorderAxis {
+    match list {
+        ReorderList::Workspaces => ReorderAxis::Vertical,
+        ReorderList::Tabs { .. } => ReorderAxis::Horizontal,
+    }
+}
+
+/// Pixel shift along the list axis for each original index. `spans` are
+/// `(origin, extent)` in original order. Horizontal tabs and vertical
+/// workspaces pass the same numbers through this function.
+fn reorder_display_shifts(spans: &[(f32, f32)], positions: &[usize], gap: f32) -> Vec<f32> {
+    let mut originals_by_position = vec![0; positions.len()];
+    for (original, position) in positions.iter().copied().enumerate() {
+        originals_by_position[position] = original;
+    }
+    let mut target = spans[0].0;
+    let mut shifts = vec![0.; positions.len()];
+    for original in originals_by_position {
+        shifts[original] = target - spans[original].0;
+        target += spans[original].1 + gap;
+    }
+    shifts
+}
+
+fn reorder_axis_offset(shift: f32, axis: ReorderAxis) -> (f32, f32) {
+    match axis {
+        ReorderAxis::Horizontal => (shift, 0.),
+        ReorderAxis::Vertical => (0., shift),
+    }
+}
+
+fn reorder_list_bounds(rects: &[(f32, f32, f32, f32)]) -> (f32, f32, f32, f32) {
+    let mut min_x = rects[0].0;
+    let mut min_y = rects[0].1;
+    let mut max_x = rects[0].0 + rects[0].2;
+    let mut max_y = rects[0].1 + rects[0].3;
+    for rect in &rects[1..] {
+        min_x = min_x.min(rect.0);
+        min_y = min_y.min(rect.1);
+        max_x = max_x.max(rect.0 + rect.2);
+        max_y = max_y.max(rect.1 + rect.3);
+    }
+    (min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// Ghost origin so the dragged row stays on its list axis.
+///
+/// Tabs lock `top` to the strip and clamp `left`; workspaces lock `left` to
+/// the sidebar and clamp `top`. Drop targeting still uses the pointer's
+/// coordinate along that same axis, including when the pointer has left the
+/// strip — there is no tear-out in this round.
+fn reorder_ghost_origin(
+    pointer: (f32, f32),
+    grab_offset: (f32, f32),
+    list: (f32, f32, f32, f32),
+    ghost_size: (f32, f32),
+    axis: ReorderAxis,
+) -> (f32, f32) {
+    let free = (pointer.0 - grab_offset.0, pointer.1 - grab_offset.1);
+    match axis {
+        ReorderAxis::Horizontal => {
+            let max_x = (list.0 + list.2 - ghost_size.0).max(list.0);
+            (free.0.clamp(list.0, max_x), list.1)
+        }
+        ReorderAxis::Vertical => {
+            let max_y = (list.1 + list.3 - ghost_size.1).max(list.1);
+            (list.0, free.1.clamp(list.1, max_y))
+        }
+    }
+}
+
+struct ReorderSlotOffsets {
+    previous: Vec<(f32, f32)>,
+    current: Vec<(f32, f32)>,
+}
+
+fn reorder_slot_offsets(
+    source_index: usize,
+    motion: ReorderMotion,
+    positions: &[usize],
+    previous_positions: &[usize],
+    rects: &[(f32, f32, f32, f32)],
+    gap: f32,
+    axis: ReorderAxis,
+) -> ReorderSlotOffsets {
+    let along = |rect: (f32, f32, f32, f32)| match axis {
+        ReorderAxis::Horizontal => (rect.0, rect.2),
+        ReorderAxis::Vertical => (rect.1, rect.3),
+    };
+    let spans = rects.iter().copied().map(along).collect::<Vec<_>>();
+    let to_offsets = |positions: &[usize]| {
+        reorder_display_shifts(&spans, positions, gap)
+            .into_iter()
+            .map(|shift| reorder_axis_offset(shift, axis))
+            .collect::<Vec<_>>()
+    };
+    let mut previous = to_offsets(previous_positions);
+    if let ReorderMotion::Settling { released_origin } = motion {
+        previous[source_index] = (
+            released_origin.0 - rects[source_index].0,
+            released_origin.1 - rects[source_index].1,
+        );
+    }
+    ReorderSlotOffsets {
+        previous,
+        current: to_offsets(positions),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum TabReorderMotion {
+enum ReorderMotion {
     Dragging,
     Settling { released_origin: (f32, f32) },
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct TabReorderProjection {
+struct ReorderProjection {
     source_id: String,
     source_index: usize,
     positions: Vec<usize>,
     previous_positions: Vec<usize>,
-    motion: TabReorderMotion,
+    motion: ReorderMotion,
 }
 
-/// Derive tab positions without mutating the authoritative snapshot. The same
-/// mapping drives both pointer-time squeezing and the request-time settle. A
-/// changed authoritative order always wins over a prediction based on stale
-/// input, including an order published by another client.
-fn tab_reorder_projection(
-    workspace_id: &str,
+/// Derive display positions without mutating the authoritative snapshot. The
+/// same mapping drives both pointer-time squeezing and the request-time settle
+/// for tabs and workspaces. A changed authoritative order always wins over a
+/// prediction based on stale input, including an order published by another
+/// client.
+fn reorder_projection(
+    list: &ReorderList,
     authoritative_order: &[String],
     drag: Option<&ReorderDrag>,
-    pending: Option<&PendingTabReorder>,
-) -> Option<TabReorderProjection> {
+    pending: Option<&PendingListReorder>,
+) -> Option<ReorderProjection> {
     let dragging = drag.and_then(|drag| {
-        let ReorderList::Tabs {
-            workspace_id: drag_workspace,
-        } = &drag.list
-        else {
-            return None;
-        };
-        if drag_workspace != workspace_id || !reorder_past_slop(drag) {
+        if drag.list != *list || !reorder_past_slop(drag) {
             return None;
         }
         Some((
@@ -935,16 +1047,16 @@ fn tab_reorder_projection(
             drag.source_index,
             drag.previous_hover,
             drag.hover,
-            TabReorderMotion::Dragging,
+            ReorderMotion::Dragging,
         ))
     });
     let pending = pending.and_then(|pending| {
-        (pending.workspace_id == workspace_id).then_some((
+        (pending.list == *list).then_some((
             pending.order.as_slice(),
             pending.source_index,
             pending.hover,
             pending.hover,
-            TabReorderMotion::Settling {
+            ReorderMotion::Settling {
                 released_origin: pending.released_origin,
             },
         ))
@@ -954,7 +1066,7 @@ fn tab_reorder_projection(
         return None;
     }
     let source_id = order.get(source_index)?.clone();
-    Some(TabReorderProjection {
+    Some(ReorderProjection {
         source_id,
         source_index,
         positions: reorder_display_positions(order, source_index, hover),
@@ -1384,13 +1496,19 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn tab_order() -> Vec<String> {
+    fn item_order() -> Vec<String> {
         ["a", "b", "c", "d"].map(str::to_owned).to_vec()
     }
 
-    fn pending_tab_reorder(order: &[String]) -> PendingTabReorder {
-        PendingTabReorder {
+    fn tabs_list() -> ReorderList {
+        ReorderList::Tabs {
             workspace_id: "w".into(),
+        }
+    }
+
+    fn pending_list_reorder(list: ReorderList, order: &[String]) -> PendingListReorder {
+        PendingListReorder {
+            list,
             order: order.to_vec(),
             source_index: 1,
             hover: ReorderHover::Item {
@@ -1402,10 +1520,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_display_positions_stay_put_before_crossing_a_midpoint() {
+    fn display_positions_stay_put_before_crossing_a_midpoint() {
         assert_eq!(
             reorder_display_positions(
-                &tab_order(),
+                &item_order(),
                 1,
                 ReorderHover::Item {
                     index: 1,
@@ -1417,10 +1535,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_display_positions_move_the_crossed_right_neighbor_into_the_hole() {
+    fn display_positions_move_the_crossed_right_neighbor_into_the_hole() {
         assert_eq!(
             reorder_display_positions(
-                &tab_order(),
+                &item_order(),
                 1,
                 ReorderHover::Item {
                     index: 2,
@@ -1432,10 +1550,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_display_positions_move_the_crossed_left_neighbor_into_the_hole() {
+    fn display_positions_move_the_crossed_left_neighbor_into_the_hole() {
         assert_eq!(
             reorder_display_positions(
-                &tab_order(),
+                &item_order(),
                 2,
                 ReorderHover::Item {
                     index: 1,
@@ -1447,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_display_positions_stay_in_bounds_at_both_ends() {
+    fn display_positions_stay_in_bounds_at_both_ends() {
         for (source_index, hover) in [
             (
                 2,
@@ -1458,37 +1576,126 @@ mod tests {
             ),
             (0, ReorderHover::AfterLast),
         ] {
-            let positions = reorder_display_positions(&tab_order(), source_index, hover);
+            let positions = reorder_display_positions(&item_order(), source_index, hover);
             assert_eq!(positions.len(), 4);
             assert!(positions.into_iter().all(|position| position < 4));
         }
     }
 
     #[test]
+    fn display_shifts_use_the_same_numbers_on_either_axis() {
+        let positions = reorder_display_positions(
+            &item_order(),
+            1,
+            ReorderHover::Item {
+                index: 2,
+                trailing: true,
+            },
+        );
+        let spans = [(0., 10.), (14., 10.), (28., 10.), (42., 10.)];
+        let shifts = reorder_display_shifts(&spans, &positions, 4.);
+        assert_eq!(shifts, [0., 14., -14., 0.]);
+        assert_eq!(
+            shifts
+                .iter()
+                .map(|&shift| reorder_axis_offset(shift, ReorderAxis::Horizontal))
+                .collect::<Vec<_>>(),
+            [(0., 0.), (14., 0.), (-14., 0.), (0., 0.)]
+        );
+        assert_eq!(
+            shifts
+                .iter()
+                .map(|&shift| reorder_axis_offset(shift, ReorderAxis::Vertical))
+                .collect::<Vec<_>>(),
+            [(0., 0.), (0., 14.), (0., -14.), (0., 0.)]
+        );
+    }
+
+    #[test]
+    fn a_pointer_below_the_tab_strip_does_not_take_the_ghost_with_it() {
+        let strip = (260., 9., 400., 28.);
+        let size = (120., 28.);
+        let grab = (40., 14.);
+        let pointer = (400., 200.);
+        let origin = reorder_ghost_origin(pointer, grab, strip, size, ReorderAxis::Horizontal);
+        assert_eq!(origin, (360., 9.));
+        assert_ne!(
+            pointer.1 - grab.1,
+            origin.1,
+            "unclamped follow would drop the ghost into the terminal"
+        );
+    }
+
+    #[test]
+    fn a_pointer_beside_the_sidebar_does_not_take_the_ghost_with_it() {
+        let list = (8., 120., 236., 120.);
+        let size = (236., 30.);
+        let grab = (20., 10.);
+        let pointer = (600., 180.);
+        let origin = reorder_ghost_origin(pointer, grab, list, size, ReorderAxis::Vertical);
+        assert_eq!(origin.0, 8.);
+        assert_eq!(origin.1, 170.);
+    }
+
+    #[test]
+    fn ghost_origin_clamps_the_free_axis_to_the_list() {
+        let strip = (260., 9., 400., 28.);
+        let size = (120., 28.);
+        let grab = (40., 14.);
+        assert_eq!(
+            reorder_ghost_origin((0., 12.), grab, strip, size, ReorderAxis::Horizontal),
+            (260., 9.)
+        );
+        assert_eq!(
+            reorder_ghost_origin((900., 12.), grab, strip, size, ReorderAxis::Horizontal),
+            (540., 9.)
+        );
+        let list = (8., 120., 236., 120.);
+        let size = (236., 30.);
+        assert_eq!(
+            reorder_ghost_origin((20., 0.), grab, list, size, ReorderAxis::Vertical),
+            (8., 120.)
+        );
+        assert_eq!(
+            reorder_ghost_origin((20., 800.), grab, list, size, ReorderAxis::Vertical),
+            (8., 210.)
+        );
+    }
+
+    #[test]
     fn an_in_flight_tab_move_keeps_the_predicted_display_order() {
-        let order = tab_order();
-        let pending = pending_tab_reorder(&order);
-        let projection = tab_reorder_projection("w", &order, None, Some(&pending))
+        let order = item_order();
+        let pending = pending_list_reorder(tabs_list(), &order);
+        let projection = reorder_projection(&tabs_list(), &order, None, Some(&pending))
             .expect("the pending request must keep its release-time projection");
 
         assert_eq!(projection.positions, [0, 2, 1, 3]);
         assert_eq!(projection.previous_positions, projection.positions);
         assert_eq!(
             projection.motion,
-            TabReorderMotion::Settling {
+            ReorderMotion::Settling {
                 released_origin: (640., 18.)
             }
         );
     }
 
     #[test]
+    fn an_in_flight_workspace_move_uses_the_same_projection() {
+        let order = item_order();
+        let pending = pending_list_reorder(ReorderList::Workspaces, &order);
+        let projection = reorder_projection(&ReorderList::Workspaces, &order, None, Some(&pending))
+            .expect("workspaces settle with the same mapping as tabs");
+        assert_eq!(projection.positions, [0, 2, 1, 3]);
+    }
+
+    #[test]
     fn a_different_authoritative_order_overrides_the_pending_prediction() {
-        let original = tab_order();
-        let pending = pending_tab_reorder(&original);
+        let original = item_order();
+        let pending = pending_list_reorder(tabs_list(), &original);
         let authoritative = ["c", "a", "b", "d"].map(str::to_owned).to_vec();
 
         assert!(
-            tab_reorder_projection("w", &authoritative, None, Some(&pending)).is_none(),
+            reorder_projection(&tabs_list(), &authoritative, None, Some(&pending)).is_none(),
             "a prediction based on stale order must never mask the published order"
         );
     }
