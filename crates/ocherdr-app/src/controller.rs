@@ -3182,14 +3182,16 @@ impl OcHerdrView {
         let grab_offset = (pointer.0 - rect.0, pointer.1 - rect.1);
         self.end_text_drag();
         self.cancel_split_drag();
+        let hover = ReorderHover::Item {
+            index: source_index,
+            trailing: false,
+        };
         self.surface_drag = SurfaceDrag::Reorder(ReorderDrag {
             list,
             source_index,
             order,
-            hover: ReorderHover::Item {
-                index: source_index,
-                trailing: false,
-            },
+            previous_hover: hover,
+            hover,
             origin: pointer,
             pointer,
             grab_offset,
@@ -3242,7 +3244,7 @@ impl OcHerdrView {
             return;
         };
         let source_id = ids[source].clone();
-        self.submit_reorder(&ReorderList::Workspaces, source_id, insert_index, cx);
+        self.submit_reorder(&ReorderList::Workspaces, source_id, insert_index, None, cx);
     }
 
     /// The only path that asks Herdr to change an order. Holding the request in
@@ -3253,6 +3255,7 @@ impl OcHerdrView {
         list: &ReorderList,
         id: String,
         insert_index: usize,
+        settling_tab: Option<PendingTabReorder>,
         cx: &mut Context<Self>,
     ) {
         let (method, params) = match list {
@@ -3266,7 +3269,10 @@ impl OcHerdrView {
             ),
         };
         if let Some(request) = self.spawn_invoke(method, params, cx) {
-            self.pending_reorder = Some(PendingReorder { _request: request });
+            self.pending_reorder = Some(PendingReorder {
+                _request: request,
+                tab: settling_tab,
+            });
         }
     }
 
@@ -3310,7 +3316,10 @@ impl OcHerdrView {
             cx.notify();
             return true;
         };
-        drag.hover = hover;
+        if drag.hover != hover {
+            drag.previous_hover = drag.hover;
+            drag.hover = hover;
+        }
         self.surface_drag = SurfaceDrag::Reorder(drag);
         cx.notify();
         true
@@ -3338,7 +3347,20 @@ impl OcHerdrView {
             if let Some(insert_index) =
                 reorder_insert_index(drag.order.len(), drag.source_index, drag.hover)
             {
-                self.submit_reorder(&list, source_id.clone(), insert_index, cx);
+                let settling_tab = match &drag.list {
+                    ReorderList::Tabs { workspace_id } => Some(PendingTabReorder {
+                        workspace_id: workspace_id.clone(),
+                        order: drag.order.clone(),
+                        source_index: drag.source_index,
+                        hover: drag.hover,
+                        released_origin: (
+                            drag.pointer.0 - drag.grab_offset.0,
+                            drag.pointer.1 - drag.grab_offset.1,
+                        ),
+                    }),
+                    ReorderList::Workspaces => None,
+                };
+                self.submit_reorder(&list, source_id.clone(), insert_index, settling_tab, cx);
             }
         }
         self.select_reorder_source(&list, source_id, cx);
@@ -6488,6 +6510,7 @@ mod tests {
                 .iter()
                 .map(|workspace| workspace.workspace_id.clone())
                 .collect(),
+            previous_hover: ReorderHover::AfterLast,
             hover: ReorderHover::AfterLast,
             origin: (0., 0.),
             pointer: (0., 0.),

@@ -2,14 +2,15 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
     AgentInfo, AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent,
     HierarchySnapshot, LayoutRect, LayoutSplit, PaneInfo, ReorderHover, Selection, SessionSummary,
-    SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, split_ratio_from_drag,
+    SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, reorder_insert_index,
+    split_ratio_from_drag,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -23,12 +24,12 @@ use ochub_ui::components::{
     modal_card, modal_footer, modal_header, modal_overlay, spinner, status_dot,
 };
 use ochub_ui::gpui::{
-    App, AppContext, AssetSource, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, Task, TitlebarOptions, UTF16Selection, WeakEntity, Window,
-    WindowAppearance, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, relative,
-    size, surface,
+    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Task,
+    TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds,
+    WindowOptions, canvas, div, ease_out_quint, point, prelude::*, px, relative, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
@@ -59,6 +60,8 @@ const SPLIT_HANDLE_HIT_PX: f32 = 10.;
 const SPLIT_HANDLE_VISUAL_PX: f32 = 4.;
 const REORDER_SLOP_PX: f32 = 4.;
 const REORDER_INDICATOR_PX: f32 = 2.;
+const TAB_REORDER_GAP_PX: f32 = 4.;
+const TAB_REORDER_ANIMATION: Duration = Duration::from_millis(180);
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -809,6 +812,20 @@ enum SurfaceDrag {
 /// here is what keeps it alive, so dropping this drops the request too.
 struct PendingReorder {
     _request: Task<()>,
+    /// Tabs keep the release-time projection visible until Herdr publishes
+    /// the authoritative order. Workspace reorders remain line-based.
+    tab: Option<PendingTabReorder>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingTabReorder {
+    workspace_id: String,
+    order: Vec<String>,
+    source_index: usize,
+    hover: ReorderHover,
+    /// Window-local origin of the drag ghost at mouse-up. The real tab starts
+    /// here and settles into the projected empty slot.
+    released_origin: (f32, f32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -817,6 +834,9 @@ struct ReorderDrag {
     source_index: usize,
     /// Ids in list order at press. Membership or order change cancels.
     order: Vec<String>,
+    /// The prior gap lets each new declarative animation start where the last
+    /// one ended instead of replaying from the authoritative layout.
+    previous_hover: ReorderHover,
     hover: ReorderHover,
     origin: (f32, f32),
     pointer: (f32, f32),
@@ -846,6 +866,101 @@ struct ReorderSpan {
 fn reorder_past_slop(drag: &ReorderDrag) -> bool {
     (drag.pointer.0 - drag.origin.0).abs() > REORDER_SLOP_PX
         || (drag.pointer.1 - drag.origin.1).abs() > REORDER_SLOP_PX
+}
+
+fn reorder_display_positions(
+    order: &[String],
+    source_index: usize,
+    hover: ReorderHover,
+) -> Vec<usize> {
+    let mut positions = (0..order.len()).collect::<Vec<_>>();
+    let Some(insert_index) = reorder_insert_index(order.len(), source_index, hover) else {
+        return positions;
+    };
+    let destination = if insert_index > source_index {
+        insert_index - 1
+    } else {
+        insert_index
+    };
+    positions[source_index] = destination;
+    if destination < source_index {
+        for position in &mut positions[destination..source_index] {
+            *position += 1;
+        }
+    } else {
+        for position in &mut positions[source_index + 1..=destination] {
+            *position -= 1;
+        }
+    }
+    positions
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TabReorderMotion {
+    Dragging,
+    Settling { released_origin: (f32, f32) },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TabReorderProjection {
+    source_id: String,
+    source_index: usize,
+    positions: Vec<usize>,
+    previous_positions: Vec<usize>,
+    motion: TabReorderMotion,
+}
+
+/// Derive tab positions without mutating the authoritative snapshot. The same
+/// mapping drives both pointer-time squeezing and the request-time settle. A
+/// changed authoritative order always wins over a prediction based on stale
+/// input, including an order published by another client.
+fn tab_reorder_projection(
+    workspace_id: &str,
+    authoritative_order: &[String],
+    drag: Option<&ReorderDrag>,
+    pending: Option<&PendingTabReorder>,
+) -> Option<TabReorderProjection> {
+    let dragging = drag.and_then(|drag| {
+        let ReorderList::Tabs {
+            workspace_id: drag_workspace,
+        } = &drag.list
+        else {
+            return None;
+        };
+        if drag_workspace != workspace_id || !reorder_past_slop(drag) {
+            return None;
+        }
+        Some((
+            drag.order.as_slice(),
+            drag.source_index,
+            drag.previous_hover,
+            drag.hover,
+            TabReorderMotion::Dragging,
+        ))
+    });
+    let pending = pending.and_then(|pending| {
+        (pending.workspace_id == workspace_id).then_some((
+            pending.order.as_slice(),
+            pending.source_index,
+            pending.hover,
+            pending.hover,
+            TabReorderMotion::Settling {
+                released_origin: pending.released_origin,
+            },
+        ))
+    });
+    let (order, source_index, previous_hover, hover, motion) = dragging.or(pending)?;
+    if order != authoritative_order {
+        return None;
+    }
+    let source_id = order.get(source_index)?.clone();
+    Some(TabReorderProjection {
+        source_id,
+        source_index,
+        positions: reorder_display_positions(order, source_index, hover),
+        previous_positions: reorder_display_positions(order, source_index, previous_hover),
+        motion,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1268,6 +1383,115 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tab_order() -> Vec<String> {
+        ["a", "b", "c", "d"].map(str::to_owned).to_vec()
+    }
+
+    fn pending_tab_reorder(order: &[String]) -> PendingTabReorder {
+        PendingTabReorder {
+            workspace_id: "w".into(),
+            order: order.to_vec(),
+            source_index: 1,
+            hover: ReorderHover::Item {
+                index: 2,
+                trailing: true,
+            },
+            released_origin: (640., 18.),
+        }
+    }
+
+    #[test]
+    fn tab_display_positions_stay_put_before_crossing_a_midpoint() {
+        assert_eq!(
+            reorder_display_positions(
+                &tab_order(),
+                1,
+                ReorderHover::Item {
+                    index: 1,
+                    trailing: false,
+                },
+            ),
+            [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn tab_display_positions_move_the_crossed_right_neighbor_into_the_hole() {
+        assert_eq!(
+            reorder_display_positions(
+                &tab_order(),
+                1,
+                ReorderHover::Item {
+                    index: 2,
+                    trailing: true,
+                },
+            ),
+            [0, 2, 1, 3]
+        );
+    }
+
+    #[test]
+    fn tab_display_positions_move_the_crossed_left_neighbor_into_the_hole() {
+        assert_eq!(
+            reorder_display_positions(
+                &tab_order(),
+                2,
+                ReorderHover::Item {
+                    index: 1,
+                    trailing: false,
+                },
+            ),
+            [0, 2, 1, 3]
+        );
+    }
+
+    #[test]
+    fn tab_display_positions_stay_in_bounds_at_both_ends() {
+        for (source_index, hover) in [
+            (
+                2,
+                ReorderHover::Item {
+                    index: 0,
+                    trailing: false,
+                },
+            ),
+            (0, ReorderHover::AfterLast),
+        ] {
+            let positions = reorder_display_positions(&tab_order(), source_index, hover);
+            assert_eq!(positions.len(), 4);
+            assert!(positions.into_iter().all(|position| position < 4));
+        }
+    }
+
+    #[test]
+    fn an_in_flight_tab_move_keeps_the_predicted_display_order() {
+        let order = tab_order();
+        let pending = pending_tab_reorder(&order);
+        let projection = tab_reorder_projection("w", &order, None, Some(&pending))
+            .expect("the pending request must keep its release-time projection");
+
+        assert_eq!(projection.positions, [0, 2, 1, 3]);
+        assert_eq!(projection.previous_positions, projection.positions);
+        assert_eq!(
+            projection.motion,
+            TabReorderMotion::Settling {
+                released_origin: (640., 18.)
+            }
+        );
+    }
+
+    #[test]
+    fn a_different_authoritative_order_overrides_the_pending_prediction() {
+        let original = tab_order();
+        let pending = pending_tab_reorder(&original);
+        let authoritative = ["c", "a", "b", "d"].map(str::to_owned).to_vec();
+
+        assert!(
+            tab_reorder_projection("w", &authoritative, None, Some(&pending)).is_none(),
+            "a prediction based on stale order must never mask the published order"
+        );
+    }
 
     #[test]
     fn legacy_connection_settings_receive_the_default_appearance() {
