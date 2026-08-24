@@ -334,6 +334,59 @@ pub fn split_ratio_from_drag(direction: SplitDirection, rect: LayoutRect, pointe
     ((pointer - f32::from(origin)) / f32::from(size)).clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX)
 }
 
+/// Pointer placement on a list that still contains the dragged item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReorderHover {
+    /// Over the item currently at `index`. `trailing` is the trailing half
+    /// (below in a vertical list, right in a horizontal list).
+    Item { index: usize, trailing: bool },
+    /// Past the last item's trailing edge.
+    AfterLast,
+}
+
+/// Map a live-list drop to Herdr's pre-removal `insert_index`.
+///
+/// Herdr removes `source` first, then inserts (`insert_index == len` is after
+/// the last item). A drop after an item that follows `source` must use the
+/// live index plus one: the items after the hole shift forward, and sending
+/// the remaining-list index would make Herdr subtract one again and no-op.
+pub fn reorder_insert_index(len: usize, source: usize, hover: ReorderHover) -> Option<usize> {
+    let insert = match hover {
+        ReorderHover::AfterLast => len,
+        ReorderHover::Item { index, trailing } => {
+            if trailing {
+                index + 1
+            } else {
+                index
+            }
+        }
+    };
+    if insert == source || insert == source + 1 {
+        None
+    } else {
+        Some(insert)
+    }
+}
+
+/// `spans` are `(origin, extent)` along the list axis, in live-list order.
+pub fn reorder_hover_along_axis(spans: &[(f32, f32)], pointer: f32) -> ReorderHover {
+    for (index, &(origin, extent)) in spans.iter().enumerate() {
+        if pointer < origin + extent * 0.5 {
+            return ReorderHover::Item {
+                index,
+                trailing: false,
+            };
+        }
+        if pointer < origin + extent {
+            return ReorderHover::Item {
+                index,
+                trailing: true,
+            };
+        }
+    }
+    ReorderHover::AfterLast
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaneLayout {
     pub workspace_id: String,
@@ -597,6 +650,93 @@ mod tests {
         assert_eq!(parse_split_path_id("split_1_0"), Some(vec![false]));
         assert_eq!(parse_split_path_id("split_2_01"), Some(vec![false, true]));
         assert_eq!(parse_split_path_id("pane-1"), None);
+    }
+
+    #[test]
+    fn dropping_before_the_first_item_inserts_at_zero() {
+        assert_eq!(
+            reorder_insert_index(
+                3,
+                1,
+                ReorderHover::Item {
+                    index: 0,
+                    trailing: false
+                }
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn dropping_after_the_last_item_inserts_at_len() {
+        assert_eq!(reorder_insert_index(3, 0, ReorderHover::AfterLast), Some(3));
+    }
+
+    #[test]
+    fn dragging_down_past_self_skips_the_vacated_index() {
+        // [A, B, C], drag A after B. Remaining is [B, C]; after B is remaining
+        // gap 1. Herdr wants the pre-removal slot 2 — sending 1 no-ops after
+        // removing A.
+        assert_eq!(
+            reorder_insert_index(
+                3,
+                0,
+                ReorderHover::Item {
+                    index: 1,
+                    trailing: true
+                }
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn dropping_on_the_original_slot_does_not_move() {
+        assert_eq!(
+            reorder_insert_index(
+                3,
+                1,
+                ReorderHover::Item {
+                    index: 1,
+                    trailing: false
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            reorder_insert_index(
+                3,
+                1,
+                ReorderHover::Item {
+                    index: 1,
+                    trailing: true
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn reorder_hover_along_axis_uses_item_midpoints_and_past_the_end() {
+        let spans = [(10., 10.), (20., 10.), (30., 10.)];
+        assert_eq!(
+            reorder_hover_along_axis(&spans, 14.),
+            ReorderHover::Item {
+                index: 0,
+                trailing: false
+            }
+        );
+        assert_eq!(
+            reorder_hover_along_axis(&spans, 26.),
+            ReorderHover::Item {
+                index: 1,
+                trailing: true
+            }
+        );
+        assert_eq!(
+            reorder_hover_along_axis(&spans, 40.),
+            ReorderHover::AfterLast
+        );
     }
 
     #[test]

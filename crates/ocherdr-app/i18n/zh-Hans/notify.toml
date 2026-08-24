@@ -44,6 +44,7 @@
 "notify.spawn_terminal" = "无法打开终端窗格"
 "notify.tab_close" = "无法关闭标签页"
 "notify.tab_create" = "无法创建标签页"
+"notify.tab_move" = "无法重排标签页"
 "notify.tab_rename" = "无法重命名标签页"
 "notify.terminal_runtime" = "终端运行时出错"
 "notify.terminal_stream" = "终端数据流出错"
@@ -54,4 +55,5 @@
 "notify.worktree_remove" = "无法移除工作树"
 "notify.workspace_close" = "无法关闭工作区"
 "notify.workspace_create" = "无法创建工作区"
+"notify.workspace_move" = "无法重排工作区"
 "notify.workspace_rename" = "无法重命名工作区"

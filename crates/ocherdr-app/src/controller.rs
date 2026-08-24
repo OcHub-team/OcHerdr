@@ -9,6 +9,7 @@ use futures::pin_mut;
 use ocherdr_core::{
     AGENT_STATUS_HANDOFF_LIMIT, AgentStatusHandoff, agent_status_panes_after_stream_closed,
     agent_status_stream_should_rebuild, event_panes_after_failed_subscribe,
+    reorder_hover_along_axis, reorder_insert_index,
 };
 use ocherdr_herdr::{TerminalFrame, next_batch, subscribe_agent_status};
 
@@ -67,6 +68,8 @@ impl OcHerdrView {
             appearance_scroll: ScrollHandle::new(),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
+            pending_reorder: None,
+            reorder_metrics: ReorderMetrics::default(),
             terminal_surface_bounds: None,
             ime_marked: None,
             rename_input: cx.new(|cx| TextInput::new(cx, i18n.text(k::COMMON_NAME))),
@@ -123,8 +126,14 @@ impl OcHerdrView {
         detail: impl std::fmt::Display,
         cx: &mut Context<Self>,
     ) {
-        if method == "layout.set_split_ratio" {
-            self.notify_failure(FailureKind::SetSplitRatio, detail, cx);
+        let kind = match method {
+            "layout.set_split_ratio" => Some(FailureKind::SetSplitRatio),
+            "workspace.move" => Some(FailureKind::MoveWorkspace),
+            "tab.move" => Some(FailureKind::MoveTab),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            self.notify_failure(kind, detail, cx);
             return;
         }
         self.post_notice(
@@ -480,6 +489,9 @@ impl OcHerdrView {
         if !matches!(overlay, Overlay::WorktreeOpen(_)) {
             self.worktree_list_task = None;
         }
+        if !matches!(overlay, Overlay::None) {
+            self.cancel_reorder_drag();
+        }
         let leaving_host_center = self.overlay.host_center() && !overlay.host_center();
         let form = match overlay {
             Overlay::RemoteForm(form) => Some(form),
@@ -590,13 +602,18 @@ impl OcHerdrView {
                 self.ensure_session_terminals(cx);
             }
         }
+        if effects.settle_reorder {
+            self.pending_reorder = None;
+        }
         if effects.notify {
             cx.notify();
         }
         if matches!(action, EventPollAction::Disconnect(_)) {
             self.cancel_split_drag();
+            self.cancel_reorder_drag();
         }
         self.reconcile_split_drag(cx);
+        self.reconcile_reorder_drag(cx);
         if let Some(stream) = action.event_stream() {
             self.event_stream = stream;
             cx.notify();
@@ -725,6 +742,7 @@ impl OcHerdrView {
             resync |= effects.resync;
         }
         self.reconcile_split_drag(cx);
+        self.reconcile_reorder_drag(cx);
         if resync {
             self.resync_snapshot(self.event_epoch, cx);
         }
@@ -816,6 +834,7 @@ impl OcHerdrView {
                             .unwrap_or_default();
                         this.snapshot = Some(snapshot);
                         this.reconcile_split_drag(cx);
+                        this.reconcile_reorder_drag(cx);
                         if worktree_open_target_is_missing(&this.overlay, this.snapshot.as_ref()) {
                             this.abandon_worktree_list();
                         }
@@ -1306,6 +1325,7 @@ impl OcHerdrView {
         self.abandon_worktree_list();
         self.session_index = Some(index);
         self.cancel_split_drag();
+        self.cancel_reorder_drag();
         self.reload(Some(session.name), cx);
     }
 
@@ -1328,6 +1348,7 @@ impl OcHerdrView {
 
     pub(super) fn select_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
         self.cancel_split_drag();
+        self.cancel_reorder_drag();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1350,6 +1371,7 @@ impl OcHerdrView {
 
     pub(super) fn select_tab(&mut self, tab_id: String, cx: &mut Context<Self>) {
         self.cancel_split_drag();
+        self.cancel_reorder_drag();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -2245,6 +2267,8 @@ impl OcHerdrView {
             ("j", false) => self.focus_pane_direction("down", cx),
             ("k", false) => self.focus_pane_direction("up", cx),
             ("l", false) => self.focus_pane_direction("right", cx),
+            ("j" | "down", true) => self.move_selected_workspace(1, cx),
+            ("k" | "up", true) => self.move_selected_workspace(-1, cx),
             _ => {
                 if let Some(number) =
                     tab_index_from_keystroke(key, event.keystroke.key_char.as_deref())
@@ -2436,7 +2460,10 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(self.surface_drag, SurfaceDrag::Split(_)) {
+        if matches!(
+            self.surface_drag,
+            SurfaceDrag::Split(_) | SurfaceDrag::Reorder(_)
+        ) {
             return;
         }
         self.end_text_drag_unless_pane(&pane_id);
@@ -2482,6 +2509,10 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
+        if self.update_reorder_drag(mouse_point(event.position), cx) {
+            cx.stop_propagation();
+            return;
+        }
         let SurfaceDrag::Text { pane_id } = &self.surface_drag else {
             return;
         };
@@ -2515,6 +2546,10 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) {
         if self.finish_split_drag(mouse_point(event.position), cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.finish_reorder_drag(mouse_point(event.position), cx) {
             cx.stop_propagation();
             return;
         }
@@ -2558,6 +2593,7 @@ impl OcHerdrView {
             return;
         };
         self.end_text_drag();
+        self.cancel_reorder_drag();
         self.surface_drag = SurfaceDrag::Split(drag);
         cx.stop_propagation();
         cx.notify();
@@ -2675,6 +2711,319 @@ impl OcHerdrView {
         true
     }
 
+    pub(super) fn press_workspace_row(
+        &mut self,
+        workspace_id: String,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.overlay, Overlay::None) {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let order = snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.workspace_id.clone())
+            .collect::<Vec<_>>();
+        let Some(source_index) = order.iter().position(|id| id == &workspace_id) else {
+            return;
+        };
+        if order.len() < 2 {
+            self.select_workspace(workspace_id, cx);
+            return;
+        }
+        self.begin_reorder(ReorderList::Workspaces, source_index, order, event, cx);
+    }
+
+    pub(super) fn press_tab_pill(
+        &mut self,
+        tab_id: String,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.overlay, Overlay::None) {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(workspace_id) = snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| tab.workspace_id.clone())
+        else {
+            return;
+        };
+        let order = snapshot
+            .tabs_for(&workspace_id)
+            .map(|tab| tab.tab_id.clone())
+            .collect::<Vec<_>>();
+        let Some(source_index) = order.iter().position(|id| id == &tab_id) else {
+            return;
+        };
+        if order.len() < 2 {
+            self.select_tab(tab_id, cx);
+            return;
+        }
+        self.begin_reorder(
+            ReorderList::Tabs { workspace_id },
+            source_index,
+            order,
+            event,
+            cx,
+        );
+    }
+
+    fn begin_reorder(
+        &mut self,
+        list: ReorderList,
+        source_index: usize,
+        order: Vec<String>,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let source_id = order[source_index].clone();
+        // Herdr owns the order. While it is publishing a move, a new drag would
+        // compute its index from a list that is about to be replaced.
+        if self.pending_reorder.is_some() {
+            self.select_reorder_source(&list, source_id, cx);
+            return;
+        }
+        // A drag needs the row it grabbed. Without a measured rect there is no
+        // grab offset and no hover, and inventing one puts the ghost and the
+        // insertion line somewhere the pointer never was.
+        let Some(rect) = self.span_for(&list, &source_id) else {
+            self.select_reorder_source(&list, source_id, cx);
+            return;
+        };
+        let pointer = mouse_point(event.position);
+        let grab_offset = (pointer.0 - rect.0, pointer.1 - rect.1);
+        self.end_text_drag();
+        self.cancel_split_drag();
+        self.surface_drag = SurfaceDrag::Reorder(ReorderDrag {
+            list,
+            source_index,
+            order,
+            hover: ReorderHover::Item {
+                index: source_index,
+                trailing: false,
+            },
+            origin: pointer,
+            pointer,
+            grab_offset,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn move_selected_workspace(&mut self, delta: isize, cx: &mut Context<Self>) {
+        // Same reason as `begin_reorder`: the index would come from a list
+        // Herdr is about to replace.
+        if self.pending_reorder.is_some() {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let ids = snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.workspace_id.clone())
+            .collect::<Vec<_>>();
+        let Some(source) = self
+            .selection
+            .workspace_id
+            .as_ref()
+            .and_then(|id| ids.iter().position(|candidate| candidate == id))
+        else {
+            return;
+        };
+        let hover = if delta < 0 {
+            if source == 0 {
+                return;
+            }
+            ReorderHover::Item {
+                index: source - 1,
+                trailing: false,
+            }
+        } else {
+            let next = source + 1;
+            if next >= ids.len() {
+                return;
+            }
+            ReorderHover::Item {
+                index: next,
+                trailing: true,
+            }
+        };
+        let Some(insert_index) = reorder_insert_index(ids.len(), source, hover) else {
+            return;
+        };
+        let source_id = ids[source].clone();
+        self.submit_reorder(&ReorderList::Workspaces, source_id, insert_index, cx);
+    }
+
+    /// The only path that asks Herdr to change an order. Holding the request in
+    /// `pending_reorder` is what stops a second reorder from being computed
+    /// against the list this one is replacing.
+    fn submit_reorder(
+        &mut self,
+        list: &ReorderList,
+        id: String,
+        insert_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let (method, params) = match list {
+            ReorderList::Workspaces => (
+                "workspace.move",
+                json!({ "workspace_id": id, "insert_index": insert_index }),
+            ),
+            ReorderList::Tabs { .. } => (
+                "tab.move",
+                json!({ "tab_id": id, "insert_index": insert_index }),
+            ),
+        };
+        if let Some(request) = self.spawn_invoke(method, params, cx) {
+            self.pending_reorder = Some(PendingReorder { _request: request });
+        }
+    }
+
+    fn cancel_reorder_drag(&mut self) {
+        if matches!(self.surface_drag, SurfaceDrag::Reorder(_)) {
+            self.surface_drag = SurfaceDrag::Idle;
+        }
+    }
+
+    fn take_reorder_drag(&mut self) -> Option<ReorderDrag> {
+        match std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle) {
+            SurfaceDrag::Reorder(drag) => Some(drag),
+            other => {
+                self.surface_drag = other;
+                None
+            }
+        }
+    }
+
+    fn reconcile_reorder_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.take_reorder_drag() else {
+            return;
+        };
+        if let SurfaceDrag::Reorder(drag) =
+            reconcile_reorder_drag_state(drag, self.snapshot.as_ref())
+        {
+            self.surface_drag = SurfaceDrag::Reorder(drag);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn update_reorder_drag(&mut self, mouse: (f32, f32), cx: &mut Context<Self>) -> bool {
+        let Some(mut drag) = self.take_reorder_drag() else {
+            return false;
+        };
+        drag.pointer = mouse;
+        // Rows left the layout mid-drag. Keeping the last hover would aim the
+        // insertion line at a position that is no longer on screen.
+        let Some(hover) = self.reorder_hover_for(&drag) else {
+            cx.notify();
+            return true;
+        };
+        drag.hover = hover;
+        self.surface_drag = SurfaceDrag::Reorder(drag);
+        cx.notify();
+        true
+    }
+
+    fn finish_reorder_drag(&mut self, mouse: (f32, f32), cx: &mut Context<Self>) -> bool {
+        let Some(mut drag) = self.take_reorder_drag() else {
+            return false;
+        };
+        drag.pointer = mouse;
+        let source_id = drag.order[drag.source_index].clone();
+        let list = drag.list.clone();
+        let Some(hover) = self.reorder_hover_for(&drag) else {
+            self.select_reorder_source(&list, source_id, cx);
+            return true;
+        };
+        drag.hover = hover;
+        if reorder_past_slop(&drag) {
+            let SurfaceDrag::Reorder(drag) =
+                reconcile_reorder_drag_state(drag, self.snapshot.as_ref())
+            else {
+                self.select_reorder_source(&list, source_id, cx);
+                return true;
+            };
+            if let Some(insert_index) =
+                reorder_insert_index(drag.order.len(), drag.source_index, drag.hover)
+            {
+                self.submit_reorder(&list, source_id.clone(), insert_index, cx);
+            }
+        }
+        self.select_reorder_source(&list, source_id, cx);
+        true
+    }
+
+    fn select_reorder_source(
+        &mut self,
+        list: &ReorderList,
+        source_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        match list {
+            ReorderList::Workspaces => self.select_workspace(source_id, cx),
+            ReorderList::Tabs { .. } => self.select_tab(source_id, cx),
+        }
+    }
+
+    fn reorder_hover_for(&self, drag: &ReorderDrag) -> Option<ReorderHover> {
+        let spans = self.spans_along_axis(&drag.list, &drag.order)?;
+        let pointer = match drag.list {
+            ReorderList::Workspaces => drag.pointer.1,
+            ReorderList::Tabs { .. } => drag.pointer.0,
+        };
+        Some(reorder_hover_along_axis(&spans, pointer))
+    }
+
+    fn spans_along_axis(&self, list: &ReorderList, order: &[String]) -> Option<Vec<(f32, f32)>> {
+        let mut spans = Vec::with_capacity(order.len());
+        for id in order {
+            let rect = self.span_for(list, id)?;
+            spans.push(match list {
+                ReorderList::Workspaces => (rect.1, rect.3),
+                ReorderList::Tabs { .. } => (rect.0, rect.2),
+            });
+        }
+        Some(spans)
+    }
+
+    fn span_for(&self, list: &ReorderList, id: &str) -> Option<(f32, f32, f32, f32)> {
+        let spans = match list {
+            ReorderList::Workspaces => &self.reorder_metrics.workspaces,
+            ReorderList::Tabs { .. } => &self.reorder_metrics.tabs,
+        };
+        spans
+            .iter()
+            .find(|span| span.id == id)
+            .map(|span| span.rect)
+    }
+
+    pub(super) fn note_reorder_span(&mut self, tabs: bool, id: String, rect: (f32, f32, f32, f32)) {
+        let spans = if tabs {
+            &mut self.reorder_metrics.tabs
+        } else {
+            &mut self.reorder_metrics.workspaces
+        };
+        if let Some(existing) = spans.iter_mut().find(|span| span.id == id) {
+            existing.rect = rect;
+        } else {
+            spans.push(ReorderSpan { id, rect });
+        }
+    }
+
     pub(super) fn copy_selection(&mut self, cx: &mut Context<Self>) {
         let Some(pane_id) = self.selection.pane_id.clone() else {
             return;
@@ -2739,12 +3088,23 @@ impl OcHerdrView {
     }
 
     pub(super) fn invoke(&mut self, method: &'static str, params: Value, cx: &mut Context<Self>) {
-        let Some(connection) = &self.connection else {
-            return;
-        };
+        if let Some(request) = self.spawn_invoke(method, params, cx) {
+            request.detach();
+        }
+    }
+
+    /// Same request as `invoke`, but the caller keeps the task so it can tie the
+    /// request's lifetime to the state that request is allowed to block.
+    fn spawn_invoke(
+        &mut self,
+        method: &'static str,
+        params: Value,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<()>> {
+        let connection = self.connection.as_ref()?;
         let socket = connection.socket_path().to_owned();
         self.operation = Some(self.i18n.running_operation(method).into());
-        cx.spawn(async move |this, cx| {
+        Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn({
                     let params = params.clone();
@@ -2760,6 +3120,9 @@ impl OcHerdrView {
                         }
                     }
                     Err(error) => {
+                        // A rejected move never produces a `moved` event, so the
+                        // gate has to open here or it would never open at all.
+                        this.pending_reorder = None;
                         this.maybe_offer_force_remove_worktree(&params, &error, cx);
                         this.notify_command_failure(method, error, cx);
                     }
@@ -2767,8 +3130,7 @@ impl OcHerdrView {
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }))
     }
 
     pub(super) fn accepts_ime(&self) -> bool {
@@ -3125,7 +3487,11 @@ enum EventPollAction {
     /// Replace Live with Lost. A dead stream has nothing left to poll.
     Disconnect(SharedString),
     Idle,
-    Applied,
+    Applied {
+        /// A `workspace.moved` / `tab.moved` landed, so Herdr has published the
+        /// order a pending reorder was waiting for.
+        reordered: bool,
+    },
     Resync {
         error: Option<SharedString>,
     },
@@ -3140,6 +3506,9 @@ struct PollEffects {
     /// Drop `worktree_list_task` and its Loading overlay. A dead stream
     /// keeps the same session id, so the list callback would otherwise apply.
     abandon_worktree_list: bool,
+    /// Release the reorder gate: the authoritative order has arrived, is being
+    /// refetched, or will never arrive because the stream died.
+    settle_reorder: bool,
     error: Option<SharedString>,
 }
 
@@ -3151,6 +3520,7 @@ fn effects_for(action: &EventPollAction) -> PollEffects {
             notify: true,
             reschedule: false,
             abandon_worktree_list: true,
+            settle_reorder: true,
             error: None,
         },
         EventPollAction::Idle => PollEffects {
@@ -3159,14 +3529,16 @@ fn effects_for(action: &EventPollAction) -> PollEffects {
             notify: false,
             reschedule: true,
             abandon_worktree_list: false,
+            settle_reorder: false,
             error: None,
         },
-        EventPollAction::Applied => PollEffects {
+        EventPollAction::Applied { reordered } => PollEffects {
             resync: false,
             apply_local: true,
             notify: true,
             reschedule: true,
             abandon_worktree_list: false,
+            settle_reorder: *reordered,
             error: None,
         },
         EventPollAction::Resync { error } => PollEffects {
@@ -3174,6 +3546,7 @@ fn effects_for(action: &EventPollAction) -> PollEffects {
             apply_local: false,
             notify: false,
             reschedule: true,
+            settle_reorder: true,
             abandon_worktree_list: false,
             error: error.clone(),
         },
@@ -3184,7 +3557,7 @@ impl EventPollAction {
     fn event_stream(&self) -> Option<EventStreamState> {
         match self {
             Self::Disconnect(detail) => Some(EventStreamState::Lost(detail.clone())),
-            Self::Idle | Self::Applied | Self::Resync { .. } => None,
+            Self::Idle | Self::Applied { .. } | Self::Resync { .. } => None,
         }
     }
 }
@@ -3207,11 +3580,20 @@ fn poll_event_stream(
 ) -> EventPollAction {
     let mut seen = false;
     let mut resync = false;
+    let mut reordered = false;
     let mut error = None;
     for _ in 0..128 {
         match next() {
             Ok(Some(event)) => {
                 seen = true;
+                // Every event that republishes a whole order settles a pending
+                // reorder, whichever command produced it.
+                reordered |= matches!(
+                    event,
+                    HerdrEvent::WorkspaceMoved { .. }
+                        | HerdrEvent::WorkspaceReordered { .. }
+                        | HerdrEvent::TabMoved { .. }
+                );
                 if snapshot.apply(&event) == SnapshotUpdate::Resync {
                     resync = true;
                 }
@@ -3227,7 +3609,7 @@ fn poll_event_stream(
     if resync {
         EventPollAction::Resync { error }
     } else if seen {
-        EventPollAction::Applied
+        EventPollAction::Applied { reordered }
     } else {
         EventPollAction::Idle
     }
@@ -3348,6 +3730,44 @@ fn reconcile_split_drag_state(
 ) -> SurfaceDrag {
     if snapshot.is_some_and(|snapshot| split_drag_survives_layout(&drag, snapshot)) {
         SurfaceDrag::Split(drag)
+    } else {
+        SurfaceDrag::Idle
+    }
+}
+
+fn reorder_live_ids(list: &ReorderList, snapshot: &HierarchySnapshot) -> Option<Vec<String>> {
+    match list {
+        ReorderList::Workspaces => Some(
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.workspace_id.clone())
+                .collect(),
+        ),
+        ReorderList::Tabs { workspace_id } => {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| &workspace.workspace_id == workspace_id)?;
+            Some(
+                snapshot
+                    .tabs_for(workspace_id)
+                    .map(|tab| tab.tab_id.clone())
+                    .collect(),
+            )
+        }
+    }
+}
+
+fn reconcile_reorder_drag_state(
+    drag: ReorderDrag,
+    snapshot: Option<&HierarchySnapshot>,
+) -> SurfaceDrag {
+    let Some(live) = snapshot.and_then(|snapshot| reorder_live_ids(&drag.list, snapshot)) else {
+        return SurfaceDrag::Idle;
+    };
+    if live == drag.order {
+        SurfaceDrag::Reorder(drag)
     } else {
         SurfaceDrag::Idle
     }
@@ -4345,6 +4765,8 @@ mod tests {
             "pane.zoom",
             "pane.focus_direction",
             "layout.set_split_ratio",
+            "workspace.move",
+            "tab.move",
             "worktree.create",
             "worktree.open",
             "worktree.remove",
@@ -4582,7 +5004,7 @@ mod tests {
             ),
             "disconnect must clear the Loading overlay, not leave it for a stale list result"
         );
-        assert!(!effects_for(&EventPollAction::Applied).abandon_worktree_list);
+        assert!(!effects_for(&EventPollAction::Applied { reordered: false }).abandon_worktree_list);
         assert!(!effects_for(&EventPollAction::Idle).abandon_worktree_list);
         assert!(!effects_for(&EventPollAction::Resync { error: None }).abandon_worktree_list);
         let closed_worker = EventPollAction::Disconnect("event worker stopped".into());
@@ -4717,7 +5139,7 @@ mod tests {
         ]
         .into_iter();
         let action = poll_event_stream(&mut snapshot, || events.next().unwrap());
-        assert_eq!(action, EventPollAction::Applied);
+        assert_eq!(action, EventPollAction::Applied { reordered: false });
         assert!(!effects_for(&action).resync);
         assert!(effects_for(&action).apply_local);
         assert!(effects_for(&action).reschedule);
@@ -4726,8 +5148,55 @@ mod tests {
     }
 
     #[test]
+    fn only_an_order_publishing_event_reports_a_settled_reorder() {
+        let mut snapshot = two_tab_snapshot();
+        let mut updated = snapshot.panes[0].clone();
+        updated.revision = 9;
+        let mut events = vec![
+            Ok(Some(HerdrEvent::PaneUpdated { pane: updated })),
+            Ok(None),
+        ]
+        .into_iter();
+        assert_eq!(
+            poll_event_stream(&mut snapshot, || events.next().unwrap()),
+            EventPollAction::Applied { reordered: false },
+            "a pane update leaves the order alone, so a pending reorder is still pending"
+        );
+
+        let workspaces = snapshot.workspaces.clone();
+        let mut events = vec![
+            Ok(Some(HerdrEvent::WorkspaceMoved {
+                workspace_id: "w".into(),
+                insert_index: 0,
+                workspaces,
+            })),
+            Ok(None),
+        ]
+        .into_iter();
+        assert_eq!(
+            poll_event_stream(&mut snapshot, || events.next().unwrap()),
+            EventPollAction::Applied { reordered: true }
+        );
+    }
+
+    #[test]
+    fn a_pending_reorder_is_released_by_everything_except_an_empty_poll() {
+        assert!(effects_for(&EventPollAction::Applied { reordered: true }).settle_reorder);
+        assert!(effects_for(&EventPollAction::Resync { error: None }).settle_reorder);
+        assert!(
+            effects_for(&EventPollAction::Disconnect("stream died".into())).settle_reorder,
+            "a dead stream will never deliver the moved event, so the gate must open"
+        );
+        assert!(!effects_for(&EventPollAction::Applied { reordered: false }).settle_reorder);
+        assert!(
+            !effects_for(&EventPollAction::Idle).settle_reorder,
+            "an empty poll says nothing about the request still in flight"
+        );
+    }
+
+    #[test]
     fn applied_poll_effects_do_not_resync() {
-        let applied = effects_for(&EventPollAction::Applied);
+        let applied = effects_for(&EventPollAction::Applied { reordered: false });
         assert!(!applied.resync);
         assert!(applied.apply_local);
         assert!(applied.notify);
@@ -5438,6 +5907,57 @@ mod tests {
         assert!(matches!(
             reconcile_split_drag_state(split_drag_at(&before, 1), Some(&after)),
             SurfaceDrag::Split(_)
+        ));
+    }
+
+    fn workspace_snapshot(ids: &[&str], labels: &[&str]) -> HierarchySnapshot {
+        HierarchySnapshot {
+            workspaces: ids
+                .iter()
+                .zip(labels)
+                .map(|(id, label)| {
+                    let mut workspace = sample_workspace(id, None);
+                    workspace.label = (*label).into();
+                    workspace
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn workspace_reorder_on(snapshot: &HierarchySnapshot, source: usize) -> ReorderDrag {
+        ReorderDrag {
+            list: ReorderList::Workspaces,
+            source_index: source,
+            order: snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.workspace_id.clone())
+                .collect(),
+            hover: ReorderHover::AfterLast,
+            origin: (0., 0.),
+            pointer: (0., 0.),
+            grab_offset: (0., 0.),
+        }
+    }
+
+    #[test]
+    fn reconciling_a_reorder_drag_goes_idle_when_list_order_changes() {
+        let before = workspace_snapshot(&["w1", "w2", "w3"], &["a", "b", "c"]);
+        let after = workspace_snapshot(&["w2", "w1", "w3"], &["b", "a", "c"]);
+        assert!(matches!(
+            reconcile_reorder_drag_state(workspace_reorder_on(&before, 0), Some(&after)),
+            SurfaceDrag::Idle
+        ));
+    }
+
+    #[test]
+    fn reconciling_a_reorder_drag_stays_when_only_a_label_changes() {
+        let before = workspace_snapshot(&["w1", "w2"], &["a", "b"]);
+        let after = workspace_snapshot(&["w1", "w2"], &["a", "renamed"]);
+        assert!(matches!(
+            reconcile_reorder_drag_state(workspace_reorder_on(&before, 0), Some(&after)),
+            SurfaceDrag::Reorder(_)
         ));
     }
 }
