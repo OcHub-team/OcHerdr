@@ -361,14 +361,68 @@ impl OcHerdrView {
         let i18n = self.i18n;
         let view = cx.entity();
         let tab_count = chrome.tabs.items.len();
-        let dragging_tab = match &self.surface_drag {
-            SurfaceDrag::Reorder(drag)
-                if matches!(drag.list, ReorderList::Tabs { .. }) && reorder_past_slop(drag) =>
-            {
-                drag.order.get(drag.source_index).cloned()
-            }
+        let authoritative_order = chrome
+            .tabs
+            .items
+            .iter()
+            .map(|row| row.a11y.id.clone())
+            .collect::<Vec<_>>();
+        let drag = match &self.surface_drag {
+            SurfaceDrag::Reorder(drag) => Some(drag),
             _ => None,
         };
+        let pending = self
+            .pending_reorder
+            .as_ref()
+            .and_then(|pending| pending.tab.as_ref());
+        let projection = self
+            .selection
+            .workspace_id
+            .as_deref()
+            .and_then(|workspace_id| {
+                tab_reorder_projection(workspace_id, &authoritative_order, drag, pending)
+            });
+        let tab_reorder = projection.and_then(|projection| {
+            let spans = authoritative_order
+                .iter()
+                .map(|id| self.reorder_metrics.tabs.iter().find(|span| &span.id == id))
+                .collect::<Option<Vec<_>>>()?;
+            let shifts_for = |positions: &[usize]| {
+                let mut originals_by_position = vec![0; positions.len()];
+                for (original, position) in positions.iter().copied().enumerate() {
+                    originals_by_position[position] = original;
+                }
+                let mut target_left = spans[0].rect.0;
+                let mut shifts = vec![0.; positions.len()];
+                for original in originals_by_position {
+                    shifts[original] = target_left - spans[original].rect.0;
+                    target_left += spans[original].rect.2 + TAB_REORDER_GAP_PX;
+                }
+                shifts
+            };
+            let shifts = shifts_for(&projection.positions);
+            let mut previous_offsets = shifts_for(&projection.previous_positions)
+                .into_iter()
+                .map(|shift| (shift, 0.))
+                .collect::<Vec<_>>();
+            if let TabReorderMotion::Settling { released_origin } = projection.motion {
+                let source = spans[projection.source_index];
+                previous_offsets[projection.source_index] = (
+                    released_origin.0 - source.rect.0,
+                    released_origin.1 - source.rect.1,
+                );
+            }
+            Some((
+                projection.source_id,
+                projection.positions,
+                previous_offsets,
+                shifts
+                    .into_iter()
+                    .map(|shift| (shift, 0.))
+                    .collect::<Vec<_>>(),
+                projection.motion,
+            ))
+        });
         let tabs = chrome
             .tabs
             .items
@@ -386,8 +440,21 @@ impl OcHerdrView {
                 };
                 let close_target = tab_target.clone();
                 let selected = row.a11y.selected == Some(true);
-                let dimmed = dragging_tab.as_deref() == Some(tab_id.as_str());
-                apply_control(div().id(("main-tab", row.number)), &row.a11y)
+                let (hidden, display_position, previous_offset, offset, motion) =
+                    if let Some((source_id, positions, previous_offsets, offsets, motion)) =
+                        &tab_reorder
+                    {
+                        (
+                            source_id == &tab_id && *motion == TabReorderMotion::Dragging,
+                            positions[index],
+                            previous_offsets[index],
+                            offsets[index],
+                            Some(*motion),
+                        )
+                    } else {
+                        (false, index, (0., 0.), (0., 0.), None)
+                    };
+                let tab = apply_control(div().id(("main-tab", row.number)), &row.a11y)
                     .relative()
                     .flex()
                     .items_center()
@@ -425,7 +492,7 @@ impl OcHerdrView {
                     })
                     .when(tab_count >= 2, |tab| tab.cursor_grab())
                     .when(tab_count < 2, |tab| tab.cursor_pointer())
-                    .opacity(if dimmed { 0.4 } else { 1. })
+                    .opacity(if hidden { 0. } else { 1. })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event, _window, cx| {
@@ -502,7 +569,37 @@ impl OcHerdrView {
                                 },
                             )),
                         )
-                    })
+                    });
+                let tab = if tab_reorder.is_some() {
+                    let animation_name = match motion {
+                        Some(TabReorderMotion::Dragging) => "tab-reorder-shift",
+                        Some(TabReorderMotion::Settling { .. }) => "tab-reorder-settle",
+                        None => unreachable!("tab reorder animation requires a motion phase"),
+                    };
+                    tab.with_animation(
+                        (
+                            ElementId::named_usize(animation_name, display_position),
+                            tab_id.clone(),
+                        ),
+                        Animation::new(TAB_REORDER_ANIMATION).with_easing(ease_out_quint()),
+                        move |tab, delta| {
+                            tab.left(px(
+                                previous_offset.0 + (offset.0 - previous_offset.0) * delta
+                            ))
+                            .top(px(
+                                previous_offset.1 + (offset.1 - previous_offset.1) * delta
+                            ))
+                        },
+                    )
+                    .into_any_element()
+                } else {
+                    tab.into_any_element()
+                };
+                div()
+                    .id((ElementId::from("tab-slot"), tab_id))
+                    .relative()
+                    .flex_none()
+                    .child(tab)
                     .child(
                         canvas(
                             move |bounds, _, cx| {
@@ -548,7 +645,7 @@ impl OcHerdrView {
                     .items_center()
                     .h_full()
                     .min_w_0()
-                    .gap_1()
+                    .gap(px(TAB_REORDER_GAP_PX))
                     .overflow_hidden()
                     .children(tabs),
             )
@@ -1215,10 +1312,10 @@ fn reorder_ghost(
 }
 
 fn reorder_indicator(metrics: &ReorderMetrics, drag: &ReorderDrag) -> Option<ochub_ui::gpui::Div> {
-    let spans = match drag.list {
-        ReorderList::Workspaces => &metrics.workspaces,
-        ReorderList::Tabs { .. } => &metrics.tabs,
+    let ReorderList::Workspaces = &drag.list else {
+        return None;
     };
+    let spans = &metrics.workspaces;
     let items = drag
         .order
         .iter()
@@ -1228,8 +1325,8 @@ fn reorder_indicator(metrics: &ReorderMetrics, drag: &ReorderDrag) -> Option<och
         return None;
     }
     let thick = REORDER_INDICATOR_PX;
-    let (x, y, w, h) = match (&drag.list, drag.hover) {
-        (ReorderList::Workspaces, ReorderHover::Item { index, trailing }) => {
+    let (x, y, w, h) = match drag.hover {
+        ReorderHover::Item { index, trailing } => {
             let rect = items.get(index)?.rect;
             if trailing {
                 (rect.0, rect.1 + rect.3 - thick / 2., rect.2, thick)
@@ -1237,21 +1334,9 @@ fn reorder_indicator(metrics: &ReorderMetrics, drag: &ReorderDrag) -> Option<och
                 (rect.0, rect.1 - thick / 2., rect.2, thick)
             }
         }
-        (ReorderList::Workspaces, ReorderHover::AfterLast) => {
+        ReorderHover::AfterLast => {
             let rect = items.last()?.rect;
             (rect.0, rect.1 + rect.3 - thick / 2., rect.2, thick)
-        }
-        (ReorderList::Tabs { .. }, ReorderHover::Item { index, trailing }) => {
-            let rect = items.get(index)?.rect;
-            if trailing {
-                (rect.0 + rect.2 - thick / 2., rect.1, thick, rect.3)
-            } else {
-                (rect.0 - thick / 2., rect.1, thick, rect.3)
-            }
-        }
-        (ReorderList::Tabs { .. }, ReorderHover::AfterLast) => {
-            let rect = items.last()?.rect;
-            (rect.0 + rect.2 - thick / 2., rect.1, thick, rect.3)
         }
     };
     Some(
