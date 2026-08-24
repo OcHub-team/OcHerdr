@@ -3,13 +3,6 @@
 //! These tests drive production `OcHerdrView` / `HostCenter` methods through the
 //! same `Context<T>` / `Window` / `Entity<T>` path the GUI uses. They do not
 //! introduce a second status type or a test-only controller.
-//!
-//! They are ignored in `just ci` because any test binary that links GhosttyKit
-//! currently hangs inside `HashMap::insert` on the 6th entry. GPUI's
-//! `App::new_app` loads 26 actions into that map, so `TestAppContext` never
-//! finishes constructing. `ocherdr-core` (no Ghostty) inserts the same keys
-//! immediately; `ocherdr-terminal` (Ghostty linked) hangs. Until that link
-//! isolation is solved, the four wiring tests cannot actually run.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -205,7 +198,6 @@ fn session_name(view: &OcHerdrView) -> Option<&str> {
     view.current_session().map(|session| session.name.as_str())
 }
 
-#[ignore = "GhosttyKit-linked test binaries hang in HashMap::insert; TestAppContext::build never returns"]
 #[gpui::test]
 fn a_closed_event_poll_marks_the_stream_lost_and_stops_rescheduling(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);
@@ -227,7 +219,6 @@ fn a_closed_event_poll_marks_the_stream_lost_and_stops_rescheduling(cx: &mut Tes
     );
 }
 
-#[ignore = "GhosttyKit-linked test binaries hang in HashMap::insert; TestAppContext::build never returns"]
 #[gpui::test]
 fn reload_writes_a_rejected_subscription_as_lost_instead_of_idle(cx: &mut TestAppContext) {
     let fake = FakeHerdr::snapshot_ok_subscribe_rejected();
@@ -253,7 +244,6 @@ fn reload_writes_a_rejected_subscription_as_lost_instead_of_idle(cx: &mut TestAp
     });
 }
 
-#[ignore = "GhosttyKit-linked test binaries hang in HashMap::insert; TestAppContext::build never returns"]
 #[gpui::test]
 fn clicking_the_status_bar_reconnects_the_current_session(cx: &mut TestAppContext) {
     let fake = FakeHerdr::snapshot_ok_subscribe_rejected();
@@ -304,7 +294,6 @@ fn clicking_the_status_bar_reconnects_the_current_session(cx: &mut TestAppContex
     });
 }
 
-#[ignore = "GhosttyKit-linked test binaries hang in HashMap::insert; TestAppContext::build never returns"]
 #[gpui::test]
 fn saving_a_host_discards_its_probe_instead_of_restoring_it(cx: &mut TestAppContext) {
     install_app(cx);

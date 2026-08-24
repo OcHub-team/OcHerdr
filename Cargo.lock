@@ -3829,7 +3829,6 @@ dependencies = [
 name = "ocherdr-core"
 version = "0.1.0"
 dependencies = [
- "gpui",
  "serde",
  "serde_json",
 ]
@@ -3857,7 +3856,6 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-video",
  "futures",
- "gpui",
  "io-surface",
  "thiserror 2.0.20",
 ]
