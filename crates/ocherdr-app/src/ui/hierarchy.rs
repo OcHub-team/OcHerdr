@@ -214,6 +214,10 @@ impl OcHerdrView {
                     .pl(px(78.))
                     .pr_4()
                     .gap_2()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, window, _| window.start_window_move()),
+                    )
                     .child(
                         div()
                             .id("sidebar-title")
@@ -562,7 +566,12 @@ impl OcHerdrView {
                 )
                 .on_click(cx.listener(|this, _, _window, cx| this.create_tab(cx))),
             )
-            .child(div().flex_1())
+            // The only part of the tab strip that is not a control, so this is
+            // where a drag means "move the window".
+            .child(div().flex_1().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, _| window.start_window_move()),
+            ))
             .child(div().id("pane-actions").role(ochub_ui::gpui::Role::Toolbar).aria_label(i18n.text(k::TERMINAL_PANE_ACTIONS)).flex().items_center().gap_1().px_2()
             .child(
                 apply_control(

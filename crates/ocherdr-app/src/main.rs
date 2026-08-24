@@ -1210,6 +1210,11 @@ fn main() {
                         appears_transparent: true,
                         traffic_light_position: Some(point(px(18.), px(18.))),
                     }),
+                    // The tab bar sits in the titlebar strip. Left to AppKit,
+                    // dragging a tab pill drags the window instead of
+                    // reordering the tab. The header's empty areas call
+                    // `start_window_move` themselves.
+                    app_owns_titlebar_drag: true,
                     ..Default::default()
                 },
                 move |window, cx| {

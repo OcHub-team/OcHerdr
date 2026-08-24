@@ -386,8 +386,10 @@ fn tab_rows<'a>(
     tabs: impl IntoIterator<Item = &'a TabInfo>,
     selected_tab_id: Option<&str>,
 ) -> Vec<TabRow> {
-    let mut items: Vec<TabRow> = tabs
-        .into_iter()
+    // Herdr's order is the order. `number` is a stable per-tab identity, not a
+    // position: a moved tab keeps the number it was created with, so sorting by
+    // it would render `tab.move` as a no-op.
+    tabs.into_iter()
         .map(|tab| TabRow {
             number: tab.number,
             a11y: list_control(
@@ -397,9 +399,7 @@ fn tab_rows<'a>(
                 selected_tab_id == Some(tab.tab_id.as_str()),
             ),
         })
-        .collect();
-    items.sort_by_key(|row| row.number);
-    items
+        .collect()
 }
 
 // ListItem is dropped from the macOS AX tree; Button and Tab survive as AXButton/AXTab.
@@ -659,6 +659,36 @@ mod tests {
             event_stream,
             profile_label: "This Mac",
         }
+    }
+
+    #[test]
+    fn the_tab_bar_follows_herdrs_order_not_the_numbers_tabs_were_created_with() {
+        // What `tab.move` publishes: the array is reordered while every tab
+        // keeps the number it was created with.
+        let mut snapshot = sample_snapshot();
+        snapshot.tabs = vec![
+            tab("t2", "w1", 2, "logs", false),
+            tab("t1", "w1", 1, "1", true),
+        ];
+        let sessions = sample_sessions();
+        let selection = sample_selection();
+        let event_stream = live_event_stream();
+        let chrome = chrome_a11y(sample_input(
+            &sessions,
+            &snapshot,
+            &selection,
+            &event_stream,
+        ));
+        assert_eq!(
+            chrome
+                .tabs
+                .items
+                .iter()
+                .map(|row| row.a11y.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t2", "t1"],
+            "sorting by number puts the moved tab back where it started"
+        );
     }
 
     #[test]
