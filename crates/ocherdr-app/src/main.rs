@@ -8,7 +8,7 @@ use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
     AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent,
-    HierarchySnapshot, LayoutRect, LayoutSplit, PaneInfo, Selection, SessionSummary,
+    HierarchySnapshot, LayoutRect, LayoutSplit, PaneInfo, ReorderHover, Selection, SessionSummary,
     SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, split_ratio_from_drag,
 };
 use ocherdr_herdr::{
@@ -57,6 +57,8 @@ const STATUS_BAR_HEIGHT: f32 = 28.;
 const PANE_HEADER_HEIGHT: f32 = 26.;
 const SPLIT_HANDLE_HIT_PX: f32 = 10.;
 const SPLIT_HANDLE_VISUAL_PX: f32 = 4.;
+const REORDER_SLOP_PX: f32 = 4.;
+const REORDER_INDICATOR_PX: f32 = 2.;
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -655,6 +657,8 @@ struct OcHerdrView {
     appearance_scroll: ScrollHandle,
     prefix_pending: bool,
     surface_drag: SurfaceDrag,
+    pending_reorder: Option<PendingReorder>,
+    reorder_metrics: ReorderMetrics,
     terminal_surface_bounds: Option<(f32, f32, f32, f32)>,
     ime_marked: Option<String>,
     rename_input: Entity<TextInput>,
@@ -800,6 +804,52 @@ enum SurfaceDrag {
     Idle,
     Text { pane_id: String },
     Split(SplitDrag),
+    Reorder(ReorderDrag),
+}
+
+/// A reorder Herdr has accepted but not yet confirmed with a `moved` event.
+/// While it is set the lists refuse new reorders: their indices would be
+/// computed from an order Herdr is about to replace. Holding the request task
+/// here is what keeps it alive, so dropping this drops the request too.
+struct PendingReorder {
+    _request: Task<()>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ReorderDrag {
+    list: ReorderList,
+    source_index: usize,
+    /// Ids in list order at press. Membership or order change cancels.
+    order: Vec<String>,
+    hover: ReorderHover,
+    origin: (f32, f32),
+    pointer: (f32, f32),
+    /// Where inside the source row the pointer grabbed it. Measured at press,
+    /// so the drag cannot exist before the row has been laid out.
+    grab_offset: (f32, f32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReorderList {
+    Workspaces,
+    Tabs { workspace_id: String },
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReorderMetrics {
+    workspaces: Vec<ReorderSpan>,
+    tabs: Vec<ReorderSpan>,
+}
+
+#[derive(Clone, Debug)]
+struct ReorderSpan {
+    id: String,
+    rect: (f32, f32, f32, f32),
+}
+
+fn reorder_past_slop(drag: &ReorderDrag) -> bool {
+    (drag.pointer.0 - drag.origin.0).abs() > REORDER_SLOP_PX
+        || (drag.pointer.1 - drag.origin.1).abs() > REORDER_SLOP_PX
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1199,6 +1249,11 @@ fn main() {
                         appears_transparent: true,
                         traffic_light_position: Some(point(px(18.), px(18.))),
                     }),
+                    // The tab bar sits in the titlebar strip. Left to AppKit,
+                    // dragging a tab pill drags the window instead of
+                    // reordering the tab. The header's empty areas call
+                    // `start_window_move` themselves.
+                    app_owns_titlebar_drag: true,
                     ..Default::default()
                 },
                 move |window, cx| {

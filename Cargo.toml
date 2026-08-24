@@ -21,6 +21,7 @@ base64 = "0.22"
 dirs = "6"
 futures = "0.3"
 ochub-ui = { version = "0.6.0", git = "https://github.com/OcHub-team/ochub-ui", tag = "v0.6.0" }
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", version = "=0.2.2" }
 gpui-platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", rev = "a8fafdd7ee36fb3fb98ebbfe5d3be983301d9e74", features = ["font-kit", "runtime_shaders"] }
 libc = "0.2"
 parking_lot = "0.12"
@@ -37,6 +38,16 @@ async-process = { git = "https://github.com/zed-industries/async-process.git", r
 gpui = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6bc21b82e78f9d0cbbbe5", version = "=0.2.2" }
 gpui_macos = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6bc21b82e78f9d0cbbbe5", version = "=0.1.0" }
 gpui_platform = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6bc21b82e78f9d0cbbbe5", version = "=0.1.0" }
+
+# Debug builds must be optimised. At opt-level 0 a GhosttyKit-linked binary
+# corrupts the first two fields of freshly grown `HashMap` tables, so
+# `RawTable::find` probes forever. It applies to every crate that instantiates
+# hashbrown at opt-level 0, this workspace's own crates included, so this
+# covers the whole dev profile rather than just dependencies. std ships
+# hashbrown with assertions compiled out, so nothing fires; the process spins.
+# See docs/known-issues.md.
+[profile.dev]
+opt-level = 1
 
 [profile.release]
 lto = "thin"

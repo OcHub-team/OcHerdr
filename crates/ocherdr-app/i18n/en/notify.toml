@@ -49,6 +49,7 @@
 "notify.spawn_terminal" = "Could not open a terminal pane"
 "notify.tab_close" = "Could not close the tab"
 "notify.tab_create" = "Could not create a tab"
+"notify.tab_move" = "Could not reorder the tab"
 "notify.tab_rename" = "Could not rename the tab"
 "notify.terminal_runtime" = "Terminal runtime failed"
 "notify.terminal_stream" = "Terminal stream failed"
@@ -59,4 +60,5 @@
 "notify.worktree_remove" = "Could not remove the worktree"
 "notify.workspace_close" = "Could not close the workspace"
 "notify.workspace_create" = "Could not create a workspace"
+"notify.workspace_move" = "Could not reorder the workspace"
 "notify.workspace_rename" = "Could not rename the workspace"

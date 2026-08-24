@@ -23,6 +23,8 @@ pub(crate) enum FailureKind {
     SpawnTerminal,
     ResizeTerminal,
     SetSplitRatio,
+    MoveWorkspace,
+    MoveTab,
     RenderTerminal,
     TerminalStream,
     TerminalRuntime,
@@ -64,6 +66,8 @@ impl FailureKind {
             | Self::SpawnTerminal
             | Self::ResizeTerminal
             | Self::SetSplitRatio
+            | Self::MoveWorkspace
+            | Self::MoveTab
             | Self::RenderTerminal
             | Self::TerminalStream
             | Self::TerminalRuntime => NotificationLevel::Error,
@@ -87,6 +91,8 @@ impl FailureKind {
             Self::SpawnTerminal => k::NOTIFY_SPAWN_TERMINAL,
             Self::ResizeTerminal => k::NOTIFY_RESIZE_TERMINAL,
             Self::SetSplitRatio => k::NOTIFY_SET_SPLIT_RATIO,
+            Self::MoveWorkspace => k::NOTIFY_WORKSPACE_MOVE,
+            Self::MoveTab => k::NOTIFY_TAB_MOVE,
             Self::RenderTerminal => k::NOTIFY_RENDER_TERMINAL,
             Self::TerminalStream => k::NOTIFY_TERMINAL_STREAM,
             Self::TerminalRuntime => k::NOTIFY_TERMINAL_RUNTIME,
@@ -129,6 +135,7 @@ fn command_title_key(method: &str) -> Key {
         "workspace.create" => k::NOTIFY_WORKSPACE_CREATE,
         "workspace.close" => k::NOTIFY_WORKSPACE_CLOSE,
         "workspace.rename" => k::NOTIFY_WORKSPACE_RENAME,
+        "workspace.move" => k::NOTIFY_WORKSPACE_MOVE,
         "worktree.create" => k::NOTIFY_WORKTREE_CREATE,
         "worktree.list" => k::NOTIFY_WORKTREE_LIST,
         "worktree.open" => k::NOTIFY_WORKTREE_OPEN,
@@ -136,6 +143,7 @@ fn command_title_key(method: &str) -> Key {
         "tab.create" => k::NOTIFY_TAB_CREATE,
         "tab.close" => k::NOTIFY_TAB_CLOSE,
         "tab.rename" => k::NOTIFY_TAB_RENAME,
+        "tab.move" => k::NOTIFY_TAB_MOVE,
         "pane.close" => k::NOTIFY_PANE_CLOSE,
         "pane.rename" => k::NOTIFY_PANE_RENAME,
         "pane.split" => k::NOTIFY_PANE_SPLIT,
