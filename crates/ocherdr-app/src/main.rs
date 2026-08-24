@@ -45,6 +45,7 @@ mod host_center;
 mod i18n;
 mod ime;
 mod notify;
+mod theme_ansi;
 mod ui;
 
 use host_center::{HostCenter, HostCenterEvent, HostRollback, HostSaveThen};
