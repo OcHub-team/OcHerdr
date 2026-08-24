@@ -87,6 +87,7 @@ impl OcHerdrView {
             open_select: None,
             appearance_scroll: ScrollHandle::new(),
             appearance_ui: Default::default(),
+            tab_scroll: ScrollHandle::new(),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
             pending_reorder: None,
@@ -1495,12 +1496,24 @@ impl OcHerdrView {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
+        let tab_index = self
+            .selection
+            .workspace_id
+            .as_deref()
+            .and_then(|workspace_id| {
+                snapshot
+                    .tabs_for(workspace_id)
+                    .position(|tab| tab.tab_id == tab_id)
+            });
         self.selection.tab_id = Some(tab_id.clone());
         self.selection.pane_id = snapshot
             .panes_for(&tab_id)
             .find(|pane| pane.focused)
             .or_else(|| snapshot.panes_for(&tab_id).next())
             .map(|pane| pane.pane_id.clone());
+        if let Some(tab_index) = tab_index {
+            self.tab_scroll.scroll_to_item(tab_index);
+        }
         self.ensure_session_terminals(cx);
         cx.notify();
     }
@@ -4817,17 +4830,19 @@ fn tab_id_for_shortcut<'a>(
     tabs: impl Iterator<Item = &'a ocherdr_core::TabInfo>,
     number: usize,
 ) -> Option<String> {
-    let mut tabs = tabs.collect::<Vec<_>>();
+    // Herdr's tab number is a stable identity, not a visual position. It can
+    // have gaps after tabs are closed and does not change when tabs are moved.
+    // Cmd+1…9 must therefore index the authoritative order used by the tab
+    // bar, otherwise an old tab whose number happens to match the shortcut
+    // can steal it from the tab displaying that shortcut.
+    let tabs = tabs.collect::<Vec<_>>();
     if tabs.is_empty() {
         return None;
     }
-    tabs.sort_by_key(|tab| tab.number);
     if number == 0 {
         return tabs.last().map(|tab| tab.tab_id.clone());
     }
-    tabs.iter()
-        .find(|tab| tab.number == number)
-        .or_else(|| tabs.get(number.saturating_sub(1)))
+    tabs.get(number.saturating_sub(1))
         .map(|tab| tab.tab_id.clone())
 }
 
@@ -6125,7 +6140,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_shortcut_uses_number_then_visual_index_and_zero_for_last() {
+    fn tab_shortcut_uses_visual_order_despite_stable_numbers_and_zero_for_last() {
         let tabs = [
             ocherdr_core::TabInfo {
                 tab_id: "first".into(),
@@ -6137,19 +6152,19 @@ mod tests {
                 agent_status: AgentStatus::Idle,
             },
             ocherdr_core::TabInfo {
-                tab_id: "third".into(),
+                tab_id: "second".into(),
                 workspace_id: "w".into(),
                 number: 3,
-                label: "three".into(),
+                label: "two".into(),
                 focused: false,
                 pane_count: 1,
                 agent_status: AgentStatus::Idle,
             },
             ocherdr_core::TabInfo {
-                tab_id: "second".into(),
+                tab_id: "third".into(),
                 workspace_id: "w".into(),
-                number: 2,
-                label: "two".into(),
+                number: 14,
+                label: "three".into(),
                 focused: false,
                 pane_count: 1,
                 agent_status: AgentStatus::Idle,

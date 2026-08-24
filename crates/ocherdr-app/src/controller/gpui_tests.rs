@@ -611,6 +611,30 @@ fn three_tab_snapshot() -> HierarchySnapshot {
     }
 }
 
+fn overflowing_tab_snapshot() -> HierarchySnapshot {
+    let tabs = (1..=12)
+        .map(|number| test_tab(&format!("t-{number}"), number, &format!("tab {number}")))
+        .collect();
+    HierarchySnapshot {
+        focused_workspace_id: Some("w".into()),
+        focused_tab_id: Some("t-1".into()),
+        workspaces: vec![WorkspaceInfo {
+            workspace_id: "w".into(),
+            number: 1,
+            label: "workspace".into(),
+            focused: true,
+            pane_count: 0,
+            tab_count: 12,
+            active_tab_id: "t-1".into(),
+            agent_status: AgentStatus::Idle,
+            tokens: Default::default(),
+            worktree: None,
+        }],
+        tabs,
+        ..Default::default()
+    }
+}
+
 fn point_local_profile_at_fake(view: &mut OcHerdrView, fake: &FakeHerdr) {
     view.profiles[0] = ConnectionProfile::Local {
         herdr_path: fake.herdr_path.to_string_lossy().into_owned(),
@@ -743,6 +767,52 @@ fn click_send_prompt(cx: &mut VisualTestContext) {
 
 fn session_name(view: &OcHerdrView) -> Option<&str> {
     view.current_session().map(|session| session.name.as_str())
+}
+
+#[gpui::test]
+fn overflowing_tab_bar_scrolls_horizontally_with_the_wheel(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    view.update(cx, |this, cx| {
+        this.snapshot = Some(overflowing_tab_snapshot());
+        this.selection = Selection {
+            connection_id: "local".into(),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-1".into()),
+            ..Default::default()
+        };
+        cx.notify();
+    });
+    cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(500.)));
+    cx.run_until_parked();
+
+    let tab_scroll = view.read_with(cx, |this, _| this.tab_scroll.clone());
+    assert!(
+        tab_scroll.max_offset().x > gpui::px(0.),
+        "the fixture must overflow the tab strip"
+    );
+    let before = tab_scroll.offset().x;
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: tab_scroll.bounds().center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-120.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+
+    assert!(
+        tab_scroll.offset().x < before,
+        "a vertical wheel gesture over the tab strip must reveal tabs to the right"
+    );
+
+    tab_scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+    view.update(cx, |this, cx| this.select_tab_number(9, cx));
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.selection.tab_id.as_deref(), Some("t-9"));
+    });
+    assert!(
+        tab_scroll.offset().x < gpui::px(0.),
+        "selecting a hidden tab by number must scroll it into view"
+    );
 }
 
 #[gpui::test]

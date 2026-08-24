@@ -730,7 +730,9 @@ impl OcHerdrView {
                     .h_full()
                     .min_w_0()
                     .gap(px(TAB_REORDER_GAP_PX))
-                    .overflow_hidden()
+                    .overflow_x_scroll()
+                    .overflow_y_hidden()
+                    .track_scroll(&self.tab_scroll)
                     .children(tabs),
             )
             .child(
