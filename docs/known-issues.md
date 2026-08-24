@@ -1,9 +1,9 @@
 # Known issues
 
-## Debug builds hang before the first window unless dependencies are optimised
+## Debug builds spin in `HashMap` unless the whole dev profile is optimised
 
-`[profile.dev.package."*"] opt-level = 1` in the workspace manifest is load-bearing.
-Without it a debug build never reaches its first window.
+`[profile.dev] opt-level = 1` in the workspace manifest is load-bearing. Without
+it a debug build never reaches its first window.
 
 **Symptom.** The process starts, uses 100% of one core, and never opens a window.
 A sample shows it inside `gpui::ActionRegistry::load_actions` →
@@ -39,6 +39,15 @@ for name in names {           // 30 distinct &str keys
 The same test compiled into `ocherdr-core` (0 GhosttyKit symbols) passes
 instantly. Compiled into `ocherdr-app` (137 GhosttyKit symbols) it hangs.
 
+**It is not specific to gpui.** Optimising only dependencies
+(`[profile.dev.package."*"]`) moves the failure rather than removing it: gpui's
+registry then builds at opt-level 1 and the window opens, but the first
+`HashMap` that this workspace's own crates grow spins instead — observed on the
+main thread inside `find_or_find_insert_index_inner`, codegen'd into
+`ocherdr-herdr` and `ocherdr-core`, with the UI frozen on "discovering Herdr
+sessions" at 100% CPU. Any crate that instantiates hashbrown at opt-level 0 is
+exposed, so the profile setting has to cover the workspace's own crates too.
+
 **Ruled out, by measurement rather than reasoning.** GhosttyKit exports exactly
 one symbol that shadows libc, `_memset`, and it wins the link — in a debug
 binary `_memset` is a local definition and libSystem's is never imported. It is
@@ -46,7 +55,7 @@ nevertheless correct: called directly through the linked symbol across 17
 lengths and 3 fill values, it fills correctly, writes nothing out of bounds, and
 returns `dest`. There is no second copy of gpui in the lock file.
 
-**Status.** `opt-level = 1` moves the layout enough that the write lands
+**Status.** `opt-level = 1` changes codegen enough that the write lands
 somewhere harmless. That is a workaround, not a fix — the underlying write is
 still happening somewhere, and release builds may simply be getting lucky. The
 next step to identify the writer is a hardware watchpoint on the table's first
