@@ -228,6 +228,10 @@ impl OcHerdrView {
                             |_, _, _, _| {},
                         )
                         .absolute()
+                        // Inset auto would use the static position below the
+                        // in-flow row instead of the slot origin.
+                        .top(px(0.))
+                        .left(px(0.))
                         .size_full(),
                     )
                     .into_any_element()
@@ -695,6 +699,10 @@ impl OcHerdrView {
                             |_, _, _, _| {},
                         )
                         .absolute()
+                        // Inset auto would use the static position below the
+                        // in-flow pill instead of the slot origin.
+                        .top(px(0.))
+                        .left(px(0.))
                         .size_full(),
                     )
                     .into_any_element()
