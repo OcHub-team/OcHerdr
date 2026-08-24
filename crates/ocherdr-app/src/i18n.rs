@@ -45,6 +45,23 @@ impl Language {
             _ => Self::System,
         }
     }
+
+    pub(crate) const fn as_config(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::English => "en",
+            Self::SimplifiedChinese => "zh-Hans",
+        }
+    }
+
+    pub(crate) fn from_config(value: &str) -> Option<Self> {
+        match value.trim() {
+            "system" => Some(Self::System),
+            "en" => Some(Self::English),
+            "zh-Hans" | "zh-hans" => Some(Self::SimplifiedChinese),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

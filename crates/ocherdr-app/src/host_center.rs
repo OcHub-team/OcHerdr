@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
 use std::path::PathBuf;
 
 use ocherdr_core::ConnectionProfile;
@@ -16,9 +15,6 @@ use super::*;
 use crate::notify::FailureKind;
 
 /// Persistable host-center slice of `connections.json`.
-///
-/// Appearance and language stay on the parent view so that file still has a
-/// single writer.
 #[derive(Clone, Debug)]
 pub(crate) struct HostPersistState {
     pub(crate) profiles: Vec<ConnectionProfile>,
@@ -28,11 +24,7 @@ pub(crate) struct HostPersistState {
     pub(crate) host_health: HashMap<String, HostHealthView>,
 }
 
-pub(crate) fn assemble_settings(
-    host: &HostPersistState,
-    appearance: AppearanceSettings,
-    language: Language,
-) -> Settings {
+pub(crate) fn assemble_settings(host: &HostPersistState) -> Settings {
     Settings {
         connections: host
             .profiles
@@ -51,20 +43,13 @@ pub(crate) fn assemble_settings(
                 HostHealthView::Checked { cached, .. } => Some((id.clone(), cached.clone())),
             })
             .collect(),
-        appearance,
-        language,
     }
 }
 
 pub(crate) fn write_settings(settings: &Settings) -> std::result::Result<(), String> {
-    let path =
-        settings_path().ok_or_else(|| "Application Support directory is unavailable".to_owned())?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Settings path has no parent directory".to_owned())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let bytes = serde_json::to_vec_pretty(settings).map_err(|error| error.to_string())?;
-    fs::write(path, bytes).map_err(|error| error.to_string())
+    let paths = crate::config::AppPaths::user()
+        .ok_or_else(|| "Application Support directory is unavailable".to_owned())?;
+    crate::config::write_connections(&paths, settings)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1356,27 +1341,10 @@ mod tests {
         }
     }
 
-    fn parent_appearance() -> AppearanceSettings {
-        AppearanceSettings {
-            theme_family: "distinct-family".into(),
-            mode: AppearanceMode::Light,
-            backdrop: BackdropMode::Opaque,
-            background_opacity: OpacityChoice::P84,
-            font: TerminalFontSettings {
-                family: "Distinct Mono".into(),
-                size: FontSizeChoice::Pt18,
-                ligatures: false,
-                thicken: true,
-                cell_width_percent: CellWidthChoice::Wide,
-                cell_height_percent: CellHeightChoice::Relaxed,
-            },
-        }
-    }
-
     #[test]
     fn assembled_settings_include_host_center_catalog() {
         let host = sample_host_state();
-        let settings = assemble_settings(&host, parent_appearance(), Language::English);
+        let settings = assemble_settings(&host);
 
         assert_eq!(settings.host_metadata, host.host_metadata);
         assert_eq!(settings.host_groups, host.host_groups);
@@ -1388,28 +1356,18 @@ mod tests {
     }
 
     #[test]
-    fn assembled_settings_keep_parent_appearance_and_language() {
-        let host = sample_host_state();
-        let appearance = parent_appearance();
-        let settings = assemble_settings(&host, appearance.clone(), Language::English);
-
-        assert_eq!(settings.appearance.theme_family, appearance.theme_family);
-        assert_eq!(settings.appearance.mode, appearance.mode);
-        assert_eq!(settings.appearance.backdrop, appearance.backdrop);
-        assert_eq!(
-            settings.appearance.background_opacity,
-            appearance.background_opacity
-        );
-        assert_eq!(settings.appearance.font, appearance.font);
-        assert_eq!(settings.language, Language::English);
-        assert_ne!(settings.appearance.mode, AppearanceSettings::default().mode);
-        assert_ne!(settings.language, Language::default());
+    fn assembled_settings_json_omits_appearance_and_language() {
+        let settings = assemble_settings(&sample_host_state());
+        let value = serde_json::to_value(&settings).expect("settings json");
+        assert!(value.get("appearance").is_none());
+        assert!(value.get("language").is_none());
+        assert!(value.get("connections").is_some());
     }
 
     #[test]
     fn assembled_settings_save_only_manual_profiles() {
         let host = sample_host_state();
-        let settings = assemble_settings(&host, parent_appearance(), Language::English);
+        let settings = assemble_settings(&host);
 
         assert_eq!(settings.connections.len(), 1);
         assert_eq!(settings.connections[0].id(), "manual-1");

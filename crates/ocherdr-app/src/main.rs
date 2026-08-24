@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,12 +38,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod a11y;
+mod config;
 mod controller;
 mod fonts;
 mod host_center;
 mod i18n;
 mod ime;
 mod notify;
+/// Write helper owned by T29-B. This crate only calls `serialize_theme_file`
+/// until merge; the rest of the module is unused here.
+#[allow(dead_code)]
+mod theme_ansi;
 mod ui;
 
 use host_center::{HostCenter, HostCenterEvent, HostRollback, HostSaveThen};
@@ -212,6 +216,23 @@ impl AppearanceMode {
             Self::Dark => 2,
         }
     }
+
+    fn as_config(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn from_config(value: &str) -> Option<Self> {
+        match value.trim() {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +258,23 @@ impl BackdropMode {
             Self::Opaque => 0,
             Self::Transparent => 1,
             Self::Blurred => 2,
+        }
+    }
+
+    fn as_config(self) -> &'static str {
+        match self {
+            Self::Opaque => "opaque",
+            Self::Transparent => "transparent",
+            Self::Blurred => "blurred",
+        }
+    }
+
+    fn from_config(value: &str) -> Option<Self> {
+        match value.trim() {
+            "opaque" => Some(Self::Opaque),
+            "transparent" => Some(Self::Transparent),
+            "blurred" => Some(Self::Blurred),
+            _ => None,
         }
     }
 }
@@ -306,8 +344,8 @@ const fn default_true() -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum OpacityChoice {
-    P100,
     #[default]
+    P100,
     P92,
     P84,
     P72,
@@ -558,10 +596,6 @@ struct Settings {
     host_groups: Vec<String>,
     #[serde(default)]
     host_health: HashMap<String, CachedHostHealth>,
-    #[serde(default)]
-    appearance: AppearanceSettings,
-    #[serde(default)]
-    language: Language,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -682,6 +716,7 @@ struct OcHerdrView {
     /// Dropping this cancels an in-flight `worktree.list`.
     worktree_list_task: Option<Task<()>>,
     appearance: AppearanceSettings,
+    config: config::ConfigDocument,
     i18n: I18n,
     host_center: Entity<HostCenter>,
     pending_persist: Option<SettingsPersist>,
@@ -1417,15 +1452,16 @@ fn missing_theme_notice(theme_family: &str, i18n: I18n) -> Option<FailureNotice>
     ))
 }
 
-fn settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("OcHerdr/connections.json"))
-}
-
-fn load_settings() -> Settings {
-    settings_path()
-        .and_then(|path| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+fn load_settings() -> config::LoadedApp {
+    match config::AppPaths::user() {
+        Some(paths) => config::load_app(&paths),
+        None => config::LoadedApp {
+            settings: Settings::default(),
+            appearance: AppearanceSettings::default(),
+            language: Language::default(),
+            document: config::ConfigDocument::new(),
+        },
+    }
 }
 
 fn bind_enter_submit<T: 'static>(
@@ -1445,13 +1481,13 @@ fn main() {
     application()
         .with_assets(OcHerdrAssets)
         .run(|cx: &mut App| {
-            let settings = load_settings();
-            I18n::install(settings.language);
+            let loaded = load_settings();
+            I18n::install(loaded.language);
             if let Some(directory) = dirs::config_dir() {
                 theme::set_themes_dir(directory.join("OcHerdr/themes"));
             }
             ochub_ui::install(cx);
-            install_appearance(&settings.appearance, cx.window_appearance());
+            install_appearance(&loaded.appearance, cx.window_appearance());
             cx.on_window_closed(|cx, _window_id| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -1481,7 +1517,7 @@ fn main() {
                 },
                 move |window, cx| {
                     window.set_window_title("OcHerdr");
-                    let view = cx.new(|cx| OcHerdrView::new(settings, window, cx));
+                    let view = cx.new(|cx| OcHerdrView::new_with(loaded, window, cx));
                     let focus = view.read(cx).focus.clone();
                     focus.focus(window, cx);
                     view
@@ -1701,23 +1737,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_connection_settings_receive_the_default_appearance() {
-        let settings: Settings = serde_json::from_str(r#"{"connections":[]}"#).unwrap();
+    fn legacy_connection_settings_keep_host_fields_without_appearance() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"connections":[],"appearance":{"theme_family":"ember"},"language":"english"}"#,
+        )
+        .unwrap();
 
-        assert_eq!(
-            settings.appearance.theme_family,
-            theme::DEFAULT_THEME_FAMILY
-        );
-        assert_eq!(settings.appearance.mode, AppearanceMode::Dark);
-        assert_eq!(settings.appearance.backdrop, BackdropMode::Blurred);
-        assert_eq!(settings.appearance.background_opacity.value(), 92);
-        assert_eq!(settings.appearance.font, TerminalFontSettings::default());
-        assert_eq!(settings.appearance.font.size.value(), 13);
-        assert!(settings.appearance.font.ligatures);
-        assert_eq!(settings.language, Language::System);
+        assert!(settings.connections.is_empty());
         assert!(settings.host_metadata.is_empty());
         assert!(settings.host_groups.is_empty());
         assert!(settings.host_health.is_empty());
+        let value = serde_json::to_value(&settings).unwrap();
+        assert!(value.get("appearance").is_none());
+        assert!(value.get("language").is_none());
     }
 
     #[test]

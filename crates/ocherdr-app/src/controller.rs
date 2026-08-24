@@ -20,9 +20,28 @@ use super::*;
 use crate::notify::{FailureKind, FailureNotice, command_notification, notification_for};
 
 impl OcHerdrView {
+    #[cfg(test)]
     pub(super) fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let i18n = I18n::new(settings.language);
-        let appearance = settings.appearance.clone();
+        Self::new_with(
+            crate::config::LoadedApp {
+                settings,
+                appearance: AppearanceSettings::default(),
+                language: Language::default(),
+                document: crate::config::ConfigDocument::new(),
+            },
+            window,
+            cx,
+        )
+    }
+
+    pub(super) fn new_with(
+        loaded: crate::config::LoadedApp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let i18n = I18n::new(loaded.language);
+        let appearance = loaded.appearance;
+        let settings = loaded.settings;
         let focus = cx.focus_handle();
         let host_center = cx.new(|cx| HostCenter::new(settings, i18n, focus.clone(), cx));
         let profiles = host_center.read(cx).profiles().to_vec();
@@ -95,6 +114,7 @@ impl OcHerdrView {
             agent_renames: HashMap::new(),
             worktree_list_task: None,
             appearance,
+            config: loaded.document,
             i18n,
             host_center,
             pending_persist: None,
@@ -326,14 +346,17 @@ impl OcHerdrView {
     }
 
     fn spawn_settings_persist(&mut self, request: SettingsPersist, cx: &mut Context<Self>) {
-        let settings = crate::host_center::assemble_settings(
-            &self.host_center.read(cx).persist_state(),
-            self.appearance.clone(),
-            self.i18n.preference(),
-        );
+        let settings =
+            crate::host_center::assemble_settings(&self.host_center.read(cx).persist_state());
+        let document = self.config.clone();
         self.persist_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { crate::host_center::write_settings(&settings) })
+                .background_spawn(async move {
+                    crate::host_center::write_settings(&settings)?;
+                    let paths = crate::config::AppPaths::user()
+                        .ok_or_else(|| "Application Support directory is unavailable".to_owned())?;
+                    crate::config::write_config(&paths, &document)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.persist_task = None;
@@ -1059,6 +1082,10 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.config.set(
+            "theme",
+            &crate::config::values::ThemeRef::Name(family_id.clone()).to_config(),
+        );
         self.appearance.theme_family = family_id;
         self.apply_appearance(window, cx);
     }
@@ -1069,6 +1096,7 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.config.set("appearance-mode", mode.as_config());
         self.appearance.mode = mode;
         self.apply_appearance(window, cx);
     }
@@ -1079,6 +1107,7 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.config.set("window-backdrop", backdrop.as_config());
         self.appearance.backdrop = backdrop;
         self.apply_appearance(window, cx);
     }
@@ -1089,6 +1118,10 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.config.set(
+            "background-opacity",
+            &crate::config::format_opacity_percent(opacity.value()),
+        );
         self.appearance.background_opacity = opacity;
         self.apply_appearance(window, cx);
     }
@@ -1099,6 +1132,12 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if family.is_empty() {
+            self.config.set_repeatable("font-family", &[]);
+        } else {
+            self.config
+                .set_repeatable("font-family", std::slice::from_ref(&family));
+        }
         self.appearance.font.family = family;
         self.apply_appearance(window, cx);
     }
@@ -1109,6 +1148,7 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.config.set("font-size", &size.value().to_string());
         self.appearance.font.size = size;
         self.apply_appearance(window, cx);
     }
@@ -1119,6 +1159,17 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mut features: Vec<String> = self
+            .config
+            .get_all("font-feature")
+            .into_iter()
+            .filter(|feature| !matches!(feature.trim(), "-liga" | "-calt" | "-dlig"))
+            .map(str::to_owned)
+            .collect();
+        if !ligatures {
+            features.extend(["-calt".to_owned(), "-liga".to_owned(), "-dlig".to_owned()]);
+        }
+        self.config.set_repeatable("font-feature", &features);
         self.appearance.font.ligatures = ligatures;
         self.apply_appearance(window, cx);
     }
@@ -1129,6 +1180,8 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.config
+            .set("font-thicken", if thicken { "true" } else { "false" });
         self.appearance.font.thicken = thicken;
         self.apply_appearance(window, cx);
     }
@@ -1139,6 +1192,10 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.config.set(
+            "adjust-cell-width",
+            &crate::config::values::MetricModifier::Percent(f64::from(percent.value())).to_config(),
+        );
         self.appearance.font.cell_width_percent = percent;
         self.apply_appearance(window, cx);
     }
@@ -1149,11 +1206,16 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.config.set(
+            "adjust-cell-height",
+            &crate::config::values::MetricModifier::Percent(f64::from(percent.value())).to_config(),
+        );
         self.appearance.font.cell_height_percent = percent;
         self.apply_appearance(window, cx);
     }
 
     pub(super) fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        self.config.set("language", language.as_config());
         self.i18n.set_preference(language);
         theme::reload_registry();
         let i18n = self.i18n;
