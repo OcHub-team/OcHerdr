@@ -439,6 +439,49 @@ impl OcHerdrView {
             )
     }
 
+    fn tab_preview_card(&self, tab_id: &str, title: String) -> TabPreviewCard {
+        let panes = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                let layout = snapshot.layout_for(tab_id);
+                snapshot
+                    .panes_for(tab_id)
+                    .map(|pane| TabPreviewPane {
+                        fractions: layout
+                            .and_then(|layout| pane_fractions(layout, &pane.pane_id))
+                            .unwrap_or((0., 0., 1., 1.)),
+                        frame: self
+                            .pane(&pane.pane_id)
+                            .and_then(|runtime| runtime.frame.clone()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        TabPreviewCard {
+            tab_id: tab_id.to_owned(),
+            title: title.into(),
+            panes,
+            waiting: self.i18n.text(k::TERMINAL_WAITING).into(),
+        }
+    }
+
+    fn tab_title_needs_fade(title: &str, window: &Window) -> bool {
+        let title: SharedString = title.replace(['\n', '\r'], " ").into();
+        let run = TextRun {
+            len: title.len(),
+            font: window.text_style().font(),
+            color: theme::text().into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(title, px(TAB_TITLE_FONT_SIZE), &[run], None);
+        shaped.width > px(TAB_PILL_WIDTH - TAB_TITLE_ACTION_WELL * 2.)
+    }
+
     pub(super) fn render_tab_bar(
         &mut self,
         chrome: &ChromeA11y,
@@ -550,13 +593,29 @@ impl OcHerdrView {
                 let debug_tab_id = tab_id.clone();
                 let debug_title_id = tab_id.clone();
                 let debug_close_id = tab_id.clone();
+                let debug_fade_id = tab_id.clone();
                 let measure_view = view.clone();
+                let preview_view = view.clone();
+                let preview_tab_id = tab_id.clone();
+                let preview_title = row.a11y.name.clone();
+                let tab_hover_group: SharedString = format!("tab-hover-{tab_id}").into();
                 let tab_target = HierarchyTarget::Tab {
                     id: row.a11y.id.clone(),
                     label: row.a11y.name.clone(),
                 };
                 let close_target = tab_target.clone();
                 let selected = row.a11y.selected == Some(true);
+                let title_needs_fade = Self::tab_title_needs_fade(&row.a11y.name, window);
+                let fade_background = if selected {
+                    theme::current().bg.rgba()
+                } else {
+                    theme::sidebar_background()
+                };
+                let fade_hover_background = if selected {
+                    theme::current().bg.rgba()
+                } else {
+                    theme::surface_hover()
+                };
                 let (hidden, display_position, previous_offset, offset, motion) =
                     if let Some((source_id, positions, previous_offsets, offsets, motion)) =
                         &tab_reorder
@@ -577,8 +636,7 @@ impl OcHerdrView {
                     .items_center()
                     .flex_none()
                     .h(px(TAB_PILL_HEIGHT))
-                    .min_w(px(108.))
-                    .max_w(px(180.))
+                    .w(px(TAB_PILL_WIDTH))
                     .overflow_hidden()
                     .rounded_full()
                     .border_1()
@@ -607,11 +665,19 @@ impl OcHerdrView {
                     })
                     .when(tab_count >= 2, |tab| tab.cursor_grab())
                     .when(tab_count < 2, |tab| tab.cursor_pointer())
+                    .group(tab_hover_group.clone())
                     .opacity(if hidden { 0. } else { 1. })
                     .debug_selector(move || format!("tab-{debug_tab_id}"))
                     .on_hover(cx.listener(move |this, hovered, _window, cx| {
                         this.set_tab_hovered(hover_id.clone(), *hovered, cx);
                     }))
+                    .hoverable_tooltip(move |_window, cx| {
+                        let card = preview_view
+                            .read(cx)
+                            .tab_preview_card(&preview_tab_id, preview_title.clone());
+                        cx.new(|_| card).into()
+                    })
+                    .tooltip_show_delay(TAB_PREVIEW_DELAY)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event, _window, cx| {
@@ -645,16 +711,12 @@ impl OcHerdrView {
                             .id(("tab-title", row.number))
                             .flex_1()
                             .min_w_0()
-                            .px_8()
-                            .truncate()
+                            .px(px(TAB_TITLE_ACTION_WELL))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_overflow(TextOverflow::Truncate("".into()))
                             .text_center()
                             .debug_selector(move || format!("tab-title-{debug_title_id}"))
-                            .tooltip({
-                                let title = row.a11y.name.clone();
-                                move |_window, cx| {
-                                    cx.new(|_| TabTitleTooltip(title.clone().into())).into()
-                                }
-                            })
                             .child(row.a11y.name.clone()),
                     )
                     .when_some(shortcut, |tab_row, shortcut| {
@@ -673,6 +735,29 @@ impl OcHerdrView {
                                     theme::muted()
                                 })
                                 .child(shortcut),
+                        )
+                    })
+                    .when(title_needs_fade, |tab_row| {
+                        tab_row.child(
+                            div()
+                                .debug_selector(move || format!("tab-title-fade-{debug_fade_id}"))
+                                .absolute()
+                                .right(px(TAB_TITLE_ACTION_WELL))
+                                .top(px(1.))
+                                .bottom(px(1.))
+                                .w(px(TAB_TITLE_FADE_WIDTH))
+                                .bg(linear_gradient(
+                                    90.,
+                                    linear_color_stop(fade_background.alpha(0.), 0.),
+                                    linear_color_stop(fade_background, 1.),
+                                ))
+                                .group_hover(tab_hover_group, move |style| {
+                                    style.bg(linear_gradient(
+                                        90.,
+                                        linear_color_stop(fade_hover_background.alpha(0.), 0.),
+                                        linear_color_stop(fade_hover_background, 1.),
+                                    ))
+                                }),
                         )
                     })
                     .child(

@@ -28,8 +28,9 @@ use ochub_ui::gpui::{
     ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Task,
-    TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds,
-    WindowOptions, canvas, div, ease_out_quint, point, prelude::*, px, relative, size, surface,
+    TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
+    WindowBounds, WindowOptions, canvas, div, ease_out_quint, linear_color_stop, linear_gradient,
+    point, prelude::*, px, relative, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
@@ -64,6 +65,14 @@ const REORDER_SLOP_PX: f32 = 4.;
 const TAB_REORDER_GAP_PX: f32 = 4.;
 const REORDER_ANIMATION: Duration = Duration::from_millis(180);
 const TAB_CLOSE_ANIMATION: Duration = Duration::from_millis(150);
+const TAB_PILL_WIDTH: f32 = 160.;
+const TAB_TITLE_ACTION_WELL: f32 = 32.;
+const TAB_TITLE_FADE_WIDTH: f32 = 16.;
+const TAB_TITLE_FONT_SIZE: f32 = 14.;
+const TAB_PREVIEW_DELAY: Duration = Duration::from_millis(900);
+const TAB_PREVIEW_ANIMATION: Duration = Duration::from_millis(140);
+const TAB_PREVIEW_WIDTH: f32 = 320.;
+const TAB_PREVIEW_HEIGHT: f32 = 180.;
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -83,23 +92,115 @@ impl AssetSource for OcHerdrAssets {
     }
 }
 
-struct TabTitleTooltip(SharedString);
+#[derive(Clone)]
+struct TabPreviewPane {
+    fractions: (f32, f32, f32, f32),
+    frame: Option<RenderedFrame>,
+}
 
-impl Render for TabTitleTooltip {
+struct TabPreviewCard {
+    tab_id: String,
+    title: SharedString,
+    panes: Vec<TabPreviewPane>,
+    waiting: SharedString,
+}
+
+impl Render for TabPreviewCard {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let waiting = self.waiting.clone();
+        let pane_tab_id = self.tab_id.clone();
+        let panes = self
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| {
+                let (x, y, width, height) = pane.fractions;
+                let waiting = waiting.clone();
+                let pane_debug_id = format!("tab-preview-pane-{pane_tab_id}-{index}");
+                div()
+                    .debug_selector(move || pane_debug_id.clone())
+                    .absolute()
+                    .left(relative(x))
+                    .top(relative(y))
+                    .w(relative(width))
+                    .h(relative(height))
+                    .p(px(2.))
+                    .child(
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(theme::border_strong())
+                            .bg(theme::current().bg.rgba())
+                            .when_some(pane.frame.clone(), |pane, frame| {
+                                pane.child(
+                                    surface(frame.pixel_buffer)
+                                        .with_frame_lifetime(frame.lifetime)
+                                        .object_fit(ObjectFit::Contain)
+                                        .size_full(),
+                                )
+                            })
+                            .when(pane.frame.is_none(), |pane| {
+                                pane.child(
+                                    div().text_xs().text_color(theme::muted()).child(waiting),
+                                )
+                            }),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let has_panes = !panes.is_empty();
+        let tab_id = self.tab_id.clone();
+        let title_id = self.tab_id.clone();
         div()
-            .max_w(px(360.))
-            .px_2()
-            .py_1()
-            .rounded(px(CORNER_COMPACT))
+            .id((ElementId::from("tab-preview-card"), tab_id.clone()))
+            .role(ochub_ui::gpui::Role::Tooltip)
+            .aria_label(self.title.clone())
+            .debug_selector(move || format!("tab-preview-{tab_id}"))
+            .w(px(TAB_PREVIEW_WIDTH))
+            .overflow_hidden()
+            .rounded(px(CORNER_PANEL))
             .border_1()
             .border_color(theme::border())
             .bg(theme::overlay())
             .shadow(theme::shadow_popover())
-            .text_sm()
-            .text_color(theme::text())
-            .whitespace_normal()
-            .child(self.0.clone())
+            .child(
+                div()
+                    .debug_selector(move || format!("tab-preview-title-{title_id}"))
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text())
+                    .whitespace_normal()
+                    .child(self.title.clone()),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(TAB_PREVIEW_HEIGHT))
+                    .overflow_hidden()
+                    .bg(theme::current().bg.rgba())
+                    .children(panes)
+                    .when(!has_panes, |preview| {
+                        preview.flex().items_center().justify_center().child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(self.waiting.clone()),
+                        )
+                    }),
+            )
+            .with_animation(
+                (ElementId::from("tab-preview-enter"), self.tab_id.clone()),
+                Animation::new(TAB_PREVIEW_ANIMATION).with_easing(ease_out_quint()),
+                |card, delta| card.opacity(delta),
+            )
     }
 }
 

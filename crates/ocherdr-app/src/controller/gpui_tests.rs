@@ -27,7 +27,8 @@ use crate::host_center::HostCenter;
 use crate::{
     AgentOutputState, AgentPromptPhase, AppearanceSettings, CachedHostHealth, EventStreamState,
     HostHealthView, I18n, Language, OcHerdrView, PendingListReorder, ReorderList, Settings,
-    install_appearance, reorder_projection,
+    TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_HEIGHT, TAB_PREVIEW_WIDTH, install_appearance,
+    reorder_projection,
 };
 
 fn install_app(cx: &mut TestAppContext) {
@@ -816,12 +817,32 @@ fn overflowing_tab_bar_scrolls_horizontally_with_the_wheel(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn tab_hover_reveals_left_close_without_resizing_elastic_tabs(cx: &mut TestAppContext) {
+fn fixed_width_tab_hover_reveals_close_then_delayed_preview(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);
     cx.update(|_, cx| cx.set_reduce_motion(true));
     view.update(cx, |this, cx| {
         let mut snapshot = three_tab_snapshot();
         snapshot.tabs[1].label = "a deliberately long tab title that must be truncated".into();
+        snapshot.tabs[1].pane_count = 1;
+        snapshot.panes.push(PaneInfo {
+            pane_id: "p-preview".into(),
+            terminal_id: "term-preview".into(),
+            workspace_id: "w".into(),
+            tab_id: "t-b".into(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+            agent: None,
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status: AgentStatus::Idle,
+            state_labels: HashMap::new(),
+            tokens: HashMap::new(),
+            revision: 1,
+        });
         this.snapshot = Some(snapshot);
         this.selection = Selection {
             connection_id: "local".into(),
@@ -836,9 +857,11 @@ fn tab_hover_reveals_left_close_without_resizing_elastic_tabs(cx: &mut TestAppCo
 
     let alpha_before = cx.debug_bounds("tab-t-a").expect("alpha tab bounds");
     let long_before = cx.debug_bounds("tab-t-b").expect("long tab bounds");
-    assert_eq!(alpha_before.size.width, gpui::px(108.));
-    assert_eq!(long_before.size.width, gpui::px(180.));
-    assert!(long_before.size.width > alpha_before.size.width);
+    assert_eq!(alpha_before.size.width, gpui::px(TAB_PILL_WIDTH));
+    assert_eq!(long_before.size.width, gpui::px(TAB_PILL_WIDTH));
+    assert_eq!(cx.debug_bounds("tab-title-fade-t-a"), None);
+    assert!(cx.debug_bounds("tab-title-fade-t-b").is_some());
+    assert_eq!(cx.debug_bounds("tab-preview-t-b"), None);
     view.read_with(cx, |this, _| {
         assert_eq!(this.hovered_tab_id, None);
         assert_eq!(
@@ -860,6 +883,7 @@ fn tab_hover_reveals_left_close_without_resizing_elastic_tabs(cx: &mut TestAppCo
     assert_eq!(long_after, long_before, "hover must not reflow the tab");
     assert_eq!(title_after.center().x, long_after.center().x);
     assert!(close_after.center().x < long_after.center().x);
+    assert_eq!(cx.debug_bounds("tab-preview-t-b"), None);
     view.read_with(cx, |this, _| {
         assert_eq!(this.hovered_tab_id.as_deref(), Some("t-b"));
         assert_eq!(
@@ -867,6 +891,27 @@ fn tab_hover_reveals_left_close_without_resizing_elastic_tabs(cx: &mut TestAppCo
             1.
         );
     });
+
+    cx.executor()
+        .advance_clock(TAB_PREVIEW_DELAY - Duration::from_millis(1));
+    cx.run_until_parked();
+    assert_eq!(cx.debug_bounds("tab-preview-t-b"), None);
+
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    let preview = cx
+        .debug_bounds("tab-preview-t-b")
+        .expect("preview appears after the configured hover delay");
+    let preview_title = cx
+        .debug_bounds("tab-preview-title-t-b")
+        .expect("preview exposes the complete title region");
+    let preview_pane = cx
+        .debug_bounds("tab-preview-pane-t-b-0")
+        .expect("preview composes the tab pane into the card");
+    assert_eq!(preview.size.width, gpui::px(TAB_PREVIEW_WIDTH));
+    assert!(preview_title.size.width > gpui::px(TAB_PILL_WIDTH));
+    assert_eq!(preview_pane.size.width, gpui::px(TAB_PREVIEW_WIDTH - 2.));
+    assert_eq!(preview_pane.size.height, gpui::px(TAB_PREVIEW_HEIGHT));
 
     cx.simulate_click(close_after.center(), gpui::Modifiers::default());
     cx.run_until_parked();
