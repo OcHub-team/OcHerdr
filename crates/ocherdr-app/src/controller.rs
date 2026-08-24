@@ -86,6 +86,7 @@ impl OcHerdrView {
             overlay: Overlay::None,
             open_select: None,
             appearance_scroll: ScrollHandle::new(),
+            appearance_ui: Default::default(),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
             pending_reorder: None,
@@ -953,11 +954,17 @@ impl OcHerdrView {
 
     pub(super) fn open_appearance(&mut self, cx: &mut Context<Self>) {
         self.open_select = None;
+        self.appearance_ui = Default::default();
         self.set_overlay(Overlay::Appearance, cx);
     }
 
     pub(super) fn close_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.appearance_ui.dismiss_sheet() {
+            cx.notify();
+            return;
+        }
         self.open_select = None;
+        self.appearance_ui = Default::default();
         self.set_overlay(Overlay::None, cx);
         self.focus.focus(window, cx);
     }

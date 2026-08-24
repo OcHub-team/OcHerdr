@@ -6,6 +6,8 @@ mod hierarchy;
 mod overlays;
 mod remote;
 
+pub(crate) use appearance::AppearanceUi;
+
 impl Render for OcHerdrView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let chrome = self.chrome_a11y();

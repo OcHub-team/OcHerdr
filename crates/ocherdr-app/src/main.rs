@@ -688,6 +688,7 @@ struct OcHerdrView {
     overlay: Overlay,
     open_select: Option<SharedString>,
     appearance_scroll: ScrollHandle,
+    appearance_ui: ui::AppearanceUi,
     prefix_pending: bool,
     surface_drag: SurfaceDrag,
     pending_reorder: Option<PendingReorder>,
