@@ -883,6 +883,8 @@ enum TerminalEnvelope {
         full: bool,
         bytes: String,
     },
+    #[serde(rename = "terminal.mouse_capture")]
+    MouseCapture { enabled: bool, sgr_pixels: bool },
     #[serde(rename = "terminal.closed")]
     Closed { reason: Option<String> },
 }
@@ -894,6 +896,12 @@ pub struct TerminalFrame {
     pub height: u16,
     pub full: bool,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalEvent {
+    Frame(TerminalFrame),
+    MouseCapture { enabled: bool, sgr_pixels: bool },
 }
 
 #[derive(Debug, Serialize)]
@@ -1043,7 +1051,7 @@ impl TerminalStream {
         })
     }
 
-    pub fn read_frame(&mut self) -> Result<Option<TerminalFrame>> {
+    pub fn read_event(&mut self) -> Result<Option<TerminalEvent>> {
         let mut line = String::new();
         if self.stdout.read_line(&mut line)? == 0 {
             return Ok(None);
@@ -1078,14 +1086,21 @@ impl TerminalStream {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(bytes)
                     .map_err(|error| HerdrError::Protocol(error.to_string()))?;
-                Ok(Some(TerminalFrame {
+                Ok(Some(TerminalEvent::Frame(TerminalFrame {
                     seq,
                     width,
                     height,
                     full,
                     bytes,
-                }))
+                })))
             }
+            TerminalEnvelope::MouseCapture {
+                enabled,
+                sgr_pixels,
+            } => Ok(Some(TerminalEvent::MouseCapture {
+                enabled,
+                sgr_pixels,
+            })),
         }
     }
 
@@ -1132,9 +1147,9 @@ impl TerminalSession {
         mode: TerminalMode,
         cols: u16,
         rows: u16,
-    ) -> (Self, UnboundedReceiver<Result<TerminalFrame>>) {
+    ) -> (Self, UnboundedReceiver<Result<TerminalEvent>>) {
         let (command_tx, command_rx) = mpsc::channel::<TerminalCommand>();
-        let (frame_tx, frame_rx) = futures_mpsc::unbounded::<Result<TerminalFrame>>();
+        let (event_tx, event_rx) = futures_mpsc::unbounded::<Result<TerminalEvent>>();
         let process_id = Arc::new(AtomicU32::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let worker_process_id = process_id.clone();
@@ -1145,7 +1160,7 @@ impl TerminalSession {
                 Ok(stream) => stream,
                 Err(error) => {
                     worker_alive.store(false, Ordering::Release);
-                    let _ = frame_tx.unbounded_send(Err(error));
+                    let _ = event_tx.unbounded_send(Err(error));
                     return;
                 }
             };
@@ -1163,15 +1178,15 @@ impl TerminalSession {
                 }
             });
             loop {
-                match stream.read_frame() {
-                    Ok(Some(frame)) => {
-                        if frame_tx.unbounded_send(Ok(frame)).is_err() {
+                match stream.read_event() {
+                    Ok(Some(event)) => {
+                        if event_tx.unbounded_send(Ok(event)).is_err() {
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = frame_tx.unbounded_send(Err(error));
+                        let _ = event_tx.unbounded_send(Err(error));
                         break;
                     }
                 }
@@ -1187,7 +1202,7 @@ impl TerminalSession {
                 process_id,
                 alive,
             },
-            frame_rx,
+            event_rx,
         )
     }
 
@@ -1430,6 +1445,22 @@ pub fn open_system_terminal(_command: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_terminal_mouse_capture_envelope() {
+        let envelope: TerminalEnvelope = serde_json::from_str(
+            r#"{"type":"terminal.mouse_capture","enabled":true,"sgr_pixels":false}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            envelope,
+            TerminalEnvelope::MouseCapture {
+                enabled: true,
+                sgr_pixels: false,
+            }
+        );
+    }
 
     #[test]
     fn quotes_remote_arguments_without_shell_injection() {

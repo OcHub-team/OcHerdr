@@ -12,7 +12,7 @@ use ocherdr_core::{
     agent_status_stream_should_rebuild, event_panes_after_failed_subscribe, parse_agent_name,
     reorder_hover_along_axis, reorder_insert_index,
 };
-use ocherdr_herdr::{TerminalFrame, next_batch, subscribe_agent_status};
+use ocherdr_herdr::{TerminalEvent, next_batch, subscribe_agent_status};
 
 use ochub_ui::notifications::NotificationHost;
 
@@ -2063,7 +2063,7 @@ impl OcHerdrView {
 
     fn listen_pane(
         pane_id: String,
-        mut frames: UnboundedReceiver<std::result::Result<TerminalFrame, HerdrError>>,
+        mut frames: UnboundedReceiver<std::result::Result<TerminalEvent, HerdrError>>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -2104,7 +2104,7 @@ impl OcHerdrView {
     fn apply_herdr_frames(
         &mut self,
         pane_id: &str,
-        batch: Option<Vec<std::result::Result<TerminalFrame, HerdrError>>>,
+        batch: Option<Vec<std::result::Result<TerminalEvent, HerdrError>>>,
         cx: &mut Context<Self>,
     ) -> bool {
         let composing = self.ime_marked.clone();
@@ -2128,7 +2128,7 @@ impl OcHerdrView {
                     let mut closed = false;
                     for item in items {
                         match item {
-                            Ok(frame) => {
+                            Ok(TerminalEvent::Frame(frame)) => {
                                 if runtime.size != (frame.width, frame.height)
                                     && incoming_frame_should_replace_grid(runtime.pixel_size)
                                 {
@@ -2153,6 +2153,10 @@ impl OcHerdrView {
                                     runtime.terminal.set_preedit(Some(preedit));
                                 }
                             }
+                            Ok(TerminalEvent::MouseCapture {
+                                enabled,
+                                sgr_pixels,
+                            }) => runtime.terminal.set_mouse_capture(enabled, sgr_pixels),
                             Err(stream_error) => {
                                 runtime.exit_seen = true;
                                 hierarchy_changed = true;
@@ -2977,15 +2981,17 @@ impl OcHerdrView {
             return;
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
+        let Some(runtime) = self.pane_mut(&pane_id) else {
+            return;
+        };
+        let captured = runtime
+            .terminal
+            .begin_text_selection(surface.0, surface.1, modifiers);
+        flush_pane_surface(runtime);
         self.surface_drag = SurfaceDrag::Text {
             pane_id: pane_id.clone(),
+            captured,
         };
-        if let Some(runtime) = self.pane_mut(&pane_id) {
-            runtime
-                .terminal
-                .begin_text_selection(surface.0, surface.1, modifiers);
-            flush_pane_surface(runtime);
-        }
         cx.stop_propagation();
         cx.notify();
     }
@@ -3004,7 +3010,7 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
-        let SurfaceDrag::Text { pane_id } = &self.surface_drag else {
+        let SurfaceDrag::Text { pane_id, .. } = &self.surface_drag else {
             return;
         };
         let pane_id = pane_id.clone();
@@ -3044,7 +3050,7 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
-        let SurfaceDrag::Text { pane_id } =
+        let SurfaceDrag::Text { pane_id, captured } =
             std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle)
         else {
             return;
@@ -3059,7 +3065,9 @@ impl OcHerdrView {
             );
             runtime.terminal.end_text_selection(point, modifiers);
             flush_pane_surface(runtime);
-            copy_terminal_selection(runtime, cx);
+            if !captured {
+                copy_terminal_selection(runtime, cx);
+            }
         }
         cx.stop_propagation();
         cx.notify();
@@ -3091,25 +3099,28 @@ impl OcHerdrView {
     }
 
     fn end_text_drag_unless_pane(&mut self, pane_id: &str) {
-        let Some(previous) = self.take_text_drag() else {
+        let Some((previous, captured)) = self.take_text_drag() else {
             return;
         };
         if previous == pane_id {
-            self.surface_drag = SurfaceDrag::Text { pane_id: previous };
+            self.surface_drag = SurfaceDrag::Text {
+                pane_id: previous,
+                captured,
+            };
             return;
         }
         self.finish_text_drag_on(&previous);
     }
 
     fn end_text_drag(&mut self) {
-        if let Some(previous) = self.take_text_drag() {
+        if let Some((previous, _)) = self.take_text_drag() {
             self.finish_text_drag_on(&previous);
         }
     }
 
-    fn take_text_drag(&mut self) -> Option<String> {
+    fn take_text_drag(&mut self) -> Option<(String, bool)> {
         match std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle) {
-            SurfaceDrag::Text { pane_id } => Some(pane_id),
+            SurfaceDrag::Text { pane_id, captured } => Some((pane_id, captured)),
             other => {
                 self.surface_drag = other;
                 None
@@ -4644,7 +4655,7 @@ fn sync_pane_session(
     profile: ConnectionProfile,
     session_name: String,
     pane_id: String,
-) -> Option<UnboundedReceiver<std::result::Result<TerminalFrame, HerdrError>>> {
+) -> Option<UnboundedReceiver<std::result::Result<TerminalEvent, HerdrError>>> {
     runtime
         .terminal
         .set_focus(wanted == TerminalMode::ControlTakeover);

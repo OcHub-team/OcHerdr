@@ -959,7 +959,7 @@ fn key_goes_to_terminal(overlay: &Overlay) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 enum SurfaceDrag {
     Idle,
-    Text { pane_id: String },
+    Text { pane_id: String, captured: bool },
     Split(SplitDrag),
     Reorder(ReorderDrag),
 }

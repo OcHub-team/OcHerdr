@@ -39,6 +39,22 @@ mod ffi {
 
 static RUNTIME: OnceLock<Result<GhosttyRuntime, String>> = OnceLock::new();
 
+const MOUSE_REPORTING_RESET: &[u8] =
+    b"\x1b[?1006l\x1b[?1016l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+const MOUSE_REPORTING_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+const PIXEL_MOUSE_REPORTING_ENABLE: &[u8] = b"\x1b[?1016h";
+
+fn mouse_capture_sequence(enabled: bool, sgr_pixels: bool) -> Vec<u8> {
+    let mut sequence = MOUSE_REPORTING_RESET.to_vec();
+    if enabled {
+        sequence.extend_from_slice(MOUSE_REPORTING_ENABLE);
+        if sgr_pixels {
+            sequence.extend_from_slice(PIXEL_MOUSE_REPORTING_ENABLE);
+        }
+    }
+    sequence
+}
+
 #[derive(Debug, Error)]
 pub enum TerminalError {
     #[error("failed to initialize Ghostty: {0}")]
@@ -979,6 +995,10 @@ impl Terminal {
         }
     }
 
+    pub fn set_mouse_capture(&self, enabled: bool, sgr_pixels: bool) {
+        self.apply_frame(&mouse_capture_sequence(enabled, sgr_pixels), false);
+    }
+
     pub fn has_selection(&self) -> bool {
         // SAFETY: the surface is live and queried on GPUI's application thread.
         unsafe { ffi::ghostty_surface_has_selection(self.raw()) }
@@ -1009,10 +1029,11 @@ impl Terminal {
         ok
     }
 
-    pub fn begin_text_selection(&self, x: f64, y: f64, modifiers: KeyModifiers) {
+    pub fn begin_text_selection(&self, x: f64, y: f64, modifiers: KeyModifiers) -> bool {
         self.mouse_pos(x, y, modifiers);
-        let _ = self.mouse_button(true, SurfaceMouseButton::Left, modifiers);
+        let captured = self.mouse_button(true, SurfaceMouseButton::Left, modifiers);
         self.refresh();
+        captured
     }
 
     pub fn update_text_selection(&self, x: f64, y: f64, modifiers: KeyModifiers) {
@@ -1255,6 +1276,21 @@ mod tests {
         });
         assert_ne!(modifiers & ffi::ghostty_input_mods_e_GHOSTTY_MODS_CTRL, 0);
         assert_ne!(modifiers & ffi::ghostty_input_mods_e_GHOSTTY_MODS_ALT, 0);
+    }
+
+    #[test]
+    fn mouse_capture_sequences_reset_modes_before_enabling_requested_encoding() {
+        let disabled = mouse_capture_sequence(false, true);
+        assert_eq!(disabled, MOUSE_REPORTING_RESET);
+
+        let enabled = mouse_capture_sequence(true, false);
+        assert!(enabled.starts_with(MOUSE_REPORTING_RESET));
+        assert!(enabled.ends_with(b"\x1b[?1006h"));
+        assert!(!enabled.ends_with(b"\x1b[?1016h"));
+
+        let pixels = mouse_capture_sequence(true, true);
+        assert!(pixels.starts_with(MOUSE_REPORTING_RESET));
+        assert!(pixels.ends_with(b"\x1b[?1016h"));
     }
 
     #[test]
