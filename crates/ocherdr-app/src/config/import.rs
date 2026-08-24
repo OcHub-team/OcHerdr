@@ -114,7 +114,7 @@ pub struct ImportedGhosttyTheme {
     pub file_json: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GhosttyImportPlan {
     pub source: PathBuf,
     pub updates: Vec<ConfigUpdate>,
@@ -140,11 +140,17 @@ pub fn plan_ghostty_import_from(
     source: &Path,
     themes_dir: &Path,
 ) -> Result<GhosttyImportPlan, GhosttyImportError> {
+    complete_import_plan(plan_ghostty_keys(text, source), themes_dir)
+}
+
+/// Keys and unknown assignments only. Theme files are not read, so a missing
+/// Ghostty.app still yields a plan the settings page can confirm.
+pub fn plan_ghostty_keys(text: &str, source: &Path) -> GhosttyKeyPlan {
     let document = ConfigDocument::parse(text);
     let (config, parse_warnings) = AppConfig::from_document(&document);
     let mut unknown_keys = Vec::new();
     let mut updates: Vec<ConfigUpdate> = Vec::new();
-    let mut theme_ref = None;
+    let mut ghostty_theme = None;
     let mut warnings = parse_warnings;
     for (index, color) in &config.extra_palette {
         unknown_keys.push(UnknownKey {
@@ -156,7 +162,7 @@ pub fn plan_ghostty_import_from(
 
     for (line, key, value) in document.assignments() {
         if key == "theme" {
-            theme_ref = ThemeRef::parse(value);
+            ghostty_theme = ThemeRef::parse(value);
             continue;
         }
         if !is_known_key(key) {
@@ -175,25 +181,105 @@ pub fn plan_ghostty_import_from(
 
     warnings.retain(|warning| !warning.message.starts_with("unknown key"));
 
-    let mut themes = Vec::new();
-    let terminal_theme = match theme_ref {
-        Some(theme) => {
-            let imported = import_theme(theme, themes_dir)?;
-            let id = ThemeRef::Name(imported.id.clone());
-            themes.push(imported);
-            Some(id)
-        }
-        None => None,
-    };
-
-    Ok(GhosttyImportPlan {
+    GhosttyKeyPlan {
         source: source.to_path_buf(),
         updates,
         unknown_keys,
-        themes,
-        terminal_theme,
         warnings,
-    })
+        ghostty_theme,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GhosttyKeyPlan {
+    pub source: PathBuf,
+    pub updates: Vec<ConfigUpdate>,
+    pub unknown_keys: Vec<UnknownKey>,
+    pub warnings: Vec<ParseWarning>,
+    pub ghostty_theme: Option<ThemeRef>,
+}
+
+impl GhosttyKeyPlan {
+    pub fn without_themes(self) -> GhosttyImportPlan {
+        GhosttyImportPlan {
+            source: self.source,
+            updates: self.updates,
+            unknown_keys: self.unknown_keys,
+            themes: Vec::new(),
+            terminal_theme: None,
+            warnings: self.warnings,
+        }
+    }
+}
+
+fn complete_import_plan(
+    keys: GhosttyKeyPlan,
+    themes_dir: &Path,
+) -> Result<GhosttyImportPlan, GhosttyImportError> {
+    let GhosttyKeyPlan {
+        source,
+        updates,
+        unknown_keys,
+        warnings,
+        ghostty_theme,
+    } = keys;
+    let mut plan = GhosttyImportPlan {
+        source,
+        updates,
+        unknown_keys,
+        themes: Vec::new(),
+        terminal_theme: None,
+        warnings,
+    };
+    let Some(theme) = ghostty_theme else {
+        return Ok(plan);
+    };
+    let imported = import_theme(theme, themes_dir)?;
+    plan.terminal_theme = Some(ThemeRef::Name(imported.id.clone()));
+    plan.themes.push(imported);
+    Ok(plan)
+}
+
+pub fn apply_ghostty_import_plan(
+    document: &mut ConfigDocument,
+    plan: &GhosttyImportPlan,
+    themes_dir: &Path,
+) -> Result<(), GhosttyImportError> {
+    if !plan.themes.is_empty() {
+        fs::create_dir_all(themes_dir).map_err(|error| GhosttyImportError::Io {
+            path: themes_dir.to_path_buf(),
+            error: error.to_string(),
+        })?;
+    }
+    for theme in &plan.themes {
+        if theme.file_name.contains("..")
+            || theme.file_name.contains('/')
+            || theme.file_name.contains('\\')
+        {
+            return Err(GhosttyImportError::ThemeFile {
+                error: format!("refusing to write theme file `{}`", theme.file_name),
+            });
+        }
+        let path = themes_dir.join(&theme.file_name);
+        fs::write(&path, &theme.file_json).map_err(|error| GhosttyImportError::Io {
+            path,
+            error: error.to_string(),
+        })?;
+    }
+    for update in &plan.updates {
+        if is_repeatable_key(&update.key) {
+            document.set_repeatable(&update.key, &update.values);
+            continue;
+        }
+        let Some(value) = update.values.last() else {
+            continue;
+        };
+        document.set(&update.key, value);
+    }
+    if let Some(theme) = &plan.terminal_theme {
+        document.set("terminal-theme", &theme.to_config());
+    }
+    Ok(())
 }
 
 fn find_ghostty_config(paths: &GhosttyImportPaths) -> Result<PathBuf, GhosttyImportError> {
@@ -575,6 +661,55 @@ shell-integration = zsh
                 .ends_with("com.mitchellh.ghostty/config")
         );
         assert_eq!(paths.app_themes, PathBuf::from(GHOSTTY_APP_THEMES));
+    }
+
+    #[test]
+    fn applying_an_import_plan_writes_theme_json_and_only_the_mapped_keys() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let themes = dir.path().join("themes");
+        fs::create_dir(&themes).unwrap();
+        let probe = "#c0ffee";
+        write_theme(&themes, "Probe", probe);
+        let config = "\
+font-size = 15
+theme = Probe
+keybind = ctrl+c=copy
+";
+        assert!(
+            fs::read_to_string(themes.join("Probe"))
+                .unwrap()
+                .contains(probe),
+            "fixture must contain the unique color or apply cannot prove it copied the theme"
+        );
+        let plan =
+            plan_ghostty_import_from(config, &dir.path().join("config"), &themes).expect("plan");
+        assert_eq!(
+            plan.themes[0].dark.background,
+            Color::parse(probe),
+            "the plan must actually carry the unique Ghostty background"
+        );
+        let dest = dir.path().join("imported-themes");
+        let mut document = ConfigDocument::parse("# keep\nmystery-option = wow\nfont-size = 13\n");
+        apply_ghostty_import_plan(&mut document, &plan, &dest).expect("apply");
+        let written = document.serialize();
+        assert!(written.contains("# keep"));
+        assert!(written.contains("mystery-option = wow"));
+        assert!(written.contains("font-size = 15"));
+        assert!(written.contains("terminal-theme = imported-probe"));
+        assert!(
+            !written.contains("keybind"),
+            "unknown keys must not be copied into OcHerdr config"
+        );
+        assert!(
+            !written.contains("theme = Probe"),
+            "Ghostty theme is imported as a family, not as our UI theme"
+        );
+        let json = fs::read_to_string(dest.join("imported-probe.ochub-theme.json"))
+            .expect("imported theme file");
+        assert_eq!(
+            json, plan.themes[0].file_json,
+            "apply must write the plan JSON byte-for-byte, not reserialize through ochub-ui"
+        );
     }
 
     #[test]

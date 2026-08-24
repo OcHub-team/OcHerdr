@@ -1124,15 +1124,71 @@ impl OcHerdrView {
 
     pub(super) fn set_background_opacity(
         &mut self,
-        opacity: OpacityChoice,
+        opacity: f64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.config.set(
             "background-opacity",
-            &crate::config::format_opacity_percent(opacity.value()),
+            &crate::config::format_opacity(opacity),
         );
         self.appearance.background_opacity = opacity;
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_terminal_theme(
+        &mut self,
+        theme: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match theme.as_deref() {
+            None => self.config.set("terminal-theme", ""),
+            Some(id) => self.config.set("terminal-theme", id),
+        }
+        self.appearance.terminal_theme = theme;
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_window_padding(
+        &mut self,
+        horizontal: bool,
+        value: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if horizontal {
+            self.config.set("window-padding-x", &value.to_string());
+            self.appearance.window_padding_x = value;
+        } else {
+            self.config.set("window-padding-y", &value.to_string());
+            self.appearance.window_padding_y = value;
+        }
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_font_thicken_strength(
+        &mut self,
+        strength: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.config
+            .set("font-thicken-strength", &strength.to_string());
+        self.appearance.font.thicken_strength = strength;
+        self.apply_appearance(window, cx);
+    }
+
+    pub(super) fn set_palette_slot(
+        &mut self,
+        slot: u8,
+        color: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.appearance.palette[slot as usize] = color;
+        let values = palette_config_values(&self.appearance.palette);
+        self.config.set_repeatable("palette", &values);
         self.apply_appearance(window, cx);
     }
 
@@ -1152,35 +1208,21 @@ impl OcHerdrView {
         self.apply_appearance(window, cx);
     }
 
-    pub(super) fn set_font_size(
-        &mut self,
-        size: FontSizeChoice,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.config.set("font-size", &size.value().to_string());
+    pub(super) fn set_font_size(&mut self, size: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.config
+            .set("font-size", &crate::config::format_font_size(size));
         self.appearance.font.size = size;
         self.apply_appearance(window, cx);
     }
 
-    pub(super) fn set_font_ligatures(
+    pub(super) fn set_font_features(
         &mut self,
-        ligatures: bool,
+        features: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut features: Vec<String> = self
-            .config
-            .get_all("font-feature")
-            .into_iter()
-            .filter(|feature| !matches!(feature.trim(), "-liga" | "-calt" | "-dlig"))
-            .map(str::to_owned)
-            .collect();
-        if !ligatures {
-            features.extend(["-calt".to_owned(), "-liga".to_owned(), "-dlig".to_owned()]);
-        }
         self.config.set_repeatable("font-feature", &features);
-        self.appearance.font.ligatures = ligatures;
+        self.appearance.font.features = features;
         self.apply_appearance(window, cx);
     }
 
@@ -1198,29 +1240,33 @@ impl OcHerdrView {
 
     pub(super) fn set_cell_width(
         &mut self,
-        percent: CellWidthChoice,
+        metric: Option<crate::config::values::MetricModifier>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.config.set(
             "adjust-cell-width",
-            &crate::config::values::MetricModifier::Percent(f64::from(percent.value())).to_config(),
+            &metric
+                .map(crate::config::values::MetricModifier::to_config)
+                .unwrap_or_default(),
         );
-        self.appearance.font.cell_width_percent = percent;
+        self.appearance.font.cell_width = metric;
         self.apply_appearance(window, cx);
     }
 
     pub(super) fn set_cell_height(
         &mut self,
-        percent: CellHeightChoice,
+        metric: Option<crate::config::values::MetricModifier>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.config.set(
             "adjust-cell-height",
-            &crate::config::values::MetricModifier::Percent(f64::from(percent.value())).to_config(),
+            &metric
+                .map(crate::config::values::MetricModifier::to_config)
+                .unwrap_or_default(),
         );
-        self.appearance.font.cell_height_percent = percent;
+        self.appearance.font.cell_height = metric;
         self.apply_appearance(window, cx);
     }
 
@@ -4533,13 +4579,36 @@ fn wheel_scroll_lines(delta: ScrollDelta, line_height: f32, leftover: &mut f32) 
 }
 
 fn current_terminal_palette(appearance: &AppearanceSettings) -> TerminalPalette {
-    let family = theme::find_family(&appearance.theme_family);
-    terminal_palette_from_theme(
-        theme::current(),
-        theme::is_dark(),
-        crate::theme_ansi::overlay_for(family.as_ref()),
-        &appearance.font,
-    )
+    let dark = theme::is_dark();
+    let overlay = terminal_overlay(appearance, dark);
+    let mut palette = terminal_palette_from_theme(theme::current(), dark, overlay, appearance);
+    palette.ansi = crate::theme_ansi::apply_overrides(palette.ansi, &appearance.palette);
+    palette
+}
+
+pub(crate) fn terminal_overlay(
+    appearance: &AppearanceSettings,
+    dark: bool,
+) -> crate::theme_ansi::ThemeAnsi {
+    let family_id = match appearance
+        .terminal_theme
+        .as_deref()
+        .and_then(crate::config::values::ThemeRef::parse)
+    {
+        None => appearance.theme_family.clone(),
+        Some(crate::config::values::ThemeRef::Name(id)) => id,
+        Some(crate::config::values::ThemeRef::Pair {
+            light,
+            dark: dark_id,
+        }) => {
+            if dark {
+                dark_id
+            } else {
+                light
+            }
+        }
+    };
+    crate::theme_ansi::overlay_for(theme::find_family(&family_id).as_ref())
 }
 
 fn terminal_ansi(
@@ -4547,80 +4616,16 @@ fn terminal_ansi(
     theme: &theme::Theme,
     dark: bool,
 ) -> [u32; 16] {
-    overlay
-        .colors(dark)
-        .unwrap_or_else(|| ansi_from_theme(theme, dark))
-}
-
-fn ansi_from_theme(theme: &theme::Theme, dark: bool) -> [u32; 16] {
-    let (black, bright_black) = split_gray_pair(theme.bg.0, theme.text.0, dark);
-    let (red, bright_red) = split_pair(theme.red.0, dark);
-    let (green, bright_green) = split_pair(theme.green.0, dark);
-    let (yellow, bright_yellow) = split_pair(theme.yellow.0, dark);
-    let (blue, bright_blue) = split_pair(theme.accent.0, dark);
-    let (magenta, bright_magenta) = split_pair(theme.mauve.0, dark);
-    let (cyan, bright_cyan) = split_pair(theme.teal.0, dark);
-    let (white, bright_white) = split_pair(theme.subtext.0, dark);
-    [
-        black,
-        red,
-        green,
-        yellow,
-        blue,
-        magenta,
-        cyan,
-        white,
-        bright_black,
-        bright_red,
-        bright_green,
-        bright_yellow,
-        bright_blue,
-        bright_magenta,
-        bright_cyan,
-        bright_white,
-    ]
-}
-
-fn split_gray_pair(bg: u32, text: u32, dark: bool) -> (u32, u32) {
-    let toward_text = if dark { 22 } else { 28 };
-    split_pair(mix_rgb(bg, text, toward_text), dark)
-}
-
-fn split_pair(color: u32, dark: bool) -> (u32, u32) {
-    let dim = mix_rgb(color, 0x000000, if dark { 28 } else { 16 });
-    let bright = mix_rgb(color, 0xFFFFFF, if dark { 16 } else { 28 });
-    if ansi_luma(bright) > ansi_luma(dim) && dim != bright {
-        return (dim, bright);
-    }
-    let bright = mix_rgb(dim, 0xFFFFFF, 42);
-    if ansi_luma(bright) > ansi_luma(dim) && dim != bright {
-        return (dim, bright);
-    }
-    (mix_rgb(bright, 0x000000, 36), bright)
-}
-
-fn mix_rgb(from: u32, to: u32, percent: u32) -> u32 {
-    let percent = percent.min(100) as i32;
-    let mix = |from: u32, to: u32| {
-        let from = from as i32;
-        let to = to as i32;
-        (from + (to - from) * percent / 100).clamp(0, 255) as u32
-    };
-    (mix((from >> 16) & 0xff, (to >> 16) & 0xff) << 16)
-        | (mix((from >> 8) & 0xff, (to >> 8) & 0xff) << 8)
-        | mix(from & 0xff, to & 0xff)
-}
-
-fn ansi_luma(color: u32) -> u32 {
-    299 * ((color >> 16) & 0xff) + 587 * ((color >> 8) & 0xff) + 114 * (color & 0xff)
+    crate::theme_ansi::resolved_ansi(overlay, theme, dark)
 }
 
 fn terminal_palette_from_theme(
     theme: ochub_ui::theme::Theme,
     dark: bool,
     overlay: crate::theme_ansi::ThemeAnsi,
-    font: &TerminalFontSettings,
+    appearance: &AppearanceSettings,
 ) -> TerminalPalette {
+    let font = &appearance.font;
     TerminalPalette {
         dark,
         background: theme.bg.0,
@@ -4629,12 +4634,29 @@ fn terminal_palette_from_theme(
         selection: theme.selection.0,
         ansi: terminal_ansi(overlay, &theme, dark),
         font_family: font.family.clone(),
-        font_size: font.size.value(),
-        ligatures: font.ligatures,
+        font_size: font.size.round().clamp(1.0, 255.0) as u8,
+        font_features: font.features.clone(),
         thicken: font.thicken,
-        cell_width_percent: font.cell_width_percent.value(),
-        cell_height_percent: font.cell_height_percent.value(),
+        thicken_strength: font.thicken_strength,
+        cell_width: font
+            .cell_width
+            .map(crate::config::values::MetricModifier::to_config),
+        cell_height: font
+            .cell_height
+            .map(crate::config::values::MetricModifier::to_config),
+        padding_x: appearance.window_padding_x,
+        padding_y: appearance.window_padding_y,
     }
+}
+
+fn palette_config_values(palette: &[Option<u32>; 16]) -> Vec<String> {
+    palette
+        .iter()
+        .enumerate()
+        .filter_map(|(index, color)| {
+            color.map(|value| format!("{index}={}", crate::config::values::Color(value).to_hex()))
+        })
+        .collect()
 }
 
 fn visible_pane_ids(snapshot: Option<&HierarchySnapshot>, tab_id: Option<&str>) -> HashSet<String> {
@@ -5874,10 +5896,10 @@ mod tests {
     #[test]
     fn terminal_palette_follows_the_gui_light_and_dark_theme() {
         let family = ochub_ui::theme::ochub_family();
-        let font = TerminalFontSettings::default();
+        let appearance = AppearanceSettings::default();
         let overlay = crate::theme_ansi::overlay_for(Some(&family));
-        let light = terminal_palette_from_theme(family.light, false, overlay, &font);
-        let dark = terminal_palette_from_theme(family.dark, true, overlay, &font);
+        let light = terminal_palette_from_theme(family.light, false, overlay, &appearance);
+        let dark = terminal_palette_from_theme(family.dark, true, overlay, &appearance);
         assert!(!light.dark);
         assert!(dark.dark);
         assert_eq!(light.background, family.light.bg.0);
@@ -5887,30 +5909,58 @@ mod tests {
         assert_ne!(light.background, 0x1E1E1E);
         assert_ne!(light.signature(), dark.signature());
         assert_eq!(light.font_size, 13);
-        assert!(light.ligatures);
+        assert!(light.font_features.is_empty());
         assert!(light.font_family.is_empty());
     }
 
     #[test]
     fn terminal_font_settings_change_the_ghostty_signature() {
         let family = ochub_ui::theme::ochub_family();
-        let default = TerminalFontSettings::default();
-        let menlo = TerminalFontSettings {
-            family: "Menlo".into(),
-            size: FontSizeChoice::Pt16,
-            ligatures: false,
-            thicken: true,
-            cell_width_percent: CellWidthChoice::Tight,
-            cell_height_percent: CellHeightChoice::Relaxed,
+        let default = AppearanceSettings::default();
+        let menlo = AppearanceSettings {
+            font: TerminalFontSettings {
+                family: "Menlo".into(),
+                size: 16.0,
+                features: crate::config::values::no_ligature_features(),
+                thicken: true,
+                thicken_strength: 80,
+                cell_width: CellWidthChoice::Tight.metric(),
+                cell_height: CellHeightChoice::Relaxed.metric(),
+            },
+            window_padding_x: 2,
+            ..AppearanceSettings::default()
         };
         let overlay = crate::theme_ansi::overlay_for(Some(&family));
         let left = terminal_palette_from_theme(family.light, false, overlay, &default);
         let right = terminal_palette_from_theme(family.light, false, overlay, &menlo);
         assert_eq!(right.font_family, "Menlo");
         assert_eq!(right.font_size, 16);
-        assert!(!right.ligatures);
+        assert_eq!(
+            right.font_features,
+            crate::config::values::no_ligature_features()
+        );
         assert!(right.thicken);
+        assert_eq!(right.thicken_strength, 80);
+        assert_eq!(right.cell_width.as_deref(), Some("-10%"));
+        assert_eq!(right.padding_x, 2);
         assert_ne!(left.signature(), right.signature());
+    }
+
+    #[test]
+    fn current_terminal_palette_applies_config_slot_overrides() {
+        let probe = 0xc0ffee;
+        let family = ochub_ui::theme::ochub_family();
+        let overlay = crate::theme_ansi::overlay_for(Some(&family));
+        let base = terminal_ansi(overlay, &family.dark, theme::is_dark());
+        assert_ne!(
+            base[3], probe,
+            "fixture color must not already be the theme slot"
+        );
+        let mut appearance = AppearanceSettings::default();
+        appearance.palette[3] = Some(probe);
+        let palette = current_terminal_palette(&appearance);
+        assert_eq!(palette.ansi[3], probe);
+        assert_eq!(palette.ansi[0], base[0]);
     }
 
     #[test]
@@ -5956,7 +6006,8 @@ mod tests {
             for slot in 0..8 {
                 assert_ne!(ansi[slot], ansi[slot + 8], "{label} slot {slot}");
                 assert!(
-                    ansi_luma(ansi[slot + 8]) > ansi_luma(ansi[slot]),
+                    crate::theme_ansi::ansi_luma(ansi[slot + 8])
+                        > crate::theme_ansi::ansi_luma(ansi[slot]),
                     "{label} slot {slot}"
                 );
             }
@@ -5965,20 +6016,20 @@ mod tests {
 
     #[test]
     fn switching_theme_family_changes_the_terminal_ansi_palette() {
-        let font = TerminalFontSettings::default();
+        let appearance = AppearanceSettings::default();
         let ochub = ochub_ui::theme::ochub_family();
         let ember = ochub_ui::theme::ember_family();
         let ochub_dark = terminal_palette_from_theme(
             ochub.dark,
             true,
             crate::theme_ansi::overlay_for(Some(&ochub)),
-            &font,
+            &appearance,
         );
         let ember_dark = terminal_palette_from_theme(
             ember.dark,
             true,
             crate::theme_ansi::overlay_for(Some(&ember)),
-            &font,
+            &appearance,
         );
         assert_ne!(ochub_dark.ansi, ember_dark.ansi);
         assert_eq!(ochub_dark.background, ochub.dark.bg.0);
@@ -5999,9 +6050,12 @@ mod tests {
         );
         let ochub_ansi = terminal_ansi(ochub_overlay, &ochub.dark, true);
         let custom_ansi = terminal_ansi(custom_overlay, &custom.dark, true);
-        let derived = ansi_from_theme(&custom.dark, true);
+        let derived = crate::theme_ansi::ansi_from_theme(&custom.dark, true);
         assert_eq!(ochub_ansi, ochub_overlay.colors(true).expect("ochub ansi"));
-        assert_ne!(ochub_ansi, ansi_from_theme(&ochub.dark, true));
+        assert_ne!(
+            ochub_ansi,
+            crate::theme_ansi::ansi_from_theme(&ochub.dark, true)
+        );
         assert_eq!(custom_ansi, derived);
         assert_ne!(custom_ansi, ochub_ansi);
         let missing = terminal_ansi(crate::theme_ansi::overlay_for(None), &ochub.dark, true);
@@ -6011,7 +6065,7 @@ mod tests {
     #[test]
     fn explicit_ansi_is_used_instead_of_deriving_from_tokens() {
         let custom = custom_theme_family("scarlet");
-        let derived = ansi_from_theme(&custom.dark, true);
+        let derived = crate::theme_ansi::ansi_from_theme(&custom.dark, true);
         let explicit = [
             0x101010, 0xB00000, 0x00B000, 0xB0B000, 0x0000B0, 0xB000B0, 0x00B0B0, 0xB0B0B0,
             0x404040, 0xFF4040, 0x40FF40, 0xFFFF40, 0x4040FF, 0xFF40FF, 0x40FFFF, 0xFFFFFF,

@@ -224,10 +224,6 @@ impl ConfigDocument {
         self.assignment_values(key).next_back()
     }
 
-    pub fn get_all(&self, key: &str) -> Vec<&str> {
-        self.assignment_values(key).collect()
-    }
-
     fn assignment_values(&self, key: &str) -> impl DoubleEndedIterator<Item = &str> {
         self.lines.iter().filter_map(move |line| match line {
             Line::Assignment(assignment) if assignment.key == key => {
@@ -297,6 +293,13 @@ impl ConfigDocument {
                 self.lines.remove(index);
             }
         }
+    }
+
+    pub fn remove(&mut self, key: &str) {
+        self.lines.retain(|line| match line {
+            Line::Assignment(assignment) => assignment.key != key,
+            Line::Raw(_) => true,
+        });
     }
 
     pub fn assignments(&self) -> impl DoubleEndedIterator<Item = (usize, &str, &str)> {
@@ -445,6 +448,30 @@ font-size = 13
         document.set("font-size", "");
         assert_eq!(document.serialize(), "font-size = \n");
         assert_eq!(document.get("font-size"), Some(""));
+    }
+
+    #[test]
+    fn removing_a_known_key_leaves_comments_and_unknown_keys() {
+        let source = "\
+# keep
+font-size = 18
+mystery-option = wow
+font-family = Menlo
+";
+        assert!(source.contains("# keep"));
+        assert!(source.contains("mystery-option = wow"));
+        let mut document = ConfigDocument::parse(source);
+        document.remove("font-size");
+        document.remove("font-family");
+        assert_eq!(
+            document.serialize(),
+            "\
+# keep
+mystery-option = wow
+"
+        );
+        assert!(document.get("font-size").is_none());
+        assert_eq!(document.get("mystery-option"), Some("wow"));
     }
 
     #[test]

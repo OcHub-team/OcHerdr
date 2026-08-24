@@ -399,17 +399,16 @@ impl BackdropMode {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 struct AppearanceSettings {
-    #[serde(default = "default_theme_family")]
     theme_family: String,
-    #[serde(default)]
+    terminal_theme: Option<String>,
     mode: AppearanceMode,
-    #[serde(default)]
     backdrop: BackdropMode,
-    #[serde(default)]
-    background_opacity: OpacityChoice,
-    #[serde(default)]
+    background_opacity: f64,
+    window_padding_x: u32,
+    window_padding_y: u32,
+    palette: [Option<u32>; 16],
     font: TerminalFontSettings,
 }
 
@@ -417,71 +416,45 @@ impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
             theme_family: default_theme_family(),
+            terminal_theme: None,
             mode: AppearanceMode::Dark,
             backdrop: BackdropMode::Blurred,
-            background_opacity: OpacityChoice::default(),
+            background_opacity: 1.0,
+            window_padding_x: 0,
+            window_padding_y: 0,
+            palette: [None; 16],
             font: TerminalFontSettings::default(),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 struct TerminalFontSettings {
-    #[serde(default)]
     family: String,
-    #[serde(default)]
-    size: FontSizeChoice,
-    #[serde(default = "default_true")]
-    ligatures: bool,
-    #[serde(default)]
+    size: f32,
+    features: Vec<String>,
     thicken: bool,
-    #[serde(default)]
-    cell_width_percent: CellWidthChoice,
-    #[serde(default)]
-    cell_height_percent: CellHeightChoice,
+    thicken_strength: u8,
+    cell_width: Option<config::values::MetricModifier>,
+    cell_height: Option<config::values::MetricModifier>,
 }
 
 impl Default for TerminalFontSettings {
     fn default() -> Self {
         Self {
             family: String::new(),
-            size: FontSizeChoice::default(),
-            ligatures: true,
+            size: 13.0,
+            features: Vec::new(),
             thicken: false,
-            cell_width_percent: CellWidthChoice::default(),
-            cell_height_percent: CellHeightChoice::default(),
+            thicken_strength: 255,
+            cell_width: None,
+            cell_height: None,
         }
     }
 }
 
 fn default_theme_family() -> String {
     theme::DEFAULT_THEME_FAMILY.to_owned()
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum OpacityChoice {
-    #[default]
-    P100,
-    P92,
-    P84,
-    P72,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum FontSizeChoice {
-    Pt11,
-    Pt12,
-    #[default]
-    Pt13,
-    Pt14,
-    Pt15,
-    Pt16,
-    Pt18,
-    Pt20,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -501,116 +474,8 @@ enum CellHeightChoice {
     Loose,
 }
 
-impl OpacityChoice {
-    const ALL: [Self; 4] = [Self::P100, Self::P92, Self::P84, Self::P72];
-
-    fn nearest(value: u8) -> Self {
-        let mut best = Self::P100;
-        let mut best_diff = best.value().abs_diff(value);
-        for choice in Self::ALL {
-            let diff = choice.value().abs_diff(value);
-            if diff < best_diff {
-                best = choice;
-                best_diff = diff;
-            }
-        }
-        best
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::P100 => 0,
-            Self::P92 => 1,
-            Self::P84 => 2,
-            Self::P72 => 3,
-        }
-    }
-
-    fn value(self) -> u8 {
-        match self {
-            Self::P100 => 100,
-            Self::P92 => 92,
-            Self::P84 => 84,
-            Self::P72 => 72,
-        }
-    }
-}
-
-impl FontSizeChoice {
-    const ALL: [Self; 8] = [
-        Self::Pt11,
-        Self::Pt12,
-        Self::Pt13,
-        Self::Pt14,
-        Self::Pt15,
-        Self::Pt16,
-        Self::Pt18,
-        Self::Pt20,
-    ];
-
-    fn nearest(value: u8) -> Self {
-        let mut best = Self::Pt11;
-        let mut best_diff = best.value().abs_diff(value);
-        for choice in Self::ALL {
-            let diff = choice.value().abs_diff(value);
-            if diff < best_diff {
-                best = choice;
-                best_diff = diff;
-            }
-        }
-        best
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::Pt11 => 0,
-            Self::Pt12 => 1,
-            Self::Pt13 => 2,
-            Self::Pt14 => 3,
-            Self::Pt15 => 4,
-            Self::Pt16 => 5,
-            Self::Pt18 => 6,
-            Self::Pt20 => 7,
-        }
-    }
-
-    fn value(self) -> u8 {
-        match self {
-            Self::Pt11 => 11,
-            Self::Pt12 => 12,
-            Self::Pt13 => 13,
-            Self::Pt14 => 14,
-            Self::Pt15 => 15,
-            Self::Pt16 => 16,
-            Self::Pt18 => 18,
-            Self::Pt20 => 20,
-        }
-    }
-}
-
 impl CellWidthChoice {
     const ALL: [Self; 3] = [Self::Tight, Self::Normal, Self::Wide];
-
-    fn nearest(value: i8) -> Self {
-        let mut best = Self::Tight;
-        let mut best_diff = best.value().abs_diff(value);
-        for choice in Self::ALL {
-            let diff = choice.value().abs_diff(value);
-            if diff < best_diff {
-                best = choice;
-                best_diff = diff;
-            }
-        }
-        best
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::Tight => 0,
-            Self::Normal => 1,
-            Self::Wide => 2,
-        }
-    }
 
     fn value(self) -> i8 {
         match self {
@@ -619,32 +484,25 @@ impl CellWidthChoice {
             Self::Wide => 10,
         }
     }
+
+    fn metric(self) -> Option<config::values::MetricModifier> {
+        match self {
+            Self::Normal => None,
+            other => Some(config::values::MetricModifier::Percent(f64::from(
+                other.value(),
+            ))),
+        }
+    }
+
+    fn matching(metric: Option<config::values::MetricModifier>) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|choice| choice.metric() == metric)
+    }
 }
 
 impl CellHeightChoice {
     const ALL: [Self; 4] = [Self::Compact, Self::Normal, Self::Relaxed, Self::Loose];
-
-    fn nearest(value: i8) -> Self {
-        let mut best = Self::Compact;
-        let mut best_diff = best.value().abs_diff(value);
-        for choice in Self::ALL {
-            let diff = choice.value().abs_diff(value);
-            if diff < best_diff {
-                best = choice;
-                best_diff = diff;
-            }
-        }
-        best
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::Compact => 0,
-            Self::Normal => 1,
-            Self::Relaxed => 2,
-            Self::Loose => 3,
-        }
-    }
 
     fn value(self) -> i8 {
         match self {
@@ -654,53 +512,20 @@ impl CellHeightChoice {
             Self::Loose => 20,
         }
     }
-}
 
-impl Serialize for OpacityChoice {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.value().serialize(serializer)
+    fn metric(self) -> Option<config::values::MetricModifier> {
+        match self {
+            Self::Normal => None,
+            other => Some(config::values::MetricModifier::Percent(f64::from(
+                other.value(),
+            ))),
+        }
     }
-}
 
-impl Serialize for FontSizeChoice {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.value().serialize(serializer)
-    }
-}
-
-impl Serialize for CellWidthChoice {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.value().serialize(serializer)
-    }
-}
-
-impl Serialize for CellHeightChoice {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.value().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for OpacityChoice {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::nearest(u8::deserialize(deserializer)?))
-    }
-}
-
-impl<'de> Deserialize<'de> for FontSizeChoice {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::nearest(u8::deserialize(deserializer)?))
-    }
-}
-
-impl<'de> Deserialize<'de> for CellWidthChoice {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::nearest(i8::deserialize(deserializer)?))
-    }
-}
-
-impl<'de> Deserialize<'de> for CellHeightChoice {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::nearest(i8::deserialize(deserializer)?))
+    fn matching(metric: Option<config::values::MetricModifier>) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|choice| choice.metric() == metric)
     }
 }
 
@@ -1550,7 +1375,7 @@ fn install_appearance(appearance: &AppearanceSettings, window_appearance: Window
     let content_opacity = if appearance.backdrop == BackdropMode::Opaque {
         100
     } else {
-        appearance.background_opacity.value()
+        config::values::opacity_percent_u8(appearance.background_opacity)
     };
     let sidebar_opacity = if appearance.backdrop == BackdropMode::Opaque {
         100
@@ -1984,52 +1809,20 @@ mod tests {
     }
 
     #[test]
-    fn appearance_settings_snap_values_that_are_not_in_the_select_lists() {
-        let appearance: AppearanceSettings = serde_json::from_value(json!({
-            "theme_family": "kept-as-is",
-            "background_opacity": 0,
-            "font": {
-                "size": 17,
-                "cell_width_percent": 50,
-                "cell_height_percent": -3
-            }
-        }))
-        .unwrap();
-
-        assert_eq!(appearance.theme_family, "kept-as-is");
-        assert_eq!(appearance.background_opacity.value(), 72);
-        assert_eq!(appearance.font.size.value(), 16);
-        assert_eq!(appearance.font.cell_width_percent.value(), 10);
-        assert_eq!(appearance.font.cell_height_percent.value(), 0);
-
-        let already_valid: AppearanceSettings = serde_json::from_value(json!({
-            "background_opacity": 92,
-            "font": { "size": 13, "cell_width_percent": 0, "cell_height_percent": 0 }
-        }))
-        .unwrap();
-        assert_eq!(already_valid.background_opacity.value(), 92);
-        assert_eq!(already_valid.font.size.value(), 13);
-        assert_eq!(already_valid.font.cell_width_percent.value(), 0);
-        assert_eq!(already_valid.font.cell_height_percent.value(), 0);
-    }
-
-    /// The select row paints the option at index() as the current one, so a
-    /// variant inserted into ALL without renumbering would silently select a
-    /// neighbour. Exhaustiveness is checked by the compiler; the numbering is not.
-    #[test]
-    fn every_choice_reports_the_index_it_occupies_in_its_option_list() {
-        for (position, choice) in OpacityChoice::ALL.into_iter().enumerate() {
-            assert_eq!(choice.index(), position, "opacity {choice:?}");
-        }
-        for (position, choice) in FontSizeChoice::ALL.into_iter().enumerate() {
-            assert_eq!(choice.index(), position, "font size {choice:?}");
-        }
-        for (position, choice) in CellWidthChoice::ALL.into_iter().enumerate() {
-            assert_eq!(choice.index(), position, "cell width {choice:?}");
-        }
-        for (position, choice) in CellHeightChoice::ALL.into_iter().enumerate() {
-            assert_eq!(choice.index(), position, "cell height {choice:?}");
-        }
+    fn cell_metric_presets_write_ghostty_percent_values() {
+        assert_eq!(CellWidthChoice::Tight.metric().unwrap().to_config(), "-10%");
+        assert_eq!(CellWidthChoice::Normal.metric(), None);
+        assert_eq!(CellWidthChoice::Wide.metric().unwrap().to_config(), "10%");
+        assert_eq!(
+            CellHeightChoice::Compact.metric().unwrap().to_config(),
+            "-8%"
+        );
+        assert_eq!(CellHeightChoice::Normal.metric(), None);
+        assert_eq!(
+            CellHeightChoice::Relaxed.metric().unwrap().to_config(),
+            "12%"
+        );
+        assert_eq!(CellHeightChoice::Loose.metric().unwrap().to_config(), "20%");
     }
 
     #[test]

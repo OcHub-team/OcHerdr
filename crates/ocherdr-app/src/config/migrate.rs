@@ -30,6 +30,10 @@ impl AppPaths {
     pub fn config(&self) -> PathBuf {
         self.dir.join("config")
     }
+
+    pub fn themes(&self) -> PathBuf {
+        self.dir.join("themes")
+    }
 }
 
 #[derive(Clone)]
@@ -47,7 +51,7 @@ pub fn load_app(paths: &AppPaths) -> LoadedApp {
     let had_language = json.get("language").is_some();
     let legacy_appearance = json
         .get("appearance")
-        .and_then(|value| serde_json::from_value::<AppearanceSettings>(value.clone()).ok());
+        .and_then(|value| serde_json::from_value::<LegacyAppearance>(value.clone()).ok());
     let legacy_language = json
         .get("language")
         .and_then(|value| serde_json::from_value::<Language>(value.clone()).ok());
@@ -56,9 +60,10 @@ pub fn load_app(paths: &AppPaths) -> LoadedApp {
     let config_missing = !paths.config().is_file();
     if config_missing && (had_appearance || had_language) {
         document = document_from_legacy(
-            legacy_appearance
-                .as_ref()
-                .unwrap_or(&AppearanceSettings::default()),
+            legacy_appearance.as_ref().unwrap_or(&LegacyAppearance {
+                theme_family: crate::default_theme_family(),
+                ..LegacyAppearance::default()
+            }),
             legacy_language.unwrap_or_default(),
         );
         let _ = write_config(paths, &document);
@@ -92,35 +97,91 @@ pub fn write_connections(paths: &AppPaths, settings: &Settings) -> Result<(), St
     fs::write(paths.connections(), bytes).map_err(|error| error.to_string())
 }
 
-pub fn document_from_legacy(appearance: &AppearanceSettings, language: Language) -> ConfigDocument {
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct LegacyAppearance {
+    #[serde(default = "crate::default_theme_family")]
+    theme_family: String,
+    #[serde(default)]
+    mode: crate::AppearanceMode,
+    #[serde(default)]
+    backdrop: crate::BackdropMode,
+    #[serde(default = "legacy_opacity")]
+    background_opacity: u8,
+    #[serde(default)]
+    font: LegacyFont,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct LegacyFont {
+    #[serde(default)]
+    family: String,
+    #[serde(default = "legacy_font_size")]
+    size: u8,
+    #[serde(default = "legacy_true")]
+    ligatures: bool,
+    #[serde(default)]
+    thicken: bool,
+    #[serde(default)]
+    cell_width_percent: i8,
+    #[serde(default)]
+    cell_height_percent: i8,
+}
+
+impl Default for LegacyFont {
+    fn default() -> Self {
+        Self {
+            family: String::new(),
+            size: legacy_font_size(),
+            ligatures: true,
+            thicken: false,
+            cell_width_percent: 0,
+            cell_height_percent: 0,
+        }
+    }
+}
+
+fn legacy_opacity() -> u8 {
+    100
+}
+
+fn legacy_font_size() -> u8 {
+    13
+}
+
+fn legacy_true() -> bool {
+    true
+}
+
+fn document_from_legacy(appearance: &LegacyAppearance, language: Language) -> ConfigDocument {
     let mut document = ConfigDocument::new();
     document.set("theme", &appearance.theme_family);
     document.set("appearance-mode", appearance.mode.as_config());
     document.set("window-backdrop", appearance.backdrop.as_config());
     document.set(
         "background-opacity",
-        &super::values::format_opacity_percent(appearance.background_opacity.value()),
+        &super::values::format_opacity_percent(appearance.background_opacity),
     );
     if !appearance.font.family.is_empty() {
         document.set("font-family", &appearance.font.family);
     }
-    document.set("font-size", &appearance.font.size.value().to_string());
+    document.set("font-size", &appearance.font.size.to_string());
     if appearance.font.thicken {
         document.set("font-thicken", "true");
     }
     if !appearance.font.ligatures {
-        document.set_repeatable(
-            "font-feature",
-            &["-calt".to_owned(), "-liga".to_owned(), "-dlig".to_owned()],
+        document.set_repeatable("font-feature", &super::values::no_ligature_features());
+    }
+    if appearance.font.cell_width_percent != 0 {
+        document.set(
+            "adjust-cell-width",
+            &format!("{}%", appearance.font.cell_width_percent),
         );
     }
-    let width = appearance.font.cell_width_percent.value();
-    if width != 0 {
-        document.set("adjust-cell-width", &format!("{width}%"));
-    }
-    let height = appearance.font.cell_height_percent.value();
-    if height != 0 {
-        document.set("adjust-cell-height", &format!("{height}%"));
+    if appearance.font.cell_height_percent != 0 {
+        document.set(
+            "adjust-cell-height",
+            &format!("{}%", appearance.font.cell_height_percent),
+        );
     }
     document.set("language", language.as_config());
     document
@@ -162,24 +223,21 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AppearanceMode, BackdropMode, CellHeightChoice, CellWidthChoice, FontSizeChoice,
-        OpacityChoice, TerminalFontSettings,
-    };
+    use crate::{AppearanceMode, BackdropMode};
 
-    fn sample_appearance() -> AppearanceSettings {
-        AppearanceSettings {
+    fn sample_appearance() -> LegacyAppearance {
+        LegacyAppearance {
             theme_family: "ember".into(),
             mode: AppearanceMode::Light,
             backdrop: BackdropMode::Opaque,
-            background_opacity: OpacityChoice::P84,
-            font: TerminalFontSettings {
+            background_opacity: 84,
+            font: LegacyFont {
                 family: "Distinct Mono".into(),
-                size: FontSizeChoice::Pt18,
+                size: 18,
                 ligatures: false,
                 thicken: true,
-                cell_width_percent: CellWidthChoice::Wide,
-                cell_height_percent: CellHeightChoice::Relaxed,
+                cell_width_percent: 10,
+                cell_height_percent: 12,
             },
         }
     }
@@ -306,8 +364,8 @@ mod tests {
             crate::default_theme_family()
         );
         assert_eq!(loaded.appearance.mode, AppearanceMode::Dark);
-        assert_eq!(loaded.appearance.background_opacity, OpacityChoice::P100);
-        assert_eq!(loaded.appearance.font.size, FontSizeChoice::Pt13);
+        assert_eq!(loaded.appearance.background_opacity, 1.0);
+        assert_eq!(loaded.appearance.font.size, 13.0);
         assert_eq!(loaded.language, Language::System);
         assert!(!paths.config().exists());
         assert!(!paths.connections().exists());
