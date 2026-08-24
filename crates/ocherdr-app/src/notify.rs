@@ -34,6 +34,7 @@ pub(crate) enum FailureKind {
     SshPortInvalid,
     NoSessionSelected,
     MissingTheme,
+    AgentBlocked,
 }
 
 impl FailureKind {
@@ -46,7 +47,8 @@ impl FailureKind {
             | Self::SshDestinationRequired
             | Self::SshPortInvalid
             | Self::NoSessionSelected
-            | Self::MissingTheme => NotificationLevel::Warning,
+            | Self::MissingTheme
+            | Self::AgentBlocked => NotificationLevel::Warning,
             Self::DiscoverSessions
             | Self::RefreshSnapshot
             | Self::ApplyLiveUpdate
@@ -96,6 +98,7 @@ impl FailureKind {
             Self::SshPortInvalid => k::NOTIFY_INVALID_SSH_PORT,
             Self::NoSessionSelected => k::NOTIFY_CANNOT_OPEN_TERMINAL,
             Self::MissingTheme => k::NOTIFY_MISSING_THEME,
+            Self::AgentBlocked => k::NOTIFY_AGENT_BLOCKED,
         }
     }
 }
@@ -138,6 +141,10 @@ fn command_title_key(method: &str) -> Key {
         "pane.split" => k::NOTIFY_PANE_SPLIT,
         "pane.zoom" => k::NOTIFY_PANE_ZOOM,
         "pane.focus_direction" => k::NOTIFY_PANE_FOCUS,
+        "agent.prompt" => k::NOTIFY_AGENT_PROMPT,
+        "agent.read" => k::NOTIFY_AGENT_READ,
+        "agent.send_keys" => k::NOTIFY_AGENT_SEND_KEYS,
+        "agent.rename" => k::NOTIFY_AGENT_RENAME,
         _ => k::NOTIFY_HERDR_COMMAND,
     }
 }

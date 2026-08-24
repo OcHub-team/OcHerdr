@@ -13,7 +13,7 @@
 //! and any string compared with `==` are identifiers — translating them
 //! changes behaviour.
 
-use ocherdr_core::AgentStatus;
+use ocherdr_core::{AgentNameError, AgentStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::tf;
@@ -132,6 +132,24 @@ impl I18n {
             AgentStatus::Blocked => k::TERMINAL_AGENT_BLOCKED,
             AgentStatus::Done => k::TERMINAL_AGENT_DONE,
             AgentStatus::Unknown => k::TERMINAL_AGENT_UNKNOWN,
+        })
+    }
+
+    pub(crate) fn agent_location(self, workspace: &str, tab: &str, pane: &str) -> String {
+        tf!(
+            self,
+            k::AGENT_LOCATION,
+            workspace = workspace,
+            tab = tab,
+            pane = pane
+        )
+    }
+
+    pub(crate) fn agent_name_error(self, error: AgentNameError) -> &'static str {
+        self.text(match error {
+            AgentNameError::FirstCharacter => k::AGENT_NAME_INVALID_FIRST,
+            AgentNameError::InvalidCharacter => k::AGENT_NAME_INVALID_CHAR,
+            AgentNameError::TooLong => k::AGENT_NAME_INVALID_LENGTH,
         })
     }
 

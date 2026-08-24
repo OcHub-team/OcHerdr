@@ -3,6 +3,11 @@
 # Flat `key = "text"` table. Keys are sorted alphabetically.
 # English is the reference catalog; the other locale is checked against it.
 
+"notify.agent_blocked" = "智能体正在等待输入"
+"notify.agent_prompt" = "无法发送提示"
+"notify.agent_read" = "无法读取智能体输出"
+"notify.agent_rename" = "无法重命名智能体"
+"notify.agent_send_keys" = "无法发送按键"
 "notify.apply_live_update" = "无法应用实时更新"
 "notify.apply_organization" = "无法应用分组与标签"
 "notify.apply_palette" = "无法应用终端主题"

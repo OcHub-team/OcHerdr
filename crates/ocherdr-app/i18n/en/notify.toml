@@ -3,6 +3,11 @@
 # Flat `key = "text"` table. Keys are sorted alphabetically.
 # English is the reference catalog; the other locale is checked against it.
 
+"notify.agent_blocked" = "Agent is waiting for input"
+"notify.agent_prompt" = "Could not send the prompt"
+"notify.agent_read" = "Could not read agent output"
+"notify.agent_rename" = "Could not rename the agent"
+"notify.agent_send_keys" = "Could not send keys"
 "notify.apply_live_update" = "Could not apply a live update"
 "notify.apply_organization" = "Could not apply organization"
 "notify.apply_palette" = "Could not apply the terminal theme"

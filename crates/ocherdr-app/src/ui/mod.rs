@@ -1,5 +1,6 @@
 use super::*;
 
+mod agent;
 mod appearance;
 mod hierarchy;
 mod overlays;
@@ -87,6 +88,9 @@ impl Render for OcHerdrView {
             }
             Overlay::Rename(target) => {
                 root = root.child(self.render_rename(&target, cx));
+            }
+            Overlay::AgentPanel { pane_id } => {
+                root = root.child(self.render_agent_panel(&pane_id, cx));
             }
         }
         root.child(self.notifications.clone())

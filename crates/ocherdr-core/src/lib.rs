@@ -8,7 +8,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod agent;
 pub mod event;
+pub use agent::{
+    AGENT_OUTPUT_SOURCE, AgentNameError, agent_output_should_refresh, parse_agent_name,
+};
 pub use event::{
     AGENT_STATUS_HANDOFF_LIMIT, AgentStatusHandoff, HerdrEvent, SnapshotUpdate,
     agent_status_handoff_push, agent_status_handoff_take, agent_status_panes_after_stream_closed,

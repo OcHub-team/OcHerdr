@@ -7,9 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
-    AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent, HierarchySnapshot, LayoutRect,
-    LayoutSplit, PaneInfo, Selection, SessionSummary, SnapshotUpdate, SplitDirection, WorktreeInfo,
-    WorktreeSourceInfo, split_ratio_from_drag,
+    AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent,
+    HierarchySnapshot, LayoutRect, LayoutSplit, PaneInfo, Selection, SessionSummary,
+    SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, split_ratio_from_drag,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -18,9 +18,9 @@ use ocherdr_herdr::{
 };
 use ocherdr_terminal::{KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
 use ochub_ui::components::{
-    ButtonSize, ButtonTone, button, context_menu, context_menu_item, empty_state, field,
-    icon_button_tone, icon_only_button_tone, modal_body, modal_card, modal_footer, modal_header,
-    modal_overlay, spinner, status_dot,
+    ButtonSize, ButtonTone, busy_button, button, context_menu, context_menu_item, disabled_button,
+    empty_state, field, field_with_error, icon_button_tone, icon_only_button_tone, modal_body,
+    modal_card, modal_footer, modal_header, modal_overlay, spinner, status_dot,
 };
 use ochub_ui::gpui::{
     App, AppContext, AssetSource, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
@@ -662,6 +662,20 @@ struct OcHerdrView {
     worktree_branch_input: Entity<TextInput>,
     worktree_base_input: Entity<TextInput>,
     worktree_path_input: Entity<TextInput>,
+    agent_name_input: Entity<TextInput>,
+    agent_prompt_input: Entity<TextInput>,
+    agent_output_scroll: ScrollHandle,
+    agent_output: AgentOutputState,
+    agent_prompt: AgentPromptPhase,
+    agent_name_error: Option<AgentNameError>,
+    /// Dropping this cancels an in-flight `agent.read`.
+    agent_read_task: Option<Task<()>>,
+    /// Dropping this cancels an in-flight `agent.prompt`.
+    agent_prompt_task: Option<Task<()>>,
+    /// Dropping this cancels an in-flight `agent.send_keys`.
+    agent_keys_task: Option<Task<()>>,
+    /// Dropping this cancels an in-flight `agent.rename`.
+    agent_rename_task: Option<Task<()>>,
     /// Dropping this cancels an in-flight `worktree.list`.
     worktree_list_task: Option<Task<()>>,
     appearance: AppearanceSettings,
@@ -713,6 +727,31 @@ enum Overlay {
         from_hosts: bool,
     },
     ConfirmBulkRemove,
+    AgentPanel {
+        pane_id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AgentOutputState {
+    Idle,
+    Loading,
+    Ready { text: String, truncated: bool },
+    Failed { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AgentPromptPhase {
+    Idle,
+    Sending,
+    Sent,
+    Failed { blocked: bool, message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AgentPromptFailure {
+    Blocked { message: String },
+    Other { message: String },
 }
 
 #[derive(Clone, Debug)]

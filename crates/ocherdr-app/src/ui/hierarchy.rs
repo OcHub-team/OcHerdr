@@ -116,7 +116,7 @@ impl OcHerdrView {
                 .hover(|style| style.bg(theme::surface_hover()))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.select_pane(pane_id.clone(), window, cx)
+                    this.open_agent_panel(pane_id.clone(), window, cx)
                 }))
                 .child(status_dot(status_color(status)))
                 .child(
@@ -1258,7 +1258,7 @@ fn render_pane(
         )
 }
 
-fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
+pub(super) fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
     match status {
         AgentStatus::Working => theme::teal(),
         AgentStatus::Blocked => theme::yellow(),

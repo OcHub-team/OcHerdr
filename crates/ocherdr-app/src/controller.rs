@@ -7,8 +7,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::future::{self, Either, poll_fn};
 use futures::pin_mut;
 use ocherdr_core::{
-    AGENT_STATUS_HANDOFF_LIMIT, AgentStatusHandoff, agent_status_panes_after_stream_closed,
-    agent_status_stream_should_rebuild, event_panes_after_failed_subscribe,
+    AGENT_OUTPUT_SOURCE, AGENT_STATUS_HANDOFF_LIMIT, AgentStatusHandoff,
+    agent_output_should_refresh, agent_status_panes_after_stream_closed,
+    agent_status_stream_should_rebuild, event_panes_after_failed_subscribe, parse_agent_name,
 };
 use ocherdr_herdr::{TerminalFrame, next_batch, subscribe_agent_status};
 
@@ -78,6 +79,18 @@ impl OcHerdrView {
                 .new(|cx| TextInput::new(cx, i18n.text(k::WORKTREE_FIELD_BASE_HINT))),
             worktree_path_input: cx
                 .new(|cx| TextInput::new(cx, i18n.text(k::WORKTREE_FIELD_PATH_HINT))),
+            agent_name_input: cx.new(|cx| TextInput::new(cx, i18n.text(k::COMMON_NAME))),
+            agent_prompt_input: cx.new(|cx| {
+                TextInput::new(cx, i18n.text(k::AGENT_PROMPT_PLACEHOLDER)).multiline(true)
+            }),
+            agent_output_scroll: ScrollHandle::new(),
+            agent_output: AgentOutputState::Idle,
+            agent_prompt: AgentPromptPhase::Idle,
+            agent_name_error: None,
+            agent_read_task: None,
+            agent_prompt_task: None,
+            agent_keys_task: None,
+            agent_rename_task: None,
             worktree_list_task: None,
             appearance,
             i18n,
@@ -89,8 +102,14 @@ impl OcHerdrView {
         bind_enter_submit(&view.rename_input, host.clone(), cx, |this, window, cx| {
             this.submit_rename(window, cx);
         });
-        bind_enter_submit(&view.worktree_label_input, host, cx, |this, window, cx| {
-            this.submit_worktree_create(window, cx)
+        bind_enter_submit(
+            &view.worktree_label_input,
+            host.clone(),
+            cx,
+            |this, window, cx| this.submit_worktree_create(window, cx),
+        );
+        bind_enter_submit(&view.agent_name_input, host, cx, |this, window, cx| {
+            this.submit_agent_rename(window, cx);
         });
         view.reload(None, cx);
         if let Some(notice) = missing_theme_notice(&view.appearance.theme_family, view.i18n) {
@@ -152,6 +171,10 @@ impl OcHerdrView {
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
         self.abandon_worktree_list();
+        if matches!(self.overlay, Overlay::AgentPanel { .. }) {
+            self.overlay = Overlay::None;
+            self.reset_agent_panel_state();
+        }
         let epoch = self.load_epoch;
         let profile = self.current_profile();
         self.operation = Some(self.i18n.text(k::NOTIFY_DISCOVERING).into());
@@ -480,6 +503,11 @@ impl OcHerdrView {
         if !matches!(overlay, Overlay::WorktreeOpen(_)) {
             self.worktree_list_task = None;
         }
+        let leaving_agent_panel = matches!(self.overlay, Overlay::AgentPanel { .. })
+            && !matches!(overlay, Overlay::AgentPanel { .. });
+        if leaving_agent_panel {
+            self.reset_agent_panel_state();
+        }
         let leaving_host_center = self.overlay.host_center() && !overlay.host_center();
         let form = match overlay {
             Overlay::RemoteForm(form) => Some(form),
@@ -538,6 +566,7 @@ impl OcHerdrView {
             .as_ref()
             .map(snapshot_pane_ids)
             .unwrap_or_default();
+        let panel_refresh = agent_panel_refresh_from_batch(&self.overlay, batch.as_deref());
         let action = match batch {
             None => EventPollAction::Disconnect(
                 HerdrError::EventStreamClosed("event worker stopped".into())
@@ -547,6 +576,7 @@ impl OcHerdrView {
             Some(items) => {
                 let Some(snapshot) = self.snapshot.as_mut() else {
                     self.abandon_worktree_list();
+                    self.reconcile_open_agent_panel(false, cx);
                     return false;
                 };
                 let mut items = items.into_iter();
@@ -602,6 +632,7 @@ impl OcHerdrView {
             cx.notify();
         }
         self.ensure_agent_status_stream(cx);
+        self.reconcile_open_agent_panel(panel_refresh, cx);
         effects.reschedule
     }
 
@@ -624,6 +655,7 @@ impl OcHerdrView {
         batch: Option<Vec<std::result::Result<HerdrEvent, HerdrError>>>,
         cx: &mut Context<Self>,
     ) -> bool {
+        let panel_refresh = agent_panel_refresh_from_batch(&self.overlay, batch.as_deref());
         let action = match batch {
             None => {
                 self.agent_status_panes = agent_status_panes_after_stream_closed();
@@ -659,6 +691,7 @@ impl OcHerdrView {
                     return true;
                 }
                 let Some(snapshot) = self.snapshot.as_mut() else {
+                    self.reconcile_open_agent_panel(false, cx);
                     return false;
                 };
                 let mut items = items.into_iter();
@@ -684,6 +717,7 @@ impl OcHerdrView {
         if effects.notify {
             cx.notify();
         }
+        self.reconcile_open_agent_panel(panel_refresh, cx);
         effects.reschedule
     }
 
@@ -709,6 +743,11 @@ impl OcHerdrView {
             return;
         };
         let (events, resync_after) = handoff.into_release();
+        let panel_refresh = agent_panel_pane(&self.overlay).is_some_and(|pane_id| {
+            events
+                .iter()
+                .any(|event| agent_output_should_refresh(pane_id, event))
+        });
         let mut resync = resync_after;
         if !events.is_empty()
             && let Some(snapshot) = self.snapshot.as_mut()
@@ -728,6 +767,7 @@ impl OcHerdrView {
         if resync {
             self.resync_snapshot(self.event_epoch, cx);
         }
+        self.reconcile_open_agent_panel(panel_refresh, cx);
     }
 
     fn rebuild_agent_status_stream(&mut self, panes: HashSet<String>, cx: &mut Context<Self>) {
@@ -1111,6 +1151,12 @@ impl OcHerdrView {
         self.worktree_path_input.update(cx, |input, cx| {
             input.set_placeholder(self.i18n.text(k::WORKTREE_FIELD_PATH_HINT), cx)
         });
+        self.agent_name_input.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text(k::COMMON_NAME), cx)
+        });
+        self.agent_prompt_input.update(cx, |input, cx| {
+            input.set_placeholder(self.i18n.text(k::AGENT_PROMPT_PLACEHOLDER), cx)
+        });
         self.persist_settings(FailureKind::SaveLanguage, cx);
         cx.notify();
     }
@@ -1173,6 +1219,7 @@ impl OcHerdrView {
             (Overlay::RemoteForm(_), false) => self.close_add_remote(cx),
             (Overlay::HostSwitcher, false) => self.close_host_switcher(cx),
             (Overlay::Appearance, false) => self.close_appearance(window, cx),
+            (Overlay::AgentPanel { .. }, false) => self.close_agent_panel(window, cx),
             (Overlay::ContextMenu(_) | Overlay::NodeManager, false) => {
                 self.set_overlay(Overlay::None, cx);
                 self.focus.focus(window, cx);
@@ -1404,6 +1451,262 @@ impl OcHerdrView {
         }
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    pub(super) fn open_agent_panel(
+        &mut self,
+        pane_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_pane(pane_id.clone(), window, cx);
+        let same =
+            matches!(&self.overlay, Overlay::AgentPanel { pane_id: open } if open == &pane_id);
+        if !same {
+            self.reset_agent_panel_state();
+            let name = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pane(&pane_id))
+                .and_then(|pane| pane.display_agent.as_deref().or(pane.agent.as_deref()))
+                .unwrap_or("")
+                .to_owned();
+            self.agent_name_input
+                .update(cx, |input, cx| input.set_content(name, cx));
+            self.set_overlay(Overlay::AgentPanel { pane_id }, cx);
+        }
+        self.fetch_agent_output(cx);
+        self.agent_prompt_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+    }
+
+    pub(super) fn close_agent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Overlay::AgentPanel { .. }) {
+            self.set_overlay(Overlay::None, cx);
+        }
+        self.focus.focus(window, cx);
+    }
+
+    pub(super) fn submit_agent_prompt(&mut self, cx: &mut Context<Self>) {
+        let Overlay::AgentPanel { pane_id } = &self.overlay else {
+            return;
+        };
+        let pane_id = pane_id.clone();
+        if matches!(self.agent_prompt, AgentPromptPhase::Sending) {
+            return;
+        }
+        let raw = self.agent_prompt_input.read(cx).content();
+        let Some(text) = agent_prompt_text_to_send(&self.agent_prompt, raw.as_ref()) else {
+            self.post_notice(
+                FailureNotice {
+                    level: ochub_ui::notifications::NotificationLevel::Warning,
+                    title: self.i18n.text(k::AGENT_PROMPT_SEND).to_owned(),
+                    message: self.i18n.text(k::AGENT_PROMPT_EMPTY).to_owned(),
+                },
+                cx,
+            );
+            return;
+        };
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let Some(next) = agent_prompt_begin(self.agent_prompt.clone()) else {
+            return;
+        };
+        self.agent_prompt = next;
+        let socket = connection.socket_path().to_owned();
+        let params = json!({ "target": pane_id, "text": text });
+        self.agent_prompt_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { request_socket(&socket, "agent.prompt", params) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.agent_prompt_task = None;
+                if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {
+                    return;
+                }
+                let complete = match &result {
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(agent_prompt_failure_from_error(error)),
+                };
+                this.agent_prompt =
+                    agent_prompt_complete(this.agent_prompt.clone(), complete.clone());
+                match complete {
+                    Ok(()) => {
+                        this.agent_prompt_input
+                            .update(cx, |input, cx| input.set_content("", cx));
+                        this.fetch_agent_output(cx);
+                    }
+                    Err(AgentPromptFailure::Blocked { .. }) => {
+                        this.notify_failure(
+                            FailureKind::AgentBlocked,
+                            this.i18n.text(k::AGENT_BLOCKED_DETAIL),
+                            cx,
+                        );
+                    }
+                    Err(AgentPromptFailure::Other { message }) => {
+                        this.notify_command_failure("agent.prompt", message, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn refresh_agent_output(&mut self, cx: &mut Context<Self>) {
+        self.fetch_agent_output(cx);
+    }
+
+    pub(super) fn submit_agent_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::AgentPanel { pane_id } = &self.overlay else {
+            return;
+        };
+        if self.agent_rename_task.is_some() {
+            return;
+        }
+        let pane_id = pane_id.clone();
+        let raw = self.agent_name_input.read(cx).content();
+        match parse_agent_name(raw.as_ref()) {
+            Err(error) => {
+                self.agent_name_error = Some(error);
+                cx.notify();
+            }
+            Ok(name) => {
+                self.agent_name_error = None;
+                let Some(connection) = &self.connection else {
+                    return;
+                };
+                let socket = connection.socket_path().to_owned();
+                let params = match name {
+                    Some(name) => json!({ "target": pane_id, "name": name }),
+                    None => json!({ "target": pane_id }),
+                };
+                self.agent_rename_task = Some(cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(
+                            async move { request_socket(&socket, "agent.rename", params) },
+                        )
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.agent_rename_task = None;
+                        if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {
+                            return;
+                        }
+                        match result {
+                            Ok(_) => this.resync_snapshot(this.event_epoch, cx),
+                            Err(error) => this.notify_command_failure("agent.rename", error, cx),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+                cx.notify();
+            }
+        }
+    }
+
+    pub(super) fn send_agent_keys(
+        &mut self,
+        keys: &'static [&'static str],
+        cx: &mut Context<Self>,
+    ) {
+        let Overlay::AgentPanel { pane_id } = &self.overlay else {
+            return;
+        };
+        if self.agent_keys_task.is_some() {
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let pane_id = pane_id.clone();
+        let socket = connection.socket_path().to_owned();
+        let params = json!({ "target": pane_id, "keys": keys });
+        self.agent_keys_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { request_socket(&socket, "agent.send_keys", params) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.agent_keys_task = None;
+                if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(_) => this.fetch_agent_output(cx),
+                    Err(error) => this.notify_command_failure("agent.send_keys", error, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn fetch_agent_output(&mut self, cx: &mut Context<Self>) {
+        let Overlay::AgentPanel { pane_id } = &self.overlay else {
+            return;
+        };
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let pane_id = pane_id.clone();
+        let socket = connection.socket_path().to_owned();
+        let params = json!({
+            "target": pane_id,
+            "source": AGENT_OUTPUT_SOURCE,
+            "format": "text",
+        });
+        self.agent_output = AgentOutputState::Loading;
+        self.agent_read_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { request_socket(&socket, "agent.read", params) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.agent_read_task = None;
+                if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {
+                    return;
+                }
+                this.agent_output = match result {
+                    Ok(value) => match parse_agent_read_result(&value) {
+                        Ok((text, truncated)) => AgentOutputState::Ready { text, truncated },
+                        Err(message) => AgentOutputState::Failed { message },
+                    },
+                    Err(error) => {
+                        this.notify_command_failure("agent.read", &error, cx);
+                        AgentOutputState::Failed {
+                            message: error.to_string(),
+                        }
+                    }
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn reset_agent_panel_state(&mut self) {
+        self.agent_read_task = None;
+        self.agent_prompt_task = None;
+        self.agent_keys_task = None;
+        self.agent_rename_task = None;
+        self.agent_output = AgentOutputState::Idle;
+        self.agent_prompt = AgentPromptPhase::Idle;
+        self.agent_name_error = None;
+    }
+
+    fn reconcile_open_agent_panel(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        if agent_panel_target_missing(&self.overlay, self.snapshot.as_ref()) {
+            self.set_overlay(Overlay::None, cx);
+            return;
+        }
+        if refresh {
+            self.fetch_agent_output(cx);
+        }
     }
 
     pub(super) fn ensure_session_terminals(&mut self, cx: &mut Context<Self>) {
@@ -2282,6 +2585,10 @@ impl OcHerdrView {
                 self.close_appearance(window, cx);
                 return true;
             }
+            if matches!(self.overlay, Overlay::AgentPanel { .. }) {
+                self.close_agent_panel(window, cx);
+                return true;
+            }
             if matches!(
                 self.overlay,
                 Overlay::ContextMenu(_) | Overlay::NodeManager | Overlay::HostSwitcher
@@ -3030,6 +3337,107 @@ fn overlay_after_abandoning_worktree_list(overlay: Overlay) -> Overlay {
     } else {
         overlay
     }
+}
+
+fn agent_panel_pane(overlay: &Overlay) -> Option<&str> {
+    match overlay {
+        Overlay::AgentPanel { pane_id } => Some(pane_id.as_str()),
+        _ => None,
+    }
+}
+
+fn agent_panel_target_missing(overlay: &Overlay, snapshot: Option<&HierarchySnapshot>) -> bool {
+    let Some(pane_id) = agent_panel_pane(overlay) else {
+        return false;
+    };
+    let Some(snapshot) = snapshot else {
+        return true;
+    };
+    snapshot
+        .pane(pane_id)
+        .is_none_or(|pane| pane.display_agent.is_none() && pane.agent.is_none())
+}
+
+fn agent_panel_refresh_from_batch(
+    overlay: &Overlay,
+    batch: Option<&[std::result::Result<HerdrEvent, HerdrError>]>,
+) -> bool {
+    let Some(pane_id) = agent_panel_pane(overlay) else {
+        return false;
+    };
+    let Some(items) = batch else {
+        return false;
+    };
+    items.iter().any(|item| {
+        item.as_ref()
+            .is_ok_and(|event| agent_output_should_refresh(pane_id, event))
+    })
+}
+
+fn agent_prompt_text_to_send(phase: &AgentPromptPhase, text: &str) -> Option<String> {
+    if matches!(phase, AgentPromptPhase::Sending) {
+        return None;
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+fn agent_prompt_begin(phase: AgentPromptPhase) -> Option<AgentPromptPhase> {
+    match phase {
+        AgentPromptPhase::Sending => None,
+        _ => Some(AgentPromptPhase::Sending),
+    }
+}
+
+fn agent_prompt_complete(
+    phase: AgentPromptPhase,
+    result: Result<(), AgentPromptFailure>,
+) -> AgentPromptPhase {
+    if !matches!(phase, AgentPromptPhase::Sending) {
+        return phase;
+    }
+    match result {
+        Ok(()) => AgentPromptPhase::Sent,
+        Err(AgentPromptFailure::Blocked { message }) => AgentPromptPhase::Failed {
+            blocked: true,
+            message,
+        },
+        Err(AgentPromptFailure::Other { message }) => AgentPromptPhase::Failed {
+            blocked: false,
+            message,
+        },
+    }
+}
+
+fn agent_prompt_failure_from_error(error: &HerdrError) -> AgentPromptFailure {
+    match error {
+        HerdrError::Api { code, message } if code == "agent_blocked" => {
+            AgentPromptFailure::Blocked {
+                message: message.clone(),
+            }
+        }
+        other => AgentPromptFailure::Other {
+            message: other.to_string(),
+        },
+    }
+}
+
+fn parse_agent_read_result(value: &Value) -> Result<(String, bool), String> {
+    let read = value
+        .get("read")
+        .ok_or_else(|| "API response is missing `read`".to_owned())?;
+    let text = read
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "read is missing `text`".to_owned())?;
+    let truncated = read
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok((text.to_owned(), truncated))
 }
 
 fn snapshot_contains_workspace(snapshot: Option<&HierarchySnapshot>, workspace_id: &str) -> bool {
@@ -5438,6 +5846,132 @@ mod tests {
         assert!(matches!(
             reconcile_split_drag_state(split_drag_at(&before, 1), Some(&after)),
             SurfaceDrag::Split(_)
+        ));
+    }
+
+    fn agent_panel(pane_id: &str) -> Overlay {
+        Overlay::AgentPanel {
+            pane_id: pane_id.into(),
+        }
+    }
+
+    fn snapshot_with_agent(pane_id: &str, agent: Option<&str>) -> HierarchySnapshot {
+        let mut snapshot = two_tab_snapshot();
+        snapshot.panes[0].pane_id = pane_id.into();
+        snapshot.panes[0].agent = agent.map(str::to_owned);
+        snapshot.panes[0].display_agent = agent.map(str::to_owned);
+        snapshot
+    }
+
+    #[test]
+    fn agent_panel_closes_when_the_pane_or_agent_is_gone() {
+        let overlay = agent_panel("p-a");
+        assert!(!agent_panel_target_missing(
+            &overlay,
+            Some(&snapshot_with_agent("p-a", Some("grok"))),
+        ));
+        assert!(agent_panel_target_missing(
+            &overlay,
+            Some(&snapshot_with_agent("p-a", None)),
+        ));
+        assert!(agent_panel_target_missing(
+            &overlay,
+            Some(&snapshot_with_agent("p-b", Some("grok"))),
+        ));
+        assert!(agent_panel_target_missing(&overlay, None));
+        assert!(!agent_panel_target_missing(&Overlay::Appearance, None));
+    }
+
+    #[test]
+    fn agent_prompt_is_not_sent_while_in_flight_or_when_empty() {
+        assert_eq!(
+            agent_prompt_text_to_send(&AgentPromptPhase::Idle, "  hello  "),
+            Some("hello".into())
+        );
+        assert_eq!(
+            agent_prompt_text_to_send(&AgentPromptPhase::Idle, "   "),
+            None
+        );
+        assert_eq!(
+            agent_prompt_text_to_send(&AgentPromptPhase::Sending, "hello"),
+            None
+        );
+        assert!(agent_prompt_begin(AgentPromptPhase::Sending).is_none());
+        assert_eq!(
+            agent_prompt_begin(AgentPromptPhase::Idle),
+            Some(AgentPromptPhase::Sending)
+        );
+    }
+
+    #[test]
+    fn a_blocked_prompt_is_reported_and_does_not_retry() {
+        let blocked = agent_prompt_failure_from_error(&HerdrError::Api {
+            code: "agent_blocked".into(),
+            message: "agent grok is blocked and requires interactive input".into(),
+        });
+        assert!(matches!(blocked, AgentPromptFailure::Blocked { .. }));
+        let finished = agent_prompt_complete(AgentPromptPhase::Sending, Err(blocked));
+        assert!(matches!(
+            finished,
+            AgentPromptPhase::Failed { blocked: true, .. }
+        ));
+        assert!(
+            agent_prompt_begin(finished).is_some(),
+            "the user can resend after blocked; the complete step itself must not enqueue a retry"
+        );
+        let stale = agent_prompt_complete(AgentPromptPhase::Idle, Ok(()));
+        assert_eq!(stale, AgentPromptPhase::Idle);
+        assert_eq!(
+            agent_prompt_complete(AgentPromptPhase::Sending, Ok(())),
+            AgentPromptPhase::Sent
+        );
+    }
+
+    #[test]
+    fn agent_read_parses_text_and_truncated() {
+        let value = json!({
+            "type": "pane_read",
+            "read": { "text": "hello\n", "truncated": true }
+        });
+        assert_eq!(
+            parse_agent_read_result(&value).unwrap(),
+            ("hello\n".into(), true)
+        );
+        assert!(parse_agent_read_result(&json!({ "ok": true })).is_err());
+    }
+
+    #[test]
+    fn agent_panel_refreshes_output_from_that_pane_status_events() {
+        let overlay = agent_panel("p-a");
+        let status = HerdrEvent::PaneAgentStatusChanged {
+            pane_id: "p-a".into(),
+            workspace_id: "w".into(),
+            agent_status: AgentStatus::Working,
+            agent: Some("grok".into()),
+            title: None,
+            display_agent: Some("grok".into()),
+            state_labels: HashMap::new(),
+        };
+        let other = HerdrEvent::PaneAgentStatusChanged {
+            pane_id: "p-b".into(),
+            workspace_id: "w".into(),
+            agent_status: AgentStatus::Done,
+            agent: Some("grok".into()),
+            title: None,
+            display_agent: Some("grok".into()),
+            state_labels: HashMap::new(),
+        };
+        assert!(agent_panel_refresh_from_batch(
+            &overlay,
+            Some(&[Ok(status.clone())]),
+        ));
+        assert!(!agent_panel_refresh_from_batch(
+            &overlay,
+            Some(&[Ok(other)]),
+        ));
+        assert!(!agent_panel_refresh_from_batch(
+            &Overlay::Appearance,
+            Some(&[Ok(status)])
         ));
     }
 }
