@@ -1,33 +1,24 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use super::super::*;
 use crate::a11y::apply_dialog;
+use crate::config::import::{
+    GhosttyImportError, GhosttyImportPaths, GhosttyImportPlan, plan_ghostty_import,
+    plan_ghostty_keys,
+};
+use crate::config::values::{
+    MetricModifier, NO_LIGATURES, format_font_size, format_opacity, no_ligature_features,
+};
 use crate::i18n::Key;
 use ochub_ui::layout::{
     self, SelectRowEvent, SelectRowState, action_row, content_column, group, page_header, row,
     row_label, scroll_body, section_header, select_row, switch_row,
 };
 
-/// UI-only appearance state that is not on [`AppearanceSettings`] yet.
-///
-/// T29-A owns config persistence; T29-B owns `Theme.ansi`. This struct holds
-/// the controls those APIs will feed, so the page can be operated before they
-/// merge.
+/// Dialog-only appearance state. Persisted values live on [`AppearanceSettings`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppearanceUi {
-    /// `None` follows the UI theme.
-    ///
-    /// TODO(T29-A): persist as `terminal-theme` (`id` or `light:X,dark:Y`).
-    terminal_theme: Option<String>,
-    /// TODO(T29-A): persist as `window-padding-x`.
-    padding_x: u32,
-    /// TODO(T29-A): persist as `window-padding-y`.
-    padding_y: u32,
-    /// TODO(T29-A): persist as `font-thicken-strength`.
-    thicken_strength: u8,
-    /// TODO(T29-A): persist as repeated `palette = N=#rrggbb`.
-    palette_overrides: [Option<u32>; 16],
     selected_slot: Option<u8>,
     sheet: AppearanceSheet,
     status: Option<SharedString>,
@@ -36,11 +27,6 @@ pub(crate) struct AppearanceUi {
 impl Default for AppearanceUi {
     fn default() -> Self {
         Self {
-            terminal_theme: None,
-            padding_x: 0,
-            padding_y: 0,
-            thicken_strength: ThickenStrengthChoice::default().value(),
-            palette_overrides: [None; 16],
             selected_slot: None,
             sheet: AppearanceSheet::None,
             status: None,
@@ -62,7 +48,7 @@ impl AppearanceUi {
 enum AppearanceSheet {
     #[default]
     None,
-    ImportPreview(GhosttyImportPreview),
+    ImportPreview(Box<GhosttyImportPreview>),
     RestoreConfirm,
 }
 
@@ -72,14 +58,15 @@ struct GhosttyImportPreview {
     ghostty_app_found: bool,
     recognized: Vec<(String, String)>,
     unknown: Vec<String>,
+    plan: Option<GhosttyImportPlan>,
+    error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThickenStrengthChoice {
     Subtle,
     Medium,
     Strong,
-    #[default]
     Max,
 }
 
@@ -94,32 +81,9 @@ impl ThickenStrengthChoice {
             Self::Max => 255,
         }
     }
-
-    fn index(self) -> usize {
-        match self {
-            Self::Subtle => 0,
-            Self::Medium => 1,
-            Self::Strong => 2,
-            Self::Max => 3,
-        }
-    }
-
-    fn nearest(value: u8) -> Self {
-        let mut best = Self::Max;
-        let mut best_diff = best.value().abs_diff(value);
-        for choice in Self::ALL {
-            let diff = choice.value().abs_diff(value);
-            if diff < best_diff {
-                best = choice;
-                best_diff = diff;
-            }
-        }
-        best
-    }
 }
 
 const PADDING_CHOICES: [u32; 6] = [0, 4, 8, 12, 16, 24];
-const PADDING_LABELS: [&str; 6] = ["0", "4", "8", "12", "16", "24"];
 const PALETTE_PRESETS: [u32; 8] = [
     0x1C1C1C, 0xC41A16, 0x1B8A4A, 0xC7A000, 0x1A5FB4, 0x813D9C, 0x0E9AA7, 0xF5F5F5,
 ];
@@ -214,7 +178,7 @@ impl OcHerdrView {
                 self.font_size_row(cx).into_any_element(),
                 self.thicken_row(cx).into_any_element(),
                 self.thicken_strength_row(cx).into_any_element(),
-                self.ligatures_row(cx).into_any_element(),
+                self.font_feature_row(cx).into_any_element(),
                 self.cell_width_row(cx).into_any_element(),
                 self.cell_height_row(cx).into_any_element(),
             ]))
@@ -294,7 +258,14 @@ impl OcHerdrView {
             labels.push(record.family.name.clone());
             ids.push(Some(record.family.id.clone()));
         }
-        let selected = terminal_theme_index(self.appearance_ui.terminal_theme.as_deref(), &ids);
+        let current = self.appearance.terminal_theme.clone();
+        if let Some(id) = current.as_deref()
+            && !ids.iter().any(|entry| entry.as_deref() == Some(id))
+        {
+            labels.push(id.to_owned());
+            ids.push(Some(id.to_owned()));
+        }
+        let selected = terminal_theme_index(current.as_deref(), &ids);
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         select_row(
             "appearance-terminal-theme",
@@ -306,9 +277,8 @@ impl OcHerdrView {
             appearance_select(
                 cx,
                 "appearance-terminal-theme",
-                move |this, index, _, cx| {
-                    this.appearance_ui.terminal_theme = ids.get(index).cloned().flatten();
-                    cx.notify();
+                move |this, index, window, cx| {
+                    this.set_terminal_theme(ids.get(index).cloned().flatten(), window, cx);
                 },
             ),
         )
@@ -339,17 +309,18 @@ impl OcHerdrView {
     }
 
     fn opacity_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // TODO(T29-A): `background-opacity` becomes a free 0..1 f64.
         let i18n = self.i18n;
+        let (labels, values, selected) = opacity_choices(self.appearance.background_opacity);
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         select_row(
             "appearance-opacity",
             i18n.text(k::APPEARANCE_OPACITY_LABEL),
             Some(i18n.text(k::APPEARANCE_OPACITY_DESCRIPTION).into()),
-            &["100%", "92%", "84%", "72%"],
-            self.appearance.background_opacity.index(),
+            &label_refs,
+            selected,
             self.select_row_state("appearance-opacity"),
-            appearance_select(cx, "appearance-opacity", |this, index, window, cx| {
-                let Some(&opacity) = OpacityChoice::ALL.get(index) else {
+            appearance_select(cx, "appearance-opacity", move |this, index, window, cx| {
+                let Some(&opacity) = values.get(index) else {
                     return;
                 };
                 this.set_background_opacity(opacity, window, cx);
@@ -359,76 +330,87 @@ impl OcHerdrView {
 
     fn padding_row(&mut self, cx: &mut Context<Self>, horizontal: bool) -> impl IntoElement {
         let i18n = self.i18n;
-        let (id, label, description, selected) = if horizontal {
+        let current = if horizontal {
+            self.appearance.window_padding_x
+        } else {
+            self.appearance.window_padding_y
+        };
+        let (labels, values, selected) = padding_choices(current);
+        let (id, label, description) = if horizontal {
             (
                 "appearance-padding-x",
                 k::APPEARANCE_WINDOW_PADDING_X_LABEL,
                 k::APPEARANCE_WINDOW_PADDING_X_DESCRIPTION,
-                padding_index(self.appearance_ui.padding_x),
             )
         } else {
             (
                 "appearance-padding-y",
                 k::APPEARANCE_WINDOW_PADDING_Y_LABEL,
                 k::APPEARANCE_WINDOW_PADDING_Y_DESCRIPTION,
-                padding_index(self.appearance_ui.padding_y),
             )
         };
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         select_row(
             id,
             i18n.text(label),
             Some(i18n.text(description).into()),
-            &PADDING_LABELS,
+            &label_refs,
             selected,
             self.select_row_state(id),
-            appearance_select(cx, id, move |this, index, _, cx| {
-                let Some(&value) = PADDING_CHOICES.get(index) else {
+            appearance_select(cx, id, move |this, index, window, cx| {
+                let Some(&value) = values.get(index) else {
                     return;
                 };
-                if horizontal {
-                    this.appearance_ui.padding_x = value;
-                } else {
-                    this.appearance_ui.padding_y = value;
-                }
-                cx.notify();
+                this.set_window_padding(horizontal, value, window, cx);
             }),
         )
     }
 
     fn font_size_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // TODO(T29-A): `font-size` becomes a free f32; keep the enum until then.
         let i18n = self.i18n;
-        let size_labels = FontSizeChoice::ALL.map(|size| size.value().to_string());
-        let size_refs = size_labels.each_ref().map(String::as_str);
+        let (labels, values, selected) = font_size_choices(self.appearance.font.size);
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         select_row(
             "appearance-font-size",
             i18n.text(k::APPEARANCE_FONT_SIZE_LABEL),
             Some(i18n.text(k::APPEARANCE_FONT_SIZE_DESCRIPTION).into()),
-            &size_refs,
-            self.appearance.font.size.index(),
+            &label_refs,
+            selected,
             self.select_row_state("appearance-font-size"),
-            appearance_select(cx, "appearance-font-size", |this, index, window, cx| {
-                let Some(&size) = FontSizeChoice::ALL.get(index) else {
-                    return;
-                };
-                this.set_font_size(size, window, cx);
-            }),
+            appearance_select(
+                cx,
+                "appearance-font-size",
+                move |this, index, window, cx| {
+                    let Some(&size) = values.get(index) else {
+                        return;
+                    };
+                    this.set_font_size(size, window, cx);
+                },
+            ),
         )
     }
 
-    fn ligatures_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // TODO(T29-A): replace this bool with repeated `font-feature` values.
+    fn font_feature_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
-        let ligatures_listener = cx.listener(|this, _: &(), window, cx| {
-            this.set_font_ligatures(!this.appearance.font.ligatures, window, cx);
-        });
-        switch_row(
-            "appearance-ligatures",
-            i18n.text(k::APPEARANCE_FONT_LIGATURES_LABEL),
-            Some(i18n.text(k::APPEARANCE_FONT_LIGATURES_DESCRIPTION).into()),
-            self.appearance.font.ligatures,
-            false,
-            move |window, cx| ligatures_listener(&(), window, cx),
+        let (labels, values, selected) = font_feature_choices(i18n, &self.appearance.font.features);
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        select_row(
+            "appearance-font-feature",
+            i18n.text(k::APPEARANCE_FONT_FEATURE_LABEL),
+            Some(i18n.text(k::APPEARANCE_FONT_FEATURE_DESCRIPTION).into()),
+            &label_refs,
+            selected,
+            self.select_row_state("appearance-font-feature"),
+            appearance_select(
+                cx,
+                "appearance-font-feature",
+                move |this, index, window, cx| {
+                    let Some(features) = values.get(index).cloned() else {
+                        return;
+                    };
+                    this.set_font_features(features, window, cx);
+                },
+            ),
         )
     }
 
@@ -449,6 +431,9 @@ impl OcHerdrView {
 
     fn thicken_strength_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
+        let (labels, values, selected) =
+            thicken_strength_choices(i18n, self.appearance.font.thicken_strength);
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         select_row(
             "appearance-thicken-strength",
             i18n.text(k::APPEARANCE_FONT_THICKEN_STRENGTH_LABEL),
@@ -456,69 +441,71 @@ impl OcHerdrView {
                 i18n.text(k::APPEARANCE_FONT_THICKEN_STRENGTH_DESCRIPTION)
                     .into(),
             ),
-            &[
-                i18n.text(k::APPEARANCE_FONT_THICKEN_STRENGTH_SUBTLE),
-                i18n.text(k::APPEARANCE_FONT_THICKEN_STRENGTH_MEDIUM),
-                i18n.text(k::APPEARANCE_FONT_THICKEN_STRENGTH_STRONG),
-                i18n.text(k::APPEARANCE_FONT_THICKEN_STRENGTH_MAX),
-            ],
-            ThickenStrengthChoice::nearest(self.appearance_ui.thicken_strength).index(),
+            &label_refs,
+            selected,
             SelectRowState::new(
                 !self.appearance.font.thicken,
                 self.open_select.as_deref() == Some("appearance-thicken-strength"),
             ),
-            appearance_select(cx, "appearance-thicken-strength", |this, index, _, cx| {
-                let Some(&choice) = ThickenStrengthChoice::ALL.get(index) else {
-                    return;
-                };
-                this.appearance_ui.thicken_strength = choice.value();
-                cx.notify();
-            }),
+            appearance_select(
+                cx,
+                "appearance-thicken-strength",
+                move |this, index, window, cx| {
+                    let Some(&strength) = values.get(index) else {
+                        return;
+                    };
+                    this.set_font_thicken_strength(strength, window, cx);
+                },
+            ),
         )
     }
 
     fn cell_width_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
+        let (labels, values, selected) = cell_width_choices(i18n, self.appearance.font.cell_width);
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         select_row(
             "appearance-cell-width",
             i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_LABEL),
             Some(i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_DESCRIPTION).into()),
-            &[
-                i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_TIGHT),
-                i18n.text(k::COMMON_DEFAULT),
-                i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_WIDE),
-            ],
-            self.appearance.font.cell_width_percent.index(),
+            &label_refs,
+            selected,
             self.select_row_state("appearance-cell-width"),
-            appearance_select(cx, "appearance-cell-width", |this, index, window, cx| {
-                let Some(&percent) = CellWidthChoice::ALL.get(index) else {
-                    return;
-                };
-                this.set_cell_width(percent, window, cx);
-            }),
+            appearance_select(
+                cx,
+                "appearance-cell-width",
+                move |this, index, window, cx| {
+                    let Some(&metric) = values.get(index) else {
+                        return;
+                    };
+                    this.set_cell_width(metric, window, cx);
+                },
+            ),
         )
     }
 
     fn cell_height_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
+        let (labels, values, selected) =
+            cell_height_choices(i18n, self.appearance.font.cell_height);
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         select_row(
             "appearance-cell-height",
             i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_LABEL),
             Some(i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_DESCRIPTION).into()),
-            &[
-                i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_COMPACT),
-                i18n.text(k::COMMON_DEFAULT),
-                i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_RELAXED),
-                i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_LOOSE),
-            ],
-            self.appearance.font.cell_height_percent.index(),
+            &label_refs,
+            selected,
             self.select_row_state("appearance-cell-height"),
-            appearance_select(cx, "appearance-cell-height", |this, index, window, cx| {
-                let Some(&percent) = CellHeightChoice::ALL.get(index) else {
-                    return;
-                };
-                this.set_cell_height(percent, window, cx);
-            }),
+            appearance_select(
+                cx,
+                "appearance-cell-height",
+                move |this, index, window, cx| {
+                    let Some(&metric) = values.get(index) else {
+                        return;
+                    };
+                    this.set_cell_height(metric, window, cx);
+                },
+            ),
         )
     }
 
@@ -767,7 +754,7 @@ impl OcHerdrView {
 
     fn render_palette_grid(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
-        let colors = displayed_ansi(placeholder_ansi(), &self.appearance_ui.palette_overrides);
+        let colors = palette_grid_colors(&self.appearance);
         let selected = self.appearance_ui.selected_slot;
         let swatches = colors.into_iter().enumerate().map(|(index, color)| {
             let slot = index as u8;
@@ -844,16 +831,15 @@ impl OcHerdrView {
                 .into_any_element();
         };
         let index = slot as usize;
-        let colors = displayed_ansi(placeholder_ansi(), &self.appearance_ui.palette_overrides);
+        let colors = palette_grid_colors(&self.appearance);
         let color = colors[index];
-        let overridden = self.appearance_ui.palette_overrides[index].is_some();
+        let overridden = self.appearance.palette[index].is_some();
         let hex = theme::ThemeColor::new(color).hex();
-        let reset = cx.listener(move |this, _: &(), _window, cx| {
-            clear_slot_override(&mut this.appearance_ui.palette_overrides, slot);
-            cx.notify();
+        let reset = cx.listener(move |this, _: &(), window, cx| {
+            this.set_palette_slot(slot, None, window, cx);
         });
         let presets = PALETTE_PRESETS.into_iter().map(|preset| {
-            let selected = self.appearance_ui.palette_overrides[index] == Some(preset);
+            let selected = self.appearance.palette[index] == Some(preset);
             let label = crate::tf!(
                 i18n,
                 k::APPEARANCE_PALETTE_SELECT,
@@ -876,9 +862,8 @@ impl OcHerdrView {
                     theme::border()
                 })
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    set_slot_override(&mut this.appearance_ui.palette_overrides, slot, preset);
-                    cx.notify();
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_palette_slot(slot, Some(preset), window, cx);
                 }))
                 .into_any_element()
         });
@@ -908,7 +893,7 @@ impl OcHerdrView {
         match self.appearance_ui.sheet.clone() {
             AppearanceSheet::None => None,
             AppearanceSheet::ImportPreview(preview) => {
-                Some(self.render_import_preview(preview, cx).into_any_element())
+                Some(self.render_import_preview(*preview, cx).into_any_element())
             }
             AppearanceSheet::RestoreConfirm => {
                 Some(self.render_restore_confirm(cx).into_any_element())
@@ -922,7 +907,7 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let i18n = self.i18n;
-        let can_import = preview.source.is_some();
+        let can_import = preview.plan.as_ref().is_some_and(plan_has_changes);
         let cancel = button(
             "cancel-ghostty-import",
             i18n.text(k::COMMON_CANCEL),
@@ -941,7 +926,7 @@ impl OcHerdrView {
                 ButtonTone::Primary,
                 ButtonSize::Sm,
             )
-            .on_click(cx.listener(|this, _, _window, cx| this.confirm_ghostty_import(cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.confirm_ghostty_import(window, cx)))
             .into_any_element()
         } else {
             disabled_button(
@@ -966,6 +951,14 @@ impl OcHerdrView {
                     .text_sm()
                     .text_color(theme::text())
                     .child(i18n.text(k::APPEARANCE_CONFIG_IMPORT_EMPTY)),
+            );
+        }
+        if let Some(error) = preview.error.as_deref() {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(theme::yellow())
+                    .child(error.to_owned()),
             );
         }
         if !preview.ghostty_app_found {
@@ -1096,7 +1089,7 @@ impl OcHerdrView {
 
     fn confirm_appearance_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.appearance_ui.sheet.clone() {
-            AppearanceSheet::ImportPreview(_) => self.confirm_ghostty_import(cx),
+            AppearanceSheet::ImportPreview(_) => self.confirm_ghostty_import(window, cx),
             AppearanceSheet::RestoreConfirm => {
                 self.appearance_ui.sheet = AppearanceSheet::None;
                 self.restore_appearance_defaults(window, cx);
@@ -1106,27 +1099,64 @@ impl OcHerdrView {
     }
 
     fn request_ghostty_import(&mut self, cx: &mut Context<Self>) {
-        let sources =
-            collect_import_sources(&ghostty_config_candidates(), Path::new(GHOSTTY_APP_THEMES));
-        self.appearance_ui.sheet =
-            AppearanceSheet::ImportPreview(placeholder_import_preview(&sources));
+        let preview = match GhosttyImportPaths::user() {
+            Some(paths) => build_import_preview(&paths),
+            None => GhosttyImportPreview {
+                source: None,
+                ghostty_app_found: Path::new(GHOSTTY_APP_THEMES).is_dir(),
+                recognized: Vec::new(),
+                unknown: Vec::new(),
+                plan: None,
+                error: Some(self.i18n.text(k::APPEARANCE_CONFIG_OPEN_FAILED).into()),
+            },
+        };
+        self.appearance_ui.sheet = AppearanceSheet::ImportPreview(Box::new(preview));
         cx.notify();
     }
 
-    fn confirm_ghostty_import(&mut self, cx: &mut Context<Self>) {
-        // TODO(T29-A): `ConfigStore::import_ghostty(preview)` should parse the
-        // Ghostty config with the shared key=value parser, map §3.1 keys, copy
-        // `theme = X` files from Ghostty.app into `themes/imported-<slug>.json`,
-        // and set `terminal-theme`. Do not parse or write config here.
-        self.appearance_ui.sheet = AppearanceSheet::None;
-        self.appearance_ui.status =
-            Some(self.i18n.text(k::APPEARANCE_CONFIG_IMPORT_DEFERRED).into());
-        cx.notify();
+    fn confirm_ghostty_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let AppearanceSheet::ImportPreview(preview) =
+            std::mem::replace(&mut self.appearance_ui.sheet, AppearanceSheet::None)
+        else {
+            return;
+        };
+        let Some(plan) = preview.plan else {
+            cx.notify();
+            return;
+        };
+        let Some(paths) = crate::config::AppPaths::user() else {
+            self.appearance_ui.status = Some(
+                self.i18n
+                    .text(k::APPEARANCE_CONFIG_IMPORT_FAILED_PATHS)
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        match crate::config::apply_ghostty_import_plan(&mut self.config, &plan, &paths.themes()) {
+            Ok(()) => {
+                theme::reload_registry();
+                self.sync_appearance_from_document();
+                self.apply_appearance(window, cx);
+                self.appearance_ui.status =
+                    Some(self.i18n.text(k::APPEARANCE_CONFIG_IMPORT_APPLIED).into());
+            }
+            Err(error) => {
+                self.appearance_ui.status = Some(
+                    crate::tf!(
+                        self.i18n,
+                        k::APPEARANCE_CONFIG_IMPORT_FAILED,
+                        error = error.to_string()
+                    )
+                    .into(),
+                );
+                cx.notify();
+            }
+        }
     }
 
     fn open_ocherdr_config(&mut self, cx: &mut Context<Self>) {
-        // TODO(T29-A): share the canonical `config` path with the file writer.
-        let Some(path) = ocherdr_config_path() else {
+        let Some(path) = crate::config::AppPaths::user().map(|paths| paths.config()) else {
             self.appearance_ui.status =
                 Some(self.i18n.text(k::APPEARANCE_CONFIG_OPEN_FAILED).into());
             cx.notify();
@@ -1151,10 +1181,20 @@ impl OcHerdrView {
     }
 
     fn restore_appearance_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        restore_appearance_state(&mut self.appearance, &mut self.appearance_ui);
+        crate::config::strip_known_keys(&mut self.config);
+        self.sync_appearance_from_document();
+        self.appearance_ui = AppearanceUi::default();
         self.open_select = None;
         self.set_language(Language::System, cx);
         self.apply_appearance(window, cx);
+    }
+
+    fn sync_appearance_from_document(&mut self) {
+        let (config, _) = crate::config::values::AppConfig::from_document(&self.config);
+        self.appearance = crate::config::values::appearance_from_config(&config);
+        if self.i18n.preference() != config.language {
+            self.i18n.set_preference(config.language);
+        }
     }
 
     fn select_row_state(&self, id: &str) -> SelectRowState {
@@ -1198,11 +1238,161 @@ fn apply_select_event(
     }
 }
 
-fn padding_index(value: u32) -> usize {
-    PADDING_CHOICES
+const FONT_SIZE_PRESETS: [f32; 8] = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0];
+const OPACITY_PRESETS: [f64; 4] = [1.0, 0.92, 0.84, 0.72];
+
+fn font_size_choices(current: f32) -> (Vec<String>, Vec<f32>, usize) {
+    let (values, selected) = inject_current(&FONT_SIZE_PRESETS, current, |value| {
+        format_font_size(*value) == format_font_size(current)
+    });
+    let labels = values.iter().copied().map(format_font_size).collect();
+    (labels, values, selected)
+}
+
+fn opacity_choices(current: f64) -> (Vec<String>, Vec<f64>, usize) {
+    let (values, selected) = inject_current(&OPACITY_PRESETS, current, |value| {
+        format_opacity(*value) == format_opacity(current)
+    });
+    let labels = values.iter().copied().map(opacity_percent_label).collect();
+    (labels, values, selected)
+}
+
+fn opacity_percent_label(opacity: f64) -> String {
+    let percent = opacity * 100.0;
+    if (percent - percent.round()).abs() < 1e-6 {
+        format!("{}%", percent.round() as i32)
+    } else {
+        let text = format!("{percent:.2}");
+        format!("{}%", text.trim_end_matches('0').trim_end_matches('.'))
+    }
+}
+
+fn padding_choices(current: u32) -> (Vec<String>, Vec<u32>, usize) {
+    let (values, selected) = inject_current(&PADDING_CHOICES, current, |value| *value == current);
+    let labels = values.iter().map(u32::to_string).collect();
+    (labels, values, selected)
+}
+
+fn thicken_strength_choices(i18n: I18n, current: u8) -> (Vec<String>, Vec<u8>, usize) {
+    let presets = ThickenStrengthChoice::ALL.map(ThickenStrengthChoice::value);
+    let (values, selected) = inject_current(&presets, current, |value| *value == current);
+    let labels = values
         .iter()
-        .position(|&choice| choice == value)
-        .unwrap_or(0)
+        .map(|&value| {
+            ThickenStrengthChoice::ALL
+                .into_iter()
+                .find(|choice| choice.value() == value)
+                .map(|choice| {
+                    i18n.text(match choice {
+                        ThickenStrengthChoice::Subtle => k::APPEARANCE_FONT_THICKEN_STRENGTH_SUBTLE,
+                        ThickenStrengthChoice::Medium => k::APPEARANCE_FONT_THICKEN_STRENGTH_MEDIUM,
+                        ThickenStrengthChoice::Strong => k::APPEARANCE_FONT_THICKEN_STRENGTH_STRONG,
+                        ThickenStrengthChoice::Max => k::APPEARANCE_FONT_THICKEN_STRENGTH_MAX,
+                    })
+                    .to_owned()
+                })
+                .unwrap_or_else(|| value.to_string())
+        })
+        .collect();
+    (labels, values, selected)
+}
+
+fn font_feature_choices(i18n: I18n, current: &[String]) -> (Vec<String>, Vec<Vec<String>>, usize) {
+    let presets = vec![Vec::new(), no_ligature_features()];
+    let (values, selected) = inject_current(&presets, current.to_vec(), |value| value == current);
+    let labels = values
+        .iter()
+        .map(|features| font_feature_label(i18n, features))
+        .collect();
+    (labels, values, selected)
+}
+
+fn font_feature_label(i18n: I18n, features: &[String]) -> String {
+    if features.is_empty() {
+        i18n.text(k::APPEARANCE_FONT_FEATURE_DEFAULT).to_owned()
+    } else if features
+        .iter()
+        .map(String::as_str)
+        .eq(NO_LIGATURES.iter().copied())
+    {
+        i18n.text(k::APPEARANCE_FONT_FEATURE_NO_LIGATURES)
+            .to_owned()
+    } else {
+        features.join(", ")
+    }
+}
+
+fn cell_width_choices(
+    i18n: I18n,
+    current: Option<MetricModifier>,
+) -> (Vec<String>, Vec<Option<MetricModifier>>, usize) {
+    let presets: Vec<Option<MetricModifier>> = CellWidthChoice::ALL
+        .into_iter()
+        .map(CellWidthChoice::metric)
+        .collect();
+    let (values, selected) = inject_current(&presets, current, |value| *value == current);
+    let labels = values
+        .iter()
+        .map(|metric| cell_width_label(i18n, *metric))
+        .collect();
+    (labels, values, selected)
+}
+
+fn cell_height_choices(
+    i18n: I18n,
+    current: Option<MetricModifier>,
+) -> (Vec<String>, Vec<Option<MetricModifier>>, usize) {
+    let presets: Vec<Option<MetricModifier>> = CellHeightChoice::ALL
+        .into_iter()
+        .map(CellHeightChoice::metric)
+        .collect();
+    let (values, selected) = inject_current(&presets, current, |value| *value == current);
+    let labels = values
+        .iter()
+        .map(|metric| cell_height_label(i18n, *metric))
+        .collect();
+    (labels, values, selected)
+}
+
+fn cell_width_label(i18n: I18n, metric: Option<MetricModifier>) -> String {
+    match CellWidthChoice::matching(metric) {
+        Some(CellWidthChoice::Tight) => i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_TIGHT).to_owned(),
+        Some(CellWidthChoice::Normal) => i18n.text(k::COMMON_DEFAULT).to_owned(),
+        Some(CellWidthChoice::Wide) => i18n.text(k::APPEARANCE_FONT_CELL_WIDTH_WIDE).to_owned(),
+        None => metric
+            .map(MetricModifier::to_config)
+            .unwrap_or_else(|| i18n.text(k::COMMON_DEFAULT).to_owned()),
+    }
+}
+
+fn cell_height_label(i18n: I18n, metric: Option<MetricModifier>) -> String {
+    match CellHeightChoice::matching(metric) {
+        Some(CellHeightChoice::Compact) => {
+            i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_COMPACT).to_owned()
+        }
+        Some(CellHeightChoice::Normal) => i18n.text(k::COMMON_DEFAULT).to_owned(),
+        Some(CellHeightChoice::Relaxed) => {
+            i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_RELAXED).to_owned()
+        }
+        Some(CellHeightChoice::Loose) => i18n.text(k::APPEARANCE_FONT_CELL_HEIGHT_LOOSE).to_owned(),
+        None => metric
+            .map(MetricModifier::to_config)
+            .unwrap_or_else(|| i18n.text(k::COMMON_DEFAULT).to_owned()),
+    }
+}
+
+fn inject_current<T: Clone>(
+    presets: &[T],
+    current: T,
+    same: impl Fn(&T) -> bool,
+) -> (Vec<T>, usize) {
+    if let Some(index) = presets.iter().position(&same) {
+        return (presets.to_vec(), index);
+    }
+    let mut values = presets.to_vec();
+    values.push(current);
+    let index = values.len() - 1;
+    (values, index)
 }
 
 fn terminal_theme_index(selected: Option<&str>, ids: &[Option<String>]) -> usize {
@@ -1224,111 +1414,104 @@ fn palette_slot_label(i18n: I18n, index: usize) -> String {
     )
 }
 
-/// Display-only 16-color grid until T29-B exposes `Theme.ansi`.
-///
-/// TODO(T29-B): replace with `family.dark/light.ansi` (falling back to
-/// `ansi_from_theme` when `ansi` is `None`). Do not keep a second copy of the
-/// OcHub/Ember tables here.
-fn placeholder_ansi() -> [u32; 16] {
-    let theme = theme::current();
-    [
-        theme.bg.0,
-        theme.red.0,
-        theme.green.0,
-        theme.yellow.0,
-        theme.accent.0,
-        theme.mauve.0,
-        theme.teal.0,
-        theme.text.0,
-        theme.overlay.0,
-        theme.red_hover.0,
-        theme.green.0,
-        theme.peach.0,
-        theme.accent_hover.0,
-        theme.mauve.0,
-        theme.teal.0,
-        theme.subtext.0,
-    ]
+fn palette_grid_colors(appearance: &AppearanceSettings) -> [u32; 16] {
+    let dark = theme::is_dark();
+    crate::theme_ansi::apply_overrides(
+        crate::theme_ansi::resolved_ansi(
+            crate::controller::terminal_overlay(appearance, dark),
+            &theme::current(),
+            dark,
+        ),
+        &appearance.palette,
+    )
 }
 
-fn displayed_ansi(base: [u32; 16], overrides: &[Option<u32>; 16]) -> [u32; 16] {
-    let mut colors = base;
-    for (index, override_color) in overrides.iter().enumerate() {
-        if let Some(color) = override_color {
-            colors[index] = *color;
-        }
-    }
-    colors
+fn plan_has_changes(plan: &GhosttyImportPlan) -> bool {
+    !plan.updates.is_empty() || !plan.themes.is_empty() || plan.terminal_theme.is_some()
 }
 
-fn set_slot_override(overrides: &mut [Option<u32>; 16], slot: u8, color: u32) {
-    overrides[slot as usize] = Some(color);
-}
-
-fn clear_slot_override(overrides: &mut [Option<u32>; 16], slot: u8) {
-    overrides[slot as usize] = None;
-}
-
-fn restore_appearance_state(appearance: &mut AppearanceSettings, ui: &mut AppearanceUi) {
-    *appearance = AppearanceSettings::default();
-    *ui = AppearanceUi::default();
-}
-
-struct ImportSources {
-    config: Option<PathBuf>,
-    ghostty_app_found: bool,
-}
-
-fn ghostty_config_candidates() -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
-    vec![
-        home.join(".config/ghostty/config"),
-        home.join("Library/Application Support/com.mitchellh.ghostty/config"),
-    ]
-}
-
-fn ocherdr_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("OcHerdr/config"))
-}
-
-fn collect_import_sources(candidates: &[PathBuf], themes_dir: &Path) -> ImportSources {
-    ImportSources {
-        config: candidates.iter().find(|path| path.is_file()).cloned(),
-        ghostty_app_found: themes_dir.is_dir(),
-    }
-}
-
-/// Placeholder preview. Does **not** read the Ghostty file.
-///
-/// TODO(T29-A): `fn preview_ghostty_import(path, themes_dir) -> Result<Preview, _>`
-/// should parse with the shared config parser, map §3.1 keys, and list unknown
-/// keys instead of this canned list.
-fn placeholder_import_preview(sources: &ImportSources) -> GhosttyImportPreview {
-    let source = sources
-        .config
-        .as_ref()
-        .map(|path| path.display().to_string());
-    if source.is_none() {
-        return GhosttyImportPreview {
-            source,
-            ghostty_app_found: sources.ghostty_app_found,
+fn build_import_preview(paths: &GhosttyImportPaths) -> GhosttyImportPreview {
+    match plan_ghostty_import(paths) {
+        Ok(plan) => import_preview_from_plan(plan, paths.app_themes.is_dir()),
+        Err(GhosttyImportError::ConfigNotFound { .. }) => GhosttyImportPreview {
+            source: None,
+            ghostty_app_found: paths.app_themes.is_dir(),
             recognized: Vec::new(),
             unknown: Vec::new(),
-        };
+            plan: None,
+            error: None,
+        },
+        Err(GhosttyImportError::ThemesMissing { .. }) => keys_only_preview(paths),
+        Err(error) => GhosttyImportPreview {
+            source: None,
+            ghostty_app_found: paths.app_themes.is_dir(),
+            recognized: Vec::new(),
+            unknown: Vec::new(),
+            plan: None,
+            error: Some(error.to_string()),
+        },
     }
+}
+
+fn keys_only_preview(paths: &GhosttyImportPaths) -> GhosttyImportPreview {
+    let source = if paths.xdg_config.is_file() {
+        Some(paths.xdg_config.clone())
+    } else if paths.app_support_config.is_file() {
+        Some(paths.app_support_config.clone())
+    } else {
+        None
+    };
+    let Some(path) = source else {
+        return GhosttyImportPreview {
+            source: None,
+            ghostty_app_found: false,
+            recognized: Vec::new(),
+            unknown: Vec::new(),
+            plan: None,
+            error: None,
+        };
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            import_preview_from_plan(plan_ghostty_keys(&text, &path).without_themes(), false)
+        }
+        Err(error) => GhosttyImportPreview {
+            source: Some(path.display().to_string()),
+            ghostty_app_found: false,
+            recognized: Vec::new(),
+            unknown: Vec::new(),
+            plan: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn import_preview_from_plan(
+    plan: GhosttyImportPlan,
+    ghostty_app_found: bool,
+) -> GhosttyImportPreview {
+    let mut recognized = Vec::new();
+    for update in &plan.updates {
+        recognized.push((update.key.clone(), update.values.join(", ")));
+    }
+    if let Some(theme) = &plan.terminal_theme {
+        recognized.push(("terminal-theme".into(), theme.to_config()));
+    }
+    for theme in &plan.themes {
+        recognized.push((theme.file_name.clone(), theme.name.clone()));
+    }
+    let unknown = plan
+        .unknown_keys
+        .iter()
+        .map(|key| format!("{} = {}", key.key, key.value))
+        .collect();
     GhosttyImportPreview {
-        source,
-        ghostty_app_found: sources.ghostty_app_found,
-        recognized: vec![
-            ("font-family".into(), "JetBrains Mono".into()),
-            ("font-size".into(), "13".into()),
-            ("background-opacity".into(), "0.92".into()),
-            ("window-padding-x".into(), "0".into()),
-            ("palette".into(), "1=#c41a16".into()),
-        ],
-        unknown: vec!["keybind".into(), "shell-integration".into()],
+        source: Some(plan.source.display().to_string()),
+        ghostty_app_found,
+        recognized,
+        unknown,
+        plan: Some(plan),
+        error: None,
     }
 }
 
@@ -1346,86 +1529,104 @@ mod tests {
     }
 
     #[test]
-    fn palette_override_replaces_only_that_slot() {
-        let base = [0x111111; 16];
-        let mut overrides = [None; 16];
-        set_slot_override(&mut overrides, 3, 0xC7A000);
-        let colors = displayed_ansi(base, &overrides);
-        assert_eq!(colors[3], 0xC7A000);
+    fn font_size_and_opacity_choices_keep_values_that_are_not_presets() {
+        let (size_labels, size_values, size_index) = font_size_choices(13.0);
+        assert_eq!(size_values[size_index], 13.0);
+        assert!(size_labels.iter().any(|label| label == "13"));
+
+        let (size_labels, size_values, size_index) = font_size_choices(13.5);
+        assert_eq!(size_values[size_index], 13.5);
         assert!(
-            colors
-                .iter()
-                .enumerate()
-                .all(|(index, color)| index == 3 || *color == 0x111111)
+            size_labels.iter().any(|label| label == "13.5"),
+            "a Ghostty font-size of 13.5 must appear in the list, not snap to 13 or 14"
         );
-        clear_slot_override(&mut overrides, 3);
-        assert_eq!(displayed_ansi(base, &overrides), base);
+
+        let (_, opacity_values, opacity_index) = opacity_choices(0.85);
+        assert_eq!(opacity_values[opacity_index], 0.85);
+        assert_eq!(opacity_percent_label(0.85), "85%");
     }
 
     #[test]
-    fn restoring_defaults_clears_theme_choice_and_placeholder_overrides() {
-        let mut appearance = AppearanceSettings {
-            theme_family: "ember".into(),
-            mode: AppearanceMode::Light,
-            backdrop: BackdropMode::Opaque,
-            ..AppearanceSettings::default()
-        };
-        let mut ui = AppearanceUi {
-            terminal_theme: Some("ember".into()),
-            padding_x: 12,
-            selected_slot: Some(1),
-            ..AppearanceUi::default()
-        };
-        set_slot_override(&mut ui.palette_overrides, 1, 0xFF0000);
-        restore_appearance_state(&mut appearance, &mut ui);
-        let defaults = AppearanceSettings::default();
-        assert_eq!(appearance.theme_family, defaults.theme_family);
-        assert_eq!(appearance.mode, defaults.mode);
-        assert_eq!(appearance.backdrop, defaults.backdrop);
-        assert_eq!(appearance.font, defaults.font);
-        assert_eq!(ui, AppearanceUi::default());
+    fn padding_and_cell_height_choices_keep_absolute_ghostty_values() {
+        let (_, padding, index) = padding_choices(2);
+        assert_eq!(padding[index], 2);
+
+        let i18n = I18n::new(Language::English);
+        let (_, values, index) = cell_height_choices(i18n, Some(MetricModifier::Absolute(1)));
+        assert_eq!(values[index], Some(MetricModifier::Absolute(1)));
+        assert_eq!(
+            cell_height_label(i18n, Some(MetricModifier::Absolute(1))),
+            "1"
+        );
     }
 
     #[test]
-    fn import_sources_prefer_the_first_existing_ghostty_config() {
+    fn palette_grid_uses_theme_ansi_then_config_overrides() {
+        let probe = 0xc0ffee;
+        let family = theme::ochub_family();
+        let overlay = crate::theme_ansi::overlay_for(Some(&family));
+        let dark = theme::is_dark();
+        let base = overlay
+            .colors(dark)
+            .expect("ochub ships an explicit ansi table");
+        assert_ne!(
+            base[3], probe,
+            "fixture color must differ from the theme slot"
+        );
+        assert_ne!(
+            base[1],
+            theme::current().red.0,
+            "ochub ansi must differ from the old token-placeholder red or this test cannot catch a revert"
+        );
+        let mut appearance = AppearanceSettings::default();
+        let colors = palette_grid_colors(&appearance);
+        assert_eq!(colors, base);
+        appearance.palette[3] = Some(probe);
+        let colors = palette_grid_colors(&appearance);
+        assert_eq!(colors[3], probe);
+        assert_eq!(colors[0], base[0]);
+    }
+
+    #[test]
+    fn import_preview_lists_recognized_and_unknown_keys_from_the_real_parser() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing");
-        let found = dir.path().join("config");
+        let config = dir.path().join("config");
         let themes = dir.path().join("themes");
-        std::fs::write(&found, "font-size = 13\n").unwrap();
         std::fs::create_dir(&themes).unwrap();
+        let body = "\
+font-size = 15
+background-opacity = 0.85
+keybind = ctrl+c=copy
+shell-integration = zsh
+";
         assert!(
-            found.is_file(),
-            "fixture file must exist before we trust the finder"
+            body.contains("0.85") && body.contains("keybind"),
+            "fixture must contain the values this test claims to surface"
         );
-        assert!(
-            themes.is_dir(),
-            "fixture themes dir must exist before we trust the finder"
-        );
-        assert!(!missing.exists());
-        let sources = collect_import_sources(&[missing.clone(), found.clone()], &themes);
-        assert_eq!(sources.config.as_deref(), Some(found.as_path()));
-        assert!(sources.ghostty_app_found);
-        let empty = collect_import_sources(&[missing], &dir.path().join("no-app"));
-        assert_eq!(empty.config, None);
-        assert!(!empty.ghostty_app_found);
-    }
-
-    #[test]
-    fn placeholder_import_preview_lists_unknown_keys_when_a_config_exists() {
-        let preview = placeholder_import_preview(&ImportSources {
-            config: Some(PathBuf::from("/tmp/ghostty-config")),
-            ghostty_app_found: false,
-        });
-        assert_eq!(preview.source.as_deref(), Some("/tmp/ghostty-config"));
-        assert!(!preview.ghostty_app_found);
-        assert!(!preview.recognized.is_empty());
+        std::fs::write(&config, body).unwrap();
+        let paths = GhosttyImportPaths {
+            xdg_config: config.clone(),
+            app_support_config: dir.path().join("missing"),
+            app_themes: themes,
+        };
+        let preview = build_import_preview(&paths);
+        assert_eq!(preview.source.as_deref(), Some(config.to_str().unwrap()));
         assert!(
             preview
-                .unknown
+                .recognized
                 .iter()
-                .any(|key| key == "keybind" || key == "shell-integration"),
-            "unknown keys must stay visible so they are not silently dropped"
+                .any(|(key, value)| key == "font-size" && value == "15")
+        );
+        assert!(
+            preview
+                .recognized
+                .iter()
+                .any(|(key, value)| key == "background-opacity" && value == "0.85")
+        );
+        assert!(
+            preview.unknown.iter().any(|key| key.starts_with("keybind")),
+            "unknown keys must stay visible so they are not silently dropped: {:?}",
+            preview.unknown
         );
         let recognized: Vec<&str> = preview
             .recognized
@@ -1433,23 +1634,73 @@ mod tests {
             .map(|(key, _)| key.as_str())
             .collect();
         for key in &preview.unknown {
+            let name = key.split('=').next().unwrap_or(key).trim();
             assert!(
-                !recognized.contains(&key.as_str()),
+                !recognized.contains(&name),
                 "unknown key `{key}` must not also appear as recognized"
             );
         }
+        assert!(preview.plan.is_some());
     }
 
     #[test]
-    fn placeholder_import_preview_is_empty_when_no_config_exists() {
-        let preview = placeholder_import_preview(&ImportSources {
-            config: None,
-            ghostty_app_found: true,
-        });
+    fn import_preview_is_empty_when_no_config_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = GhosttyImportPaths {
+            xdg_config: dir.path().join("missing"),
+            app_support_config: dir.path().join("also-missing"),
+            app_themes: dir.path().join("themes"),
+        };
+        let preview = build_import_preview(&paths);
         assert_eq!(preview.source, None);
-        assert!(preview.ghostty_app_found);
         assert!(preview.recognized.is_empty());
         assert!(preview.unknown.is_empty());
+        assert!(preview.plan.is_none());
+    }
+
+    #[test]
+    fn missing_ghostty_app_still_previews_known_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let body = "font-size = 15\ntheme = Probe\n";
+        assert!(body.contains("font-size = 15"));
+        std::fs::write(&config, body).unwrap();
+        let paths = GhosttyImportPaths {
+            xdg_config: config,
+            app_support_config: dir.path().join("missing"),
+            app_themes: dir.path().join("no-app"),
+        };
+        let preview = build_import_preview(&paths);
+        assert!(!preview.ghostty_app_found);
+        assert!(
+            preview
+                .recognized
+                .iter()
+                .any(|(key, value)| key == "font-size" && value == "15")
+        );
+        assert!(
+            preview
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.themes.is_empty() && plan.terminal_theme.is_none())
+        );
+        assert!(preview.plan.as_ref().is_some_and(plan_has_changes));
+    }
+
+    #[test]
+    fn restoring_known_keys_leaves_comments_and_unknown_assignments() {
+        let mut document = crate::config::ConfigDocument::parse(
+            "# keep\nfont-size = 18\nmystery-option = wow\nlanguage = en\n",
+        );
+        assert!(document.serialize().contains("# keep"));
+        crate::config::strip_known_keys(&mut document);
+        let written = document.serialize();
+        assert!(written.contains("# keep"));
+        assert!(written.contains("mystery-option = wow"));
+        assert!(!written.contains("font-size"));
+        let (config, _) = crate::config::values::AppConfig::from_document(&document);
+        let appearance = crate::config::values::appearance_from_config(&config);
+        assert_eq!(appearance, AppearanceSettings::default());
     }
 
     #[test]

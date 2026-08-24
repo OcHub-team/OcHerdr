@@ -84,6 +84,85 @@ pub fn inject_theme_ansi(document: &mut Value, ansi: &ThemeAnsi) -> Result<()> {
     Ok(())
 }
 
+/// Overlay colors when present, otherwise the token-derived 16-color table.
+pub fn resolved_ansi(overlay: ThemeAnsi, theme: &theme::Theme, dark: bool) -> [u32; 16] {
+    overlay
+        .colors(dark)
+        .unwrap_or_else(|| ansi_from_theme(theme, dark))
+}
+
+pub fn apply_overrides(mut colors: [u32; 16], overrides: &[Option<u32>; 16]) -> [u32; 16] {
+    for (index, color) in overrides.iter().enumerate() {
+        if let Some(color) = color {
+            colors[index] = *color;
+        }
+    }
+    colors
+}
+
+pub fn ansi_from_theme(theme: &theme::Theme, dark: bool) -> [u32; 16] {
+    let (black, bright_black) = split_gray_pair(theme.bg.0, theme.text.0, dark);
+    let (red, bright_red) = split_pair(theme.red.0, dark);
+    let (green, bright_green) = split_pair(theme.green.0, dark);
+    let (yellow, bright_yellow) = split_pair(theme.yellow.0, dark);
+    let (blue, bright_blue) = split_pair(theme.accent.0, dark);
+    let (magenta, bright_magenta) = split_pair(theme.mauve.0, dark);
+    let (cyan, bright_cyan) = split_pair(theme.teal.0, dark);
+    let (white, bright_white) = split_pair(theme.subtext.0, dark);
+    [
+        black,
+        red,
+        green,
+        yellow,
+        blue,
+        magenta,
+        cyan,
+        white,
+        bright_black,
+        bright_red,
+        bright_green,
+        bright_yellow,
+        bright_blue,
+        bright_magenta,
+        bright_cyan,
+        bright_white,
+    ]
+}
+
+fn split_gray_pair(bg: u32, text: u32, dark: bool) -> (u32, u32) {
+    let toward_text = if dark { 22 } else { 28 };
+    split_pair(mix_rgb(bg, text, toward_text), dark)
+}
+
+fn split_pair(color: u32, dark: bool) -> (u32, u32) {
+    let dim = mix_rgb(color, 0x000000, if dark { 28 } else { 16 });
+    let bright = mix_rgb(color, 0xFFFFFF, if dark { 16 } else { 28 });
+    if ansi_luma(bright) > ansi_luma(dim) && dim != bright {
+        return (dim, bright);
+    }
+    let bright = mix_rgb(dim, 0xFFFFFF, 42);
+    if ansi_luma(bright) > ansi_luma(dim) && dim != bright {
+        return (dim, bright);
+    }
+    (mix_rgb(bright, 0x000000, 36), bright)
+}
+
+fn mix_rgb(from: u32, to: u32, percent: u32) -> u32 {
+    let percent = percent.min(100) as i32;
+    let mix = |from: u32, to: u32| {
+        let from = from as i32;
+        let to = to as i32;
+        (from + (to - from) * percent / 100).clamp(0, 255) as u32
+    };
+    (mix((from >> 16) & 0xff, (to >> 16) & 0xff) << 16)
+        | (mix((from >> 8) & 0xff, (to >> 8) & 0xff) << 8)
+        | mix(from & 0xff, to & 0xff)
+}
+
+pub(crate) fn ansi_luma(color: u32) -> u32 {
+    299 * ((color >> 16) & 0xff) + 587 * ((color >> 8) & 0xff) + 114 * (color & 0xff)
+}
+
 fn merge_variant(
     document: &mut Value,
     variant: &'static str,

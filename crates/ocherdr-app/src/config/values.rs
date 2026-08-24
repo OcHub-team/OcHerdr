@@ -66,13 +66,6 @@ impl MetricModifier {
             }
         }
     }
-
-    pub fn as_percent_i8(self) -> i8 {
-        match self {
-            Self::Percent(value) => value.round() as i8,
-            Self::Absolute(_) => 0,
-        }
-    }
 }
 
 /// Terminal color `0xRRGGBB`.
@@ -427,57 +420,74 @@ fn invalid(warnings: &mut Vec<ParseWarning>, line: usize, key: &str, value: &str
 }
 
 pub fn appearance_from_config(config: &AppConfig) -> AppearanceSettings {
-    use crate::{CellHeightChoice, CellWidthChoice, FontSizeChoice, OpacityChoice};
-
-    let font_size = config.font_size.round().clamp(1.0, 255.0) as u8;
-    let opacity_percent = (config.background_opacity * 100.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    let ligatures = !config
-        .font_feature
-        .iter()
-        .any(|feature| matches!(feature.trim(), "-liga" | "-calt" | "-dlig"));
     AppearanceSettings {
         theme_family: config.theme.display_id(),
+        terminal_theme: config.terminal_theme.as_ref().map(ThemeRef::to_config),
         mode: config.appearance_mode,
         backdrop: config.window_backdrop,
-        background_opacity: OpacityChoice::nearest(opacity_percent),
+        background_opacity: config.background_opacity,
+        window_padding_x: config.window_padding_x,
+        window_padding_y: config.window_padding_y,
+        palette: config.palette.map(|slot| slot.map(|color| color.0)),
         font: TerminalFontSettings {
             family: config.font_family.first().cloned().unwrap_or_default(),
-            size: FontSizeChoice::nearest(font_size),
-            ligatures,
+            size: config.font_size,
+            features: config.font_feature.clone(),
             thicken: config.font_thicken,
-            cell_width_percent: CellWidthChoice::nearest(
-                config
-                    .adjust_cell_width
-                    .map(MetricModifier::as_percent_i8)
-                    .unwrap_or(0),
-            ),
-            cell_height_percent: CellHeightChoice::nearest(
-                config
-                    .adjust_cell_height
-                    .map(MetricModifier::as_percent_i8)
-                    .unwrap_or(0),
-            ),
+            thicken_strength: config.font_thicken_strength,
+            cell_width: config.adjust_cell_width,
+            cell_height: config.adjust_cell_height,
         },
     }
 }
 
-pub fn format_opacity_percent(percent: u8) -> String {
-    if percent == 100 {
+pub fn strip_known_keys(document: &mut super::document::ConfigDocument) {
+    let keys: Vec<String> = document
+        .assignments()
+        .filter(|(_, key, _)| is_known_key(key))
+        .map(|(_, key, _)| key.to_owned())
+        .collect();
+    for key in keys {
+        document.remove(&key);
+    }
+}
+
+pub fn format_font_size(size: f32) -> String {
+    if size == size.trunc() {
+        format!("{}", size as i32)
+    } else {
+        format!("{size}")
+    }
+}
+
+pub fn format_opacity(opacity: f64) -> String {
+    if opacity == 1.0 {
         "1".to_owned()
     } else {
-        format!("{:.2}", f64::from(percent) / 100.0)
+        format!("{opacity:.4}")
             .trim_end_matches('0')
             .trim_end_matches('.')
             .to_owned()
     }
 }
 
+pub fn format_opacity_percent(percent: u8) -> String {
+    format_opacity(f64::from(percent) / 100.0)
+}
+
+pub fn opacity_percent_u8(opacity: f64) -> u8 {
+    (opacity * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+pub const NO_LIGATURES: [&str; 3] = ["-calt", "-liga", "-dlig"];
+
+pub fn no_ligature_features() -> Vec<String> {
+    NO_LIGATURES.map(str::to_owned).to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CellHeightChoice, CellWidthChoice, FontSizeChoice, OpacityChoice};
 
     #[test]
     fn color_parses_hash_hex_and_writes_lowercase() {
@@ -571,28 +581,62 @@ keybind = ignore-me
     }
 
     #[test]
-    fn appearance_settings_map_from_app_config() {
-        let config = AppConfig {
-            font_size: 16.0,
-            background_opacity: 0.72,
-            font_family: vec!["Menlo".into()],
-            font_feature: vec!["-liga".into()],
-            adjust_cell_width: Some(MetricModifier::Percent(-10.0)),
-            adjust_cell_height: Some(MetricModifier::Percent(12.0)),
-            appearance_mode: AppearanceMode::Light,
-            ..AppConfig::default()
-        };
-        let appearance = appearance_from_config(&config);
-        assert_eq!(appearance.font.size, FontSizeChoice::Pt16);
-        assert_eq!(appearance.background_opacity, OpacityChoice::P72);
-        assert_eq!(appearance.font.family, "Menlo");
-        assert!(!appearance.font.ligatures);
-        assert_eq!(appearance.font.cell_width_percent, CellWidthChoice::Tight);
-        assert_eq!(
-            appearance.font.cell_height_percent,
-            CellHeightChoice::Relaxed
+    fn appearance_settings_keep_free_ghostty_values() {
+        let probe = "#c0ffee";
+        let source = "\
+font-size = 13.5
+background-opacity = 0.85
+window-padding-x = 2
+window-padding-y = 7
+font-thicken-strength = 80
+font-feature = ss01
+adjust-cell-height = 1
+terminal-theme = imported-probe
+palette = 3=#c0ffee
+";
+        assert!(
+            source.contains("13.5")
+                && source.contains("0.85")
+                && source.contains("ss01")
+                && source.contains(probe)
+                && source.contains("adjust-cell-height = 1"),
+            "fixture must carry the free values this test claims to preserve"
         );
-        assert_eq!(appearance.mode, AppearanceMode::Light);
+        let document = ConfigDocument::parse(source);
+        let (config, _) = AppConfig::from_document(&document);
+        let appearance = appearance_from_config(&config);
+        assert_eq!(appearance.font.size, 13.5);
+        assert_eq!(appearance.background_opacity, 0.85);
+        assert_eq!(appearance.window_padding_x, 2);
+        assert_eq!(appearance.window_padding_y, 7);
+        assert_eq!(appearance.font.thicken_strength, 80);
+        assert_eq!(appearance.font.features, ["ss01"]);
+        assert_eq!(
+            appearance.font.cell_height,
+            Some(MetricModifier::Absolute(1))
+        );
+        assert_eq!(appearance.terminal_theme.as_deref(), Some("imported-probe"));
+        assert_eq!(appearance.palette[3], Some(0xc0ffee));
+        assert_eq!(appearance.mode, AppearanceMode::Dark);
+    }
+
+    #[test]
+    fn strip_known_keys_leaves_comments_and_unknown_assignments() {
+        let source = "\
+# keep this
+font-size = 18
+mystery-option = wow
+language = en
+";
+        assert!(source.contains("# keep this"));
+        assert!(source.contains("mystery-option = wow"));
+        let mut document = ConfigDocument::parse(source);
+        strip_known_keys(&mut document);
+        let written = document.serialize();
+        assert!(written.contains("# keep this"));
+        assert!(written.contains("mystery-option = wow"));
+        assert!(!written.contains("font-size"));
+        assert!(!written.contains("language"));
     }
 
     #[test]

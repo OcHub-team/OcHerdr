@@ -94,10 +94,13 @@ pub struct TerminalPalette {
     pub ansi: [u32; 16],
     pub font_family: String,
     pub font_size: u8,
-    pub ligatures: bool,
+    pub font_features: Vec<String>,
     pub thicken: bool,
-    pub cell_width_percent: i8,
-    pub cell_height_percent: i8,
+    pub thicken_strength: u8,
+    pub cell_width: Option<String>,
+    pub cell_height: Option<String>,
+    pub padding_x: u32,
+    pub padding_y: u32,
 }
 
 impl TerminalPalette {
@@ -121,19 +124,24 @@ impl TerminalPalette {
         }
         write_font_families(&mut out, self.font_family.trim());
         let _ = writeln!(out, "font-size = {}", self.font_size.clamp(8, 32));
-        if !self.ligatures {
-            let _ = writeln!(out, "font-feature = -calt");
-            let _ = writeln!(out, "font-feature = -liga");
-            let _ = writeln!(out, "font-feature = -dlig");
+        for feature in &self.font_features {
+            let _ = writeln!(out, "font-feature = {feature}");
         }
         if self.thicken {
             let _ = writeln!(out, "font-thicken = true");
+            let _ = writeln!(out, "font-thicken-strength = {}", self.thicken_strength);
         }
-        if self.cell_width_percent != 0 {
-            let _ = writeln!(out, "adjust-cell-width = {}%", self.cell_width_percent);
+        if let Some(value) = &self.cell_width {
+            let _ = writeln!(out, "adjust-cell-width = {value}");
         }
-        if self.cell_height_percent != 0 {
-            let _ = writeln!(out, "adjust-cell-height = {}%", self.cell_height_percent);
+        if let Some(value) = &self.cell_height {
+            let _ = writeln!(out, "adjust-cell-height = {value}");
+        }
+        if self.padding_x != 0 {
+            let _ = writeln!(out, "window-padding-x = {}", self.padding_x);
+        }
+        if self.padding_y != 0 {
+            let _ = writeln!(out, "window-padding-y = {}", self.padding_y);
         }
         out
     }
@@ -1271,10 +1279,13 @@ mod tests {
             ],
             font_family: "SF Mono".into(),
             font_size: 14,
-            ligatures: false,
+            font_features: vec!["-calt".into(), "-liga".into(), "-dlig".into()],
             thicken: true,
-            cell_width_percent: -8,
-            cell_height_percent: 12,
+            thicken_strength: 80,
+            cell_width: Some("-8%".into()),
+            cell_height: Some("12%".into()),
+            padding_x: 2,
+            padding_y: 4,
         };
         let config = palette.config_text();
         assert!(config.contains("background = #EFF1F5"));
@@ -1287,14 +1298,20 @@ mod tests {
         assert!(config.contains("font-size = 14"));
         assert!(config.contains("font-feature = -calt"));
         assert!(config.contains("font-thicken = true"));
+        assert!(config.contains("font-thicken-strength = 80"));
         assert!(config.contains("adjust-cell-width = -8%"));
         assert!(config.contains("adjust-cell-height = 12%"));
+        assert!(config.contains("window-padding-x = 2"));
+        assert!(config.contains("window-padding-y = 4"));
         let builtin = TerminalPalette {
             font_family: String::new(),
-            ligatures: true,
+            font_features: Vec::new(),
             thicken: false,
-            cell_width_percent: 0,
-            cell_height_percent: 0,
+            thicken_strength: 255,
+            cell_width: None,
+            cell_height: None,
+            padding_x: 0,
+            padding_y: 0,
             ..palette.clone()
         };
         let builtin_config = builtin.config_text();
