@@ -70,9 +70,12 @@ const TAB_TITLE_ACTION_WELL: f32 = 32.;
 const TAB_TITLE_FADE_WIDTH: f32 = 16.;
 const TAB_TITLE_FONT_SIZE: f32 = 14.;
 const TAB_PREVIEW_DELAY: Duration = Duration::from_millis(900);
+const TAB_PREVIEW_HIDE_DELAY: Duration = Duration::from_millis(200);
 const TAB_PREVIEW_ANIMATION: Duration = Duration::from_millis(140);
 const TAB_PREVIEW_WIDTH: f32 = 320.;
 const TAB_PREVIEW_HEIGHT: f32 = 180.;
+const TAB_PREVIEW_GAP: f32 = 6.;
+const TAB_PREVIEW_MARGIN: f32 = 8.;
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -105,8 +108,8 @@ struct TabPreviewCard {
     waiting: SharedString,
 }
 
-impl Render for TabPreviewCard {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+impl TabPreviewCard {
+    fn into_element(self) -> impl IntoElement {
         let waiting = self.waiting.clone();
         let pane_tab_id = self.tab_id.clone();
         let panes = self
@@ -202,6 +205,22 @@ impl Render for TabPreviewCard {
                 |card, delta| card.opacity(delta),
             )
     }
+}
+
+/// Window-local origin of the preview card. X is centered on the tab and
+/// clamped so the card stays inside the window; Y is always below the tab
+/// (never flipped above, even for an edge tab).
+fn tab_preview_origin(tab_rect: (f32, f32, f32, f32), window_width: f32) -> (f32, f32) {
+    let (x, y, width, height) = tab_rect;
+    let centered = x + width / 2. - TAB_PREVIEW_WIDTH / 2.;
+    let min_x = TAB_PREVIEW_MARGIN;
+    let max_x = window_width - TAB_PREVIEW_WIDTH - TAB_PREVIEW_MARGIN;
+    let origin_x = if min_x <= max_x {
+        centered.clamp(min_x, max_x)
+    } else {
+        (window_width - TAB_PREVIEW_WIDTH).max(0.) / 2.
+    };
+    (origin_x, y + height + TAB_PREVIEW_GAP)
 }
 
 struct LoadedSession {
@@ -639,6 +658,14 @@ struct OcHerdrView {
     appearance_ui: ui::AppearanceUi,
     tab_scroll: ScrollHandle,
     hovered_tab_id: Option<String>,
+    /// Dropping this cancels a pending show or hide.
+    tab_preview_task: Option<Task<()>>,
+    /// Tab whose preview is currently painted, after `TAB_PREVIEW_DELAY`.
+    tab_preview_id: Option<String>,
+    /// Target the in-flight `tab_preview_task` is trying to realize.
+    tab_preview_goal: Option<String>,
+    /// Mouse is over the preview overlay, so leaving the tab must not hide it.
+    tab_preview_hovered: bool,
     tab_close_reveals: HashMap<String, Transition>,
     prefix_pending: bool,
     surface_drag: SurfaceDrag,
@@ -1620,6 +1647,42 @@ mod tests {
         let origin = reorder_ghost_origin(pointer, grab, list, size, ReorderAxis::Vertical);
         assert_eq!(origin.0, 8.);
         assert_eq!(origin.1, 170.);
+    }
+
+    #[test]
+    fn tab_preview_origin_centers_under_the_tab() {
+        let tab = (320., 10., TAB_PILL_WIDTH, TAB_PILL_HEIGHT);
+        let (x, y) = tab_preview_origin(tab, 800.);
+        assert_eq!(x, 240.);
+        assert_eq!(x + TAB_PREVIEW_WIDTH / 2., tab.0 + tab.2 / 2.);
+        assert_eq!(y, tab.1 + tab.3 + TAB_PREVIEW_GAP);
+    }
+
+    #[test]
+    fn tab_preview_origin_clamps_to_the_left_margin() {
+        let tab = (0., 10., TAB_PILL_WIDTH, TAB_PILL_HEIGHT);
+        let unclamped = tab.0 + tab.2 / 2. - TAB_PREVIEW_WIDTH / 2.;
+        let (x, y) = tab_preview_origin(tab, 800.);
+        assert!(unclamped < TAB_PREVIEW_MARGIN);
+        assert_eq!(x, TAB_PREVIEW_MARGIN);
+        assert_eq!(y, tab.1 + tab.3 + TAB_PREVIEW_GAP);
+    }
+
+    #[test]
+    fn tab_preview_origin_clamps_to_the_right_margin() {
+        let window_width = 800.;
+        let tab = (
+            window_width - TAB_PILL_WIDTH,
+            10.,
+            TAB_PILL_WIDTH,
+            TAB_PILL_HEIGHT,
+        );
+        let unclamped = tab.0 + tab.2 / 2. - TAB_PREVIEW_WIDTH / 2.;
+        let max_x = window_width - TAB_PREVIEW_WIDTH - TAB_PREVIEW_MARGIN;
+        let (x, y) = tab_preview_origin(tab, window_width);
+        assert!(unclamped > max_x);
+        assert_eq!(x, max_x);
+        assert_eq!(y, tab.1 + tab.3 + TAB_PREVIEW_GAP);
     }
 
     #[test]

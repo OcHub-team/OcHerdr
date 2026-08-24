@@ -106,6 +106,9 @@ impl Render for OcHerdrView {
                 root = root.child(self.render_agent_panel(&pane_id, cx));
             }
         }
+        if let Some(preview) = self.render_tab_preview(window, cx) {
+            root = root.child(preview);
+        }
         if let SurfaceDrag::Reorder(drag) = self.surface_drag.clone()
             && reorder_past_slop(&drag)
         {
