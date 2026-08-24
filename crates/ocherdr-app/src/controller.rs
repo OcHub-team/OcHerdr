@@ -822,14 +822,19 @@ impl OcHerdrView {
                             Some(Self::listen_agent_status(subscription, cx));
                         this.resync_snapshot(epoch, cx);
                     }
-                    Err(error) => {
-                        this.agent_status_panes = event_panes_after_failed_subscribe(
-                            &this.agent_status_panes,
-                            &panes,
-                            &previous,
-                        );
-                        this.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
-                    }
+                    Err(error) => match agent_status_subscribe_failure_action(&error) {
+                        AgentStatusSubscribeFailureAction::Resync => {
+                            this.resync_snapshot(epoch, cx);
+                        }
+                        AgentStatusSubscribeFailureAction::Report => {
+                            this.agent_status_panes = event_panes_after_failed_subscribe(
+                                &this.agent_status_panes,
+                                &panes,
+                                &previous,
+                            );
+                            this.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
+                        }
+                    },
                 }
             })
             .ok();
@@ -3740,6 +3745,21 @@ fn snapshot_refresh_should_queue(refreshing: bool) -> bool {
     refreshing
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentStatusSubscribeFailureAction {
+    Resync,
+    Report,
+}
+
+fn agent_status_subscribe_failure_action(error: &HerdrError) -> AgentStatusSubscribeFailureAction {
+    match error {
+        HerdrError::Api { code, .. } if code == "pane_not_found" => {
+            AgentStatusSubscribeFailureAction::Resync
+        }
+        _ => AgentStatusSubscribeFailureAction::Report,
+    }
+}
+
 fn snapshot_handoff_should_release(refreshing: bool) -> bool {
     !refreshing
 }
@@ -4818,6 +4838,39 @@ mod tests {
             host: Some(HostPersistFollowUp::Revertible { error: kind }),
             rollback: Some(HostRollback::tagged(tag)),
         }
+    }
+
+    #[test]
+    fn pane_not_found_agent_status_subscribe_failure_resyncs() {
+        let error = HerdrError::Api {
+            code: "pane_not_found".into(),
+            message: "pane w19:p3 not found".into(),
+        };
+        assert_eq!(
+            agent_status_subscribe_failure_action(&error),
+            AgentStatusSubscribeFailureAction::Resync
+        );
+    }
+
+    #[test]
+    fn other_agent_status_subscribe_api_failures_are_reported() {
+        let error = HerdrError::Api {
+            code: "unknown_type".into(),
+            message: "subscription rejected".into(),
+        };
+        assert_eq!(
+            agent_status_subscribe_failure_action(&error),
+            AgentStatusSubscribeFailureAction::Report
+        );
+    }
+
+    #[test]
+    fn non_api_agent_status_subscribe_failures_are_reported() {
+        let error = HerdrError::EventStreamClosed("socket closed".into());
+        assert_eq!(
+            agent_status_subscribe_failure_action(&error),
+            AgentStatusSubscribeFailureAction::Report
+        );
     }
 
     #[test]

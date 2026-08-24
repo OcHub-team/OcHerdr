@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -62,6 +62,59 @@ struct FakeHerdr {
 struct QueuedEvent {
     payload: Value,
     written: SyncSender<()>,
+}
+
+struct StalePaneHerdr {
+    socket_path: PathBuf,
+    snapshot_requests: Arc<AtomicUsize>,
+    agent_status_rejections: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    server: Option<JoinHandle<()>>,
+    _dir: tempfile::TempDir,
+}
+
+impl StalePaneHerdr {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let socket_path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind stale pane socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stale pane socket");
+        let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let agent_status_rejections = Arc::new(AtomicUsize::new(0));
+        let server_snapshot_requests = snapshot_requests.clone();
+        let server_agent_status_rejections = agent_status_rejections.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let snapshot = agent_snapshot();
+        let server = thread::spawn(move || {
+            serve_stale_pane_subscribe(
+                listener,
+                server_stop,
+                snapshot,
+                server_snapshot_requests,
+                server_agent_status_rejections,
+            );
+        });
+        Self {
+            socket_path,
+            snapshot_requests,
+            agent_status_rejections,
+            stop,
+            server: Some(server),
+            _dir: dir,
+        }
+    }
+}
+
+impl Drop for StalePaneHerdr {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+    }
 }
 
 impl FakeHerdr {
@@ -427,6 +480,88 @@ fn stream_fake_events(mut stream: UnixStream, id: Value, events: Receiver<Queued
             .written
             .send(())
             .expect("confirm fake Herdr event write");
+    }
+}
+
+fn serve_stale_pane_subscribe(
+    listener: UnixListener,
+    stop: Arc<AtomicBool>,
+    snapshot: HierarchySnapshot,
+    snapshot_requests: Arc<AtomicUsize>,
+    agent_status_rejections: Arc<AtomicUsize>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => reply_to_stale_pane_request(
+                stream,
+                &snapshot,
+                &snapshot_requests,
+                &agent_status_rejections,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn reply_to_stale_pane_request(
+    stream: UnixStream,
+    snapshot: &HierarchySnapshot,
+    snapshot_requests: &AtomicUsize,
+    agent_status_rejections: &AtomicUsize,
+) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone fake Herdr stream"));
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read fake Herdr request");
+    let request: Value = serde_json::from_str(&line).expect("decode fake Herdr request");
+    let id = request.get("id").cloned().expect("request id");
+    match request.get("method").and_then(Value::as_str) {
+        Some("session.snapshot") => {
+            snapshot_requests.fetch_add(1, Ordering::Relaxed);
+            write_fake_response(
+                stream,
+                json!({
+                    "id": id,
+                    "result": { "snapshot": snapshot },
+                }),
+            );
+        }
+        Some("events.subscribe")
+            if request["params"]["subscriptions"]
+                .as_array()
+                .is_some_and(|subscriptions| {
+                    subscriptions.iter().any(|subscription| {
+                        subscription.get("type") == Some(&json!("pane.agent_status_changed"))
+                            && subscription.get("pane_id").is_some()
+                    })
+                }) =>
+        {
+            agent_status_rejections.fetch_add(1, Ordering::Relaxed);
+            write_fake_response(
+                stream,
+                json!({
+                    "id": id,
+                    "error": {
+                        "code": "pane_not_found",
+                        "message": "pane w19:p3 not found",
+                    },
+                }),
+            );
+        }
+        other => write_fake_response(
+            stream,
+            json!({
+                "id": id,
+                "error": {
+                    "code": "unexpected",
+                    "message": format!("unexpected method {other:?}"),
+                },
+            }),
+        ),
     }
 }
 
@@ -823,6 +958,52 @@ fn reload_writes_a_rejected_subscription_as_lost_instead_of_idle(cx: &mut TestAp
             session_name(this),
             Some("alpha"),
             "the rejected subscribe still selected a running session"
+        );
+    });
+}
+
+#[gpui::test]
+fn stale_pane_agent_status_subscribe_resyncs_without_notifying(cx: &mut TestAppContext) {
+    let fake = StalePaneHerdr::new();
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+
+    view.update(cx, |this, cx| {
+        let session = SessionSummary {
+            name: "stale-pane-test".into(),
+            running: true,
+            socket_path: fake.socket_path.clone(),
+            session_dir: fake._dir.path().join("stale-pane-test"),
+            default: false,
+        };
+        this.connection = Some(
+            SessionConnection::connect(&this.profiles[0], &session)
+                .expect("connect stale pane session"),
+        );
+        this.snapshot = Some(agent_snapshot());
+        this.ensure_agent_status_stream(cx);
+    });
+    cx.run_until_parked();
+
+    let rejection_count = fake.agent_status_rejections.load(Ordering::Relaxed);
+    assert!(
+        rejection_count > 0,
+        "the fixture must prove it matched and rejected pane.agent_status_changed"
+    );
+    assert_eq!(
+        rejection_count, 1,
+        "an unchanged pane snapshot must not turn resync into a subscribe loop"
+    );
+    assert_eq!(
+        fake.snapshot_requests.load(Ordering::Relaxed),
+        1,
+        "pane_not_found must trigger one snapshot resync"
+    );
+    view.read_with(cx, |this, cx| {
+        assert_eq!(
+            this.notifications.read(cx).history().count(),
+            0,
+            "a stale pane set must resync without producing an ApplyLiveUpdate notification"
         );
     });
 }
