@@ -624,6 +624,7 @@ impl OcHerdrView {
                     ochub_ui::gpui::ElementId::from("reconnect-live-updates"),
                     reason.clone(),
                 ))
+                .debug_selector(|| "reconnect-live-updates".into())
                 // The enclosing `status-message` control already carries the button role
                 // and the localized name; a nested one would announce twice.
                 .flex()

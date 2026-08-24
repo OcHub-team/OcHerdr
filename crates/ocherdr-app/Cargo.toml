@@ -28,3 +28,7 @@ path = "src/main.rs"
 
 [build-dependencies]
 toml = "1.1"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

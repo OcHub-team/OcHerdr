@@ -5441,3 +5441,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod gpui_tests;
