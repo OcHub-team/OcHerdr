@@ -89,6 +89,10 @@ impl OcHerdrView {
             appearance_ui: Default::default(),
             tab_scroll: ScrollHandle::new(),
             hovered_tab_id: None,
+            tab_preview_task: None,
+            tab_preview_id: None,
+            tab_preview_goal: None,
+            tab_preview_hovered: false,
             tab_close_reveals: HashMap::new(),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
@@ -1585,9 +1589,79 @@ impl OcHerdrView {
         } else {
             false
         };
+        self.sync_tab_preview(cx);
         if changed {
             cx.notify();
         }
+    }
+
+    pub(super) fn set_tab_preview_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if self.tab_preview_hovered == hovered {
+            return;
+        }
+        self.tab_preview_hovered = hovered;
+        self.sync_tab_preview(cx);
+        cx.notify();
+    }
+
+    fn tab_preview_target(&self) -> Option<String> {
+        if matches!(self.surface_drag, SurfaceDrag::Reorder(_)) {
+            return None;
+        }
+        if let Some(id) = self.hovered_tab_id.clone() {
+            return Some(id);
+        }
+        if self.tab_preview_hovered {
+            self.tab_preview_id.clone()
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn dismiss_tab_preview(&mut self) {
+        self.tab_preview_task = None;
+        self.tab_preview_id = None;
+        self.tab_preview_goal = None;
+        self.tab_preview_hovered = false;
+    }
+
+    fn sync_tab_preview(&mut self, cx: &mut Context<Self>) {
+        let target = self.tab_preview_target();
+        if target.as_deref() == self.tab_preview_id.as_deref() {
+            self.tab_preview_task = None;
+            self.tab_preview_goal = target;
+            return;
+        }
+        if self.tab_preview_goal.as_deref() == target.as_deref() && self.tab_preview_task.is_some()
+        {
+            return;
+        }
+        if target.is_some() && self.tab_preview_id.is_some() {
+            self.tab_preview_id = None;
+            self.tab_preview_hovered = false;
+        }
+        let delay = if target.is_some() {
+            TAB_PREVIEW_DELAY
+        } else {
+            TAB_PREVIEW_HIDE_DELAY
+        };
+        self.tab_preview_goal = target.clone();
+        self.tab_preview_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                this.tab_preview_task = None;
+                let current = this.tab_preview_target();
+                if current.as_deref() != this.tab_preview_goal.as_deref() {
+                    return;
+                }
+                this.tab_preview_id = current;
+                if this.tab_preview_id.is_none() {
+                    this.tab_preview_hovered = false;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub(super) fn select_pane(

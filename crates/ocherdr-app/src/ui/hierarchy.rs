@@ -504,6 +504,13 @@ impl OcHerdrView {
         {
             self.hovered_tab_id = None;
         }
+        if self
+            .tab_preview_id
+            .as_ref()
+            .is_some_and(|id| !authoritative_order.contains(id))
+        {
+            self.dismiss_tab_preview();
+        }
         self.tab_close_reveals
             .retain(|tab_id, _| authoritative_order.contains(tab_id));
         let now = Instant::now();
@@ -595,9 +602,6 @@ impl OcHerdrView {
                 let debug_close_id = tab_id.clone();
                 let debug_fade_id = tab_id.clone();
                 let measure_view = view.clone();
-                let preview_view = view.clone();
-                let preview_tab_id = tab_id.clone();
-                let preview_title = row.a11y.name.clone();
                 let tab_hover_group: SharedString = format!("tab-hover-{tab_id}").into();
                 let tab_target = HierarchyTarget::Tab {
                     id: row.a11y.id.clone(),
@@ -671,13 +675,6 @@ impl OcHerdrView {
                     .on_hover(cx.listener(move |this, hovered, _window, cx| {
                         this.set_tab_hovered(hover_id.clone(), *hovered, cx);
                     }))
-                    .hoverable_tooltip(move |_window, cx| {
-                        let card = preview_view
-                            .read(cx)
-                            .tab_preview_card(&preview_tab_id, preview_title.clone());
-                        cx.new(|_| card).into()
-                    })
-                    .tooltip_show_delay(TAB_PREVIEW_DELAY)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event, _window, cx| {
@@ -1365,6 +1362,53 @@ impl OcHerdrView {
                 |overlay, ghost| overlay.child(ghost),
             )
             .into_any_element()
+    }
+
+    pub(super) fn render_tab_preview(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<ochub_ui::gpui::AnyElement> {
+        if matches!(self.surface_drag, SurfaceDrag::Reorder(_)) {
+            self.dismiss_tab_preview();
+            return None;
+        }
+        let tab_id = self.tab_preview_id.as_ref()?;
+        let rect = self
+            .reorder_metrics
+            .tabs
+            .iter()
+            .find(|span| span.id == *tab_id)
+            .map(|span| span.rect)?;
+        let window_width = f32::from(window.viewport_size().width);
+        let (x, _) = tab_preview_origin(rect, window_width);
+        let title = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.tab_id == *tab_id)
+                    .map(|tab| tab.label.clone())
+            })
+            .unwrap_or_default();
+        let card = self.tab_preview_card(tab_id, title);
+        Some(
+            div()
+                .id("tab-preview-layer")
+                .absolute()
+                // Inset auto would use the static in-flow position (T28).
+                .top(px(rect.1 + rect.3))
+                .left(px(x))
+                .pt(px(TAB_PREVIEW_GAP))
+                .occlude()
+                .on_hover(cx.listener(|this, hovered, _window, cx| {
+                    this.set_tab_preview_hovered(*hovered, cx);
+                }))
+                .child(card.into_element())
+                .into_any_element(),
+        )
     }
 }
 

@@ -27,8 +27,8 @@ use crate::host_center::HostCenter;
 use crate::{
     AgentOutputState, AgentPromptPhase, AppearanceSettings, CachedHostHealth, EventStreamState,
     HostHealthView, I18n, Language, OcHerdrView, PendingListReorder, ReorderList, Settings,
-    TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_HEIGHT, TAB_PREVIEW_WIDTH, install_appearance,
-    reorder_projection,
+    TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_GAP, TAB_PREVIEW_HEIGHT, TAB_PREVIEW_WIDTH,
+    install_appearance, reorder_projection,
 };
 
 fn install_app(cx: &mut TestAppContext) {
@@ -912,6 +912,16 @@ fn fixed_width_tab_hover_reveals_close_then_delayed_preview(cx: &mut TestAppCont
     assert!(preview_title.size.width > gpui::px(TAB_PILL_WIDTH));
     assert_eq!(preview_pane.size.width, gpui::px(TAB_PREVIEW_WIDTH - 2.));
     assert_eq!(preview_pane.size.height, gpui::px(TAB_PREVIEW_HEIGHT));
+    assert_eq!(
+        preview.origin.x + preview.size.width / 2.,
+        long_after.center().x,
+        "preview must be centered under the hovered tab"
+    );
+    assert_eq!(
+        preview.origin.y,
+        long_after.origin.y + long_after.size.height + gpui::px(TAB_PREVIEW_GAP),
+        "preview must sit below the tab, not at the cursor"
+    );
 
     cx.simulate_click(close_after.center(), gpui::Modifiers::default());
     cx.run_until_parked();
