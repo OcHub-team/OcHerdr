@@ -45,9 +45,6 @@ mod host_center;
 mod i18n;
 mod ime;
 mod notify;
-/// Write helper owned by T29-B. This crate only calls `serialize_theme_file`
-/// until merge; the rest of the module is unused here.
-#[allow(dead_code)]
 mod theme_ansi;
 mod ui;
 

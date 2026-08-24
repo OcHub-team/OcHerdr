@@ -4480,60 +4480,19 @@ fn current_terminal_palette(appearance: &AppearanceSettings) -> TerminalPalette 
     terminal_palette_from_theme(
         theme::current(),
         theme::is_dark(),
-        family.as_ref(),
+        crate::theme_ansi::overlay_for(family.as_ref()),
         &appearance.font,
     )
 }
 
-/// 16-color terminal palettes, not UI tokens. UI red/green are muted for chrome;
-/// `ls`, diffs, and agent CLIs need distinct bright slots.
-const OCHUB_DARK_ANSI: [u32; 16] = [
-    0x2C2D28, 0xB54C48, 0x2F7A4C, 0xB08A32, 0x355EA8, 0x6A56A8, 0x1F7F78, 0xB8B7AE, 0x6E6F64,
-    0xFF8A82, 0x6FD496, 0xF0C46A, 0x7DB0FF, 0xC4A8FF, 0x5ED4C8, 0xF4F3EA,
-];
-const OCHUB_LIGHT_ANSI: [u32; 16] = [
-    0x3A3A34, 0x9A322C, 0x1A5C34, 0x7A5008, 0x1A4AB0, 0x4C3C90, 0x085C54, 0x8A8982, 0x6B6A64,
-    0xD4564C, 0x2D9A58, 0xC48A18, 0x4A82EE, 0x8B70D8, 0x1AA89A, 0xD0CFC6,
-];
-const EMBER_DARK_ANSI: [u32; 16] = [
-    0x2A1E16, 0xB44A38, 0x4A7A32, 0xB07A24, 0x3A5A98, 0x8A5A9A, 0x2A7A6A, 0xC8B8A4, 0x7A5A42,
-    0xF07058, 0x88C058, 0xE8B040, 0x6A8AD8, 0xC890E0, 0x58C8B0, 0xF7EEE5,
-];
-const EMBER_LIGHT_ANSI: [u32; 16] = [
-    0x3A2A1C, 0x9A3028, 0x2A5C28, 0x7A5008, 0x2A4890, 0x5C3878, 0x0A5C50, 0x8A7A68, 0x6B5A48,
-    0xD45640, 0x3A9A48, 0xC48A18, 0x4A72D0, 0x8B68C0, 0x1A9888, 0xE8D8C8,
-];
-
 fn terminal_ansi(
-    family: Option<&theme::ThemeFamily>,
+    overlay: crate::theme_ansi::ThemeAnsi,
     theme: &theme::Theme,
     dark: bool,
 ) -> [u32; 16] {
-    match family {
-        // Missing theme: UI already falls back to OcHub chrome; keep the
-        // hand-tuned OcHub table instead of deriving from whatever tokens
-        // `theme::current()` happens to hold.
-        None => ochub_ansi(dark),
-        Some(family) if family.id == theme::DEFAULT_THEME_FAMILY => ochub_ansi(dark),
-        Some(family) if family.id == theme::EMBER_THEME_FAMILY => ember_ansi(dark),
-        Some(_) => ansi_from_theme(theme, dark),
-    }
-}
-
-fn ochub_ansi(dark: bool) -> [u32; 16] {
-    if dark {
-        OCHUB_DARK_ANSI
-    } else {
-        OCHUB_LIGHT_ANSI
-    }
-}
-
-fn ember_ansi(dark: bool) -> [u32; 16] {
-    if dark {
-        EMBER_DARK_ANSI
-    } else {
-        EMBER_LIGHT_ANSI
-    }
+    overlay
+        .colors(dark)
+        .unwrap_or_else(|| ansi_from_theme(theme, dark))
 }
 
 fn ansi_from_theme(theme: &theme::Theme, dark: bool) -> [u32; 16] {
@@ -4602,7 +4561,7 @@ fn ansi_luma(color: u32) -> u32 {
 fn terminal_palette_from_theme(
     theme: ochub_ui::theme::Theme,
     dark: bool,
-    family: Option<&theme::ThemeFamily>,
+    overlay: crate::theme_ansi::ThemeAnsi,
     font: &TerminalFontSettings,
 ) -> TerminalPalette {
     TerminalPalette {
@@ -4611,7 +4570,7 @@ fn terminal_palette_from_theme(
         foreground: theme.text.0,
         cursor: theme.accent.0,
         selection: theme.selection.0,
-        ansi: terminal_ansi(family, &theme, dark),
+        ansi: terminal_ansi(overlay, &theme, dark),
         font_family: font.family.clone(),
         font_size: font.size.value(),
         ligatures: font.ligatures,
@@ -5857,8 +5816,9 @@ mod tests {
     fn terminal_palette_follows_the_gui_light_and_dark_theme() {
         let family = ochub_ui::theme::ochub_family();
         let font = TerminalFontSettings::default();
-        let light = terminal_palette_from_theme(family.light, false, Some(&family), &font);
-        let dark = terminal_palette_from_theme(family.dark, true, Some(&family), &font);
+        let overlay = crate::theme_ansi::overlay_for(Some(&family));
+        let light = terminal_palette_from_theme(family.light, false, overlay, &font);
+        let dark = terminal_palette_from_theme(family.dark, true, overlay, &font);
         assert!(!light.dark);
         assert!(dark.dark);
         assert_eq!(light.background, family.light.bg.0);
@@ -5884,8 +5844,9 @@ mod tests {
             cell_width_percent: CellWidthChoice::Tight,
             cell_height_percent: CellHeightChoice::Relaxed,
         };
-        let left = terminal_palette_from_theme(family.light, false, Some(&family), &default);
-        let right = terminal_palette_from_theme(family.light, false, Some(&family), &menlo);
+        let overlay = crate::theme_ansi::overlay_for(Some(&family));
+        let left = terminal_palette_from_theme(family.light, false, overlay, &default);
+        let right = terminal_palette_from_theme(family.light, false, overlay, &menlo);
         assert_eq!(right.font_family, "Menlo");
         assert_eq!(right.font_size, 16);
         assert!(!right.ligatures);
@@ -5898,15 +5859,39 @@ mod tests {
         let ochub = ochub_ui::theme::ochub_family();
         let ember = ochub_ui::theme::ember_family();
         let custom = custom_theme_family("scarlet");
-        for (label, family, palette, dark) in [
-            ("ochub-dark", Some(&ochub), ochub.dark, true),
-            ("ochub-light", Some(&ochub), ochub.light, false),
-            ("ember-dark", Some(&ember), ember.dark, true),
-            ("ember-light", Some(&ember), ember.light, false),
-            ("custom-dark", Some(&custom), custom.dark, true),
-            ("missing-dark", None, ochub.dark, true),
+        let custom_overlay = crate::theme_ansi::overlay_for(Some(&custom));
+        assert!(
+            custom_overlay.colors(true).is_none(),
+            "fixture must omit ansi so derivation is what we measure"
+        );
+        for (label, overlay, palette, dark) in [
+            (
+                "ochub-dark",
+                crate::theme_ansi::overlay_for(Some(&ochub)),
+                ochub.dark,
+                true,
+            ),
+            (
+                "ochub-light",
+                crate::theme_ansi::overlay_for(Some(&ochub)),
+                ochub.light,
+                false,
+            ),
+            (
+                "ember-dark",
+                crate::theme_ansi::overlay_for(Some(&ember)),
+                ember.dark,
+                true,
+            ),
+            (
+                "ember-light",
+                crate::theme_ansi::overlay_for(Some(&ember)),
+                ember.light,
+                false,
+            ),
+            ("custom-dark", custom_overlay, custom.dark, true),
         ] {
-            let ansi = terminal_ansi(family, &palette, dark);
+            let ansi = terminal_ansi(overlay, &palette, dark);
             let unique: HashSet<u32> = ansi.iter().copied().collect();
             assert_eq!(unique.len(), 16, "{label}");
             for slot in 0..8 {
@@ -5924,8 +5909,18 @@ mod tests {
         let font = TerminalFontSettings::default();
         let ochub = ochub_ui::theme::ochub_family();
         let ember = ochub_ui::theme::ember_family();
-        let ochub_dark = terminal_palette_from_theme(ochub.dark, true, Some(&ochub), &font);
-        let ember_dark = terminal_palette_from_theme(ember.dark, true, Some(&ember), &font);
+        let ochub_dark = terminal_palette_from_theme(
+            ochub.dark,
+            true,
+            crate::theme_ansi::overlay_for(Some(&ochub)),
+            &font,
+        );
+        let ember_dark = terminal_palette_from_theme(
+            ember.dark,
+            true,
+            crate::theme_ansi::overlay_for(Some(&ember)),
+            &font,
+        );
         assert_ne!(ochub_dark.ansi, ember_dark.ansi);
         assert_eq!(ochub_dark.background, ochub.dark.bg.0);
         assert_eq!(ember_dark.background, ember.dark.bg.0);
@@ -5937,13 +5932,43 @@ mod tests {
     fn a_valid_custom_theme_family_gets_its_own_ansi_palette() {
         let ochub = ochub_ui::theme::ochub_family();
         let custom = custom_theme_family("scarlet");
-        let ochub_ansi = terminal_ansi(Some(&ochub), &ochub.dark, true);
-        let custom_ansi = terminal_ansi(Some(&custom), &custom.dark, true);
-        let missing_ansi = terminal_ansi(None, &ochub.dark, true);
-        assert_eq!(ochub_ansi, OCHUB_DARK_ANSI);
-        assert_eq!(missing_ansi, OCHUB_DARK_ANSI);
+        let ochub_overlay = crate::theme_ansi::overlay_for(Some(&ochub));
+        let custom_overlay = crate::theme_ansi::overlay_for(Some(&custom));
+        assert!(
+            custom_overlay.colors(true).is_none(),
+            "fixture must omit ansi so derivation is what we measure"
+        );
+        let ochub_ansi = terminal_ansi(ochub_overlay, &ochub.dark, true);
+        let custom_ansi = terminal_ansi(custom_overlay, &custom.dark, true);
+        let derived = ansi_from_theme(&custom.dark, true);
+        assert_eq!(ochub_ansi, ochub_overlay.colors(true).expect("ochub ansi"));
+        assert_ne!(ochub_ansi, ansi_from_theme(&ochub.dark, true));
+        assert_eq!(custom_ansi, derived);
         assert_ne!(custom_ansi, ochub_ansi);
-        assert_ne!(custom_ansi, missing_ansi);
+        let missing = terminal_ansi(crate::theme_ansi::overlay_for(None), &ochub.dark, true);
+        assert_eq!(missing, ochub_ansi);
+    }
+
+    #[test]
+    fn explicit_ansi_is_used_instead_of_deriving_from_tokens() {
+        let custom = custom_theme_family("scarlet");
+        let derived = ansi_from_theme(&custom.dark, true);
+        let explicit = [
+            0x101010, 0xB00000, 0x00B000, 0xB0B000, 0x0000B0, 0xB000B0, 0x00B0B0, 0xB0B0B0,
+            0x404040, 0xFF4040, 0x40FF40, 0xFFFF40, 0x4040FF, 0xFF40FF, 0x40FFFF, 0xFFFFFF,
+        ];
+        assert_ne!(
+            explicit, derived,
+            "fixture must differ from derivation or the test cannot catch a fallback"
+        );
+        let overlay = crate::theme_ansi::ThemeAnsi {
+            dark: crate::theme_ansi::ThemeAnsiPalette {
+                ansi: Some(explicit.map(theme::ThemeColor::new)),
+            },
+            ..crate::theme_ansi::ThemeAnsi::default()
+        };
+        assert_eq!(terminal_ansi(overlay, &custom.dark, true), explicit);
+        assert_ne!(terminal_ansi(overlay, &custom.dark, true), derived);
     }
 
     fn custom_theme_family(id: &str) -> theme::ThemeFamily {
