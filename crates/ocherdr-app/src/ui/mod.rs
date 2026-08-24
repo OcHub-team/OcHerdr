@@ -49,6 +49,17 @@ impl Render for OcHerdrView {
                 // GPUI bubbling: send_key stops propagation after handling.
                 this.send_key(event, window, cx);
             }))
+            .on_mouse_move(cx.listener(|this, event, window, cx| {
+                this.pane_mouse_move(event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
             .child(body);
         if !self.overlay.host_center() {
             root = root.child(self.render_status_bar(&chrome, cx));
@@ -88,6 +99,11 @@ impl Render for OcHerdrView {
             Overlay::Rename(target) => {
                 root = root.child(self.render_rename(&target, cx));
             }
+        }
+        if let SurfaceDrag::Reorder(drag) = self.surface_drag.clone()
+            && reorder_past_slop(&drag)
+        {
+            root = root.child(self.render_reorder_overlay(&drag, cx));
         }
         root.child(self.notifications.clone())
     }

@@ -38,6 +38,14 @@ gpui = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6b
 gpui_macos = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6bc21b82e78f9d0cbbbe5", version = "=0.1.0" }
 gpui_platform = { git = "https://github.com/OcHub-team/zed", rev = "186ff5fc775fb9c807d6bc21b82e78f9d0cbbbe5", version = "=0.1.0" }
 
+# Dependencies must be optimised even in debug builds. At opt-level 0 a
+# GhosttyKit-linked binary corrupts the first 16 bytes of freshly grown
+# `HashMap` tables, so `RawTable::find` probes forever and the app never
+# reaches its first window. std ships hashbrown with assertions compiled out,
+# so nothing fires; the process just spins. See docs/known-issues.md.
+[profile.dev.package."*"]
+opt-level = 1
+
 [profile.release]
 lto = "thin"
 strip = "symbols"

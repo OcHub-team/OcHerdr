@@ -27,7 +27,7 @@
 "terminal.no_tabs.body" = "Create a workspace to open the first terminal."
 "terminal.pane_actions" = "Pane actions"
 "terminal.prefix" = "PREFIX"
-"terminal.prefix.hint" = "C new tab · ⇧N new workspace · S settings in Terminal · 1–9 switch tab"
+"terminal.prefix.hint" = "C new tab · ⇧N new workspace · ⇧K/⇧J move workspace · S settings in Terminal · 1–9 switch tab"
 "terminal.region" = "Terminal"
 "terminal.rename_pane" = "Rename pane"
 "terminal.resize_split" = "Resize split"

@@ -52,12 +52,25 @@ impl OcHerdrView {
             })
             .collect::<Vec<_>>();
 
+        let view = cx.entity();
+        let workspace_count = chrome.workspaces.items.len();
+        let dragging_workspace = match &self.surface_drag {
+            SurfaceDrag::Reorder(drag)
+                if matches!(drag.list, ReorderList::Workspaces) && reorder_past_slop(drag) =>
+            {
+                drag.order.get(drag.source_index).cloned()
+            }
+            _ => None,
+        };
         let hierarchy = chrome
             .workspaces
             .items
             .iter()
             .map(|row| {
                 let workspace_id = row.a11y.id.clone();
+                let press_id = workspace_id.clone();
+                let measure_id = workspace_id.clone();
+                let measure_view = view.clone();
                 let workspace_target = HierarchyTarget::Workspace {
                     id: row.a11y.id.clone(),
                     label: row.a11y.name.clone(),
@@ -68,29 +81,76 @@ impl OcHerdrView {
                     .as_ref()
                     .is_some_and(|info| info.is_linked_worktree);
                 let affiliation = row.worktree.as_ref().map(|info| info.affiliation_label());
-                tree_row(
-                    ("workspace", row.number),
-                    &row.a11y,
-                    12.,
-                    if linked {
-                        IconName::Layers
-                    } else {
-                        IconName::Folder
-                    },
-                    selected,
-                    status_color(row.agent_status),
-                    affiliation.as_deref(),
-                )
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.select_workspace(workspace_id.clone(), cx)
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event, window, cx| {
-                        this.open_context_menu(workspace_target.clone(), event, window, cx)
-                    }),
-                )
-                .into_any_element()
+                let dimmed = dragging_workspace.as_deref() == Some(workspace_id.as_str());
+                div()
+                    .id(("workspace-slot", row.number))
+                    .relative()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, _window, cx| {
+                            this.press_workspace_row(press_id.clone(), event, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event, window, cx| {
+                            this.pane_mouse_up(event, window, cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, event, window, cx| {
+                            this.pane_mouse_up(event, window, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event, window, cx| {
+                        this.pane_mouse_move(event, window, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event, window, cx| {
+                            this.open_context_menu(workspace_target.clone(), event, window, cx)
+                        }),
+                    )
+                    .child(
+                        tree_row(
+                            ("workspace", row.number),
+                            &row.a11y,
+                            12.,
+                            if linked {
+                                IconName::Layers
+                            } else {
+                                IconName::Folder
+                            },
+                            selected,
+                            status_color(row.agent_status),
+                            affiliation.as_deref(),
+                        )
+                        .when(workspace_count >= 2, |row| row.cursor_grab())
+                        .opacity(if dimmed { 0.4 } else { 1. }),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                measure_view.update(cx, |this, _cx| {
+                                    this.note_reorder_span(
+                                        false,
+                                        measure_id.clone(),
+                                        (
+                                            f32::from(bounds.origin.x),
+                                            f32::from(bounds.origin.y),
+                                            f32::from(bounds.size.width),
+                                            f32::from(bounds.size.height),
+                                        ),
+                                    );
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .into_any_element()
             })
             .collect::<Vec<_>>();
 
@@ -295,117 +355,174 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let i18n = self.i18n;
+        let view = cx.entity();
         let tab_count = chrome.tabs.items.len();
-        let tabs =
-            chrome
-                .tabs
-                .items
-                .iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    let shortcut = tab_key_equivalent(index, tab_count);
-                    let tab_id = row.a11y.id.clone();
-                    let tab_target = HierarchyTarget::Tab {
-                        id: row.a11y.id.clone(),
-                        label: row.a11y.name.clone(),
-                    };
-                    let close_target = tab_target.clone();
-                    let selected = row.a11y.selected == Some(true);
-                    apply_control(div().id(("main-tab", row.number)), &row.a11y)
-                        .flex()
-                        .items_center()
-                        .flex_none()
-                        .h(px(TAB_PILL_HEIGHT))
-                        .min_w(px(108.))
-                        .max_w(px(180.))
-                        .px_3()
-                        .gap_1()
-                        .overflow_hidden()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(if selected {
-                            theme::border()
-                        } else {
-                            theme::surface().alpha(0.)
-                        })
-                        .bg(if selected {
+        let dragging_tab = match &self.surface_drag {
+            SurfaceDrag::Reorder(drag)
+                if matches!(drag.list, ReorderList::Tabs { .. }) && reorder_past_slop(drag) =>
+            {
+                drag.order.get(drag.source_index).cloned()
+            }
+            _ => None,
+        };
+        let tabs = chrome
+            .tabs
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let shortcut = tab_key_equivalent(index, tab_count);
+                let tab_id = row.a11y.id.clone();
+                let press_id = tab_id.clone();
+                let measure_id = tab_id.clone();
+                let measure_view = view.clone();
+                let tab_target = HierarchyTarget::Tab {
+                    id: row.a11y.id.clone(),
+                    label: row.a11y.name.clone(),
+                };
+                let close_target = tab_target.clone();
+                let selected = row.a11y.selected == Some(true);
+                let dimmed = dragging_tab.as_deref() == Some(tab_id.as_str());
+                apply_control(div().id(("main-tab", row.number)), &row.a11y)
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .h(px(TAB_PILL_HEIGHT))
+                    .min_w(px(108.))
+                    .max_w(px(180.))
+                    .px_3()
+                    .gap_1()
+                    .overflow_hidden()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if selected {
+                        theme::border()
+                    } else {
+                        theme::surface().alpha(0.)
+                    })
+                    .bg(if selected {
+                        theme::current().bg.rgba()
+                    } else {
+                        theme::surface().alpha(0.)
+                    })
+                    .text_sm()
+                    .text_color(if selected {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    })
+                    .hover(move |style| {
+                        style.bg(if selected {
                             theme::current().bg.rgba()
                         } else {
-                            theme::surface().alpha(0.)
+                            theme::surface_hover()
                         })
-                        .text_sm()
-                        .text_color(if selected {
-                            theme::text()
+                    })
+                    .when(tab_count >= 2, |tab| tab.cursor_grab())
+                    .when(tab_count < 2, |tab| tab.cursor_pointer())
+                    .opacity(if dimmed { 0.4 } else { 1. })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, _window, cx| {
+                            this.press_tab_pill(press_id.clone(), event, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event, window, cx| {
+                            this.pane_mouse_up(event, window, cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, event, window, cx| {
+                            this.pane_mouse_up(event, window, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event, window, cx| {
+                        this.pane_mouse_move(event, window, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event, window, cx| {
+                            this.open_context_menu(tab_target.clone(), event, window, cx)
+                        }),
+                    )
+                    .child(icon(
+                        IconName::Terminal,
+                        if selected {
+                            theme::accent()
                         } else {
                             theme::muted()
-                        })
-                        .hover(move |style| {
-                            style.bg(if selected {
-                                theme::current().bg.rgba()
-                            } else {
-                                theme::surface_hover()
-                            })
-                        })
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.select_tab(tab_id.clone(), cx)
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event, window, cx| {
-                                this.open_context_menu(tab_target.clone(), event, window, cx)
-                            }),
-                        )
-                        .child(icon(
-                            IconName::Terminal,
-                            if selected {
-                                theme::accent()
-                            } else {
-                                theme::muted()
-                            },
-                            13.,
-                        ))
-                        .child(
+                        },
+                        13.,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(row.a11y.name.clone()),
+                    )
+                    .when_some(shortcut, |tab_row, shortcut| {
+                        tab_row.child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(row.a11y.name.clone()),
+                                .flex_none()
+                                .text_xs()
+                                .text_color(if selected {
+                                    theme::text()
+                                } else {
+                                    theme::muted()
+                                })
+                                .child(shortcut),
                         )
-                        .when_some(shortcut, |tab_row, shortcut| {
-                            tab_row.child(
-                                div()
-                                    .flex_none()
-                                    .text_xs()
-                                    .text_color(if selected {
-                                        theme::text()
-                                    } else {
-                                        theme::muted()
-                                    })
-                                    .child(shortcut),
+                    })
+                    .when(selected, |tab_row| {
+                        tab_row.child(
+                            icon_only_button_tone(
+                                ("close-tab", row.number),
+                                i18n.text(k::TERMINAL_CLOSE_TAB),
+                                IconName::Close,
+                                ButtonTone::Ghost,
+                                ButtonSize::Sm,
                             )
-                        })
-                        .when(selected, |tab_row| {
-                            tab_row.child(
-                                icon_only_button_tone(
-                                    ("close-tab", row.number),
-                                    i18n.text(k::TERMINAL_CLOSE_TAB),
-                                    IconName::Close,
-                                    ButtonTone::Ghost,
-                                    ButtonSize::Sm,
-                                )
-                                .size(px(18.))
-                                .rounded_full()
-                                .on_click(cx.listener(
-                                    move |this, _, _window, cx| {
-                                        this.request_close(close_target.clone(), cx)
-                                    },
-                                )),
-                            )
-                        })
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>();
+                            .size(px(18.))
+                            .rounded_full()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, _window, cx| {
+                                    this.request_close(close_target.clone(), cx)
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                measure_view.update(cx, |this, _cx| {
+                                    this.note_reorder_span(
+                                        true,
+                                        measure_id.clone(),
+                                        (
+                                            f32::from(bounds.origin.x),
+                                            f32::from(bounds.origin.y),
+                                            f32::from(bounds.size.width),
+                                            f32::from(bounds.size.height),
+                                        ),
+                                    );
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         let pane_id_right = self.selection.pane_id.clone();
         let pane_id_down = self.selection.pane_id.clone();
         let pane_id_zoom = self.selection.pane_id.clone();
@@ -883,6 +1000,43 @@ impl OcHerdrView {
             .children(split_overlay)
             .into_any_element()
     }
+
+    pub(super) fn render_reorder_overlay(
+        &self,
+        drag: &ReorderDrag,
+        cx: &mut Context<Self>,
+    ) -> ochub_ui::gpui::AnyElement {
+        div()
+            .id("reorder-drag-overlay")
+            .absolute()
+            .size_full()
+            .cursor_grabbing()
+            .on_mouse_move(cx.listener(|this, event, window, cx| {
+                this.pane_mouse_move(event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
+            .when_some(
+                reorder_indicator(&self.reorder_metrics, drag),
+                |overlay, line| overlay.child(line),
+            )
+            .when_some(
+                reorder_ghost(
+                    self.snapshot.as_ref(),
+                    &self.reorder_metrics,
+                    drag,
+                    &drag.order[drag.source_index],
+                ),
+                |overlay, ghost| overlay.child(ghost),
+            )
+            .into_any_element()
+    }
 }
 
 fn tab_key_equivalent(index: usize, tab_count: usize) -> Option<String> {
@@ -962,6 +1116,145 @@ fn tree_row(
             )
         })
         .child(status_dot(color))
+}
+
+fn reorder_ghost(
+    snapshot: Option<&HierarchySnapshot>,
+    metrics: &ReorderMetrics,
+    drag: &ReorderDrag,
+    source_id: &str,
+) -> Option<ochub_ui::gpui::Div> {
+    let span = match drag.list {
+        ReorderList::Workspaces => metrics.workspaces.iter().find(|span| span.id == source_id),
+        ReorderList::Tabs { .. } => metrics.tabs.iter().find(|span| span.id == source_id),
+    }?;
+    let left = px(drag.pointer.0 - drag.grab_offset.0);
+    let top = px(drag.pointer.1 - drag.grab_offset.1);
+    Some(match &drag.list {
+        ReorderList::Workspaces => {
+            let workspace = snapshot?
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == source_id)?;
+            let linked = workspace
+                .worktree
+                .as_ref()
+                .is_some_and(|info| info.is_linked_worktree);
+            div()
+                .absolute()
+                .left(left)
+                .top(top)
+                .w(px(span.rect.2))
+                .h(px(span.rect.3))
+                .opacity(0.85)
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .rounded(px(CORNER_COMPACT))
+                .bg(theme::sidebar_selected())
+                .border_1()
+                .border_color(theme::accent())
+                .shadow_md()
+                .child(icon(
+                    if linked {
+                        IconName::Layers
+                    } else {
+                        IconName::Folder
+                    },
+                    theme::accent(),
+                    13.,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_xs()
+                        .child(workspace.label.clone()),
+                )
+        }
+        ReorderList::Tabs { .. } => {
+            let tab = snapshot?.tabs.iter().find(|tab| tab.tab_id == source_id)?;
+            div()
+                .absolute()
+                .left(left)
+                .top(top)
+                .w(px(span.rect.2.max(108.)))
+                .h(px(TAB_PILL_HEIGHT))
+                .opacity(0.85)
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .rounded_full()
+                .bg(theme::current().bg.rgba())
+                .border_1()
+                .border_color(theme::accent())
+                .shadow_md()
+                .child(icon(IconName::Terminal, theme::accent(), 13.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .child(tab.label.clone()),
+                )
+        }
+    })
+}
+
+fn reorder_indicator(metrics: &ReorderMetrics, drag: &ReorderDrag) -> Option<ochub_ui::gpui::Div> {
+    let spans = match drag.list {
+        ReorderList::Workspaces => &metrics.workspaces,
+        ReorderList::Tabs { .. } => &metrics.tabs,
+    };
+    let items = drag
+        .order
+        .iter()
+        .filter_map(|id| spans.iter().find(|span| span.id == *id))
+        .collect::<Vec<_>>();
+    if items.len() != drag.order.len() {
+        return None;
+    }
+    let thick = REORDER_INDICATOR_PX;
+    let (x, y, w, h) = match (&drag.list, drag.hover) {
+        (ReorderList::Workspaces, ReorderHover::Item { index, trailing }) => {
+            let rect = items.get(index)?.rect;
+            if trailing {
+                (rect.0, rect.1 + rect.3 - thick / 2., rect.2, thick)
+            } else {
+                (rect.0, rect.1 - thick / 2., rect.2, thick)
+            }
+        }
+        (ReorderList::Workspaces, ReorderHover::AfterLast) => {
+            let rect = items.last()?.rect;
+            (rect.0, rect.1 + rect.3 - thick / 2., rect.2, thick)
+        }
+        (ReorderList::Tabs { .. }, ReorderHover::Item { index, trailing }) => {
+            let rect = items.get(index)?.rect;
+            if trailing {
+                (rect.0 + rect.2 - thick / 2., rect.1, thick, rect.3)
+            } else {
+                (rect.0 - thick / 2., rect.1, thick, rect.3)
+            }
+        }
+        (ReorderList::Tabs { .. }, ReorderHover::AfterLast) => {
+            let rect = items.last()?.rect;
+            (rect.0 + rect.2 - thick / 2., rect.1, thick, rect.3)
+        }
+    };
+    Some(
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(w))
+            .h(px(h))
+            .bg(theme::accent())
+            .rounded_full(),
+    )
 }
 
 fn pane_fractions(
