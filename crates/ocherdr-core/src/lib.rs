@@ -253,6 +253,14 @@ pub struct PaneInfo {
     pub revision: u64,
 }
 
+/// Agent fields used by OcHerdr from Herdr's `AgentInfo` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub pane_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 impl PaneInfo {
     pub fn display_name(&self) -> &str {
         self.label
@@ -421,7 +429,7 @@ pub struct HierarchySnapshot {
     #[serde(default, rename = "layouts")]
     pub layouts: Vec<PaneLayout>,
     #[serde(default)]
-    pub agents: Vec<serde_json::Value>,
+    pub agents: Vec<AgentInfo>,
 }
 
 impl HierarchySnapshot {

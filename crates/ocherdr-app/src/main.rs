@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
-    AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent,
+    AgentInfo, AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent,
     HierarchySnapshot, LayoutRect, LayoutSplit, PaneInfo, ReorderHover, Selection, SessionSummary,
     SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, split_ratio_from_drag,
 };
@@ -669,17 +669,14 @@ struct OcHerdrView {
     agent_name_input: Entity<TextInput>,
     agent_prompt_input: Entity<TextInput>,
     agent_output_scroll: ScrollHandle,
+    agent_name: AgentNameState,
     agent_output: AgentOutputState,
-    agent_prompt: AgentPromptPhase,
+    agent_prompts: HashMap<String, AgentPromptPhase>,
     agent_name_error: Option<AgentNameError>,
-    /// Dropping this cancels an in-flight `agent.read`.
-    agent_read_task: Option<Task<()>>,
-    /// Dropping this cancels an in-flight `agent.prompt`.
-    agent_prompt_task: Option<Task<()>>,
-    /// Dropping this cancels an in-flight `agent.send_keys`.
-    agent_keys_task: Option<Task<()>>,
-    /// Dropping this cancels an in-flight `agent.rename`.
-    agent_rename_task: Option<Task<()>>,
+    /// Mutation tasks stay owned after their panel closes so their real-world
+    /// result can still be reported.
+    agent_keys: HashMap<String, Task<()>>,
+    agent_renames: HashMap<String, Task<()>>,
     /// Dropping this cancels an in-flight `worktree.list`.
     worktree_list_task: Option<Task<()>>,
     appearance: AppearanceSettings,
@@ -736,26 +733,25 @@ enum Overlay {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+enum AgentNameState {
+    Idle,
+    Loading { _task: Task<()> },
+    Ready,
+    Failed(String),
+}
+
 enum AgentOutputState {
     Idle,
-    Loading,
+    Loading { _task: Task<()> },
     Ready { text: String, truncated: bool },
     Failed { message: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 enum AgentPromptPhase {
-    Idle,
-    Sending,
+    Sending { _task: Task<()> },
     Sent,
-    Failed { blocked: bool, message: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AgentPromptFailure {
     Blocked { message: String },
-    Other { message: String },
+    Failed { message: String },
 }
 
 #[derive(Clone, Debug)]

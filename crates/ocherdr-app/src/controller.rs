@@ -87,13 +87,12 @@ impl OcHerdrView {
                 TextInput::new(cx, i18n.text(k::AGENT_PROMPT_PLACEHOLDER)).multiline(true)
             }),
             agent_output_scroll: ScrollHandle::new(),
+            agent_name: AgentNameState::Idle,
             agent_output: AgentOutputState::Idle,
-            agent_prompt: AgentPromptPhase::Idle,
+            agent_prompts: HashMap::new(),
             agent_name_error: None,
-            agent_read_task: None,
-            agent_prompt_task: None,
-            agent_keys_task: None,
-            agent_rename_task: None,
+            agent_keys: HashMap::new(),
+            agent_renames: HashMap::new(),
             worktree_list_task: None,
             appearance,
             i18n,
@@ -1486,18 +1485,14 @@ impl OcHerdrView {
             matches!(&self.overlay, Overlay::AgentPanel { pane_id: open } if open == &pane_id);
         if !same {
             self.reset_agent_panel_state();
-            let name = self
-                .snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.pane(&pane_id))
-                .and_then(|pane| pane.display_agent.as_deref().or(pane.agent.as_deref()))
-                .unwrap_or("")
-                .to_owned();
             self.agent_name_input
-                .update(cx, |input, cx| input.set_content(name, cx));
+                .update(cx, |input, cx| input.set_content("", cx));
             self.set_overlay(Overlay::AgentPanel { pane_id }, cx);
         }
+        self.fetch_agent_name(cx);
         self.fetch_agent_output(cx);
+        self.agent_prompt_input
+            .update(cx, |input, cx| input.set_content("", cx));
         self.agent_prompt_input
             .read(cx)
             .focus_handle(cx)
@@ -1516,11 +1511,14 @@ impl OcHerdrView {
             return;
         };
         let pane_id = pane_id.clone();
-        if matches!(self.agent_prompt, AgentPromptPhase::Sending) {
+        if matches!(
+            self.agent_prompts.get(&pane_id),
+            Some(AgentPromptPhase::Sending { .. })
+        ) {
             return;
         }
         let raw = self.agent_prompt_input.read(cx).content();
-        let Some(text) = agent_prompt_text_to_send(&self.agent_prompt, raw.as_ref()) else {
+        let Some(text) = agent_prompt_text_to_send(raw.as_ref()) else {
             self.post_notice(
                 FailureNotice {
                     level: ochub_ui::notifications::NotificationLevel::Warning,
@@ -1534,48 +1532,59 @@ impl OcHerdrView {
         let Some(connection) = &self.connection else {
             return;
         };
-        let Some(next) = agent_prompt_begin(self.agent_prompt.clone()) else {
-            return;
-        };
-        self.agent_prompt = next;
         let socket = connection.socket_path().to_owned();
+        let sent_text = text.clone();
         let params = json!({ "target": pane_id, "text": text });
-        self.agent_prompt_task = Some(cx.spawn(async move |this, cx| {
+        let target = pane_id.clone();
+        let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { request_socket(&socket, "agent.prompt", params) })
                 .await;
             this.update(cx, |this, cx| {
-                this.agent_prompt_task = None;
-                if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {
-                    return;
-                }
-                let complete = match &result {
-                    Ok(_) => Ok(()),
-                    Err(error) => Err(agent_prompt_failure_from_error(error)),
-                };
-                this.agent_prompt =
-                    agent_prompt_complete(this.agent_prompt.clone(), complete.clone());
-                match complete {
-                    Ok(()) => {
-                        this.agent_prompt_input
-                            .update(cx, |input, cx| input.set_content("", cx));
-                        this.fetch_agent_output(cx);
+                match result {
+                    Ok(_) => {
+                        this.agent_prompts
+                            .insert(target.clone(), AgentPromptPhase::Sent);
+                        if agent_panel_pane(&this.overlay) == Some(target.as_str())
+                            && this.agent_prompt_input.read(cx).content().as_ref() == sent_text
+                        {
+                            this.agent_prompt_input
+                                .update(cx, |input, cx| input.set_content("", cx));
+                        }
+                        if agent_panel_pane(&this.overlay) == Some(target.as_str()) {
+                            this.fetch_agent_output(cx);
+                        }
                     }
-                    Err(AgentPromptFailure::Blocked { .. }) => {
+                    Err(HerdrError::Api { code, message }) if code == "agent_blocked" => {
+                        this.agent_prompts.insert(
+                            target.clone(),
+                            AgentPromptPhase::Blocked {
+                                message: message.clone(),
+                            },
+                        );
                         this.notify_failure(
                             FailureKind::AgentBlocked,
                             this.i18n.text(k::AGENT_BLOCKED_DETAIL),
                             cx,
                         );
                     }
-                    Err(AgentPromptFailure::Other { message }) => {
+                    Err(error) => {
+                        let message = error.to_string();
+                        this.agent_prompts.insert(
+                            target.clone(),
+                            AgentPromptPhase::Failed {
+                                message: message.clone(),
+                            },
+                        );
                         this.notify_command_failure("agent.prompt", message, cx);
                     }
                 }
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        self.agent_prompts
+            .insert(pane_id, AgentPromptPhase::Sending { _task: task });
         cx.notify();
     }
 
@@ -1587,7 +1596,9 @@ impl OcHerdrView {
         let Overlay::AgentPanel { pane_id } = &self.overlay else {
             return;
         };
-        if self.agent_rename_task.is_some() {
+        if self.agent_renames.contains_key(pane_id)
+            || !matches!(self.agent_name, AgentNameState::Ready)
+        {
             return;
         }
         let pane_id = pane_id.clone();
@@ -1607,25 +1618,40 @@ impl OcHerdrView {
                     Some(name) => json!({ "target": pane_id, "name": name }),
                     None => json!({ "target": pane_id }),
                 };
-                self.agent_rename_task = Some(cx.spawn(async move |this, cx| {
+                let target = pane_id.clone();
+                let task = cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_spawn(
                             async move { request_socket(&socket, "agent.rename", params) },
                         )
                         .await;
                     this.update(cx, |this, cx| {
-                        this.agent_rename_task = None;
-                        if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {
-                            return;
-                        }
+                        this.agent_renames.remove(&target);
                         match result {
-                            Ok(_) => this.resync_snapshot(this.event_epoch, cx),
+                            Ok(value) => match parse_agent_info_result(value) {
+                                Ok(agent) => {
+                                    if agent_panel_pane(&this.overlay) == Some(target.as_str()) {
+                                        this.agent_name = AgentNameState::Ready;
+                                        this.agent_name_input.update(cx, |input, cx| {
+                                            input.set_content(
+                                                agent.name.as_deref().unwrap_or(""),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                    this.resync_snapshot(this.event_epoch, cx);
+                                }
+                                Err(message) => {
+                                    this.notify_command_failure("agent.rename", message, cx)
+                                }
+                            },
                             Err(error) => this.notify_command_failure("agent.rename", error, cx),
                         }
                         cx.notify();
                     })
                     .ok();
-                }));
+                });
+                self.agent_renames.insert(pane_id, task);
                 cx.notify();
             }
         }
@@ -1639,7 +1665,7 @@ impl OcHerdrView {
         let Overlay::AgentPanel { pane_id } = &self.overlay else {
             return;
         };
-        if self.agent_keys_task.is_some() {
+        if self.agent_keys.contains_key(pane_id) {
             return;
         }
         let Some(connection) = &self.connection else {
@@ -1648,23 +1674,71 @@ impl OcHerdrView {
         let pane_id = pane_id.clone();
         let socket = connection.socket_path().to_owned();
         let params = json!({ "target": pane_id, "keys": keys });
-        self.agent_keys_task = Some(cx.spawn(async move |this, cx| {
+        let target = pane_id.clone();
+        let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { request_socket(&socket, "agent.send_keys", params) })
                 .await;
             this.update(cx, |this, cx| {
-                this.agent_keys_task = None;
-                if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {
-                    return;
-                }
+                this.agent_keys.remove(&target);
                 match result {
-                    Ok(_) => this.fetch_agent_output(cx),
+                    Ok(_) if agent_panel_pane(&this.overlay) == Some(target.as_str()) => {
+                        this.fetch_agent_output(cx)
+                    }
+                    Ok(_) => {}
                     Err(error) => this.notify_command_failure("agent.send_keys", error, cx),
                 }
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        self.agent_keys.insert(pane_id, task);
+        cx.notify();
+    }
+
+    fn fetch_agent_name(&mut self, cx: &mut Context<Self>) {
+        let Overlay::AgentPanel { pane_id } = &self.overlay else {
+            return;
+        };
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let pane_id = pane_id.clone();
+        let socket = connection.socket_path().to_owned();
+        let params = json!({ "target": pane_id });
+        let target = pane_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { request_socket(&socket, "agent.get", params) })
+                .await;
+            this.update(cx, |this, cx| {
+                if agent_panel_pane(&this.overlay) != Some(target.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(value) => match parse_agent_info_result(value) {
+                        Ok(agent) => {
+                            this.agent_name = AgentNameState::Ready;
+                            this.agent_name_input.update(cx, |input, cx| {
+                                input.set_content(agent.name.as_deref().unwrap_or(""), cx)
+                            });
+                        }
+                        Err(message) => {
+                            this.agent_name = AgentNameState::Failed(message.clone());
+                            this.notify_command_failure("agent.get", message, cx);
+                        }
+                    },
+                    Err(error) => {
+                        let message = error.to_string();
+                        this.agent_name = AgentNameState::Failed(message.clone());
+                        this.notify_command_failure("agent.get", message, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.agent_name = AgentNameState::Loading { _task: task };
         cx.notify();
     }
 
@@ -1682,13 +1756,11 @@ impl OcHerdrView {
             "source": AGENT_OUTPUT_SOURCE,
             "format": "text",
         });
-        self.agent_output = AgentOutputState::Loading;
-        self.agent_read_task = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { request_socket(&socket, "agent.read", params) })
                 .await;
             this.update(cx, |this, cx| {
-                this.agent_read_task = None;
                 if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {
                     return;
                 }
@@ -1707,17 +1779,16 @@ impl OcHerdrView {
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        self.agent_output = AgentOutputState::Loading { _task: task };
         cx.notify();
     }
 
     fn reset_agent_panel_state(&mut self) {
-        self.agent_read_task = None;
-        self.agent_prompt_task = None;
-        self.agent_keys_task = None;
-        self.agent_rename_task = None;
+        self.agent_name = AgentNameState::Idle;
         self.agent_output = AgentOutputState::Idle;
-        self.agent_prompt = AgentPromptPhase::Idle;
+        self.agent_prompts
+            .retain(|_, phase| matches!(phase, AgentPromptPhase::Sending { .. }));
         self.agent_name_error = None;
     }
 
@@ -3736,55 +3807,19 @@ fn agent_panel_refresh_from_batch(
     })
 }
 
-fn agent_prompt_text_to_send(phase: &AgentPromptPhase, text: &str) -> Option<String> {
-    if matches!(phase, AgentPromptPhase::Sending) {
-        return None;
-    }
-    let text = text.trim();
+fn agent_prompt_text_to_send(text: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }
     Some(text.to_owned())
 }
 
-fn agent_prompt_begin(phase: AgentPromptPhase) -> Option<AgentPromptPhase> {
-    match phase {
-        AgentPromptPhase::Sending => None,
-        _ => Some(AgentPromptPhase::Sending),
-    }
-}
-
-fn agent_prompt_complete(
-    phase: AgentPromptPhase,
-    result: Result<(), AgentPromptFailure>,
-) -> AgentPromptPhase {
-    if !matches!(phase, AgentPromptPhase::Sending) {
-        return phase;
-    }
-    match result {
-        Ok(()) => AgentPromptPhase::Sent,
-        Err(AgentPromptFailure::Blocked { message }) => AgentPromptPhase::Failed {
-            blocked: true,
-            message,
-        },
-        Err(AgentPromptFailure::Other { message }) => AgentPromptPhase::Failed {
-            blocked: false,
-            message,
-        },
-    }
-}
-
-fn agent_prompt_failure_from_error(error: &HerdrError) -> AgentPromptFailure {
-    match error {
-        HerdrError::Api { code, message } if code == "agent_blocked" => {
-            AgentPromptFailure::Blocked {
-                message: message.clone(),
-            }
-        }
-        other => AgentPromptFailure::Other {
-            message: other.to_string(),
-        },
-    }
+fn parse_agent_info_result(value: Value) -> Result<AgentInfo, String> {
+    let agent = value
+        .get("agent")
+        .cloned()
+        .ok_or_else(|| "API response is missing `agent`".to_owned())?;
+    serde_json::from_value(agent).map_err(|error| format!("invalid `agent`: {error}"))
 }
 
 fn parse_agent_read_result(value: &Value) -> Result<(String, bool), String> {
@@ -3798,7 +3833,7 @@ fn parse_agent_read_result(value: &Value) -> Result<(String, bool), String> {
     let truncated = read
         .get("truncated")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .ok_or_else(|| "read is missing `truncated`".to_owned())?;
     Ok((text.to_owned(), truncated))
 }
 
@@ -6352,48 +6387,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_prompt_is_not_sent_while_in_flight_or_when_empty() {
+    fn agent_prompt_preserves_the_user_text_and_rejects_only_exact_empty() {
         assert_eq!(
-            agent_prompt_text_to_send(&AgentPromptPhase::Idle, "  hello  "),
-            Some("hello".into())
+            agent_prompt_text_to_send("  hello  "),
+            Some("  hello  ".into())
         );
-        assert_eq!(
-            agent_prompt_text_to_send(&AgentPromptPhase::Idle, "   "),
-            None
-        );
-        assert_eq!(
-            agent_prompt_text_to_send(&AgentPromptPhase::Sending, "hello"),
-            None
-        );
-        assert!(agent_prompt_begin(AgentPromptPhase::Sending).is_none());
-        assert_eq!(
-            agent_prompt_begin(AgentPromptPhase::Idle),
-            Some(AgentPromptPhase::Sending)
-        );
-    }
-
-    #[test]
-    fn a_blocked_prompt_is_reported_and_does_not_retry() {
-        let blocked = agent_prompt_failure_from_error(&HerdrError::Api {
-            code: "agent_blocked".into(),
-            message: "agent grok is blocked and requires interactive input".into(),
-        });
-        assert!(matches!(blocked, AgentPromptFailure::Blocked { .. }));
-        let finished = agent_prompt_complete(AgentPromptPhase::Sending, Err(blocked));
-        assert!(matches!(
-            finished,
-            AgentPromptPhase::Failed { blocked: true, .. }
-        ));
-        assert!(
-            agent_prompt_begin(finished).is_some(),
-            "the user can resend after blocked; the complete step itself must not enqueue a retry"
-        );
-        let stale = agent_prompt_complete(AgentPromptPhase::Idle, Ok(()));
-        assert_eq!(stale, AgentPromptPhase::Idle);
-        assert_eq!(
-            agent_prompt_complete(AgentPromptPhase::Sending, Ok(())),
-            AgentPromptPhase::Sent
-        );
+        assert_eq!(agent_prompt_text_to_send("   "), Some("   ".into()));
+        assert_eq!(agent_prompt_text_to_send(""), None);
     }
 
     #[test]
@@ -6407,6 +6407,26 @@ mod tests {
             ("hello\n".into(), true)
         );
         assert!(parse_agent_read_result(&json!({ "ok": true })).is_err());
+        assert!(parse_agent_read_result(&json!({ "read": { "text": "hello" } })).is_err());
+        assert!(
+            parse_agent_read_result(&json!({ "read": { "text": "hello", "truncated": "false" } }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_info_parses_the_custom_name_instead_of_display_metadata() {
+        let agent = parse_agent_info_result(json!({
+            "agent": {
+                "pane_id": "p-a",
+                "name": "reviewer",
+                "agent": "claude",
+                "display_agent": "Claude Code"
+            }
+        }))
+        .unwrap();
+        assert_eq!(agent.pane_id, "p-a");
+        assert_eq!(agent.name.as_deref(), Some("reviewer"));
     }
 
     #[test]

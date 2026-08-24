@@ -14,14 +14,13 @@ pub enum AgentNameError {
     TooLong,
 }
 
-/// Parse a custom agent name. Empty (after trim) means clear the custom name,
-/// matching Herdr's `agent.rename` `name: null`.
+/// Parse a custom agent name. An exactly empty input means clear the custom
+/// name by omitting `name` from `agent.rename`.
 pub fn parse_agent_name(raw: &str) -> Result<Option<&str>, AgentNameError> {
-    let name = raw.trim();
-    if name.is_empty() {
+    if raw.is_empty() {
         return Ok(None);
     }
-    let bytes = name.as_bytes();
+    let bytes = raw.as_bytes();
     if !bytes[0].is_ascii_lowercase() {
         return Err(AgentNameError::FirstCharacter);
     }
@@ -33,7 +32,7 @@ pub fn parse_agent_name(raw: &str) -> Result<Option<&str>, AgentNameError> {
     }) {
         return Err(AgentNameError::InvalidCharacter);
     }
-    Ok(Some(name))
+    Ok(Some(raw))
 }
 
 /// CLI and Herdr's own default for `agent.read`. Visible is only the current
@@ -123,7 +122,19 @@ mod tests {
     #[test]
     fn an_empty_agent_name_clears_the_custom_name() {
         assert_eq!(parse_agent_name(""), Ok(None));
-        assert_eq!(parse_agent_name("   "), Ok(None));
+    }
+
+    #[test]
+    fn agent_names_reject_leading_trailing_and_only_whitespace() {
+        assert_eq!(
+            parse_agent_name(" reviewer"),
+            Err(AgentNameError::FirstCharacter)
+        );
+        assert_eq!(
+            parse_agent_name("reviewer "),
+            Err(AgentNameError::InvalidCharacter)
+        );
+        assert_eq!(parse_agent_name("   "), Err(AgentNameError::FirstCharacter));
     }
 
     #[test]

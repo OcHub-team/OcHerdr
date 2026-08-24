@@ -37,14 +37,21 @@ impl OcHerdrView {
                 .unwrap_or(pane.tab_id.as_str());
             i18n.agent_location(workspace, tab, &pane.pane_id)
         });
-        let sending = matches!(self.agent_prompt, AgentPromptPhase::Sending);
-        let renaming = self.agent_rename_task.is_some();
-        let keys_busy = self.agent_keys_task.is_some();
+        let sending = matches!(
+            self.agent_prompts.get(pane_id),
+            Some(AgentPromptPhase::Sending { .. })
+        );
+        let renaming = self.agent_renames.contains_key(pane_id);
+        let keys_busy = self.agent_keys.contains_key(pane_id);
         let name_error = self
             .agent_name_error
-            .map(|error| i18n.agent_name_error(error));
-        let output = self.agent_output.clone();
-        let prompt_phase = self.agent_prompt.clone();
+            .map(|error| i18n.agent_name_error(error).to_owned())
+            .or_else(|| match &self.agent_name {
+                AgentNameState::Failed(message) => Some(message.clone()),
+                AgentNameState::Idle | AgentNameState::Loading { .. } | AgentNameState::Ready => {
+                    None
+                }
+            });
         let output_scroll = self.agent_output_scroll.clone();
 
         let close = icon_only_button_tone(
@@ -54,26 +61,35 @@ impl OcHerdrView {
             ButtonTone::Ghost,
             ButtonSize::Sm,
         )
+        .debug_selector(|| "close-agent-panel".into())
         .on_click(cx.listener(|this, _, window, cx| this.close_agent_panel(window, cx)));
 
-        let save_name = if renaming {
-            busy_button(
+        let save_name = match (&self.agent_name, renaming) {
+            (_, true) | (AgentNameState::Loading { .. }, false) => busy_button(
                 "save-agent-name",
                 i18n.text(k::COMMON_SAVE),
                 ButtonTone::Primary,
                 ButtonSize::Sm,
                 true,
             )
-            .into_any_element()
-        } else {
-            button(
+            .into_any_element(),
+            (AgentNameState::Ready, false) => button(
                 "save-agent-name",
                 i18n.text(k::COMMON_SAVE),
                 ButtonTone::Primary,
                 ButtonSize::Sm,
             )
+            .debug_selector(|| "save-agent-name".into())
             .on_click(cx.listener(|this, _, window, cx| this.submit_agent_rename(window, cx)))
-            .into_any_element()
+            .into_any_element(),
+            (AgentNameState::Idle | AgentNameState::Failed(_), false) => disabled_button(
+                "save-agent-name",
+                i18n.text(k::COMMON_SAVE),
+                ButtonTone::Primary,
+                ButtonSize::Sm,
+                true,
+            )
+            .into_any_element(),
         };
 
         let refresh = icon_only_button_tone(
@@ -126,23 +142,18 @@ impl OcHerdrView {
                 ButtonTone::Primary,
                 ButtonSize::Sm,
             )
+            .debug_selector(|| "send-agent-prompt".into())
             .on_click(cx.listener(|this, _, _window, cx| this.submit_agent_prompt(cx)))
             .into_any_element()
         };
 
-        let feedback = match &prompt_phase {
-            AgentPromptPhase::Idle | AgentPromptPhase::Sending => None,
-            AgentPromptPhase::Sent => {
+        let feedback = match self.agent_prompts.get(pane_id) {
+            None | Some(AgentPromptPhase::Sending { .. }) => None,
+            Some(AgentPromptPhase::Sent) => {
                 Some((theme::muted(), i18n.text(k::AGENT_PROMPT_SENT).to_owned()))
             }
-            AgentPromptPhase::Failed { blocked: true, .. } => Some((
-                theme::yellow(),
-                i18n.text(k::AGENT_BLOCKED_DETAIL).to_owned(),
-            )),
-            AgentPromptPhase::Failed {
-                blocked: false,
-                message,
-            } => Some((theme::red(), message.clone())),
+            Some(AgentPromptPhase::Blocked { message }) => Some((theme::yellow(), message.clone())),
+            Some(AgentPromptPhase::Failed { message }) => Some((theme::red(), message.clone())),
         };
 
         let card = apply_dialog(
@@ -202,7 +213,7 @@ impl OcHerdrView {
                         .child(section_header(i18n.text(k::AGENT_OUTPUT), None))
                         .child(refresh),
                 )
-                .child(render_agent_output(&output, output_scroll, i18n))
+                .child(render_agent_output(&self.agent_output, output_scroll, i18n))
                 .child(
                     div()
                         .flex()
@@ -268,7 +279,7 @@ fn agent_meta_row(label: &'static str, value: Option<AnyElement>) -> Div {
 
 fn render_agent_output(output: &AgentOutputState, scroll: ScrollHandle, i18n: I18n) -> AnyElement {
     let body = match output {
-        AgentOutputState::Idle | AgentOutputState::Loading => div()
+        AgentOutputState::Idle | AgentOutputState::Loading { .. } => div()
             .flex()
             .items_center()
             .gap_2()

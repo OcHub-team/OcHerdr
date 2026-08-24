@@ -160,6 +160,7 @@ impl OcHerdrView {
             .iter()
             .map(|row| {
                 let pane_id = row.pane_id.clone();
+                let debug_pane_id = pane_id.clone();
                 let status = row.agent_status;
                 apply_control(
                     div().id(ochub_ui::gpui::ElementId::Name(
@@ -175,6 +176,7 @@ impl OcHerdrView {
                 .rounded(px(CORNER_COMPACT))
                 .hover(|style| style.bg(theme::surface_hover()))
                 .cursor_pointer()
+                .debug_selector(move || format!("agent-{debug_pane_id}"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_agent_panel(pane_id.clone(), window, cx)
                 }))
