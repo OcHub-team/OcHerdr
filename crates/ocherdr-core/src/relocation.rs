@@ -505,6 +505,69 @@ pub fn predict_relocation(
     })
 }
 
+/// Every layout the target tab passes through during the §4.2 orchestration,
+/// so the client can tell an expected intermediate `layout.updated` from a
+/// foreign change (design §7.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelocationSteps {
+    /// After step 1 (`pane.move` to a new tab): the source is gone and its
+    /// parent split collapsed.
+    pub removed: PredictedLayout,
+    /// After step 2 (`pane.move` back with `right`/`down`): the source is the
+    /// target's second child. Equal to `final_layout` for right/down drops.
+    pub inserted: PredictedLayout,
+    /// After step 3 (`pane.swap`, left/up only): the source is the first
+    /// child. This is what [`predict_relocation`] returns.
+    pub final_layout: PredictedLayout,
+}
+
+/// [`predict_relocation`] plus the two intermediate layouts of the
+/// orchestration. Same preconditions and `None` cases.
+pub fn predict_relocation_steps(
+    layout: &PaneLayout,
+    source: &str,
+    target: &str,
+    edge: DropEdge,
+    ratio: f32,
+) -> Option<RelocationSteps> {
+    if source == target {
+        return None;
+    }
+    let tree = rebuild_tree(layout)?;
+    if tree.pane_count() < 2 || !tree.root.contains(source) || !tree.root.contains(target) {
+        return None;
+    }
+    let area = tree.area;
+    let predicted = |root: LayoutNode| {
+        let tree = LayoutTree { root, area };
+        let panes = tree.pane_rects();
+        let splits = tree.splits();
+        PredictedLayout {
+            tree,
+            panes,
+            splits,
+        }
+    };
+    let request_ratio = edge.request_ratio(ratio);
+    let removed_root = remove_pane(tree.root, source)?;
+    let inserted_root = split_at(
+        removed_root.clone(),
+        target,
+        edge.split_direction(),
+        source,
+        request_ratio,
+    );
+    let mut final_root = inserted_root.clone();
+    if edge.moved_pane_is_first() {
+        swap_pane_ids(&mut final_root, source, target);
+    }
+    Some(RelocationSteps {
+        removed: predicted(removed_root),
+        inserted: predicted(inserted_root),
+        final_layout: predicted(final_root),
+    })
+}
+
 /// Predict a centre drop: only the two panes' rects trade places (Herdr's
 /// `pane.swap` keeps the split shape and ratios). Returns the full pane list
 /// in the layout's order, or `None` when either pane is missing or `a == b`.
@@ -1207,5 +1270,67 @@ mod tests {
         let mut other_tab = base;
         other_tab.tab_id = "t2".into();
         assert_ne!(layout_fingerprint(&other_tab), fp);
+    }
+
+    fn pane_order(layout: &PredictedLayout) -> Vec<&str> {
+        layout.panes.iter().map(|p| p.pane_id.as_str()).collect()
+    }
+
+    #[test]
+    fn relocation_steps_walk_removed_inserted_final_for_a_left_drop() {
+        // [a | [b / [c | d]]]: drop `a` on the left edge of `d`.
+        let base = layout_from_tree(&nested_tree(), false);
+        let steps = predict_relocation_steps(&base, "a", "d", DropEdge::Left, 0.5).unwrap();
+        // Step 1: `a` gone, the root collapses to `[b / [c | d]]`.
+        assert_eq!(pane_order(&steps.removed), vec!["b", "c", "d"]);
+        assert_eq!(steps.removed.splits.len(), 2);
+        assert_eq!(steps.removed.panes[0].rect, rect(0, 0, 100, 25));
+        // Step 2: `a` inserted as `d`'s *second* child.
+        assert_eq!(pane_order(&steps.inserted), vec!["b", "c", "d", "a"]);
+        // Step 3: swapped so `a` is first, and identical to predict_relocation.
+        assert_eq!(pane_order(&steps.final_layout), vec!["b", "c", "a", "d"]);
+        assert_eq!(
+            steps.final_layout,
+            predict_relocation(&base, "a", "d", DropEdge::Left, 0.5).unwrap()
+        );
+        // Same split shape between step 2 and 3: only the leaves trade.
+        let shape = |layout: &PredictedLayout| {
+            layout
+                .splits
+                .iter()
+                .map(|s| (s.path.clone(), s.direction))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&steps.inserted), shape(&steps.final_layout));
+    }
+
+    #[test]
+    fn relocation_steps_use_one_minus_ratio_on_left_and_up() {
+        let base = layout_from_tree(&horizontal_tree(), false);
+        let left = predict_relocation_steps(&base, "b", "a", DropEdge::Left, 0.3).unwrap();
+        let right = predict_relocation_steps(&base, "b", "a", DropEdge::Right, 0.3).unwrap();
+        // The split fed to the tree carries the request ratio.
+        assert!((left.inserted.splits[0].ratio - 0.7).abs() < 1e-6);
+        assert!((right.inserted.splits[0].ratio - 0.3).abs() < 1e-6);
+        assert_eq!(DropEdge::Left.request_ratio(0.3), 0.7);
+        assert_eq!(DropEdge::Up.request_ratio(0.3), 0.7);
+        assert_eq!(DropEdge::Right.request_ratio(0.3), 0.3);
+        assert_eq!(DropEdge::Down.request_ratio(0.3), 0.3);
+        // Right/down: inserted == final, so the target keeps 30 cells.
+        assert_eq!(right.inserted, right.final_layout);
+        assert_eq!(right.final_layout.panes[0].rect, rect(0, 0, 30, 50));
+        assert_eq!(right.final_layout.panes[1].rect, rect(30, 0, 70, 50));
+        // Left: after the swap `b` is first with 70 cells, `a` keeps 30.
+        assert_ne!(left.inserted, left.final_layout);
+        assert_eq!(pane_order(&left.final_layout), vec!["b", "a"]);
+        assert_eq!(left.final_layout.panes[0].rect, rect(0, 0, 70, 50));
+        assert_eq!(left.final_layout.panes[1].rect, rect(70, 0, 30, 50));
+    }
+
+    #[test]
+    fn relocation_steps_reject_what_predict_relocation_rejects() {
+        let base = layout_from_tree(&horizontal_tree(), false);
+        assert!(predict_relocation_steps(&base, "a", "a", DropEdge::Left, 0.5).is_none());
+        assert!(predict_relocation_steps(&base, "a", "zz", DropEdge::Left, 0.5).is_none());
     }
 }

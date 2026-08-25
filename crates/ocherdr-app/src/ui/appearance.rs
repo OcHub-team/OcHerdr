@@ -1192,6 +1192,7 @@ impl OcHerdrView {
     fn sync_appearance_from_document(&mut self) {
         let (config, _) = crate::config::values::AppConfig::from_document(&self.config);
         self.appearance = crate::config::values::appearance_from_config(&config);
+        self.pane_edge_relocation = config.pane_edge_relocation;
         if self.i18n.preference() != config.language {
             self.i18n.set_preference(config.language);
         }

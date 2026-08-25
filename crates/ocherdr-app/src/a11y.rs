@@ -138,6 +138,9 @@ pub struct ChromeA11yInput<'a> {
     pub operation: Option<&'a str>,
     pub event_stream: &'a EventStreamState,
     pub profile_label: &'a str,
+    /// Temporary tabs of in-flight pane relocations (design §7.2): real in
+    /// the snapshot, absent from the tab strip.
+    pub hidden_tab_ids: &'a HashSet<String>,
 }
 
 pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
@@ -156,7 +159,9 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
         let agents = agent_rows(&snapshot.panes, input.selection.pane_id.as_deref(), i18n);
         let tabs = if let Some(workspace_id) = input.selection.workspace_id.as_deref() {
             tab_rows(
-                snapshot.tabs_for(workspace_id),
+                snapshot
+                    .tabs_for(workspace_id)
+                    .filter(|tab| !input.hidden_tab_ids.contains(&tab.tab_id)),
                 input.selection.tab_id.as_deref(),
             )
         } else {
@@ -277,12 +282,36 @@ pub fn pane_drag_handle_name(pane: &PaneInfo, i18n: I18n) -> String {
 }
 
 /// What the drag would do if released now, for the drag overlay's
-/// accessible value. Edge zones read as invalid until phase 3 makes them
-/// droppable.
+/// accessible value and the drop-zone label (design §5.2).
 pub fn pane_drag_state_text(zone: Option<DropZone>, droppable: bool, i18n: I18n) -> &'static str {
     match zone {
-        Some(DropZone::Center) if droppable => i18n.text(k::TERMINAL_DROP_SWAP),
+        Some(zone) if droppable => drop_zone_label(zone, i18n),
         _ => i18n.text(k::TERMINAL_DROP_INVALID),
+    }
+}
+
+/// "Swap" / "Move left|right|above|below".
+pub fn drop_zone_label(zone: DropZone, i18n: I18n) -> &'static str {
+    i18n.text(match zone {
+        DropZone::Center => k::TERMINAL_DROP_SWAP,
+        DropZone::Left => k::TERMINAL_DROP_MOVE_LEFT,
+        DropZone::Right => k::TERMINAL_DROP_MOVE_RIGHT,
+        DropZone::Up => k::TERMINAL_DROP_MOVE_UP,
+        DropZone::Down => k::TERMINAL_DROP_MOVE_DOWN,
+    })
+}
+
+/// Accessible value of the keyboard move mode: the pending intent with the
+/// target's name once one is chosen, else the key hint.
+pub fn keyboard_move_state_text(
+    target: Option<(&str, DropZone)>,
+    droppable: bool,
+    i18n: I18n,
+) -> String {
+    match target {
+        Some((name, zone)) if droppable => format!("{} · {name}", drop_zone_label(zone, i18n)),
+        Some((name, _)) => format!("{} · {name}", i18n.text(k::TERMINAL_DROP_INVALID)),
+        None => i18n.text(k::TERMINAL_MOVE_PANE_PICK_TARGET).to_owned(),
     }
 }
 
@@ -509,6 +538,7 @@ impl OcHerdrView {
     pub(super) fn chrome_a11y(&self) -> ChromeA11y {
         let profile = self.current_profile();
         let profile_label = profile_display_label(&profile, self.i18n);
+        let hidden_tab_ids = self.hidden_tab_ids();
         chrome_a11y(ChromeA11yInput {
             sessions: &self.sessions,
             session_index: self.session_index,
@@ -521,6 +551,7 @@ impl OcHerdrView {
             operation: self.operation.as_deref(),
             event_stream: &self.event_stream,
             profile_label: &profile_label,
+            hidden_tab_ids: &hidden_tab_ids,
         })
     }
 }
@@ -529,6 +560,9 @@ impl OcHerdrView {
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::LazyLock;
+
+    static HIDDEN_NONE: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
 
     use ocherdr_core::{AgentStatus, PaneInfo, TabInfo, WorkspaceInfo};
 
@@ -673,7 +707,55 @@ mod tests {
             operation: None,
             event_stream,
             profile_label: "This Mac",
+            hidden_tab_ids: &HIDDEN_NONE,
         }
+    }
+
+    #[test]
+    fn hidden_temporary_tabs_are_left_out_of_the_tab_list() {
+        let mut snapshot = sample_snapshot();
+        snapshot.tabs.push(tab("t-tmp", "w1", 7, "tmp", false));
+        let sessions = sample_sessions();
+        let selection = sample_selection();
+        let event_stream = live_event_stream();
+        let hidden: HashSet<String> = ["t-tmp".to_owned()].into_iter().collect();
+        let mut input = sample_input(&sessions, &snapshot, &selection, &event_stream);
+        input.hidden_tab_ids = &hidden;
+        let chrome = chrome_a11y(input);
+        let ids: Vec<&str> = chrome
+            .tabs
+            .items
+            .iter()
+            .map(|row| row.a11y.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["t1", "t2"]);
+    }
+
+    #[test]
+    fn drop_zone_labels_name_the_side_and_keyboard_mode_reads_the_intent() {
+        let i18n = I18n::new(Language::English);
+        assert_eq!(
+            pane_drag_state_text(Some(DropZone::Left), true, i18n),
+            "Move left"
+        );
+        assert_eq!(
+            pane_drag_state_text(Some(DropZone::Down), true, i18n),
+            "Move below"
+        );
+        assert_eq!(
+            pane_drag_state_text(Some(DropZone::Left), false, i18n),
+            "Not a drop target"
+        );
+        assert_eq!(
+            keyboard_move_state_text(Some(("codex", DropZone::Right)), true, i18n),
+            "Move right · codex"
+        );
+        assert!(keyboard_move_state_text(None, false, i18n).contains("arrow keys"));
+        let chinese = I18n::new(Language::SimplifiedChinese);
+        assert_eq!(
+            pane_drag_state_text(Some(DropZone::Up), true, chinese),
+            "移至上方"
+        );
     }
 
     #[test]
@@ -914,6 +996,7 @@ mod tests {
             operation: None,
             event_stream: &EventStreamState::Idle,
             profile_label: "This Mac",
+            hidden_tab_ids: &HIDDEN_NONE,
         });
         assert_eq!(chrome.sidebar.role, Role::Toolbar);
         assert_eq!(chrome.sidebar.name, "Spaces");

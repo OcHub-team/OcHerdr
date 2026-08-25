@@ -21,8 +21,8 @@ pub use event::{
 };
 pub use relocation::{
     DROP_ZONE_CENTER_FRACTION, DropEdge, DropZone, LayoutNode, LayoutTree, PredictedLayout,
-    PredictedPane, PredictedSplit, ZoneRect, drop_zone, layout_fingerprint, predict_relocation,
-    predict_swap, rebuild_tree, valid_split_ratio,
+    PredictedPane, PredictedSplit, RelocationSteps, ZoneRect, drop_zone, layout_fingerprint,
+    predict_relocation, predict_relocation_steps, predict_swap, rebuild_tree, valid_split_ratio,
 };
 
 pub const MINIMUM_HERDR_VERSION: &str = "0.8.1";

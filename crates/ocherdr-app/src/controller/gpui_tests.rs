@@ -57,9 +57,27 @@ struct FakeHerdr {
     events: Option<Sender<QueuedEvent>>,
     /// Every request the live-events server answered, in arrival order.
     requests: Arc<Mutex<Vec<Value>>>,
+    /// How the fake answers `pane.move` (scripted failures).
+    script: Arc<PaneMoveScript>,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
     _dir: tempfile::TempDir,
+}
+
+/// Scripted `pane.move` behaviour: how many of the next `new_tab` (step 1)
+/// and `tab` (step 2) requests the fake rejects.
+#[derive(Default)]
+struct PaneMoveScript {
+    park_failures: AtomicUsize,
+    insert_failures: AtomicUsize,
+}
+
+impl PaneMoveScript {
+    fn take_failure(counter: &AtomicUsize) -> bool {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
 }
 
 struct QueuedEvent {
@@ -126,14 +144,34 @@ impl FakeHerdr {
     }
 
     fn snapshot_with_live_events(snapshot: HierarchySnapshot) -> Self {
+        Self::snapshot_with_live_events_and_script(snapshot, PaneMoveScript::default())
+    }
+
+    fn snapshot_with_live_events_and_script(
+        snapshot: HierarchySnapshot,
+        script: PaneMoveScript,
+    ) -> Self {
         let (events, receiver) = mpsc::channel();
         let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let log = requests.clone();
+        let script = Arc::new(script);
+        let server_script = script.clone();
         let mut fake = Self::start(Some(events), move |listener, stop| {
-            serve_snapshot_with_live_events(listener, stop, snapshot, receiver, log);
+            serve_snapshot_with_live_events(listener, stop, snapshot, receiver, log, server_script);
         });
         fake.requests = requests;
+        fake.script = script;
         fake
+    }
+
+    /// Methods of every request in arrival order.
+    fn request_methods(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("fake herdr request log")
+            .iter()
+            .filter_map(|request| request.get("method")?.as_str().map(str::to_owned))
+            .collect()
     }
 
     fn requests_for(&self, method: &str) -> Vec<Value> {
@@ -184,6 +222,7 @@ impl FakeHerdr {
             herdr_path,
             events,
             requests: Arc::new(Mutex::new(Vec::new())),
+            script: Arc::new(PaneMoveScript::default()),
             stop,
             server: Some(server),
             _dir: dir,
@@ -436,6 +475,7 @@ fn serve_snapshot_with_live_events(
     snapshot: HierarchySnapshot,
     events: Receiver<QueuedEvent>,
     requests: Arc<Mutex<Vec<Value>>>,
+    script: Arc<PaneMoveScript>,
 ) {
     let mut events = Some(events);
     while !stop.load(Ordering::Relaxed) {
@@ -525,6 +565,77 @@ fn serve_snapshot_with_live_events(
                                 "error": {
                                     "code": "invalid_request",
                                     "message": "invalid request: unknown variant `pane.move`, expected one of `pane.list`, `pane.get`",
+                                },
+                            }),
+                        )
+                    }
+                    // Step 1 of an edge relocation: park in a new tab. Mirrors
+                    // Herdr's `PaneMoveResult` shape (`created_tab`, `pane`).
+                    Some("pane.move")
+                        if request["params"]["destination"]["type"] == json!("new_tab") =>
+                    {
+                        if PaneMoveScript::take_failure(&script.park_failures) {
+                            write_fake_response(
+                                stream,
+                                json!({
+                                    "id": id,
+                                    "error": { "code": "pane_move_failed", "message": "park refused" },
+                                }),
+                            );
+                            continue;
+                        }
+                        let pane_id = request["params"]["pane_id"].clone();
+                        write_fake_response(
+                            stream,
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "type": "pane_move",
+                                    "move_result": {
+                                        "changed": true,
+                                        "previous_pane_id": pane_id,
+                                        "previous_workspace_id": "w",
+                                        "previous_tab_id": "t-a",
+                                        "pane": parked_pane_json(pane_id.as_str().unwrap_or("")),
+                                        "target_layout": single_pane_layout("t-tmp", pane_id.as_str().unwrap_or("")),
+                                        "created_tab": temp_tab(),
+                                        "focused_pane_id": pane_id,
+                                    },
+                                },
+                            }),
+                        )
+                    }
+                    // Step 2: back into the original tab beside the target.
+                    Some("pane.move")
+                        if request["params"]["destination"]["type"] == json!("tab") =>
+                    {
+                        if PaneMoveScript::take_failure(&script.insert_failures) {
+                            write_fake_response(
+                                stream,
+                                json!({
+                                    "id": id,
+                                    "error": { "code": "pane_move_failed", "message": "target pane could not be split" },
+                                }),
+                            );
+                            continue;
+                        }
+                        let pane_id = request["params"]["pane_id"].clone();
+                        write_fake_response(
+                            stream,
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "type": "pane_move",
+                                    "move_result": {
+                                        "changed": true,
+                                        "previous_pane_id": pane_id,
+                                        "previous_workspace_id": "w",
+                                        "previous_tab_id": "t-tmp",
+                                        "pane": { "pane_id": pane_id, "tab_id": "t-a" },
+                                        "target_layout": Value::Null,
+                                        "closed_tab_id": "t-tmp",
+                                        "focused_pane_id": pane_id,
+                                    },
                                 },
                             }),
                         )
@@ -1908,7 +2019,7 @@ fn an_invalid_drop_sends_nothing_and_returns_home(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn an_edge_drop_is_not_droppable_in_phase_two(cx: &mut TestAppContext) {
+fn an_edge_drop_is_not_droppable_with_the_flag_off(cx: &mut TestAppContext) {
     let (fake, view, cx) = connect_two_pane_view(cx);
     // Far right edge of the right pane: zone Right, computed but not droppable.
     let grab = (SURFACE.0 + 12., SURFACE.1 + 12.);
@@ -2107,4 +2218,645 @@ fn a_split_drag_squeezes_the_preview_and_sends_one_set_split_ratio(cx: &mut Test
     assert_eq!(requests.len(), 1, "one request on release: {requests:?}");
     let ratio = requests[0]["params"]["ratio"].as_f64().expect("ratio");
     assert!((ratio - 0.7).abs() < 1e-3, "{ratio}");
+}
+
+// ---- Edge relocation (design §4.2, §7, phase 3) ----
+
+fn temp_tab() -> TabInfo {
+    TabInfo {
+        tab_id: "t-tmp".into(),
+        workspace_id: "w".into(),
+        number: 9,
+        label: "tmp".into(),
+        focused: false,
+        pane_count: 1,
+        agent_status: AgentStatus::Idle,
+    }
+}
+
+fn parked_pane_json(pane_id: &str) -> Value {
+    let mut pane = split_pane(pane_id, false);
+    pane.tab_id = "t-tmp".into();
+    serde_json::to_value(pane).expect("pane json")
+}
+
+fn single_pane_layout(tab_id: &str, pane_id: &str) -> ocherdr_core::PaneLayout {
+    ocherdr_core::PaneLayout {
+        workspace_id: "w".into(),
+        tab_id: tab_id.into(),
+        zoomed: false,
+        area: layout_rect(0, 0, 120, 40),
+        focused_pane_id: pane_id.into(),
+        panes: vec![ocherdr_core::LayoutPane {
+            pane_id: pane_id.into(),
+            focused: true,
+            rect: layout_rect(0, 0, 120, 40),
+        }],
+        splits: Vec::new(),
+    }
+}
+
+fn layout_event(layout: ocherdr_core::PaneLayout) -> Value {
+    json!({
+        "event": "layout_updated",
+        "data": { "type": "layout_updated", "layout": layout }
+    })
+}
+
+/// What Herdr broadcasts for step 1 (`p-left` parked in `t-tmp`):
+/// `tab.created → pane.moved → layout.updated(t-a) → layout.updated(t-tmp)`.
+fn park_events() -> Vec<Value> {
+    vec![
+        json!({ "event": "tab_created", "data": { "type": "tab_created", "tab": temp_tab() } }),
+        json!({
+            "event": "pane_moved",
+            "data": {
+                "type": "pane_moved",
+                "pane": parked_pane_json("p-left"),
+                "previous_pane_id": "p-left",
+                "previous_workspace_id": "w",
+                "previous_tab_id": "t-a",
+                "created_tab": temp_tab(),
+            }
+        }),
+        layout_event(single_pane_layout("t-a", "p-right")),
+        layout_event(single_pane_layout("t-tmp", "p-left")),
+    ]
+}
+
+/// What Herdr broadcasts for step 2 (`p-left` back beside `p-right` as the
+/// second child): `tab.closed → pane.moved → layout.updated(t-a)`.
+fn insert_events() -> Vec<Value> {
+    let mut back = split_pane("p-left", true);
+    back.tab_id = "t-a".into();
+    vec![
+        json!({
+            "event": "tab_closed",
+            "data": { "type": "tab_closed", "tab_id": "t-tmp", "workspace_id": "w" }
+        }),
+        json!({
+            "event": "pane_moved",
+            "data": {
+                "type": "pane_moved",
+                "pane": back,
+                "previous_pane_id": "p-left",
+                "previous_workspace_id": "w",
+                "previous_tab_id": "t-tmp",
+                "closed_tab_id": "t-tmp",
+            }
+        }),
+        layout_event(two_pane_layout("p-right", "p-left")),
+    ]
+}
+
+fn send_events(fake: &FakeHerdr, events: Vec<Value>, cx: &mut VisualTestContext) {
+    for event in events {
+        fake.send_event(event);
+    }
+    thread::sleep(Duration::from_millis(30));
+    cx.run_until_parked();
+}
+
+fn connect_edge_view(
+    cx: &mut TestAppContext,
+    script: PaneMoveScript,
+) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
+    let fake = FakeHerdr::snapshot_with_live_events_and_script(two_pane_snapshot(), script);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, _| {
+        this.headless_terminals = true;
+        this.pane_edge_relocation = true;
+    });
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update(cx, |this, _| {
+        this.terminal_surface_bounds = Some(SURFACE);
+        assert!(this.edge_drops_enabled(), "flag + capability");
+    });
+    (fake, view, cx)
+}
+
+/// Right edge of `p-right`.
+const RIGHT_EDGE: (f32, f32) = (SURFACE.0 + SURFACE.2 - 6., SURFACE.1 + 200.);
+/// Left edge of `p-right`.
+const LEFT_EDGE: (f32, f32) = (SURFACE.0 + 300. + 6., SURFACE.1 + 200.);
+
+fn assert_park_request(request: &Value) {
+    assert_eq!(request["method"], json!("pane.move"));
+    assert_eq!(request["params"]["pane_id"], json!("p-left"));
+    assert_eq!(
+        request["params"]["destination"],
+        json!({ "type": "new_tab", "workspace_id": "w" })
+    );
+    assert_eq!(request["params"]["focus"], json!(false));
+}
+
+fn assert_insert_request(request: &Value) {
+    assert_eq!(request["method"], json!("pane.move"));
+    assert_eq!(
+        request["params"]["pane_id"],
+        json!("p-left"),
+        "pane id comes from the step-1 response"
+    );
+    assert_eq!(request["params"]["destination"]["type"], json!("tab"));
+    assert_eq!(request["params"]["destination"]["tab_id"], json!("t-a"));
+    assert_eq!(
+        request["params"]["destination"]["target_pane_id"],
+        json!("p-right")
+    );
+    assert_eq!(request["params"]["destination"]["split"], json!("right"));
+    let ratio = request["params"]["destination"]["ratio"]
+        .as_f64()
+        .expect("ratio");
+    assert!((ratio - 0.5).abs() < 1e-6, "{ratio}");
+    assert_eq!(request["params"]["focus"], json!(true));
+}
+
+#[gpui::test]
+fn a_right_drop_issues_two_pane_moves_back_to_back_and_settles_without_a_resync(
+    cx: &mut TestAppContext,
+) {
+    let (fake, view, cx) = connect_edge_view(cx, PaneMoveScript::default());
+    let snapshots_before = fake.requests_for("session.snapshot").len();
+    drag_left_pane_to(&view, RIGHT_EDGE, cx);
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a").expect("plan pending");
+        assert_eq!(pending.phase, crate::RelocationPhase::Parking);
+        assert!(matches!(
+            pending.plan.intent,
+            crate::RelocationIntent::Insert {
+                edge: ocherdr_core::DropEdge::Right,
+                ..
+            }
+        ));
+        assert!(this.tab_relocation_locked("t-a"));
+        let predicted = this
+            .displayed_pane_fractions(
+                this.snapshot.as_ref().and_then(|s| s.layout_for("t-a")),
+                "p-left",
+                Instant::now(),
+                false,
+            )
+            .expect("predicted rect");
+        assert!(
+            (predicted.0 - 0.5).abs() < 1e-6,
+            "the source is drawn on the right at once: {predicted:?}"
+        );
+    });
+    cx.run_until_parked();
+
+    // Both requests went out before any event was injected, in order, the
+    // second built from the first response.
+    let methods = fake.request_methods();
+    let moves: Vec<usize> = methods
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| *m == "pane.move")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(moves.len(), 2, "{methods:?}");
+    assert_eq!(moves[1], moves[0] + 1, "back to back: {methods:?}");
+    let requests = fake.requests_for("pane.move");
+    assert_park_request(&requests[0]);
+    assert_insert_request(&requests[1]);
+    assert!(
+        fake.requests_for("pane.swap").is_empty(),
+        "right needs no swap"
+    );
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a").expect("still pending");
+        assert_eq!(
+            pending.phase,
+            crate::RelocationPhase::Inserting {
+                temp_tab_id: "t-tmp".into(),
+                moved_pane_id: "p-left".into(),
+                responded: true,
+                layout_seen: false,
+            }
+        );
+        assert!(this.hidden_tab_ids().contains("t-tmp"));
+    });
+
+    // Step 1 events: the temp tab is real in the snapshot but hidden.
+    send_events(&fake, park_events(), cx);
+    view.read_with(cx, |this, _| {
+        let snapshot = this.snapshot.as_ref().expect("snapshot");
+        assert!(snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp"));
+        assert_eq!(
+            snapshot.pane("p-left").map(|p| p.tab_id.as_str()),
+            Some("t-tmp")
+        );
+        let tabs: Vec<String> = this
+            .chrome_a11y()
+            .tabs
+            .items
+            .iter()
+            .map(|row| row.a11y.id.clone())
+            .collect();
+        assert!(!tabs.contains(&"t-tmp".to_owned()), "hidden: {tabs:?}");
+        let rendered: Vec<String> = this
+            .rendered_panes_for_tab(snapshot, "t-a")
+            .into_iter()
+            .map(|pane| pane.pane_id)
+            .collect();
+        assert_eq!(rendered, vec!["p-right", "p-left"], "plan pane set");
+        assert!(this.tab_relocation_locked("t-a"));
+        assert!(this.pane_resize_frozen("p-left"), "frozen while parked");
+        assert_eq!(
+            this.selection.pane_id.as_deref(),
+            Some("p-left"),
+            "selection pinned to the moved pane"
+        );
+        let pending = this.pane_relocations.get("t-a").expect("still pending");
+        assert!(matches!(
+            pending.phase,
+            crate::RelocationPhase::Inserting {
+                layout_seen: false,
+                ..
+            }
+        ));
+    });
+
+    // Step 2 events: the final layout settles the plan.
+    send_events(&fake, insert_events(), cx);
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a");
+        assert!(
+            pending.is_none()
+                || matches!(
+                    pending.map(|p| &p.phase),
+                    Some(crate::RelocationPhase::Settling { .. })
+                ),
+            "response + matching layout → Settling: {:?}",
+            pending.map(|p| &p.phase)
+        );
+        assert!(
+            !this
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .tabs
+                .iter()
+                .any(|tab| tab.tab_id == "t-tmp")
+        );
+    });
+    thread::sleep(Duration::from_millis(220));
+    view.update(cx, |this, _| {
+        this.expire_pane_motion(Instant::now(), false);
+        assert!(!this.tab_relocation_locked("t-a"));
+        let layout = this
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.layout_for("t-a"))
+            .expect("layout");
+        assert_eq!(layout.panes[0].pane_id, "p-right");
+        assert_eq!(layout.panes[1].pane_id, "p-left");
+        assert_eq!(this.selection.pane_id.as_deref(), Some("p-left"));
+    });
+    assert_eq!(
+        fake.requests_for("session.snapshot").len(),
+        snapshots_before,
+        "the incremental pane.moved apply never resyncs"
+    );
+    assert_eq!(fake.requests_for("pane.move").len(), 2);
+}
+
+#[gpui::test]
+fn a_left_drop_adds_a_pane_swap_after_the_second_move(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_edge_view(cx, PaneMoveScript::default());
+    drag_left_pane_to(&view, LEFT_EDGE, cx);
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a").expect("plan pending");
+        assert!(matches!(
+            pending.plan.intent,
+            crate::RelocationIntent::Insert {
+                edge: ocherdr_core::DropEdge::Left,
+                ..
+            }
+        ));
+        let predicted = this
+            .displayed_pane_fractions(
+                this.snapshot.as_ref().and_then(|s| s.layout_for("t-a")),
+                "p-left",
+                Instant::now(),
+                false,
+            )
+            .expect("predicted rect");
+        assert!(
+            predicted.0.abs() < 1e-6 && (predicted.2 - 0.5).abs() < 1e-6,
+            "left of the target: {predicted:?}"
+        );
+    });
+    cx.run_until_parked();
+    let methods = fake.request_methods();
+    let tail: Vec<&str> = methods
+        .iter()
+        .filter(|m| m.starts_with("pane."))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        tail,
+        vec!["pane.move", "pane.move", "pane.swap"],
+        "strictly serial, no event in between: {methods:?}"
+    );
+    let moves = fake.requests_for("pane.move");
+    assert_park_request(&moves[0]);
+    assert_insert_request(&moves[1]);
+    let swaps = fake.requests_for("pane.swap");
+    assert_eq!(swaps[0]["params"]["source_pane_id"], json!("p-left"));
+    assert_eq!(swaps[0]["params"]["target_pane_id"], json!("p-right"));
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a").expect("still pending");
+        assert_eq!(
+            pending.phase,
+            crate::RelocationPhase::CorrectingOrder {
+                responded: true,
+                layout_seen: false,
+            }
+        );
+    });
+    send_events(&fake, park_events(), cx);
+    send_events(&fake, insert_events(), cx);
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a").expect("still pending");
+        assert_eq!(
+            pending.phase,
+            crate::RelocationPhase::CorrectingOrder {
+                responded: true,
+                layout_seen: false,
+            },
+            "the step-2 layout (source second) is not the landing"
+        );
+    });
+    // The swap's layout: source first.
+    send_events(
+        &fake,
+        vec![layout_event(two_pane_layout("p-left", "p-right"))],
+        cx,
+    );
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a");
+        assert!(
+            pending.is_none()
+                || matches!(
+                    pending.map(|p| &p.phase),
+                    Some(crate::RelocationPhase::Settling { .. })
+                ),
+            "{:?}",
+            pending.map(|p| &p.phase)
+        );
+    });
+    assert_eq!(fake.requests_for("pane.move").len(), 2);
+    assert_eq!(fake.requests_for("pane.swap").len(), 1);
+}
+
+#[gpui::test]
+fn a_failed_second_move_parks_the_pane_and_retry_reissues_it(cx: &mut TestAppContext) {
+    let script = PaneMoveScript {
+        insert_failures: AtomicUsize::new(1),
+        ..PaneMoveScript::default()
+    };
+    let (fake, view, cx) = connect_edge_view(cx, script);
+    drag_left_pane_to(&view, RIGHT_EDGE, cx);
+    cx.run_until_parked();
+    assert_eq!(fake.requests_for("pane.move").len(), 2);
+    send_events(&fake, park_events(), cx);
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a").expect("parked plan");
+        assert_eq!(
+            pending.phase,
+            crate::RelocationPhase::Parked {
+                temp_tab_id: "t-tmp".into(),
+                moved_pane_id: "p-left".into(),
+            }
+        );
+        assert!(this.parked_relocation("t-a").is_some(), "inline notice");
+        assert!(!this.tab_relocation_locked("t-a"), "no prediction, no lock");
+        assert!(
+            this.hidden_tab_ids().is_empty(),
+            "the temp tab is shown while parked"
+        );
+        assert!(
+            this.displayed_pane_fractions(
+                this.snapshot.as_ref().and_then(|s| s.layout_for("t-a")),
+                "p-right",
+                Instant::now(),
+                false,
+            )
+            .is_some_and(|rect| (rect.2 - 1.).abs() < 1e-6),
+            "authoritative single-pane layout on screen"
+        );
+    });
+    view.update(cx, |this, cx| this.retry_parked_relocation("t-a", cx));
+    cx.run_until_parked();
+    let moves = fake.requests_for("pane.move");
+    assert_eq!(moves.len(), 3, "retry re-issues step 2 only");
+    assert_insert_request(&moves[2]);
+    assert!(fake.requests_for("pane.swap").is_empty());
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a").expect("inserting again");
+        assert!(matches!(
+            pending.phase,
+            crate::RelocationPhase::Inserting {
+                responded: true,
+                ..
+            }
+        ));
+        assert!(this.tab_relocation_locked("t-a"));
+    });
+}
+
+#[gpui::test]
+fn a_failed_first_move_reverts_without_touching_the_selection(cx: &mut TestAppContext) {
+    let script = PaneMoveScript {
+        park_failures: AtomicUsize::new(1),
+        ..PaneMoveScript::default()
+    };
+    let (fake, view, cx) = connect_edge_view(cx, script);
+    drag_left_pane_to(&view, RIGHT_EDGE, cx);
+    view.read_with(cx, |this, _| assert!(this.tab_relocation_locked("t-a")));
+    cx.run_until_parked();
+    assert_eq!(fake.requests_for("pane.move").len(), 1);
+    view.read_with(cx, |this, _| {
+        assert!(this.pane_relocations.is_empty(), "reverted");
+        assert_eq!(this.selection.pane_id.as_deref(), Some("p-left"));
+    });
+}
+
+#[gpui::test]
+fn a_foreign_layout_during_an_insert_reverts_to_authority(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_edge_view(cx, PaneMoveScript::default());
+    drag_left_pane_to(&view, RIGHT_EDGE, cx);
+    cx.run_until_parked();
+    assert_eq!(fake.requests_for("pane.move").len(), 2);
+    // Someone split the tab before our move landed.
+    let mut layout = two_pane_layout("p-left", "p-right");
+    layout.panes.push(ocherdr_core::LayoutPane {
+        pane_id: "p-new".into(),
+        focused: false,
+        rect: layout_rect(60, 20, 60, 20),
+    });
+    layout.panes[1].rect = layout_rect(60, 0, 60, 20);
+    layout.splits.push(ocherdr_core::LayoutSplit {
+        id: "split_1_1".into(),
+        direction: ocherdr_core::SplitDirection::Down,
+        ratio: 0.5,
+        rect: layout_rect(60, 0, 60, 40),
+    });
+    send_events(&fake, vec![layout_event(layout)], cx);
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.pane_relocations.is_empty(),
+            "fingerprint mismatch aborts"
+        );
+        assert!(!this.tab_relocation_locked("t-a"));
+    });
+}
+
+#[gpui::test]
+fn edge_zones_need_both_the_flag_and_the_capability(cx: &mut TestAppContext) {
+    // Flag off (default) on a capable Herdr.
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.pane_move_supported());
+        assert!(!this.edge_drops_enabled());
+    });
+    drag_left_pane_to(&view, RIGHT_EDGE, cx);
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| assert!(this.pane_relocations.is_empty()));
+    assert!(fake.requests_for("pane.move").is_empty());
+    drop(fake);
+
+    // Flag on, Herdr too old for `pane.move`.
+    let mut snapshot = two_pane_snapshot();
+    snapshot.version = "0.6.0".into();
+    snapshot.protocol = 13;
+    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, _| {
+        this.headless_terminals = true;
+        this.pane_edge_relocation = true;
+    });
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update(cx, |this, _| this.terminal_surface_bounds = Some(SURFACE));
+    view.read_with(cx, |this, _| {
+        assert!(!this.pane_move_supported());
+        assert!(!this.edge_drops_enabled());
+    });
+    drag_left_pane_to(&view, RIGHT_EDGE, cx);
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(this.pane_relocations.is_empty());
+        assert!(this.pane_drag_return.is_some(), "the preview returned home");
+    });
+    assert!(fake.requests_for("pane.move").is_empty());
+}
+
+fn key(name: &str, control: bool) -> gpui::KeyDownEvent {
+    gpui::KeyDownEvent {
+        keystroke: gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            key: name.into(),
+            key_char: None,
+        },
+        is_held: false,
+        prefer_character_input: false,
+    }
+}
+
+#[gpui::test]
+fn keyboard_move_mode_commits_through_the_same_plan_machinery(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_edge_view(cx, PaneMoveScript::default());
+    view.update_in(cx, |this, window, cx| {
+        assert!(this.handle_app_shortcut(&key("b", true), window, cx));
+        assert!(this.prefix_pending);
+        assert!(this.handle_app_shortcut(&key("m", false), window, cx));
+        let mode = this.pane_keyboard_move.as_ref().expect("move mode");
+        assert_eq!(mode.pane_id, "p-left");
+        assert!(mode.target.is_none());
+        // Right arrow picks the neighbour, centre zone.
+        assert!(this.handle_app_shortcut(&key("right", false), window, cx));
+        let mode = this.pane_keyboard_move.as_ref().expect("move mode");
+        let target = mode.target.as_ref().expect("target");
+        assert_eq!(target.target_pane_id, "p-right");
+        assert_eq!(target.zone, ocherdr_core::DropZone::Center);
+        // Tab cycles to the left edge (flag + capability are on).
+        assert!(this.handle_app_shortcut(&key("tab", false), window, cx));
+        let zone = this
+            .pane_keyboard_move
+            .as_ref()
+            .unwrap()
+            .target
+            .as_ref()
+            .unwrap()
+            .zone;
+        assert_eq!(zone, ocherdr_core::DropZone::Left);
+        // Esc cancels without a request.
+        assert!(this.handle_app_shortcut(&key("escape", false), window, cx));
+        assert!(this.pane_keyboard_move.is_none());
+        assert!(this.pane_relocations.is_empty());
+        // Again, and confirm a left insert.
+        assert!(this.handle_app_shortcut(&key("b", true), window, cx));
+        assert!(this.handle_app_shortcut(&key("m", false), window, cx));
+        assert!(this.handle_app_shortcut(&key("right", false), window, cx));
+        assert!(this.handle_app_shortcut(&key("tab", false), window, cx));
+        assert!(this.handle_app_shortcut(&key("enter", false), window, cx));
+        assert!(this.pane_keyboard_move.is_none());
+        let pending = this
+            .pane_relocations
+            .get("t-a")
+            .expect("plan from the keyboard");
+        assert!(matches!(
+            pending.plan.intent,
+            crate::RelocationIntent::Insert {
+                edge: ocherdr_core::DropEdge::Left,
+                ..
+            }
+        ));
+    });
+    cx.run_until_parked();
+    assert_eq!(fake.requests_for("pane.move").len(), 2);
+    assert_eq!(fake.requests_for("pane.swap").len(), 1);
+}
+
+#[gpui::test]
+fn a_disconnect_while_parked_restores_the_notice_from_the_reconnect_snapshot(
+    cx: &mut TestAppContext,
+) {
+    let script = PaneMoveScript {
+        insert_failures: AtomicUsize::new(1),
+        ..PaneMoveScript::default()
+    };
+    let (fake, view, cx) = connect_edge_view(cx, script);
+    drag_left_pane_to(&view, RIGHT_EDGE, cx);
+    cx.run_until_parked();
+    send_events(&fake, park_events(), cx);
+    view.update(cx, |this, cx| {
+        assert!(this.parked_relocation("t-a").is_some());
+        // The connection drops: local state is abandoned, the parked pane
+        // is remembered.
+        this.abort_pane_relocations_for_disconnect();
+        assert!(this.pane_relocations.is_empty());
+        assert!(this.parked_recovery.is_some());
+        // Reconnect snapshot still shows the pane in the temporary tab.
+        this.restore_parked_recovery(cx);
+        let pending = this.parked_relocation("t-a").expect("parked notice back");
+        assert_eq!(
+            pending.phase,
+            crate::RelocationPhase::Parked {
+                temp_tab_id: "t-tmp".into(),
+                moved_pane_id: "p-left".into(),
+            }
+        );
+        assert!(this.parked_recovery.is_none());
+        // A snapshot where the pane already left the temp tab offers nothing.
+        this.abort_pane_relocations_for_disconnect();
+        this.snapshot = Some(two_pane_snapshot());
+        this.restore_parked_recovery(cx);
+        assert!(this.pane_relocations.is_empty());
+    });
 }

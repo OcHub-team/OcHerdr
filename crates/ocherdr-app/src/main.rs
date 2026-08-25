@@ -6,11 +6,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
-    AgentInfo, AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, DropZone,
-    HerdrEvent, HierarchySnapshot, LayoutNode, LayoutRect, LayoutSplit, PaneInfo, PaneLayout,
-    PredictedPane, ReorderHover, Selection, SessionSummary, SnapshotUpdate, SplitDirection,
-    WorktreeInfo, WorktreeSourceInfo, ZoneRect, drop_zone, layout_fingerprint, predict_swap,
-    rebuild_tree, reorder_insert_index, split_ratio_from_drag,
+    AgentInfo, AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, DropEdge,
+    DropZone, HerdrEvent, HierarchySnapshot, LayoutNode, LayoutRect, LayoutSplit, PaneInfo,
+    PaneLayout, PredictedLayout, PredictedPane, ReorderHover, Selection, SessionSummary,
+    SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, ZoneRect, drop_zone,
+    layout_fingerprint, predict_relocation_steps, predict_swap, rebuild_tree, reorder_insert_index,
+    split_ratio_from_drag,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -90,6 +91,9 @@ const PANE_DRAG_LIFT_ANIMATION: Duration = Duration::from_millis(120);
 const PANE_DROP_ZONE_ANIMATION: Duration = Duration::from_millis(100);
 const PANE_DRAG_RETURN_ANIMATION: Duration = Duration::from_millis(120);
 const PANE_SETTLE_ANIMATION: Duration = Duration::from_millis(160);
+/// Share of the target pane it keeps on an edge drop (design §5.3: 0.5 in
+/// the first version; presets come later).
+const PANE_EDGE_DROP_RATIO: f32 = 0.5;
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -694,6 +698,16 @@ struct OcHerdrView {
     /// Operation ids for `RelocationPlan`, so a late response cannot settle a
     /// plan that was replaced.
     pane_relocation_serial: u64,
+    /// `pane-edge-relocation` config key: the experimental four-edge drop
+    /// (design §13 step 3). Combined with `pane_move_supported()` at press.
+    pane_edge_relocation: bool,
+    /// Keyboard "move pane" mode (design §11): the selected pane is lifted
+    /// and arrows pick the drop target until Enter or Esc.
+    pane_keyboard_move: Option<KeyboardPaneMove>,
+    /// A pane that was parked in a temporary tab when the connection
+    /// dropped. Restored as a `Parked` plan if the reconnect snapshot still
+    /// shows the tab holding it (design §7.3).
+    parked_recovery: Option<ParkedRecovery>,
     /// Tests that only exercise layout and gestures must not spin up
     /// GhosttyKit: its runtime is single-instance and main-thread bound, so
     /// `Terminal::new` from parallel test threads segfaults and from a lone
@@ -863,11 +877,41 @@ struct PaneDrag {
     /// Source pane rect in window coordinates at press.
     source_rect: (f32, f32, f32, f32),
     hover: Option<PaneDropHover>,
-    /// Whether the four edge zones accept drops. Always `false` until phase 3
-    /// ships the `pane.move` orchestration; the zones are still computed so
-    /// the model (and its tests) already cover them.
+    /// Whether the four edge zones accept drops: the `pane-edge-relocation`
+    /// flag and the connection's `pane.move` capability, read at press.
     edge_drops: bool,
     pressed_at: Instant,
+}
+
+/// Keyboard equivalent of the pane drag (design §11). Entered with the
+/// prefix key `m`; arrows choose a neighbouring pane, Tab cycles the zone,
+/// Enter commits through the same plan machinery, Esc cancels.
+#[derive(Clone, Debug, PartialEq)]
+struct KeyboardPaneMove {
+    workspace_id: String,
+    tab_id: String,
+    pane_id: String,
+    fingerprint: u64,
+    /// Chosen target pane and zone; `None` until the first arrow.
+    target: Option<PaneDropHover>,
+    edge_drops: bool,
+}
+
+impl KeyboardPaneMove {
+    fn droppable(&self) -> bool {
+        self.target
+            .as_ref()
+            .is_some_and(|hover| hover.droppable(self.edge_drops))
+    }
+}
+
+/// What survives a disconnect of a relocation that had already parked its
+/// pane in a temporary tab.
+#[derive(Clone)]
+struct ParkedRecovery {
+    plan: RelocationPlan,
+    temp_tab_id: String,
+    moved_pane_id: String,
 }
 
 /// The pane and zone under the pointer during a pane drag.
@@ -888,6 +932,105 @@ impl PaneDropHover {
     }
 }
 
+/// A drop to commit, from the mouse gesture or the keyboard mode.
+#[derive(Clone, Debug, PartialEq)]
+struct PaneDropRequest {
+    workspace_id: String,
+    tab_id: String,
+    pane_id: String,
+    /// `layout_fingerprint` of the tab when the gesture started.
+    fingerprint: u64,
+    hover: PaneDropHover,
+    edge_drops: bool,
+}
+
+/// Neighbour of `source` in `direction` for the keyboard move mode: the
+/// pane sharing the longest edge on that side, else the nearest pane whose
+/// centre lies on that side. `None` when nothing is there.
+fn keyboard_neighbour(layout: &PaneLayout, source: &str, direction: DropEdge) -> Option<String> {
+    let source_rect = layout
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == source)?
+        .rect;
+    let centre = |rect: LayoutRect| {
+        (
+            f32::from(rect.x) + f32::from(rect.width) / 2.,
+            f32::from(rect.y) + f32::from(rect.height) / 2.,
+        )
+    };
+    let (sx, sy) = centre(source_rect);
+    let overlap = |a0: u16, a1: u16, b0: u16, b1: u16| -> i32 {
+        i32::from(a1.min(b1)) - i32::from(a0.max(b0))
+    };
+    let mut best: Option<(i32, f32, &str)> = None;
+    for pane in layout.panes.iter().filter(|pane| pane.pane_id != source) {
+        let r = pane.rect;
+        let (cx, cy) = centre(r);
+        let (on_side, shared) = match direction {
+            DropEdge::Left => (
+                cx < sx,
+                overlap(
+                    source_rect.y,
+                    source_rect.y + source_rect.height,
+                    r.y,
+                    r.y + r.height,
+                ),
+            ),
+            DropEdge::Right => (
+                cx > sx,
+                overlap(
+                    source_rect.y,
+                    source_rect.y + source_rect.height,
+                    r.y,
+                    r.y + r.height,
+                ),
+            ),
+            DropEdge::Up => (
+                cy < sy,
+                overlap(
+                    source_rect.x,
+                    source_rect.x + source_rect.width,
+                    r.x,
+                    r.x + r.width,
+                ),
+            ),
+            DropEdge::Down => (
+                cy > sy,
+                overlap(
+                    source_rect.x,
+                    source_rect.x + source_rect.width,
+                    r.x,
+                    r.x + r.width,
+                ),
+            ),
+        };
+        if !on_side {
+            continue;
+        }
+        let distance = ((cx - sx).powi(2) + (cy - sy).powi(2)).sqrt();
+        let candidate = (shared.max(0), -distance, pane.pane_id.as_str());
+        if best.is_none_or(|current| (candidate.0, candidate.1) > (current.0, current.1)) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, _, id)| id.to_owned())
+}
+
+/// Tab cycles the drop zone in the keyboard move mode.
+fn next_keyboard_zone(zone: DropZone, edge_drops: bool) -> DropZone {
+    if !edge_drops {
+        return DropZone::Center;
+    }
+    match zone {
+        DropZone::Center => DropZone::Left,
+        DropZone::Left => DropZone::Right,
+        DropZone::Right => DropZone::Up,
+        DropZone::Up => DropZone::Down,
+        DropZone::Down => DropZone::Center,
+    }
+}
+
 /// Where a released-but-not-dropped preview flies back from (design §10:
 /// "invalid drop / cancel → preview returns to the source rect, 120 ms").
 #[derive(Clone, Debug, PartialEq)]
@@ -898,9 +1041,56 @@ struct PaneDragReturn {
     started: Instant,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum RelocationIntent {
     Swap,
+    /// Design §4.2: park in a new tab, move back beside the target, and for
+    /// left/up swap the two leaves. `ratio` is the target's share.
+    Insert {
+        edge: DropEdge,
+        ratio: f32,
+    },
+}
+
+impl RelocationIntent {
+    /// Whether the orchestration needs the third `pane.swap` request.
+    fn corrects_order(self) -> bool {
+        matches!(self, Self::Insert { edge, .. } if edge.moved_pane_is_first())
+    }
+}
+
+/// The shapes the target tab passes through during an insert (design
+/// §7.3): each authoritative `layout.updated` is classified against these.
+#[derive(Clone, Debug, PartialEq)]
+struct InsertShapes {
+    /// After step 1: the source removed, its parent split collapsed.
+    removed: SplitLayoutFingerprint,
+    /// After step 2: the source as the target's second child.
+    inserted: SplitLayoutFingerprint,
+    /// After step 3 (or step 2 for right/down): the prediction.
+    final_shape: SplitLayoutFingerprint,
+}
+
+impl InsertShapes {
+    fn from_steps(steps: &ocherdr_core::RelocationSteps) -> Self {
+        Self {
+            removed: predicted_shape(&steps.removed),
+            inserted: predicted_shape(&steps.inserted),
+            final_shape: predicted_shape(&steps.final_layout),
+        }
+    }
+}
+
+/// Where an observed layout of the target tab sits in the transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutShape {
+    /// Still the release-time layout (the event has not arrived).
+    Release,
+    Removed,
+    Inserted,
+    Final,
+    /// None of the expected shapes: someone else changed the tab.
+    Foreign,
 }
 
 /// Immutable plan built at release (design §7.1). `predicted_rects` only
@@ -922,19 +1112,329 @@ struct RelocationPlan {
     area: LayoutRect,
     predicted_rects: Vec<PredictedPane>,
     visual_snapshot: Option<RenderedFrame>,
+    /// Workspace of the source tab: `pane.move`'s `new_tab` destination.
+    workspace_id: String,
+    /// Intermediate shapes of an insert; `None` for a swap.
+    insert_shapes: Option<InsertShapes>,
 }
 
+/// Design §7.2. Phases before `Settling` keep the tab locked and render the
+/// plan's predicted rects; `Parked` shows the authoritative snapshot plus the
+/// recovery notice.
 #[derive(Clone, Debug, PartialEq)]
 enum RelocationPhase {
     /// `pane.swap` sent. Needs both the response and a matching
     /// `layout.updated` before the correction runs.
     Swapping { responded: bool, layout_seen: bool },
+    /// Step 1 (`pane.move` to a new tab) in flight.
+    Parking,
+    /// Step 2 (`pane.move` back beside the target) in flight or answered.
+    /// `temp_tab_id` is hidden from the tab strip while this phase lasts.
+    Inserting {
+        temp_tab_id: String,
+        moved_pane_id: String,
+        responded: bool,
+        layout_seen: bool,
+    },
+    /// Step 3 (`pane.swap`, left/up) in flight or answered.
+    CorrectingOrder { responded: bool, layout_seen: bool },
+    /// Step 2 failed: the pane sits in `temp_tab_id`. No prediction, no
+    /// lock; the inline notice offers retry / go to tab.
+    Parked {
+        temp_tab_id: String,
+        moved_pane_id: String,
+    },
     /// Shells and borders move from the predicted rects to the authoritative
     /// ones (design §10: 120–180 ms, `ease_out_quint`).
     Settling {
         started: Instant,
         from: Vec<(String, (f32, f32, f32, f32))>,
     },
+}
+
+impl RelocationPhase {
+    /// Predicted rects are on screen and the tab is locked.
+    fn locks_tab(&self) -> bool {
+        !matches!(self, Self::Parked { .. })
+    }
+
+    /// The temporary tab this phase keeps out of the tab strip.
+    fn hidden_tab_id(&self) -> Option<&str> {
+        match self {
+            Self::Inserting { temp_tab_id, .. } => Some(temp_tab_id),
+            _ => None,
+        }
+    }
+
+    fn parked_tab_id(&self) -> Option<&str> {
+        match self {
+            Self::Parked { temp_tab_id, .. } => Some(temp_tab_id),
+            _ => None,
+        }
+    }
+}
+
+/// Pane the first `pane.move` response reports, read back for step 2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParkedPane {
+    temp_tab_id: String,
+    pane_id: String,
+}
+
+/// What reaches the insert state machine (design §7.2).
+#[derive(Clone, Debug, PartialEq)]
+enum RelocationSignal {
+    /// Step 1 answered.
+    Parked(Option<ParkedPane>),
+    /// Step 2 answered (`true` = accepted and changed).
+    Inserted(bool),
+    /// Step 3 answered.
+    Reordered(bool),
+    /// The target tab's authoritative layout changed.
+    Layout(LayoutShape),
+    /// User pressed "Retry" on the parked notice.
+    Retry,
+}
+
+/// Side effect the controller performs after a transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RelocationAction {
+    None,
+    /// Issue step 2 with the parked pane's ids.
+    SendInsert,
+    /// Issue step 3.
+    SendSwap,
+    /// Response and matching layout both in: run the settle correction.
+    Settle,
+    /// Drop the plan; the authoritative snapshot is what is on screen.
+    Revert,
+    /// Step 2 failed: show the parked notice, unhide the temp tab.
+    Park,
+    /// Step 3 failed: the layout is legal but mirrored. Unlock, one notice.
+    Misordered,
+}
+
+/// Pure transition of the insert phases. `corrects_order` is whether the
+/// plan needs step 3 (left/up). Returns the next phase (`None` = plan
+/// dropped) and the action to take.
+fn advance_insert_phase(
+    phase: RelocationPhase,
+    signal: RelocationSignal,
+    corrects_order: bool,
+) -> (Option<RelocationPhase>, RelocationAction) {
+    use RelocationAction as A;
+    use RelocationPhase as P;
+    use RelocationSignal as S;
+    match (phase, signal) {
+        (P::Parking, S::Parked(Some(parked))) => (
+            Some(P::Inserting {
+                temp_tab_id: parked.temp_tab_id,
+                moved_pane_id: parked.pane_id,
+                responded: false,
+                layout_seen: false,
+            }),
+            A::SendInsert,
+        ),
+        (P::Parking, S::Parked(None)) => (None, A::Revert),
+        // `Final` can equal the release shape (two-pane tab, left drop), so
+        // it is benign here too: step 1 has not even answered yet.
+        (
+            P::Parking,
+            S::Layout(LayoutShape::Release | LayoutShape::Removed | LayoutShape::Final),
+        ) => (Some(P::Parking), A::None),
+        (P::Parking, S::Layout(_)) => (None, A::Revert),
+        (
+            P::Inserting {
+                temp_tab_id,
+                moved_pane_id,
+                layout_seen,
+                ..
+            },
+            S::Inserted(true),
+        ) => {
+            if corrects_order {
+                (
+                    Some(P::CorrectingOrder {
+                        responded: false,
+                        layout_seen: false,
+                    }),
+                    A::SendSwap,
+                )
+            } else if layout_seen {
+                (
+                    Some(P::Inserting {
+                        temp_tab_id,
+                        moved_pane_id,
+                        responded: true,
+                        layout_seen: true,
+                    }),
+                    A::Settle,
+                )
+            } else {
+                (
+                    Some(P::Inserting {
+                        temp_tab_id,
+                        moved_pane_id,
+                        responded: true,
+                        layout_seen: false,
+                    }),
+                    A::None,
+                )
+            }
+        }
+        (
+            P::Inserting {
+                temp_tab_id,
+                moved_pane_id,
+                ..
+            },
+            S::Inserted(false),
+        ) => (
+            Some(P::Parked {
+                temp_tab_id,
+                moved_pane_id,
+            }),
+            A::Park,
+        ),
+        (
+            P::Inserting {
+                temp_tab_id,
+                moved_pane_id,
+                responded,
+                layout_seen,
+            },
+            S::Layout(shape),
+        ) => {
+            let landed = match shape {
+                LayoutShape::Inserted => true,
+                LayoutShape::Final => !corrects_order,
+                _ => false,
+            };
+            match shape {
+                LayoutShape::Release | LayoutShape::Removed => (
+                    Some(P::Inserting {
+                        temp_tab_id,
+                        moved_pane_id,
+                        responded,
+                        layout_seen,
+                    }),
+                    A::None,
+                ),
+                LayoutShape::Inserted | LayoutShape::Final if landed && corrects_order => (
+                    // Step 2 landed for a left/up plan: still waiting for the
+                    // response before the swap goes out.
+                    Some(P::Inserting {
+                        temp_tab_id,
+                        moved_pane_id,
+                        responded,
+                        layout_seen,
+                    }),
+                    A::None,
+                ),
+                LayoutShape::Inserted | LayoutShape::Final if landed => (
+                    Some(P::Inserting {
+                        temp_tab_id,
+                        moved_pane_id,
+                        responded,
+                        layout_seen: true,
+                    }),
+                    if responded { A::Settle } else { A::None },
+                ),
+                _ => (None, A::Revert),
+            }
+        }
+        (P::CorrectingOrder { layout_seen, .. }, S::Reordered(true)) => (
+            Some(P::CorrectingOrder {
+                responded: true,
+                layout_seen,
+            }),
+            if layout_seen { A::Settle } else { A::None },
+        ),
+        (P::CorrectingOrder { .. }, S::Reordered(false)) => (None, A::Misordered),
+        (P::CorrectingOrder { responded, .. }, S::Layout(LayoutShape::Final)) => (
+            Some(P::CorrectingOrder {
+                responded,
+                layout_seen: true,
+            }),
+            if responded { A::Settle } else { A::None },
+        ),
+        // Events ride a different socket than responses, so an earlier
+        // step's layout can land after a later step answered: every
+        // expected intermediate shape is benign here.
+        (
+            P::CorrectingOrder {
+                responded,
+                layout_seen,
+            },
+            S::Layout(LayoutShape::Release | LayoutShape::Removed | LayoutShape::Inserted),
+        ) => (
+            Some(P::CorrectingOrder {
+                responded,
+                layout_seen,
+            }),
+            A::None,
+        ),
+        (P::CorrectingOrder { .. }, S::Layout(LayoutShape::Foreign)) => (None, A::Revert),
+        (
+            P::Parked {
+                temp_tab_id,
+                moved_pane_id,
+            },
+            S::Retry,
+        ) => (
+            Some(P::Inserting {
+                temp_tab_id,
+                moved_pane_id,
+                responded: false,
+                layout_seen: false,
+            }),
+            A::SendInsert,
+        ),
+        // Parked shows the authoritative snapshot: layout changes are fine.
+        (phase @ P::Parked { .. }, S::Layout(_)) => (Some(phase), A::None),
+        // Stale or out-of-order signals never move the machine.
+        (phase, _) => (Some(phase), A::None),
+    }
+}
+
+/// Pane order and split shape of a predicted layout, for exact comparison
+/// with an authoritative `layout.updated`.
+fn predicted_shape(layout: &PredictedLayout) -> SplitLayoutFingerprint {
+    SplitLayoutFingerprint {
+        zoomed: false,
+        splits: layout
+            .splits
+            .iter()
+            .map(|split| (split.path.clone(), split.direction))
+            .collect(),
+        panes: layout
+            .panes
+            .iter()
+            .map(|pane| pane.pane_id.clone())
+            .collect(),
+    }
+}
+
+/// Classify the target tab's authoritative layout against an insert plan.
+fn classify_insert_layout(layout: &PaneLayout, plan: &RelocationPlan) -> LayoutShape {
+    let Some(shapes) = plan.insert_shapes.as_ref() else {
+        return LayoutShape::Foreign;
+    };
+    // Shapes first: in a two-pane tab the final layout of a left drop has
+    // the release-time shape, and a foreign change that happens to produce
+    // the expected shape is harmless.
+    let shape = controller::split_layout_fingerprint(layout);
+    if shape == shapes.final_shape {
+        LayoutShape::Final
+    } else if shape == shapes.inserted {
+        LayoutShape::Inserted
+    } else if shape == shapes.removed {
+        LayoutShape::Removed
+    } else if layout_fingerprint(layout) == plan.fingerprint {
+        LayoutShape::Release
+    } else {
+        LayoutShape::Foreign
+    }
 }
 
 #[derive(Clone)]
@@ -1191,12 +1691,21 @@ fn layout_still_matches_plan(layout: &PaneLayout, plan: &RelocationPlan) -> bool
 }
 
 impl RelocationPlan {
-    /// Phase 2 only ships same-tab swaps; a plan spanning tabs would need
-    /// the `pane.move` orchestration of phase 3.
+    /// Both intents are same-tab only: the drop model never offers a pane
+    /// of another tab as a target.
     fn is_supported(&self) -> bool {
-        match self.intent {
-            RelocationIntent::Swap => self.source_tab_id == self.target_tab_id,
-        }
+        self.source_tab_id == self.target_tab_id
+            && match self.intent {
+                RelocationIntent::Swap => true,
+                RelocationIntent::Insert { .. } => self.insert_shapes.is_some(),
+            }
+    }
+
+    /// Pane ids the prediction lays out, in tree order.
+    fn predicted_pane_ids(&self) -> impl Iterator<Item = &str> {
+        self.predicted_rects
+            .iter()
+            .map(|pane| pane.pane_id.as_str())
     }
 
     /// Frame to show for the source pane while the plan is pending, when the
@@ -1250,12 +1759,16 @@ impl PendingPaneRelocation {
         reduce_motion: bool,
     ) -> Option<(f32, f32, f32, f32)> {
         match &self.phase {
-            RelocationPhase::Swapping { .. } => self
+            RelocationPhase::Swapping { .. }
+            | RelocationPhase::Parking
+            | RelocationPhase::Inserting { .. }
+            | RelocationPhase::CorrectingOrder { .. } => self
                 .plan
                 .predicted_fractions()
                 .into_iter()
                 .find(|(id, _)| id == pane_id)
                 .map(|(_, rect)| rect),
+            RelocationPhase::Parked { .. } => None,
             RelocationPhase::Settling { started, from } => {
                 let from = from.iter().find(|(id, _)| id == pane_id).map(|(_, r)| *r)?;
                 let to = layout.and_then(|layout| {
@@ -1279,10 +1792,10 @@ impl PendingPaneRelocation {
 
     fn is_settled(&self, now: Instant, reduce_motion: bool) -> bool {
         match &self.phase {
-            RelocationPhase::Swapping { .. } => false,
             RelocationPhase::Settling { started, .. } => {
                 reduce_motion || now.saturating_duration_since(*started) >= PANE_SETTLE_ANIMATION
             }
+            _ => false,
         }
     }
 }
@@ -2145,6 +2658,8 @@ mod tests {
             area: layout.area,
             predicted_rects: predict_swap(layout, "a", "b").unwrap(),
             visual_snapshot: None,
+            workspace_id: "w".into(),
+            insert_shapes: None,
         }
     }
 
@@ -2774,5 +3289,344 @@ mod tests {
     fn a_filter_that_matches_nothing_returns_no_indices() {
         let (_, indexes) = indices_for(HostFilter::Tag("no-such-tag".into()));
         assert!(indexes.is_empty());
+    }
+
+    // ---- Insert transaction (design §7.2) ----
+
+    fn insert_plan(layout: &PaneLayout, edge: DropEdge) -> RelocationPlan {
+        let steps = predict_relocation_steps(layout, "a", "b", edge, 0.5).unwrap();
+        RelocationPlan {
+            operation_id: 2,
+            source_pane_id: "a".into(),
+            source_tab_id: "t".into(),
+            target_pane_id: "b".into(),
+            target_tab_id: "t".into(),
+            intent: RelocationIntent::Insert { edge, ratio: 0.5 },
+            fingerprint: layout_fingerprint(layout),
+            topology: controller::split_layout_fingerprint(layout),
+            area: layout.area,
+            predicted_rects: steps.final_layout.panes.clone(),
+            visual_snapshot: None,
+            workspace_id: "w".into(),
+            insert_shapes: Some(InsertShapes::from_steps(&steps)),
+        }
+    }
+
+    fn parked() -> ParkedPane {
+        ParkedPane {
+            temp_tab_id: "t-tmp".into(),
+            pane_id: "a".into(),
+        }
+    }
+
+    fn inserting(responded: bool, layout_seen: bool) -> RelocationPhase {
+        RelocationPhase::Inserting {
+            temp_tab_id: "t-tmp".into(),
+            moved_pane_id: "a".into(),
+            responded,
+            layout_seen,
+        }
+    }
+
+    #[test]
+    fn a_right_drop_walks_parking_inserting_settle() {
+        use RelocationAction as A;
+        use RelocationPhase as P;
+        use RelocationSignal as S;
+        let (phase, action) = advance_insert_phase(P::Parking, S::Parked(Some(parked())), false);
+        assert_eq!(phase, Some(inserting(false, false)));
+        assert_eq!(
+            action,
+            A::SendInsert,
+            "step 2 goes out inside the step-1 callback"
+        );
+        // The removed layout lands: benign.
+        let (phase, action) =
+            advance_insert_phase(phase.unwrap(), S::Layout(LayoutShape::Removed), false);
+        assert_eq!(phase, Some(inserting(false, false)));
+        assert_eq!(action, A::None);
+        // Response before the final layout.
+        let (phase, action) = advance_insert_phase(phase.unwrap(), S::Inserted(true), false);
+        assert_eq!(phase, Some(inserting(true, false)));
+        assert_eq!(action, A::None);
+        let (phase, action) =
+            advance_insert_phase(phase.unwrap(), S::Layout(LayoutShape::Final), false);
+        assert_eq!(phase, Some(inserting(true, true)));
+        assert_eq!(action, A::Settle);
+        // The other order: layout first, then the response settles.
+        let (phase, action) = advance_insert_phase(
+            inserting(false, false),
+            S::Layout(LayoutShape::Inserted),
+            false,
+        );
+        assert_eq!(phase, Some(inserting(false, true)));
+        assert_eq!(action, A::None);
+        let (_, action) = advance_insert_phase(phase.unwrap(), S::Inserted(true), false);
+        assert_eq!(action, A::Settle);
+    }
+
+    #[test]
+    fn a_left_drop_adds_the_order_correction_before_settling() {
+        use RelocationAction as A;
+        use RelocationPhase as P;
+        use RelocationSignal as S;
+        let (phase, action) =
+            advance_insert_phase(inserting(false, false), S::Inserted(true), true);
+        assert_eq!(
+            phase,
+            Some(P::CorrectingOrder {
+                responded: false,
+                layout_seen: false
+            })
+        );
+        assert_eq!(action, A::SendSwap);
+        // The step-2 layout (source second) is an intermediate, not a landing;
+        // so is a late step-1 layout arriving after the step-2 response.
+        let (phase, action) =
+            advance_insert_phase(phase.unwrap(), S::Layout(LayoutShape::Removed), true);
+        assert_eq!(action, A::None);
+        let (phase, action) =
+            advance_insert_phase(phase.unwrap(), S::Layout(LayoutShape::Inserted), true);
+        assert_eq!(action, A::None);
+        let (phase, action) = advance_insert_phase(phase.unwrap(), S::Reordered(true), true);
+        assert_eq!(
+            phase,
+            Some(P::CorrectingOrder {
+                responded: true,
+                layout_seen: false
+            })
+        );
+        assert_eq!(action, A::None);
+        let (_, action) = advance_insert_phase(phase.unwrap(), S::Layout(LayoutShape::Final), true);
+        assert_eq!(action, A::Settle);
+        // While still Inserting, the step-2 layout of a left drop is not a
+        // landing either.
+        let (phase, action) = advance_insert_phase(
+            inserting(false, false),
+            S::Layout(LayoutShape::Inserted),
+            true,
+        );
+        assert_eq!(phase, Some(inserting(false, false)));
+        assert_eq!(action, A::None);
+    }
+
+    #[test]
+    fn every_failure_branch_lands_where_the_design_says() {
+        use RelocationAction as A;
+        use RelocationPhase as P;
+        use RelocationSignal as S;
+        // Step 1 fails: revert, nothing else.
+        assert_eq!(
+            advance_insert_phase(P::Parking, S::Parked(None), false),
+            (None, A::Revert)
+        );
+        // Step 2 fails: Parked with the temp tab, then Retry re-issues step 2.
+        let (phase, action) =
+            advance_insert_phase(inserting(false, false), S::Inserted(false), true);
+        let parked_phase = P::Parked {
+            temp_tab_id: "t-tmp".into(),
+            moved_pane_id: "a".into(),
+        };
+        assert_eq!(phase, Some(parked_phase.clone()));
+        assert_eq!(action, A::Park);
+        let (phase, action) = advance_insert_phase(parked_phase.clone(), S::Retry, true);
+        assert_eq!(phase, Some(inserting(false, false)));
+        assert_eq!(action, A::SendInsert);
+        // Parked shows authority: layouts do not disturb it.
+        assert_eq!(
+            advance_insert_phase(parked_phase.clone(), S::Layout(LayoutShape::Foreign), true),
+            (Some(parked_phase), A::None)
+        );
+        // Step 3 fails: Misordered, plan dropped, layout kept.
+        assert_eq!(
+            advance_insert_phase(
+                P::CorrectingOrder {
+                    responded: false,
+                    layout_seen: false
+                },
+                S::Reordered(false),
+                true
+            ),
+            (None, A::Misordered)
+        );
+        // A foreign layout at any in-flight phase aborts to authority.
+        assert_eq!(
+            advance_insert_phase(P::Parking, S::Layout(LayoutShape::Foreign), false),
+            (None, A::Revert)
+        );
+        assert_eq!(
+            advance_insert_phase(
+                inserting(true, false),
+                S::Layout(LayoutShape::Foreign),
+                false
+            ),
+            (None, A::Revert)
+        );
+        assert_eq!(
+            advance_insert_phase(
+                P::CorrectingOrder {
+                    responded: true,
+                    layout_seen: false
+                },
+                S::Layout(LayoutShape::Foreign),
+                true
+            ),
+            (None, A::Revert)
+        );
+        // Out-of-order signals are ignored.
+        assert_eq!(
+            advance_insert_phase(P::Parking, S::Inserted(true), false),
+            (Some(P::Parking), A::None)
+        );
+        assert_eq!(
+            advance_insert_phase(P::Parking, S::Reordered(true), false),
+            (Some(P::Parking), A::None)
+        );
+    }
+
+    #[test]
+    fn insert_layouts_are_classified_against_the_predicted_shapes() {
+        let layout = two_pane_layout();
+        // `a` onto the right edge of `b`: final = [b | a].
+        let plan = insert_plan(&layout, DropEdge::Right);
+        assert_eq!(
+            classify_insert_layout(&layout, &plan),
+            LayoutShape::Release,
+            "unchanged layout"
+        );
+        let mut removed = layout.clone();
+        removed.panes.remove(0);
+        removed.panes[0].rect = layout.area;
+        removed.splits.clear();
+        assert_eq!(
+            classify_insert_layout(&removed, &plan),
+            LayoutShape::Removed
+        );
+        let mut final_layout = layout.clone();
+        final_layout.panes.swap(0, 1);
+        final_layout.panes[0].rect = LayoutRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        final_layout.panes[1].rect = LayoutRect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        assert_eq!(
+            classify_insert_layout(&final_layout, &plan),
+            LayoutShape::Final,
+            "right/down: inserted == final"
+        );
+        let mut foreign = layout.clone();
+        foreign.panes.push(ocherdr_core::LayoutPane {
+            pane_id: "c".into(),
+            focused: false,
+            rect: layout.area,
+        });
+        assert_eq!(
+            classify_insert_layout(&foreign, &plan),
+            LayoutShape::Foreign
+        );
+
+        // `a` onto the left edge of `b`: step 2 gives [b | a], the swap
+        // gives [a | b], which is the release shape again.
+        let plan = insert_plan(&layout, DropEdge::Left);
+        assert_eq!(
+            classify_insert_layout(&final_layout, &plan),
+            LayoutShape::Inserted
+        );
+        assert_eq!(classify_insert_layout(&layout, &plan), LayoutShape::Final);
+        assert!(plan.intent.corrects_order());
+        assert!(plan.is_supported());
+        let swap = swap_plan(&layout);
+        assert!(!swap.intent.corrects_order());
+    }
+
+    #[test]
+    fn a_pending_insert_renders_the_prediction_until_parked() {
+        let layout = two_pane_layout();
+        let plan = insert_plan(&layout, DropEdge::Right);
+        let now = Instant::now();
+        for phase in [
+            RelocationPhase::Parking,
+            inserting(false, false),
+            RelocationPhase::CorrectingOrder {
+                responded: false,
+                layout_seen: false,
+            },
+        ] {
+            let pending = PendingPaneRelocation {
+                plan: plan.clone(),
+                phase,
+            };
+            let rect = pending
+                .display_fractions("a", Some(&layout), now, false)
+                .expect("predicted");
+            assert!(
+                (rect.0 - 0.5).abs() < 1e-6,
+                "`a` is drawn on the right: {rect:?}"
+            );
+            assert!(pending.phase.locks_tab());
+            assert!(!pending.is_settled(now, true));
+        }
+        let parked = PendingPaneRelocation {
+            plan,
+            phase: RelocationPhase::Parked {
+                temp_tab_id: "t-tmp".into(),
+                moved_pane_id: "a".into(),
+            },
+        };
+        assert!(
+            parked
+                .display_fractions("a", Some(&layout), now, false)
+                .is_none()
+        );
+        assert!(!parked.phase.locks_tab());
+        assert_eq!(parked.phase.parked_tab_id(), Some("t-tmp"));
+        assert_eq!(inserting(false, false).hidden_tab_id(), Some("t-tmp"));
+        assert_eq!(parked.phase.hidden_tab_id(), None, "parked tabs are shown");
+    }
+
+    #[test]
+    fn keyboard_move_picks_the_neighbour_and_cycles_zones() {
+        let layout = two_pane_layout();
+        assert_eq!(
+            keyboard_neighbour(&layout, "a", DropEdge::Right).as_deref(),
+            Some("b")
+        );
+        assert_eq!(keyboard_neighbour(&layout, "a", DropEdge::Left), None);
+        assert_eq!(keyboard_neighbour(&layout, "a", DropEdge::Up), None);
+        assert_eq!(
+            keyboard_neighbour(&layout, "b", DropEdge::Left).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            next_keyboard_zone(DropZone::Center, false),
+            DropZone::Center
+        );
+        assert_eq!(next_keyboard_zone(DropZone::Center, true), DropZone::Left);
+        assert_eq!(next_keyboard_zone(DropZone::Down, true), DropZone::Center);
+        let mode = KeyboardPaneMove {
+            workspace_id: "w".into(),
+            tab_id: "t".into(),
+            pane_id: "a".into(),
+            fingerprint: 0,
+            target: Some(PaneDropHover {
+                target_pane_id: "b".into(),
+                zone: DropZone::Left,
+                target_rect: (0., 0., 0., 0.),
+            }),
+            edge_drops: false,
+        };
+        assert!(!mode.droppable(), "edges need the flag");
+        let mode = KeyboardPaneMove {
+            edge_drops: true,
+            ..mode
+        };
+        assert!(mode.droppable());
     }
 }

@@ -174,6 +174,10 @@ impl I18n {
         tf!(self, k::TERMINAL_DRAG_PANE, name = name)
     }
 
+    pub(crate) fn move_pane_mode(self, name: &str) -> String {
+        tf!(self, k::TERMINAL_MOVE_PANE_MODE, name = name)
+    }
+
     pub(crate) fn close_action(self, kind: Key) -> String {
         tf!(self, k::COMMON_CLOSE_ACTION, kind = self.text(kind))
     }

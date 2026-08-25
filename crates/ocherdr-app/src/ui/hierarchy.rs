@@ -1,7 +1,8 @@
 use super::super::*;
 use crate::a11y::{
-    ChromeA11y, apply_control, apply_list, apply_region, event_stream_lost_copy,
-    event_stream_status_copy, pane_a11y, pane_drag_handle_name, pane_drag_state_text,
+    ChromeA11y, apply_control, apply_list, apply_region, drop_zone_label, event_stream_lost_copy,
+    event_stream_status_copy, keyboard_move_state_text, pane_a11y, pane_drag_handle_name,
+    pane_drag_state_text,
 };
 
 impl OcHerdrView {
@@ -1195,7 +1196,7 @@ impl OcHerdrView {
         };
         let tab_id = tab_id.as_str();
         let layout = snapshot.layout_for(tab_id).cloned();
-        let panes = snapshot.panes_for(tab_id).cloned().collect::<Vec<_>>();
+        let panes = self.rendered_panes_for_tab(&snapshot, tab_id);
         let view = cx.entity();
         let now = Instant::now();
         let reduce_motion = cx.reduce_motion();
@@ -1207,7 +1208,14 @@ impl OcHerdrView {
             SurfaceDrag::Pane(drag) if pane_drag_past_slop(drag) => Some(drag.clone()),
             _ => None,
         };
-        let drag_source_id = pane_drag.as_ref().map(|drag| drag.pane_id.clone());
+        let keyboard_move = self
+            .pane_keyboard_move
+            .clone()
+            .filter(|mode| mode.tab_id == tab_id);
+        let drag_source_id = pane_drag
+            .as_ref()
+            .map(|drag| drag.pane_id.clone())
+            .or_else(|| keyboard_move.as_ref().map(|mode| mode.pane_id.clone()));
         let draggable = layout
             .as_ref()
             .is_some_and(|layout| !layout.zoomed && layout.panes.len() > 1)
@@ -1354,6 +1362,12 @@ impl OcHerdrView {
             .as_ref()
             .filter(|drag| drag.tab_id == tab_id)
             .map(|drag| self.render_pane_drag_overlay(&snapshot, drag, reduce_motion, cx));
+        let keyboard_move_overlay = keyboard_move
+            .as_ref()
+            .map(|mode| self.render_keyboard_move_overlay(&snapshot, mode, reduce_motion));
+        let parked_notice = self
+            .parked_relocation(tab_id)
+            .map(|pending| render_parked_notice(tab_id, &pending.plan, i18n, cx));
         let origin = self.surface_origin();
         let pane_return = self
             .pane_drag_return
@@ -1432,7 +1446,73 @@ impl OcHerdrView {
             .children(split_handles.into_iter().flatten())
             .children(split_overlay)
             .children(pane_drag_overlay)
+            .children(keyboard_move_overlay)
             .children(pane_return)
+            .children(parked_notice)
+            .into_any_element()
+    }
+
+    /// Keyboard move mode (design §11): the chosen target's highlight and an
+    /// accessible status describing the pending intent.
+    fn render_keyboard_move_overlay(
+        &self,
+        snapshot: &HierarchySnapshot,
+        mode: &KeyboardPaneMove,
+        reduce_motion: bool,
+    ) -> ochub_ui::gpui::AnyElement {
+        let i18n = self.i18n;
+        let origin = self.surface_origin();
+        let droppable = mode.droppable();
+        let target_name = mode.target.as_ref().map(|hover| {
+            snapshot
+                .pane(&hover.target_pane_id)
+                .map(|pane| pane.display_name().to_owned())
+                .unwrap_or_else(|| hover.target_pane_id.clone())
+        });
+        let state_text = keyboard_move_state_text(
+            mode.target
+                .as_ref()
+                .zip(target_name.as_deref())
+                .map(|(hover, name)| (name, hover.zone)),
+            droppable,
+            i18n,
+        );
+        let highlight = mode
+            .target
+            .as_ref()
+            .map(|hover| render_drop_highlight(hover, droppable, origin, reduce_motion, i18n));
+        let source_name = snapshot
+            .pane(&mode.pane_id)
+            .map(|pane| pane.display_name().to_owned())
+            .unwrap_or_else(|| mode.pane_id.clone());
+        div()
+            .id("pane-keyboard-move-overlay")
+            .role(ochub_ui::gpui::Role::Status)
+            .aria_label(i18n.move_pane_mode(&source_name))
+            .aria_value(state_text.clone())
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .children(highlight)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .left(px(8.))
+                    .px_3()
+                    .py_1()
+                    .rounded(px(CORNER_CONTROL))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .text_xs()
+                    .text_color(theme::subtext())
+                    .child(format!(
+                        "{} — {state_text}",
+                        i18n.move_pane_mode(&source_name)
+                    )),
+            )
             .into_any_element()
     }
 
@@ -1455,55 +1535,11 @@ impl OcHerdrView {
             .is_some_and(|hover| hover.droppable(drag.edge_drops));
         let zone = drag.hover.as_ref().map(|hover| hover.zone);
         let state_text = pane_drag_state_text(zone, droppable, i18n);
-        let highlight = drag.hover.as_ref().filter(|_| droppable).map(|hover| {
-            let (x, y, w, h) = surface_local(hover.target_rect, origin);
-            let label = match hover.zone {
-                DropZone::Center => i18n.text(k::TERMINAL_DROP_SWAP),
-                DropZone::Left | DropZone::Right | DropZone::Up | DropZone::Down => {
-                    i18n.text(k::TERMINAL_DROP_INVALID)
-                }
-            };
-            let card = div()
-                .absolute()
-                .left(px(x))
-                .top(px(y))
-                .w(px(w))
-                .h(px(h))
-                .p(px(2.))
-                .child(
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .border_2()
-                        .border_color(theme::accent())
-                        .bg(theme::accent().alpha(0.14))
-                        .child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .rounded(px(CORNER_CONTROL))
-                                .bg(theme::accent())
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::current().bg.rgba())
-                                .child(label),
-                        ),
-                );
-            if reduce_motion {
-                card.into_any_element()
-            } else {
-                card.with_animation(
-                    ElementId::Name(
-                        format!("pane-drop-zone-{}-{:?}", hover.target_pane_id, hover.zone).into(),
-                    ),
-                    Animation::new(PANE_DROP_ZONE_ANIMATION).with_easing(ease_out_quint()),
-                    |card, t| card.opacity(t),
-                )
-                .into_any_element()
-            }
-        });
+        let highlight = drag
+            .hover
+            .as_ref()
+            .filter(|_| droppable)
+            .map(|hover| render_drop_highlight(hover, true, origin, reduce_motion, i18n));
         let pane = snapshot.pane(&drag.pane_id).cloned();
         let frame = self
             .pane(&drag.pane_id)
@@ -2293,6 +2329,128 @@ fn render_pane_drag_return(
         )
         .into_any_element(),
     )
+}
+
+/// Accent outline, translucent fill and zone label over the target pane
+/// (design §5.2); fades in over `PANE_DROP_ZONE_ANIMATION`.
+fn render_drop_highlight(
+    hover: &PaneDropHover,
+    droppable: bool,
+    origin: (f32, f32),
+    reduce_motion: bool,
+    i18n: I18n,
+) -> ochub_ui::gpui::AnyElement {
+    let (x, y, w, h) = surface_local(hover.target_rect, origin);
+    let label = if droppable {
+        drop_zone_label(hover.zone, i18n)
+    } else {
+        i18n.text(k::TERMINAL_DROP_INVALID)
+    };
+    let tone = if droppable {
+        theme::accent()
+    } else {
+        theme::border_strong()
+    };
+    let card = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(w))
+        .h(px(h))
+        .p(px(2.))
+        .child(
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_2()
+                .border_color(tone)
+                .bg(tone.alpha(0.14))
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded(px(CORNER_CONTROL))
+                        .bg(tone)
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::current().bg.rgba())
+                        .child(label),
+                ),
+        );
+    if reduce_motion {
+        card.into_any_element()
+    } else {
+        card.with_animation(
+            ElementId::Name(
+                format!("pane-drop-zone-{}-{:?}", hover.target_pane_id, hover.zone).into(),
+            ),
+            Animation::new(PANE_DROP_ZONE_ANIMATION).with_easing(ease_out_quint()),
+            |card, t| card.opacity(t),
+        )
+        .into_any_element()
+    }
+}
+
+/// Step 2 of an edge relocation failed: the pane sits in a temporary tab
+/// (design §7.3). Inline in the original tab, with the two recovery actions.
+fn render_parked_notice(
+    tab_id: &str,
+    plan: &RelocationPlan,
+    i18n: I18n,
+    cx: &mut Context<OcHerdrView>,
+) -> ochub_ui::gpui::AnyElement {
+    let retry_tab = tab_id.to_owned();
+    let go_tab = tab_id.to_owned();
+    div()
+        .id("pane-relocation-parked")
+        .role(ochub_ui::gpui::Role::Status)
+        .aria_label(i18n.text(k::TERMINAL_RELOCATION_PARKED))
+        .absolute()
+        .top(px(12.))
+        .left(px(12.))
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .rounded(px(CORNER_CONTROL))
+        .bg(theme::panel())
+        .border_1()
+        .border_color(theme::yellow())
+        .shadow_md()
+        .text_sm()
+        .text_color(theme::text())
+        .child(status_dot(theme::yellow()))
+        .child(format!(
+            "{} · {}",
+            i18n.text(k::TERMINAL_RELOCATION_PARKED),
+            plan.source_pane_id
+        ))
+        .child(
+            button(
+                "pane-relocation-retry",
+                i18n.text(k::TERMINAL_RELOCATION_RETRY),
+                ButtonTone::Primary,
+                ButtonSize::Sm,
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.retry_parked_relocation(&retry_tab, cx);
+            })),
+        )
+        .child(
+            button(
+                "pane-relocation-go-to-tab",
+                i18n.text(k::TERMINAL_RELOCATION_GO_TO_TAB),
+                ButtonTone::Neutral,
+                ButtonSize::Sm,
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.go_to_parked_tab(&go_tab, cx);
+            })),
+        )
+        .into_any_element()
 }
 
 pub(super) fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
