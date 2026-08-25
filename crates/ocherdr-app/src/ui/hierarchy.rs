@@ -1305,7 +1305,6 @@ impl OcHerdrView {
                         .get(tab_id)
                         .and_then(|pending| pending.plan.frame_for(&pane.pane_id))
                 });
-            let control_action = self.pane_control_action(&pane.pane_id);
             let waiting = frame.is_none();
             let screen_text = if window.is_a11y_active() && !waiting {
                 self.pane(&pane.pane_id)
@@ -1354,11 +1353,9 @@ impl OcHerdrView {
                         frame,
                         presentation,
                         a11y,
-                        control_action,
                     },
                     i18n,
                     view.clone(),
-                    cx,
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2225,21 +2222,18 @@ struct PaneRenderInput {
     frame: Option<RenderedFrame>,
     presentation: PanePresentation,
     a11y: crate::a11y::PaneA11y,
-    control_action: PaneControlAction,
 }
 
 fn render_pane(
     input: PaneRenderInput,
     i18n: I18n,
     view: Entity<OcHerdrView>,
-    cx: &mut Context<OcHerdrView>,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
     let PaneRenderInput {
         pane,
         frame,
         presentation,
         a11y,
-        control_action,
     } = input;
     let PanePresentation {
         fractions,
@@ -2252,15 +2246,6 @@ fn render_pane(
     let selected = a11y.selected;
     let waiting_for_frame = frame.is_none();
     let measure_pane_id = pane.pane_id.clone();
-    let control_pane_id = pane.pane_id.clone();
-    let control_debug_id = pane.pane_id.clone();
-    let (control_label, control_tone) = match control_action {
-        PaneControlAction::Take => (i18n.text(k::TERMINAL_CONTROL_TAKE), ButtonTone::Primary),
-        PaneControlAction::ForceTakeover => {
-            (i18n.text(k::TERMINAL_CONTROL_FORCE), ButtonTone::Danger)
-        }
-        PaneControlAction::Release => (i18n.text(k::TERMINAL_CONTROL_RELEASE), ButtonTone::Ghost),
-    };
     let group = SharedString::from(format!("terminal-pane-group-{}", pane.pane_id));
     div()
         .id(ochub_ui::gpui::ElementId::Name(
@@ -2316,31 +2301,7 @@ fn render_pane(
                         .text_color(theme::subtext())
                         .children(handle)
                         .child(status_dot(status_color(pane.agent_status)))
-                        .child(div().truncate().flex_1().child(pane_name))
-                        .when(selected, |header| {
-                            header.child(
-                                button(
-                                    ochub_ui::gpui::ElementId::Name(
-                                        format!("terminal-control-{control_pane_id}").into(),
-                                    ),
-                                    control_label,
-                                    control_tone,
-                                    ButtonSize::Sm,
-                                )
-                                .debug_selector(move || {
-                                    format!("terminal-control-{control_debug_id}")
-                                })
-                                .on_click(cx.listener(
-                                    move |this, _, _window, cx| {
-                                        this.run_pane_control_action(
-                                            control_pane_id.clone(),
-                                            control_action,
-                                            cx,
-                                        );
-                                    },
-                                )),
-                            )
-                        }),
+                        .child(div().truncate().flex_1().child(pane_name)),
                 )
                 .child(
                     div()

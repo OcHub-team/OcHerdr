@@ -26,10 +26,9 @@ use serde_json::{Value, json};
 use crate::host_center::HostCenter;
 use crate::{
     AgentOutputState, AgentPromptPhase, AppearanceSettings, CachedHostHealth, EventStreamState,
-    HEADER_HEIGHT, HostHealthView, I18n, Language, OcHerdrView, PaneControlAction,
-    PendingListReorder, ReorderList, Settings, TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_GAP,
-    TAB_PREVIEW_HEIGHT, TAB_PREVIEW_WIDTH, TAB_STRIP_LEAD_INSET, install_appearance,
-    reorder_projection,
+    HEADER_HEIGHT, HostHealthView, I18n, Language, OcHerdrView, PendingListReorder, ReorderList,
+    Settings, TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_GAP, TAB_PREVIEW_HEIGHT,
+    TAB_PREVIEW_WIDTH, TAB_STRIP_LEAD_INSET, install_appearance, reorder_projection,
 };
 
 fn install_app(cx: &mut TestAppContext) {
@@ -3419,8 +3418,8 @@ fn key(name: &str, control: bool) -> gpui::KeyDownEvent {
     }
 }
 
-/// Real Ghostty surfaces (not `headless_terminals`): after explicitly taking
-/// control, libghostty encodes the key and its bytes go to that pane's stream.
+/// Real Ghostty surfaces (not `headless_terminals`): a key press takes control,
+/// then libghostty encodes it and sends its bytes to that pane's stream.
 #[gpui::test]
 fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut TestAppContext) {
     let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
@@ -3434,7 +3433,6 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
             "the visible tab spawns a Ghostty surface"
         );
         assert!(this.pane("p-right").is_some());
-        this.run_pane_control_action("p-left".into(), PaneControlAction::Take, cx);
         let mut shift_enter = key("enter", false);
         shift_enter.keystroke.modifiers.shift = true;
         shift_enter.keystroke.key_char = Some("\n".into());

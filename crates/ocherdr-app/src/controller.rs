@@ -2364,49 +2364,22 @@ impl OcHerdrView {
         self.session_panes = None;
     }
 
-    pub(super) fn pane_control_action(&self, pane_id: &str) -> PaneControlAction {
-        let Some(session) = self.session_panes.as_ref() else {
-            return PaneControlAction::Take;
-        };
-        pane_control_action(
-            session.control.as_ref(),
-            session.control_conflict.as_deref(),
-            pane_id,
-        )
-    }
-
-    pub(super) fn run_pane_control_action(
-        &mut self,
-        pane_id: String,
-        action: PaneControlAction,
-        cx: &mut Context<Self>,
-    ) {
+    /// A direct terminal interaction is an explicit request to take over the
+    /// pane. The request is deliberately user-driven, never a reconnect
+    /// retry, so clients cannot get into a takeover loop.
+    pub(super) fn take_terminal_control(&mut self, pane_id: String, cx: &mut Context<Self>) {
         let Some(session) = self.session_panes.as_mut() else {
             return;
         };
-        match action {
-            PaneControlAction::Take | PaneControlAction::ForceTakeover => {
-                session.control = Some(TerminalControl {
-                    pane_id,
-                    mode: if action == PaneControlAction::ForceTakeover {
-                        TerminalMode::ControlTakeover
-                    } else {
-                        TerminalMode::Control
-                    },
-                });
-                session.control_conflict = None;
-            }
-            PaneControlAction::Release => {
-                if session
-                    .control
-                    .as_ref()
-                    .is_some_and(|control| control.pane_id == pane_id)
-                {
-                    session.control = None;
-                    session.control_conflict = None;
-                }
-            }
+        if session.control.as_ref().is_some_and(|control| {
+            control.pane_id == pane_id && control.mode == TerminalMode::ControlTakeover
+        }) {
+            return;
         }
+        session.control = Some(TerminalControl {
+            pane_id,
+            mode: TerminalMode::ControlTakeover,
+        });
         self.ensure_session_terminals(cx);
         cx.notify();
     }
@@ -3406,6 +3379,7 @@ impl OcHerdrView {
         let Some(pane_id) = self.selection.pane_id.clone() else {
             return;
         };
+        self.take_terminal_control(pane_id.clone(), cx);
         let key = &event.keystroke;
         let stream_closed = {
             let Some(runtime) = self.pane_mut(&pane_id) else {
@@ -3511,6 +3485,7 @@ impl OcHerdrView {
         }
         self.end_text_drag_unless_pane(&pane_id);
         self.select_pane(pane_id.clone(), window, cx);
+        self.take_terminal_control(pane_id.clone(), cx);
         let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
@@ -5374,7 +5349,7 @@ impl OcHerdrView {
                 .pane_id
                 .as_deref()
                 .and_then(|pane_id| self.pane(pane_id))
-                .is_some_and(|runtime| runtime.mode.is_controlled())
+                .is_some()
     }
 
     pub(super) fn commit_ime_text(
@@ -5390,6 +5365,7 @@ impl OcHerdrView {
         let Some(pane_id) = self.selection.pane_id.clone() else {
             return;
         };
+        self.take_terminal_control(pane_id.clone(), cx);
         let stream_closed = {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
@@ -5564,20 +5540,6 @@ fn snapshot_runtime_targets(
         .collect()
 }
 
-fn pane_control_action(
-    control: Option<&TerminalControl>,
-    control_conflict: Option<&str>,
-    pane_id: &str,
-) -> PaneControlAction {
-    if control.is_some_and(|control| control.pane_id == pane_id) {
-        PaneControlAction::Release
-    } else if control_conflict == Some(pane_id) {
-        PaneControlAction::ForceTakeover
-    } else {
-        PaneControlAction::Take
-    }
-}
-
 fn demote_terminal_control(session: &mut SessionPanes, pane_id: &str) -> bool {
     if session
         .control
@@ -5587,7 +5549,6 @@ fn demote_terminal_control(session: &mut SessionPanes, pane_id: &str) -> bool {
         return false;
     }
     session.control = None;
-    session.control_conflict = Some(pane_id.to_owned());
     true
 }
 
@@ -7225,26 +7186,6 @@ mod tests {
     }
 
     #[test]
-    fn control_conflict_offers_force_takeover_without_retrying_automatically() {
-        let control = TerminalControl {
-            pane_id: "p-a".into(),
-            mode: TerminalMode::Control,
-        };
-        assert_eq!(
-            pane_control_action(Some(&control), None, "p-a"),
-            PaneControlAction::Release
-        );
-        assert_eq!(
-            pane_control_action(None, Some("p-a"), "p-a"),
-            PaneControlAction::ForceTakeover
-        );
-        assert_eq!(
-            pane_control_action(None, Some("p-a"), "p-b"),
-            PaneControlAction::Take
-        );
-    }
-
-    #[test]
     fn lost_control_demotes_the_pane_to_observe_before_any_reconnect() {
         let mut session = SessionPanes::new(SessionKey {
             profile_id: "local".into(),
@@ -7252,12 +7193,11 @@ mod tests {
         });
         session.control = Some(TerminalControl {
             pane_id: "p-a".into(),
-            mode: TerminalMode::Control,
+            mode: TerminalMode::ControlTakeover,
         });
 
         assert!(demote_terminal_control(&mut session, "p-a"));
         assert!(session.control.is_none());
-        assert_eq!(session.control_conflict.as_deref(), Some("p-a"));
         assert!(!demote_terminal_control(&mut session, "p-a"));
     }
 

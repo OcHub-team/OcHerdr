@@ -286,10 +286,8 @@ struct SessionPanes {
     /// Dropping a mismatched owner drops every pane runtime and its listen task.
     owner: SessionKey,
     panes: HashMap<String, PaneRuntime>,
-    /// The one pane this OcHerdr instance has explicitly asked to control.
+    /// The one pane this OcHerdr instance most recently interacted with.
     control: Option<TerminalControl>,
-    /// A pane owned by another client. Its next explicit request may force a takeover.
-    control_conflict: Option<String>,
 }
 
 impl SessionPanes {
@@ -298,7 +296,6 @@ impl SessionPanes {
             owner,
             panes: HashMap::new(),
             control: None,
-            control_conflict: None,
         }
     }
 }
@@ -307,13 +304,6 @@ impl SessionPanes {
 struct TerminalControl {
     pane_id: String,
     mode: TerminalMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaneControlAction {
-    Take,
-    ForceTakeover,
-    Release,
 }
 
 struct PaneRuntime {
@@ -325,8 +315,8 @@ struct PaneRuntime {
     frame: Option<RenderedFrame>,
     mode: TerminalMode,
     /// The selected pane: the only one that receives keyboard, IME, and
-    /// mouse input and reports terminal focus. Independent of `mode`, since
-    /// every visible pane holds a control stream.
+    /// mouse input and reports terminal focus. It can stay focused while
+    /// observing, so a direct interaction can promote it to control.
     focused: bool,
     size: (u16, u16),
     pixel_size: (u32, u32),
