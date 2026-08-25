@@ -42,6 +42,7 @@ use serde_json::{Value, json};
 mod a11y;
 mod config;
 mod controller;
+use controller::HerdrCapabilities;
 mod fonts;
 mod host_center;
 mod i18n;
@@ -630,6 +631,8 @@ struct OcHerdrView {
     sessions: Vec<SessionSummary>,
     session_index: Option<usize>,
     connection: Option<SessionConnection>,
+    /// What the connected Herdr can do, derived from the last full snapshot.
+    herdr_capabilities: HerdrCapabilities,
     event_stream: EventStreamState,
     /// Dropping this cancels the session-wide event await loop.
     event_listen: Option<Task<()>>,

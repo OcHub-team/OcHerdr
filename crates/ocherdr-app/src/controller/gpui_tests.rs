@@ -173,6 +173,10 @@ impl FakeHerdr {
         }
     }
 
+    fn socket_path(&self) -> PathBuf {
+        self._dir.path().join("herdr.sock")
+    }
+
     /// Do not return until the live subscription has accepted and flushed the
     /// event. This makes the fixture prove its injection happened before the
     /// view assertions use that event as evidence.
@@ -441,6 +445,33 @@ fn serve_snapshot_with_live_events(
                         json!({
                             "id": id,
                             "result": { "type": "ok" },
+                        }),
+                    ),
+                    // The fixture plays an old Herdr when asked to move into
+                    // `unsupported`: the request enum fails to deserialize.
+                    Some("pane.move")
+                        if request["params"]["target_tab_id"] == json!("unsupported") =>
+                    {
+                        write_fake_response(
+                            stream,
+                            json!({
+                                "id": id,
+                                "error": {
+                                    "code": "invalid_request",
+                                    "message": "invalid request: unknown variant `pane.move`, expected one of `pane.list`, `pane.get`",
+                                },
+                            }),
+                        )
+                    }
+                    Some("pane.move") => write_fake_response(
+                        stream,
+                        json!({
+                            "id": id,
+                            "result": {
+                                "type": "ok",
+                                "pane": { "pane_id": request["params"]["pane_id"] },
+                                "created_tab": { "tab_id": "t-created", "number": 9 },
+                            },
                         }),
                     ),
                     other => write_fake_response(
@@ -1420,5 +1451,154 @@ fn saving_a_host_discards_its_probe_instead_of_restoring_it(cx: &mut TestAppCont
             !center.host_health.contains_key("manual-1"),
             "saving a host must discard the old probe, not restore the previous Cached result"
         );
+    });
+}
+
+fn pane_move_capable_snapshot() -> HierarchySnapshot {
+    HierarchySnapshot {
+        version: "0.7.0".into(),
+        protocol: 14,
+        ..three_tab_snapshot()
+    }
+}
+
+/// Wire the view to the fake socket directly and pull the snapshot through
+/// `resync_snapshot`, the same path every live refresh takes. This skips
+/// `reload`'s `herdr session list` process spawn, which is the one step in
+/// that path that can fail under fork pressure and would otherwise leave the
+/// capability assertions racing the host's load rather than the code.
+fn connect_view_to_fake_and_resync(
+    view: &Entity<OcHerdrView>,
+    fake: &FakeHerdr,
+    cx: &mut VisualTestContext,
+) {
+    view.update(cx, |this, cx| {
+        point_local_profile_at_fake(this, fake);
+        let session = SessionSummary {
+            name: "alpha".into(),
+            running: true,
+            socket_path: fake.socket_path(),
+            session_dir: fake._dir.path().join("alpha"),
+            default: false,
+        };
+        this.connection = Some(
+            SessionConnection::connect(&this.profiles[0], &session)
+                .expect("connect fake herdr session"),
+        );
+        this.sessions = vec![session];
+        this.session_index = Some(0);
+        this.event_stream = EventStreamState::Live;
+        let epoch = this.event_epoch;
+        this.resync_snapshot(epoch, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.connection.is_some(),
+            "the direct connection stays wired"
+        );
+        assert!(
+            this.snapshot.is_some() && !this.snapshot_refreshing,
+            "the fake's snapshot must be applied before the capability is read"
+        );
+    });
+}
+
+#[gpui::test]
+fn invoke_with_response_hands_the_whole_result_to_the_callback(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(pane_move_capable_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+
+    let received: Arc<Mutex<Option<Result<Value, String>>>> = Arc::new(Mutex::new(None));
+    let sink = received.clone();
+    view.update(cx, |this, cx| {
+        assert!(
+            this.pane_move_supported(),
+            "snapshot advertises protocol 14"
+        );
+        this.invoke_with_response(
+            "pane.move",
+            json!({ "pane_id": "p-1", "target_tab_id": "t-b" }),
+            move |this, result, _cx| {
+                assert!(
+                    this.operation.is_none(),
+                    "the running indicator clears before the callback runs"
+                );
+                *sink.lock().unwrap() = Some(result.map_err(|error| error.to_string()));
+            },
+            cx,
+        );
+        assert!(this.operation.is_some(), "the request shows as running");
+    });
+    cx.run_until_parked();
+
+    let result = received
+        .lock()
+        .unwrap()
+        .take()
+        .expect("callback runs once the socket answers")
+        .expect("fake Herdr accepted the move");
+    assert_eq!(result["created_tab"]["tab_id"], json!("t-created"));
+    assert_eq!(result["pane"]["pane_id"], json!("p-1"));
+    view.read_with(cx, |this, _| {
+        assert!(this.operation.is_none());
+        assert!(this.pane_move_supported());
+    });
+}
+
+#[gpui::test]
+fn an_unknown_pane_move_method_degrades_the_capability_and_reports_the_error(
+    cx: &mut TestAppContext,
+) {
+    let fake = FakeHerdr::snapshot_with_live_events(pane_move_capable_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+
+    let received: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let sink = received.clone();
+    view.update(cx, |this, cx| {
+        assert!(
+            this.pane_move_supported(),
+            "snapshot advertises protocol 14"
+        );
+        this.invoke_with_response(
+            "pane.move",
+            json!({ "pane_id": "p-1", "target_tab_id": "unsupported" }),
+            move |_this, result, _cx| {
+                *sink.lock().unwrap() = Some(result.expect_err("fake rejects").to_string());
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let error = received
+        .lock()
+        .unwrap()
+        .take()
+        .expect("callback sees the error");
+    assert!(error.contains("unknown variant"), "{error}");
+    view.read_with(cx, |this, _| {
+        assert!(this.operation.is_none());
+        assert!(
+            !this.pane_move_supported(),
+            "an unknown-method rejection flips the capability off"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_snapshot_without_pane_move_metadata_leaves_the_capability_off(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(three_tab_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+
+    view.read_with(cx, |this, _| {
+        assert!(this.connection.is_some());
+        assert!(!this.pane_move_supported());
     });
 }

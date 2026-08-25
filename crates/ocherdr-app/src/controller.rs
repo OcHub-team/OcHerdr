@@ -64,6 +64,7 @@ impl OcHerdrView {
             sessions: Vec::new(),
             session_index: None,
             connection: None,
+            herdr_capabilities: HerdrCapabilities::default(),
             event_stream: EventStreamState::Idle,
             event_listen: None,
             agent_status_listen: None,
@@ -257,6 +258,11 @@ impl OcHerdrView {
                         this.session_index = loaded.selected;
                         this.connection = loaded.connection;
                         this.snapshot = loaded.snapshot;
+                        this.herdr_capabilities = this
+                            .snapshot
+                            .as_ref()
+                            .map(HerdrCapabilities::from_snapshot)
+                            .unwrap_or_default();
                         this.selection.connection_id = this.current_profile().id().into();
                         this.selection.session_name =
                             this.current_session().map(|s| s.name.clone());
@@ -283,6 +289,7 @@ impl OcHerdrView {
                         this.sessions.clear();
                         this.session_index = None;
                         this.connection = None;
+                        this.herdr_capabilities = HerdrCapabilities::default();
                         this.event_stream = EventStreamState::Idle;
                         this.event_listen = None;
                         this.agent_status_listen = None;
@@ -312,6 +319,7 @@ impl OcHerdrView {
         self.sessions.clear();
         self.session_index = None;
         self.connection = None;
+        self.herdr_capabilities = HerdrCapabilities::default();
         self.event_stream = EventStreamState::Idle;
         self.event_listen = None;
         self.agent_status_listen = None;
@@ -907,6 +915,7 @@ impl OcHerdrView {
                             .as_ref()
                             .map(snapshot_pane_ids)
                             .unwrap_or_default();
+                        this.herdr_capabilities = HerdrCapabilities::from_snapshot(&snapshot);
                         this.snapshot = Some(snapshot);
                         this.reconcile_split_drag(cx);
                         this.reconcile_reorder_drag(cx);
@@ -3747,12 +3756,42 @@ impl OcHerdrView {
         }
     }
 
+    /// Same request as `invoke`, but the whole `result` object (or the error)
+    /// is handed to `on_response` on the main thread once the socket answers.
+    /// Failure side effects (notice, reorder gate, worktree force-remove offer)
+    /// happen before the callback runs, so callers only chain the next step.
+    #[allow(dead_code)] // consumed by the pane relocation transaction (design §7)
+    pub(super) fn invoke_with_response(
+        &mut self,
+        method: &'static str,
+        params: Value,
+        on_response: impl FnOnce(&mut Self, std::result::Result<Value, HerdrError>, &mut Context<Self>)
+        + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(request) =
+            self.spawn_invoke_inner(method, params, Some(Box::new(on_response)), cx)
+        {
+            request.detach();
+        }
+    }
+
     /// Same request as `invoke`, but the caller keeps the task so it can tie the
     /// request's lifetime to the state that request is allowed to block.
     fn spawn_invoke(
         &mut self,
         method: &'static str,
         params: Value,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<()>> {
+        self.spawn_invoke_inner(method, params, None, cx)
+    }
+
+    fn spawn_invoke_inner(
+        &mut self,
+        method: &'static str,
+        params: Value,
+        on_response: Option<InvokeResponseCallback>,
         cx: &mut Context<Self>,
     ) -> Option<Task<()>> {
         let connection = self.connection.as_ref()?;
@@ -3762,13 +3801,13 @@ impl OcHerdrView {
             let result = cx
                 .background_spawn({
                     let params = params.clone();
-                    async move { request_socket(&socket, method, params).map(|_| ()) }
+                    async move { request_socket(&socket, method, params) }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.operation = None;
-                match result {
-                    Ok(()) => {
+                match &result {
+                    Ok(_) => {
                         if command_needs_snapshot_resync(method) {
                             this.resync_snapshot(this.event_epoch, cx);
                         }
@@ -3777,14 +3816,37 @@ impl OcHerdrView {
                         // A rejected move never produces a `moved` event, so the
                         // gate has to open here or it would never open at all.
                         this.pending_reorder = None;
-                        this.maybe_offer_force_remove_worktree(&params, &error, cx);
+                        this.note_unsupported_method(method, error);
+                        this.maybe_offer_force_remove_worktree(&params, error, cx);
                         this.notify_command_failure(method, error, cx);
                     }
+                }
+                if let Some(on_response) = on_response {
+                    on_response(this, result, cx);
                 }
                 cx.notify();
             })
             .ok();
         }))
+    }
+
+    #[allow(dead_code)] // consumed by the pane drag drop-zone gating (design §8)
+    pub(super) fn pane_move_supported(&self) -> bool {
+        self.connection.is_some() && self.herdr_capabilities.pane_move
+    }
+
+    /// The snapshot said `pane.move` exists but Herdr rejected the method
+    /// itself: degrade to swap-only for the rest of this connection.
+    fn note_unsupported_method(&mut self, method: &str, error: &HerdrError) {
+        if method != "pane.move" || !self.herdr_capabilities.pane_move {
+            return;
+        }
+        if is_unknown_method_error(error) {
+            self.herdr_capabilities.pane_move = false;
+            eprintln!(
+                "ocherdr: Herdr rejected `pane.move` as an unknown method; disabling pane relocation for this connection ({error})"
+            );
+        }
     }
 
     pub(super) fn accepts_ime(&self) -> bool {
@@ -4013,10 +4075,78 @@ fn snapshot_handoff_should_release(refreshing: bool) -> bool {
     !refreshing
 }
 
+type InvokeResponseCallback = Box<
+    dyn FnOnce(&mut OcHerdrView, std::result::Result<Value, HerdrError>, &mut Context<OcHerdrView>),
+>;
+
 // pane.rename emits nothing. pane.close can delete the parent tab and
-// reshuffle focus / tab numbers without emitting tab.closed.
+// reshuffle focus / tab numbers without emitting tab.closed. pane.move and
+// pane.swap both emit (`pane.moved` / `layout.updated`), so they stay out.
 fn command_needs_snapshot_resync(method: &str) -> bool {
     matches!(method, "pane.rename" | "pane.close")
+}
+
+/// `pane.move` shipped in Herdr 0.7.0 / socket protocol 14.
+const PANE_MOVE_MIN_PROTOCOL: u32 = 14;
+const PANE_MOVE_MIN_VERSION: [u64; 3] = [0, 7, 0];
+
+/// Features the connected Herdr is known to support, read off the
+/// `version` / `protocol` metadata every `session.snapshot` carries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HerdrCapabilities {
+    pub pane_move: bool,
+}
+
+impl HerdrCapabilities {
+    pub(crate) fn from_snapshot(snapshot: &HierarchySnapshot) -> Self {
+        Self::detect(&snapshot.version, snapshot.protocol)
+    }
+
+    pub(crate) fn detect(version: &str, protocol: u32) -> Self {
+        Self {
+            pane_move: protocol >= PANE_MOVE_MIN_PROTOCOL
+                || parse_semver(version).is_some_and(|parsed| parsed >= PANE_MOVE_MIN_VERSION),
+        }
+    }
+}
+
+/// Lenient `major.minor.patch` extraction: tolerates a `herdr ` / `v` prefix
+/// and pre-release suffixes, returns `None` when no leading number exists.
+fn parse_semver(version: &str) -> Option<[u64; 3]> {
+    let token = version
+        .split_whitespace()
+        .find(|part| {
+            part.trim_start_matches('v')
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })?
+        .trim_start_matches('v');
+    let mut numbers = token
+        .split(['.', '-', '+'])
+        .take_while(|part| part.chars().all(|c| c.is_ascii_digit()))
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u64>().ok());
+    let major = numbers.next()??;
+    let minor = numbers.next().flatten().unwrap_or(0);
+    let patch = numbers.next().flatten().unwrap_or(0);
+    Some([major, minor, patch])
+}
+
+/// An older Herdr fails to deserialize the request enum for a method it does
+/// not know and answers `invalid_request` / "unknown variant `pane.move`".
+fn is_unknown_method_error(error: &HerdrError) -> bool {
+    let HerdrError::Api { code, message } = error else {
+        return false;
+    };
+    if matches!(code.as_str(), "unknown_method" | "method_not_found") {
+        return true;
+    }
+    let message = message.to_ascii_lowercase();
+    code == "invalid_request"
+        && (message.contains("unknown variant")
+            || message.contains("unknown method")
+            || message.contains("method not found"))
 }
 
 fn worktree_repo_params(workspace: &WorkspaceInfo) -> serde_json::Map<String, Value> {
@@ -5455,9 +5585,63 @@ mod tests {
     }
 
     #[test]
+    fn pane_move_capability_comes_from_protocol_or_version() {
+        assert!(HerdrCapabilities::detect("0.6.0", 14).pane_move);
+        assert!(HerdrCapabilities::detect("0.9.2", 20).pane_move);
+        assert!(HerdrCapabilities::detect("0.7.0", 0).pane_move);
+        assert!(HerdrCapabilities::detect("herdr 0.7.1", 0).pane_move);
+        assert!(HerdrCapabilities::detect("v1.0.0-beta.1", 0).pane_move);
+        assert!(!HerdrCapabilities::detect("0.6.9", 13).pane_move);
+        assert!(HerdrCapabilities::detect("0.7", 13).pane_move);
+        assert!(!HerdrCapabilities::detect("", 0).pane_move);
+        assert!(!HerdrCapabilities::detect("garbage", 0).pane_move);
+        assert!(!HerdrCapabilities::detect("x.y.z", 0).pane_move);
+        assert_eq!(
+            HerdrCapabilities::default(),
+            HerdrCapabilities { pane_move: false }
+        );
+    }
+
+    #[test]
+    fn semver_parsing_is_lenient_but_never_invents_numbers() {
+        assert_eq!(parse_semver("0.7.0"), Some([0, 7, 0]));
+        assert_eq!(parse_semver("herdr 0.8.1"), Some([0, 8, 1]));
+        assert_eq!(parse_semver("v1.2.3-rc.1+build"), Some([1, 2, 3]));
+        assert_eq!(parse_semver("2"), Some([2, 0, 0]));
+        assert_eq!(parse_semver(""), None);
+        assert_eq!(parse_semver("garbage"), None);
+    }
+
+    #[test]
+    fn unknown_method_errors_are_recognised_by_code_and_message() {
+        let api = |code: &str, message: &str| HerdrError::Api {
+            code: code.into(),
+            message: message.into(),
+        };
+        assert!(is_unknown_method_error(&api(
+            "invalid_request",
+            "invalid request: unknown variant `pane.move`, expected one of `pane.list`"
+        )));
+        assert!(is_unknown_method_error(&api("unknown_method", "nope")));
+        assert!(!is_unknown_method_error(&api(
+            "invalid_request",
+            "invalid request: missing field `target_pane_id`"
+        )));
+        assert!(!is_unknown_method_error(&api(
+            "not_found",
+            "pane p-9 not found"
+        )));
+        assert!(!is_unknown_method_error(&HerdrError::Protocol(
+            "empty".into()
+        )));
+    }
+
+    #[test]
     fn invoke_resyncs_only_commands_that_do_not_emit_events() {
         assert!(command_needs_snapshot_resync("pane.rename"));
         assert!(command_needs_snapshot_resync("pane.close"));
+        assert!(!command_needs_snapshot_resync("pane.move"));
+        assert!(!command_needs_snapshot_resync("pane.swap"));
         for method in [
             "workspace.create",
             "workspace.close",
