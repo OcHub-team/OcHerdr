@@ -26,9 +26,9 @@ use serde_json::{Value, json};
 use crate::host_center::HostCenter;
 use crate::{
     AgentOutputState, AgentPromptPhase, AppearanceSettings, CachedHostHealth, EventStreamState,
-    HostHealthView, I18n, Language, OcHerdrView, PendingListReorder, ReorderList, Settings,
-    TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_GAP, TAB_PREVIEW_HEIGHT, TAB_PREVIEW_WIDTH,
-    install_appearance, reorder_projection,
+    HEADER_HEIGHT, HostHealthView, I18n, Language, OcHerdrView, PendingListReorder, ReorderList,
+    Settings, TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_GAP, TAB_PREVIEW_HEIGHT,
+    TAB_PREVIEW_WIDTH, TAB_STRIP_LEAD_INSET, install_appearance, reorder_projection,
 };
 
 fn install_app(cx: &mut TestAppContext) {
@@ -1074,6 +1074,58 @@ fn overflowing_tab_bar_scrolls_horizontally_with_the_wheel(cx: &mut TestAppConte
         tab_scroll.offset().x < gpui::px(0.),
         "selecting a hidden tab by number must scroll it into view"
     );
+}
+
+/// The strip's move areas are laid out as full-height siblings of the
+/// controls, so "empty strip space" is exactly what they cover: the gutter
+/// before the first tab and everything between `+` and the toolbar. A press
+/// there reaches no tab, so selection and the reorder machinery stay put.
+#[gpui::test]
+fn empty_tab_strip_space_is_a_full_height_window_move_area(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    view.update(cx, |this, cx| {
+        this.snapshot = Some(three_tab_snapshot());
+        this.selection = Selection {
+            connection_id: "local".into(),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-a".into()),
+            ..Default::default()
+        };
+        cx.notify();
+    });
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(500.)));
+    cx.run_until_parked();
+
+    let lead = cx
+        .debug_bounds("tab-strip-lead")
+        .expect("leading move area");
+    let space = cx
+        .debug_bounds("tab-strip-space")
+        .expect("trailing move area");
+    let first = cx.debug_bounds("tab-t-a").expect("first tab");
+    let last = cx.debug_bounds("tab-t-c").expect("last tab");
+    // The strip's content box: its height minus the 1px bottom border.
+    assert_eq!(lead.size.height, gpui::px(HEADER_HEIGHT - 1.));
+    assert_eq!(space.size.height, gpui::px(HEADER_HEIGHT - 1.));
+    assert_eq!(lead.size.width, gpui::px(TAB_STRIP_LEAD_INSET));
+    assert!(
+        lead.origin.x + lead.size.width <= first.origin.x,
+        "the gutter ends where the first tab starts: {lead:?} vs {first:?}"
+    );
+    assert!(
+        space.origin.x > last.origin.x + last.size.width,
+        "the free space starts after the last tab and `+`: {space:?} vs {last:?}"
+    );
+    assert!(
+        space.size.width > gpui::px(100.),
+        "the free space fills the strip"
+    );
+    for tab in ["tab-t-a", "tab-t-b", "tab-t-c"] {
+        let bounds = cx.debug_bounds(tab).unwrap();
+        assert!(!bounds.intersects(&space) && !bounds.intersects(&lead));
+    }
+    // The press itself cannot be simulated: the test platform's
+    // `start_window_move` is `unimplemented!()`.
 }
 
 #[gpui::test]

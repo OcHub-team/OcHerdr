@@ -856,12 +856,17 @@ impl OcHerdrView {
             .flex()
             .items_center()
             .h(px(HEADER_HEIGHT))
-            .pl_3()
             .pr_2()
             .gap_1()
             .border_b_1()
             .border_color(theme::border())
             .bg(theme::sidebar_background())
+            // The strip's leading inset is a move area rather than padding so
+            // the gutter left of the first tab also drags the window.
+            .child(
+                self.window_move_area("tab-strip-lead", cx)
+                    .w(px(TAB_STRIP_LEAD_INSET)),
+            )
             .child(
                 apply_list(div().id(chrome.tabs.id), &chrome.tabs)
                     .flex()
@@ -888,12 +893,9 @@ impl OcHerdrView {
                 )
                 .on_click(cx.listener(|this, _, _window, cx| this.create_tab(cx))),
             )
-            // The only part of the tab strip that is not a control, so this is
-            // where a drag means "move the window".
-            .child(div().flex_1().on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| window.start_window_move()),
-            ))
+            // Everything between `+` and the toolbar is empty strip, so a
+            // drag there means "move the window".
+            .child(self.window_move_area("tab-strip-space", cx).flex_1())
             .child(div().id("pane-actions").role(ochub_ui::gpui::Role::Toolbar).aria_label(i18n.text(k::TERMINAL_PANE_ACTIONS)).flex().items_center().gap_1().px_2()
             .child(
                 apply_control(
@@ -1714,6 +1716,47 @@ impl OcHerdrView {
     }
 }
 
+/// What a left press on empty tab-strip space does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabStripPress {
+    /// Single press: hand the drag to the window server.
+    MoveWindow,
+    /// Second click of a double-click: the titlebar action macOS is
+    /// configured for (zoom or minimise).
+    TitlebarDoubleClick,
+}
+
+/// Decides between a window drag and the titlebar double-click action from
+/// the press's `click_count`.
+pub(crate) fn tab_strip_press(click_count: usize) -> TabStripPress {
+    if click_count == 2 {
+        TabStripPress::TitlebarDoubleClick
+    } else {
+        TabStripPress::MoveWindow
+    }
+}
+
+impl OcHerdrView {
+    /// Empty tab-strip space: full strip height so the hit area is the visible
+    /// gap, not a zero-height line. Controls in the strip are siblings, never
+    /// children, so a press here can only mean the window.
+    fn window_move_area(&self, id: &'static str, cx: &mut Context<Self>) -> ochub_ui::gpui::Div {
+        div()
+            .h_full()
+            .flex_none()
+            .debug_selector(move || id.to_owned())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, event: &MouseDownEvent, window, _| {
+                    match tab_strip_press(event.click_count) {
+                        TabStripPress::MoveWindow => window.start_window_move(),
+                        TabStripPress::TitlebarDoubleClick => window.titlebar_double_click(),
+                    }
+                }),
+            )
+    }
+}
+
 fn tab_key_equivalent(index: usize, tab_count: usize) -> Option<String> {
     if tab_count < 2 {
         return None;
@@ -2531,8 +2574,17 @@ pub(super) fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::{pane_fractions, tab_key_equivalent};
+    use super::{TabStripPress, pane_fractions, tab_key_equivalent, tab_strip_press};
     use ocherdr_core::{LayoutPane, LayoutRect, PaneLayout};
+
+    #[test]
+    fn empty_strip_press_moves_the_window_and_a_double_click_zooms() {
+        assert_eq!(tab_strip_press(1), TabStripPress::MoveWindow);
+        assert_eq!(tab_strip_press(2), TabStripPress::TitlebarDoubleClick);
+        // A triple click already started a move on click one and ran the
+        // titlebar action on click two; do not run it again.
+        assert_eq!(tab_strip_press(3), TabStripPress::MoveWindow);
+    }
 
     fn layout_rect(x: u16, y: u16, width: u16, height: u16) -> LayoutRect {
         LayoutRect {
