@@ -2051,8 +2051,8 @@ fn split_line_fraction(
     })
 }
 
-/// Divider of one split (design §5.4): a 10 px hit strip around a 4 px
-/// neutral line that turns accent on hover and stays accent while dragged.
+/// Divider of one split (design §5.4): a 10 px hit strip. Its line stays
+/// canvas-coloured at rest, then turns accent on hover and while dragged.
 /// `geometry` is the split rect and divider line as surface fractions,
 /// already squeezed to the preview ratio during a drag.
 fn render_split_handle(
@@ -2070,7 +2070,9 @@ fn render_split_handle(
     let line_color = if dragging {
         theme::accent()
     } else {
-        theme::border()
+        // Rounded panes reveal this strip. Keeping its resting colour equal
+        // to the terminal canvas avoids a permanent grey gutter.
+        theme::current().bg.rgba()
     };
     // Mouse-only. A tab-reachable splitter would fight terminal key
     // forwarding. Keyboard resize is the Herdr TUI and `herdr pane resize`.
