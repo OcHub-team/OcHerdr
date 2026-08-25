@@ -50,10 +50,19 @@ pub struct WorkspaceRow {
     pub a11y: ControlA11y,
 }
 
+/// One sidebar row per agent pane, mirroring the Herdr TUI's agent panel:
+/// `workspace[ · tab] · pane label`, the agent kind muted beside it when the
+/// pane label is something else (a custom agent name, a reported display
+/// name), and the status on the right.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRow {
     pub pane_id: String,
     pub agent_status: AgentStatus,
+    /// `workspace · pane label`, with the tab label in between when the
+    /// workspace has several tabs or the tab is named.
+    pub primary: String,
+    /// The agent kind (`codex`, `claude`) when it is not already the pane label.
+    pub kind: Option<String>,
     pub a11y: ControlA11y,
 }
 
@@ -156,7 +165,7 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
             &snapshot.workspaces,
             input.selection.workspace_id.as_deref(),
         );
-        let agents = agent_rows(&snapshot.panes, input.selection.pane_id.as_deref(), i18n);
+        let agents = agent_rows(snapshot, input.selection.pane_id.as_deref(), i18n);
         let tabs = if let Some(workspace_id) = input.selection.workspace_id.as_deref() {
             tab_rows(
                 snapshot
@@ -402,28 +411,63 @@ fn workspace_rows(workspaces: &[WorkspaceInfo], selected_id: Option<&str>) -> Ve
         .collect()
 }
 
-fn agent_rows(panes: &[PaneInfo], selected_pane_id: Option<&str>, i18n: I18n) -> Vec<AgentRow> {
-    let mut seen_agents = HashSet::new();
+/// The Herdr sidebar's agent list (`collect_agent_panel_entries_with_runtimes`
+/// over `Workspace::pane_details`): every pane whose terminal has an agent —
+/// a detected/reported kind (`pane.agent`) or a custom agent name (an
+/// `agents` entry) — in workspace order, then tab order, then pane order.
+/// No dedupe: two `codex` panes are two rows.
+fn agent_rows(
+    snapshot: &HierarchySnapshot,
+    selected_pane_id: Option<&str>,
+    i18n: I18n,
+) -> Vec<AgentRow> {
     let mut items = Vec::new();
-    for pane in panes {
-        let Some(agent_name) = pane.display_agent.as_deref().or(pane.agent.as_deref()) else {
-            continue;
-        };
-        if !seen_agents.insert(agent_name) {
-            continue;
+    for workspace in &snapshot.workspaces {
+        let tabs = snapshot
+            .tabs_for(&workspace.workspace_id)
+            .collect::<Vec<_>>();
+        let multi_tab = tabs.len() > 1;
+        for tab in tabs {
+            let show_tab = multi_tab || tab_is_named(tab);
+            for pane in snapshot.panes_for(&tab.tab_id) {
+                let agent_name = snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.pane_id == pane.pane_id)
+                    .and_then(|agent| agent.name.as_deref());
+                let kind = pane.agent.as_deref();
+                let Some(fallback) = agent_name.or(kind) else {
+                    continue;
+                };
+                let label = pane.display_agent.as_deref().unwrap_or(fallback);
+                let primary = if show_tab {
+                    format!("{} · {} · {}", workspace.label, tab.label, label)
+                } else {
+                    format!("{} · {}", workspace.label, label)
+                };
+                let kind = kind.filter(|kind| *kind != label).map(str::to_owned);
+                items.push(AgentRow {
+                    pane_id: pane.pane_id.clone(),
+                    agent_status: pane.agent_status,
+                    a11y: list_control(
+                        pane.pane_id.clone(),
+                        Role::Button,
+                        format!("{primary} · {}", i18n.agent_status(pane.agent_status)),
+                        selected_pane_id == Some(pane.pane_id.as_str()),
+                    ),
+                    primary,
+                    kind,
+                });
+            }
         }
-        items.push(AgentRow {
-            pane_id: pane.pane_id.clone(),
-            agent_status: pane.agent_status,
-            a11y: list_control(
-                agent_name.to_owned(),
-                Role::Button,
-                format!("{} · {}", agent_name, i18n.agent_status(pane.agent_status)),
-                selected_pane_id == Some(pane.pane_id.as_str()),
-            ),
-        });
     }
     items
+}
+
+/// Herdr labels an auto-named tab with its number; anything else is a name
+/// the user (or a client) chose, which the TUI shows even for a lone tab.
+fn tab_is_named(tab: &TabInfo) -> bool {
+    tab.label != tab.number.to_string()
 }
 
 fn tab_rows<'a>(
@@ -564,7 +608,7 @@ mod tests {
 
     static HIDDEN_NONE: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
 
-    use ocherdr_core::{AgentStatus, PaneInfo, TabInfo, WorkspaceInfo};
+    use ocherdr_core::{AgentInfo, AgentStatus, PaneInfo, TabInfo, WorkspaceInfo};
 
     use super::*;
     use crate::i18n::Language;
@@ -927,12 +971,12 @@ mod tests {
         let grok = &chrome.agents.items[0];
         assert_eq!(grok.a11y.role, Role::Button);
         assert!(!grok.a11y.tab_stop);
-        assert_eq!(grok.a11y.id, "grok");
-        assert_eq!(grok.a11y.name, "grok · idle");
+        assert_eq!(grok.a11y.id, "p1");
+        assert_eq!(grok.a11y.name, "schedule review · 1 · grok · idle");
         assert_eq!(grok.a11y.selected, Some(true));
         let codex = &chrome.agents.items[1];
-        assert_eq!(codex.a11y.id, "codex");
-        assert_eq!(codex.a11y.name, "codex · working");
+        assert_eq!(codex.a11y.id, "p2");
+        assert_eq!(codex.a11y.name, "schedule review · 1 · codex · working");
         assert_eq!(codex.a11y.selected, Some(false));
 
         for action in chrome.toolbar.actions() {
@@ -978,6 +1022,107 @@ mod tests {
             );
             assert!(!control.name.is_empty(), "{}", control.id);
         }
+    }
+
+    /// Mirrors Herdr's `collect_agent_panel_entries_with_runtimes`: one row
+    /// per agent pane in workspace → tab → pane order, no dedupe by kind,
+    /// custom names and reported display names as the pane label, the tab
+    /// label only where the TUI shows it.
+    #[test]
+    fn agent_rows_list_every_agent_pane_like_the_herdr_sidebar() {
+        let i18n = I18n::new(Language::English);
+        let mut snapshot = HierarchySnapshot {
+            workspaces: vec![
+                workspace("w-ocherdr", 1, "ocherdr", true, "t1"),
+                workspace("w-ms", 2, "model-switch", false, "t2"),
+                workspace("w-notes", 3, "notes", false, "t3"),
+            ],
+            tabs: vec![
+                tab("t1", "w-ocherdr", 1, "1", true),
+                tab("t2", "w-ms", 1, "1", false),
+                tab("t3", "w-notes", 1, "review", false),
+            ],
+            panes: vec![
+                pane(
+                    "p-grok",
+                    "t1",
+                    "w-ocherdr",
+                    "grok",
+                    AgentStatus::Working,
+                    true,
+                ),
+                pane(
+                    "p-codex-a",
+                    "t1",
+                    "w-ocherdr",
+                    "codex",
+                    AgentStatus::Idle,
+                    false,
+                ),
+                pane(
+                    "p-shell",
+                    "t1",
+                    "w-ocherdr",
+                    "codex",
+                    AgentStatus::Unknown,
+                    false,
+                ),
+                pane(
+                    "p-codex-b",
+                    "t2",
+                    "w-ms",
+                    "codex",
+                    AgentStatus::Blocked,
+                    false,
+                ),
+                pane(
+                    "p-claude",
+                    "t3",
+                    "w-notes",
+                    "claude",
+                    AgentStatus::Done,
+                    false,
+                ),
+            ],
+            agents: vec![AgentInfo {
+                pane_id: "p-grok".into(),
+                name: Some("grok-t31".into()),
+            }],
+            ..HierarchySnapshot::default()
+        };
+        // The fixture's `pane()` reports the kind as the display name too;
+        // strip that so the rows exercise the name/kind fallback.
+        for pane in &mut snapshot.panes {
+            pane.display_agent = None;
+        }
+        snapshot.panes[2].agent = None; // a plain shell: not an agent pane
+        // A reported display name wins over the kind, as in `pane_details`.
+        snapshot.panes[4].display_agent = Some("Claude Code".into());
+
+        let rows = agent_rows(&snapshot, Some("p-codex-b"), i18n);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (
+                    row.pane_id.as_str(),
+                    row.primary.as_str(),
+                    row.kind.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("p-grok", "ocherdr · grok-t31", Some("grok")),
+                ("p-codex-a", "ocherdr · codex", None),
+                ("p-codex-b", "model-switch · codex", None),
+                ("p-claude", "notes · review · Claude Code", Some("claude")),
+            ],
+            "every agent pane, in Herdr order, with no dedupe by kind"
+        );
+        assert_eq!(rows[0].a11y.name, "ocherdr · grok-t31 · working");
+        assert_eq!(rows[2].a11y.name, "model-switch · codex · blocked");
+        assert_eq!(
+            rows.iter().map(|row| row.a11y.selected).collect::<Vec<_>>(),
+            vec![Some(false), Some(false), Some(true), Some(false)]
+        );
+        assert_eq!(rows[0].a11y.id, "p-grok", "rows are addressed by pane");
     }
 
     #[test]

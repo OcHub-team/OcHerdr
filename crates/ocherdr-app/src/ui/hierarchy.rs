@@ -246,7 +246,10 @@ impl OcHerdrView {
             .map(|row| {
                 let pane_id = row.pane_id.clone();
                 let debug_pane_id = pane_id.clone();
+                let menu_pane_id = pane_id.clone();
                 let status = row.agent_status;
+                let primary = row.primary.clone();
+                let kind = row.kind.clone();
                 apply_control(
                     div().id(ochub_ui::gpui::ElementId::Name(
                         format!("agent-{pane_id}").into(),
@@ -262,19 +265,42 @@ impl OcHerdrView {
                 .hover(|style| style.bg(theme::surface_hover()))
                 .cursor_pointer()
                 .debug_selector(move || format!("agent-{debug_pane_id}"))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_agent_panel(pane_id.clone(), window, cx)
+                // Single click jumps to the pane; the second click of a
+                // double-click opens the agent panel (also on the context
+                // menu), matching the TUI where the list is a navigator.
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    if event.click_count() >= 2 {
+                        this.open_agent_panel(pane_id.clone(), window, cx)
+                    } else {
+                        this.jump_to_agent_pane(pane_id.clone(), window, cx)
+                    }
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event, window, cx| {
+                        this.open_agent_context_menu(menu_pane_id.clone(), event, window, cx)
+                    }),
+                )
                 .child(status_dot(status_color(status)))
                 .child(
                     div()
                         .flex_1()
-                        .truncate()
-                        .text_sm()
-                        .child(row.a11y.id.clone()),
+                        .min_w_0()
+                        .flex()
+                        .items_baseline()
+                        .gap_1()
+                        .child(div().truncate().text_sm().child(primary))
+                        .children(kind.map(|kind| {
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(kind)
+                        })),
                 )
                 .child(
                     div()
+                        .flex_none()
                         .text_xs()
                         .text_color(theme::muted())
                         .child(i18n.agent_status(status)),

@@ -415,6 +415,23 @@ impl OcHerdrView {
                 );
             }
             HierarchyTarget::Pane { id, .. } => {
+                if menu.agent_details {
+                    let details_id = id.clone();
+                    items.push(
+                        context_menu_item(
+                            "agent-menu-details",
+                            i18n.text(k::AGENT_DETAILS),
+                            None::<&str>,
+                            Some(IconName::Eye),
+                            false,
+                        )
+                        .debug_selector(|| "agent-menu-details".into())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_agent_panel(details_id.clone(), window, cx)
+                        }))
+                        .into_any_element(),
+                    );
+                }
                 items.push(
                     context_menu_item(
                         "pane-menu-copy",

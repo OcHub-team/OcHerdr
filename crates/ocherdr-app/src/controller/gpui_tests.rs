@@ -415,6 +415,10 @@ fn reply_to_agent_request(
             "id": id,
             "result": { "snapshot": agent_snapshot() },
         }),
+        Some("agent.focus") => json!({
+            "id": id,
+            "result": { "type": "ok" },
+        }),
         Some("agent.prompt") if matches!(prompt_reply, PromptReply::Success) => json!({
             "id": id,
             "result": { "type": "agent_prompted" },
@@ -1052,11 +1056,48 @@ fn connect_agent_view(view: &mut OcHerdrView, fake: &FakeAgentHerdr) {
     view.operation = None;
 }
 
+fn agent_row_center(cx: &mut VisualTestContext) -> gpui::Point<gpui::Pixels> {
+    cx.debug_bounds("agent-p1")
+        .expect("agent row should be in the rendered tree")
+        .center()
+}
+
 fn click_agent_row(cx: &mut VisualTestContext) {
-    let bounds = cx
-        .debug_bounds("agent-p1")
-        .expect("agent row should be in the rendered tree");
-    cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    let center = agent_row_center(cx);
+    cx.simulate_click(center, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// Double-click on the row: the second press/release carries `click_count: 2`.
+fn double_click_agent_row(cx: &mut VisualTestContext) {
+    let center = agent_row_center(cx);
+    cx.simulate_click(center, gpui::Modifiers::default());
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: center,
+        modifiers: Default::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: center,
+        modifiers: Default::default(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
+}
+
+/// Open the agent panel the way the sidebar row does now: the context
+/// menu's "Details" entry.
+fn open_agent_row_details(cx: &mut VisualTestContext) {
+    let center = agent_row_center(cx);
+    cx.simulate_mouse_down(center, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let details = cx
+        .debug_bounds("agent-menu-details")
+        .expect("the agent row's context menu leads with Details");
+    cx.simulate_click(details.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 }
 
@@ -1435,7 +1476,7 @@ fn fixed_width_tab_hover_reveals_close_then_delayed_preview(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-fn clicking_an_agent_row_reads_its_name_and_recent_output(cx: &mut TestAppContext) {
+fn the_details_entry_reads_the_agents_name_and_recent_output(cx: &mut TestAppContext) {
     let fake = FakeAgentHerdr::new(PromptReply::Success);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
@@ -1444,7 +1485,7 @@ fn clicking_an_agent_row_reads_its_name_and_recent_output(cx: &mut TestAppContex
         cx.notify();
     });
 
-    click_agent_row(cx);
+    open_agent_row_details(cx);
 
     let reads = fake.requests_for("agent.read");
     assert_eq!(
@@ -1482,7 +1523,7 @@ fn rename_uses_the_agent_info_returned_by_herdr(cx: &mut TestAppContext) {
         connect_agent_view(this, &fake);
         cx.notify();
     });
-    click_agent_row(cx);
+    open_agent_row_details(cx);
     view.update(cx, |this, cx| {
         this.agent_name_input
             .update(cx, |input, cx| input.set_content("requested-name", cx));
@@ -1518,7 +1559,7 @@ fn clicking_send_issues_the_exact_non_waiting_prompt(cx: &mut TestAppContext) {
         connect_agent_view(this, &fake);
         cx.notify();
     });
-    click_agent_row(cx);
+    open_agent_row_details(cx);
     view.update(cx, |this, cx| {
         this.agent_prompt_input
             .update(cx, |input, cx| input.set_content("  preserve me  ", cx));
@@ -1550,7 +1591,7 @@ fn agent_blocked_sends_once_and_writes_the_failed_prompt_state(cx: &mut TestAppC
         connect_agent_view(this, &fake);
         cx.notify();
     });
-    click_agent_row(cx);
+    open_agent_row_details(cx);
     view.update(cx, |this, cx| {
         this.agent_prompt_input
             .update(cx, |input, cx| input.set_content("blocked prompt", cx));
@@ -1582,7 +1623,7 @@ fn a_prompt_failure_completes_after_its_panel_closes(cx: &mut TestAppContext) {
         connect_agent_view(this, &fake);
         cx.notify();
     });
-    click_agent_row(cx);
+    open_agent_row_details(cx);
     view.update(cx, |this, cx| {
         this.agent_prompt_input
             .update(cx, |input, cx| input.set_content("finish after close", cx));
@@ -3638,4 +3679,96 @@ fn a_created_workspace_is_selected_when_its_events_beat_the_response(cx: &mut Te
     cx.run_until_parked();
 
     assert_selected(&view, cx, ("w-new", "t-w-new", "p-w-new"));
+}
+
+#[gpui::test]
+fn clicking_an_agent_row_jumps_to_its_pane_and_asks_herdr_to_focus_it(cx: &mut TestAppContext) {
+    let fake = FakeAgentHerdr::new(PromptReply::Success);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, cx| {
+        connect_agent_view(this, &fake);
+        this.headless_terminals = true;
+        this.selection.tab_id = None;
+        this.selection.pane_id = None;
+        cx.notify();
+    });
+
+    click_agent_row(cx);
+
+    let focuses = fake.requests_for("agent.focus");
+    assert_eq!(focuses.len(), 1, "one agent.focus for the clicked pane");
+    assert_eq!(focuses[0].get("params"), Some(&json!({ "target": "p1" })));
+    assert!(
+        fake.requests_for("agent.read").is_empty(),
+        "a click does not open the panel"
+    );
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.selection.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(this.selection.tab_id.as_deref(), Some("t1"));
+        assert_eq!(this.selection.pane_id.as_deref(), Some("p1"));
+        assert!(
+            matches!(this.overlay, crate::Overlay::None),
+            "the agent panel stays closed on a single click"
+        );
+    });
+}
+
+#[gpui::test]
+fn right_clicking_an_agent_row_offers_details_which_opens_the_panel(cx: &mut TestAppContext) {
+    let fake = FakeAgentHerdr::new(PromptReply::Success);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, cx| {
+        connect_agent_view(this, &fake);
+        this.headless_terminals = true;
+        cx.notify();
+    });
+
+    let center = agent_row_center(cx);
+    cx.simulate_mouse_down(center, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(
+            matches!(&this.overlay, crate::Overlay::ContextMenu(menu) if menu.agent_details),
+            "secondary click opens the agent row's context menu"
+        );
+    });
+    assert!(fake.requests_for("agent.focus").is_empty());
+
+    let details = cx
+        .debug_bounds("agent-menu-details")
+        .expect("Details entry rendered");
+    cx.simulate_click(details.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    view.read_with(cx, |this, _| {
+        assert!(
+            matches!(&this.overlay, crate::Overlay::AgentPanel { pane_id } if pane_id == "p1"),
+            "Details opens the agent panel"
+        );
+    });
+    assert_eq!(fake.requests_for("agent.read").len(), 1);
+}
+
+#[gpui::test]
+fn double_clicking_an_agent_row_opens_the_panel(cx: &mut TestAppContext) {
+    let fake = FakeAgentHerdr::new(PromptReply::Success);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, cx| {
+        connect_agent_view(this, &fake);
+        this.headless_terminals = true;
+        cx.notify();
+    });
+
+    double_click_agent_row(cx);
+
+    view.read_with(cx, |this, _| {
+        assert!(
+            matches!(&this.overlay, crate::Overlay::AgentPanel { pane_id } if pane_id == "p1"),
+            "the second click of a double-click opens the panel"
+        );
+    });
+    assert_eq!(fake.requests_for("agent.read").len(), 1);
 }

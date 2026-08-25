@@ -26,11 +26,11 @@ use ochub_ui::components::{
     modal_card, modal_footer, modal_header, modal_overlay, spinner, status_dot,
 };
 use ochub_ui::gpui::{
-    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Task, TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window,
+    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClickEvent, ClipboardItem,
+    Context, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
+    FontWeight, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, Task, TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window,
     WindowAppearance, WindowBounds, WindowOptions, canvas, div, ease_out_quint, linear_color_stop,
     linear_gradient, point, prelude::*, px, relative, size, surface,
 };
@@ -356,6 +356,9 @@ struct HierarchyContextMenu {
     target: HierarchyTarget,
     x: f32,
     y: f32,
+    /// Opened from the sidebar agent list: leads with "Details", the only way
+    /// that list reaches the agent panel now that a click jumps to the pane.
+    agent_details: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3400,6 +3403,7 @@ mod tests {
                 target: target.clone(),
                 x: 0.,
                 y: 0.,
+                agent_details: false,
             }),
             Overlay::Rename(target.clone()),
             Overlay::ConfirmClose(target),

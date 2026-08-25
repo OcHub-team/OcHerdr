@@ -1,6 +1,7 @@
 # en — Agent interaction panel.
 
 "agent.blocked.detail" = "The agent is waiting for approval or a question. The prompt was not sent."
+"agent.details" = "Details"
 "agent.keys" = "Keys"
 "agent.keys.ctrl_c" = "Ctrl+C"
 "agent.keys.enter" = "Enter"

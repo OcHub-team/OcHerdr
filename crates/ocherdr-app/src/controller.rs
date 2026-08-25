@@ -1517,10 +1517,64 @@ impl OcHerdrView {
                 y: f32::from(event.position.y)
                     .min((f32::from(viewport.height) - 260.).max(8.))
                     .max(8.),
+                agent_details: false,
             }),
             cx,
         );
         cx.stop_propagation();
+    }
+
+    /// Secondary click on a sidebar agent row: the pane menu led by
+    /// "Details", which is how the row still reaches the agent panel.
+    pub(super) fn open_agent_context_menu(
+        &mut self,
+        pane_id: String,
+        event: &MouseDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.pane(&pane_id))
+            .map(|pane| pane.display_name().to_owned())
+            .unwrap_or_else(|| pane_id.clone());
+        self.open_context_menu(
+            HierarchyTarget::Pane { id: pane_id, label },
+            event,
+            window,
+            cx,
+        );
+        if let Overlay::ContextMenu(menu) = &mut self.overlay {
+            menu.agent_details = true;
+        }
+    }
+
+    /// Click on a sidebar agent row: select its workspace, tab and pane
+    /// locally (the same path as clicking the pane) and ask Herdr to focus
+    /// it, so the TUI and other clients follow too.
+    pub(super) fn jump_to_agent_pane(
+        &mut self,
+        pane_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((workspace_id, tab_id)) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.pane(&pane_id))
+            .map(|pane| (pane.workspace_id.clone(), pane.tab_id.clone()))
+        else {
+            return;
+        };
+        if self.selection.workspace_id.as_deref() != Some(workspace_id.as_str())
+            || self.selection.tab_id.as_deref() != Some(tab_id.as_str())
+        {
+            self.selection.workspace_id = Some(workspace_id);
+            self.select_tab(tab_id, cx);
+        }
+        self.select_pane(pane_id.clone(), window, cx);
+        self.invoke("agent.focus", json!({ "target": pane_id }), cx);
     }
 
     pub(super) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
