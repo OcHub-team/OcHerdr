@@ -18,8 +18,11 @@ bincode protocol.
 4. Bootstrap state with `session.snapshot`; unknown fields are ignored for forward
    compatibility.
 5. Use public API methods for Workspace, Tab, Pane, and layout mutations.
-6. Open `terminal session control --takeover` for the focused pane and `observe` for
-   sibling panes. Release and terminate every bridge when focus or connection changes.
+6. Open `terminal session control --takeover` for every pane of the visible tab and
+   `observe` for panes of hidden tabs. Only the selected pane receives input and
+   terminal focus; the other control streams exist so Herdr sizes each PTY from the
+   grid OcHerdr renders for it (an observe stream only records the viewport). Release
+   and terminate every bridge when the visible tab or connection changes.
 7. Feed decoded ANSI bytes into Ghostty's `manualMirror` surface. Ghostty owns VT
    state, shaping, glyph/image rendering, and produces a leased BGRA IOSurface.
 8. Wrap that IOSurface as a CoreVideo pixel buffer without copying it and without
@@ -43,8 +46,13 @@ forwarded public socket instead of through a shell.
 
 ## Terminal policy
 
-Only one controller may own a terminal. OcHerdr always requests takeover for the pane
-selected by the user. All other visible panes are observers. A sequence gap in a delta
+Only one controller may own a terminal. OcHerdr requests takeover for every pane of
+the visible tab, so each PTY follows its on-screen grid after a window resize, divider
+drag, or relocation; panes of hidden tabs are observers and Herdr keeps their size.
+Stream mode is separate from focus: keyboard, IME, and mouse input and focus-in/out
+reporting go to the selected pane only. Because takeover is per pane, a second
+OcHerdr on the same session takes every visible pane's stream away from the first
+(see `known-issues.md`). A sequence gap in a delta
 frame invalidates the local terminal state and requires a fresh bridge. A full frame is
 an ANSI redraw and is applied to the existing Ghostty surface; it does not destroy or
 recreate renderer state.

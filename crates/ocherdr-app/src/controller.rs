@@ -2111,7 +2111,11 @@ impl OcHerdrView {
             .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
             .collect::<HashMap<_, _>>();
         #[cfg_attr(not(test), allow(unused_mut))]
-        let mut wanted = snapshot_runtime_targets(snapshot, selected_pane.as_deref());
+        let mut wanted = snapshot_runtime_targets(
+            snapshot,
+            selected_pane.as_deref(),
+            visible_tab_id.as_deref(),
+        );
         #[cfg(test)]
         if self.headless_terminals {
             wanted.clear();
@@ -2140,13 +2144,15 @@ impl OcHerdrView {
                 .expect("live session adopted panes")
                 .panes;
             panes.retain(|pane_id, _| live_pane_ids.contains(pane_id));
-            for (pane_id, mode) in &wanted {
+            for target in &wanted {
+                let pane_id = &target.pane_id;
+                let mode = target.mode;
                 match visible_pane_plan(
                     panes.get(pane_id).map(|runtime| runtime.mode),
                     panes
                         .get(pane_id)
                         .is_some_and(|runtime| runtime.session.is_closed() || runtime.exit_seen),
-                    *mode,
+                    mode,
                 ) {
                     VisiblePanePlan::Keep
                     | VisiblePanePlan::PromoteToControl
@@ -2161,7 +2167,8 @@ impl OcHerdrView {
                             }
                             if let Some(frames) = sync_pane_session(
                                 runtime,
-                                *mode,
+                                mode,
+                                target.focused,
                                 profile.clone(),
                                 session_name.clone(),
                                 pane_id.clone(),
@@ -2177,20 +2184,21 @@ impl OcHerdrView {
                             profile.clone(),
                             session_name.clone(),
                             pane_id.clone(),
-                            *mode,
+                            mode,
                             cols,
                             rows,
                         );
                         match Terminal::new(cols, rows, 10_000, &palette) {
                             Ok(terminal) => {
-                                terminal.set_focus(*mode == TerminalMode::ControlTakeover);
+                                terminal.set_focus(target.focused);
                                 panes.insert(
                                     pane_id.clone(),
                                     PaneRuntime {
                                         session,
                                         terminal,
                                         frame: None,
-                                        mode: *mode,
+                                        mode,
+                                        focused: target.focused,
                                         size: (cols, rows),
                                         pixel_size: (0, 0),
                                         frame_context: 0,
@@ -2210,7 +2218,8 @@ impl OcHerdrView {
                     }
                 }
             }
-            for (pane_id, _) in &wanted {
+            for target in &wanted {
+                let pane_id = &target.pane_id;
                 let pane_tab = pane_tabs.get(pane_id).map(String::as_str);
                 if !should_flush_session_pane(
                     pane_tab,
@@ -2499,7 +2508,13 @@ impl OcHerdrView {
                 runtime.color_scheme_dark = palette.dark;
                 runtime.palette_signature = palette.signature();
             }
-            if !frozen && runtime.pixel_size != (width_px, height_px) {
+            let plan = pane_resize_plan(
+                frozen,
+                runtime.mode,
+                runtime.pixel_size,
+                (width_px, height_px),
+            );
+            if plan != PaneResizePlan::Skip {
                 runtime.frame_context = runtime.frame_context.wrapping_add(1);
                 let resolved = runtime.terminal.resize_pixels(
                     width_px,
@@ -2508,7 +2523,7 @@ impl OcHerdrView {
                     runtime.frame_context,
                 );
                 let size = (resolved.columns, resolved.rows);
-                if runtime.mode == TerminalMode::ControlTakeover {
+                if plan == PaneResizePlan::ResizeAndPush {
                     let _ = runtime.session.send(TerminalCommand::Resize {
                         cols: resolved.columns,
                         rows: resolved.rows,
@@ -5087,22 +5102,68 @@ fn session_terminals_need_rebuild(
         || closed_stream
 }
 
+/// Stream and focus wanted for one snapshot pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneRuntimeTarget {
+    pane_id: String,
+    mode: TerminalMode,
+    focused: bool,
+}
+
+/// Every pane of the visible tab holds a control stream, so Herdr sizes its
+/// PTY from the grid OcHerdr pushes (an observe stream only records the
+/// viewport). Hidden tabs keep observe streams and let Herdr size them.
+/// Focus is separate: only the selected pane has it.
 fn snapshot_runtime_targets(
     snapshot: &HierarchySnapshot,
     selected_pane: Option<&str>,
-) -> Vec<(String, TerminalMode)> {
+    visible_tab: Option<&str>,
+) -> Vec<PaneRuntimeTarget> {
     snapshot
         .panes
         .iter()
         .map(|pane| {
-            let mode = if selected_pane == Some(pane.pane_id.as_str()) {
+            let focused = selected_pane == Some(pane.pane_id.as_str());
+            let mode = if focused || visible_tab == Some(pane.tab_id.as_str()) {
                 TerminalMode::ControlTakeover
             } else {
                 TerminalMode::Observe
             };
-            (pane.pane_id.clone(), mode)
+            PaneRuntimeTarget {
+                pane_id: pane.pane_id.clone(),
+                mode,
+                focused,
+            }
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneResizePlan {
+    /// Grid frozen by a pending relocation or split drag, or pixels unchanged.
+    Skip,
+    /// Refit the local Ghostty grid; the stream cannot size the PTY.
+    ResizeLocal,
+    /// Refit the local grid and push the new size down the control stream.
+    ResizeAndPush,
+}
+
+/// What a measured pane body means for the terminal: the grid follows the
+/// body once it is authoritative, and a control stream carries the size to
+/// Herdr so the PTY matches the grid on screen.
+fn pane_resize_plan(
+    frozen: bool,
+    mode: TerminalMode,
+    current_pixels: (u32, u32),
+    measured_pixels: (u32, u32),
+) -> PaneResizePlan {
+    if frozen || current_pixels == measured_pixels {
+        return PaneResizePlan::Skip;
+    }
+    match mode {
+        TerminalMode::ControlTakeover => PaneResizePlan::ResizeAndPush,
+        TerminalMode::Observe => PaneResizePlan::ResizeLocal,
+    }
 }
 
 fn should_flush_session_pane(
@@ -6008,13 +6069,15 @@ fn visible_pane_ids(snapshot: Option<&HierarchySnapshot>, tab_id: Option<&str>) 
 fn sync_pane_session(
     runtime: &mut PaneRuntime,
     wanted: TerminalMode,
+    focused: bool,
     profile: ConnectionProfile,
     session_name: String,
     pane_id: String,
 ) -> Option<UnboundedReceiver<std::result::Result<TerminalEvent, HerdrError>>> {
-    runtime
-        .terminal
-        .set_focus(wanted == TerminalMode::ControlTakeover);
+    if runtime.focused != focused {
+        runtime.terminal.set_focus(focused);
+        runtime.focused = focused;
+    }
     if runtime.mode == wanted {
         return None;
     }
@@ -6543,23 +6606,31 @@ mod tests {
         assert!(incoming_frame_should_replace_grid((0, 0)));
     }
 
+    fn target(pane_id: &str, mode: TerminalMode, focused: bool) -> PaneRuntimeTarget {
+        PaneRuntimeTarget {
+            pane_id: pane_id.into(),
+            mode,
+            focused,
+        }
+    }
+
     #[test]
     fn session_targets_every_snapshot_pane_and_only_selects_one_control() {
         let snapshot = two_tab_snapshot();
-        let targets = snapshot_runtime_targets(&snapshot, Some("p-a"));
+        let targets = snapshot_runtime_targets(&snapshot, Some("p-a"), Some("t-a"));
         assert_eq!(
             targets,
             vec![
-                ("p-a".into(), TerminalMode::ControlTakeover),
-                ("p-b".into(), TerminalMode::Observe),
+                target("p-a", TerminalMode::ControlTakeover, true),
+                target("p-b", TerminalMode::Observe, false),
             ]
         );
-        let switched = snapshot_runtime_targets(&snapshot, Some("p-b"));
+        let switched = snapshot_runtime_targets(&snapshot, Some("p-b"), Some("t-b"));
         assert_eq!(
             switched,
             vec![
-                ("p-a".into(), TerminalMode::Observe),
-                ("p-b".into(), TerminalMode::ControlTakeover),
+                target("p-a", TerminalMode::Observe, false),
+                target("p-b", TerminalMode::ControlTakeover, true),
             ]
         );
         assert_eq!(
@@ -6568,6 +6639,81 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn every_pane_of_the_visible_tab_holds_a_control_stream_and_only_one_has_focus() {
+        let mut snapshot = two_tab_snapshot();
+        snapshot.panes.push(test_pane("p-a2", "t-a"));
+        let targets = snapshot_runtime_targets(&snapshot, Some("p-a"), Some("t-a"));
+        assert_eq!(
+            targets,
+            vec![
+                target("p-a", TerminalMode::ControlTakeover, true),
+                target("p-b", TerminalMode::Observe, false),
+                target("p-a2", TerminalMode::ControlTakeover, false),
+            ]
+        );
+        assert_eq!(
+            targets.iter().filter(|target| target.focused).count(),
+            1,
+            "focus stays with the selected pane"
+        );
+        // Selecting the sibling keeps both streams; only focus moves.
+        let switched = snapshot_runtime_targets(&snapshot, Some("p-a2"), Some("t-a"));
+        assert_eq!(
+            switched,
+            vec![
+                target("p-a", TerminalMode::ControlTakeover, false),
+                target("p-b", TerminalMode::Observe, false),
+                target("p-a2", TerminalMode::ControlTakeover, true),
+            ]
+        );
+        assert_eq!(
+            visible_pane_plan(
+                Some(TerminalMode::ControlTakeover),
+                false,
+                TerminalMode::ControlTakeover
+            ),
+            VisiblePanePlan::Keep,
+            "moving focus between visible panes must not respawn their streams"
+        );
+    }
+
+    #[test]
+    fn a_grid_change_pushes_the_size_down_every_control_stream() {
+        let panes = [
+            ("selected", TerminalMode::ControlTakeover),
+            ("sibling", TerminalMode::ControlTakeover),
+            ("hidden-tab", TerminalMode::Observe),
+        ];
+        let pushed = panes
+            .iter()
+            .filter(|(_, mode)| {
+                pane_resize_plan(false, *mode, (800, 600), (640, 480))
+                    == PaneResizePlan::ResizeAndPush
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        assert_eq!(pushed, ["selected", "sibling"]);
+        assert_eq!(
+            pane_resize_plan(false, TerminalMode::Observe, (800, 600), (640, 480)),
+            PaneResizePlan::ResizeLocal
+        );
+        assert_eq!(
+            pane_resize_plan(false, TerminalMode::ControlTakeover, (800, 600), (800, 600)),
+            PaneResizePlan::Skip
+        );
+        // Frozen while a relocation or split drag previews geometry; the
+        // release re-measures and then pushes.
+        assert_eq!(
+            pane_resize_plan(true, TerminalMode::ControlTakeover, (800, 600), (640, 480)),
+            PaneResizePlan::Skip
+        );
+        assert_eq!(
+            pane_resize_plan(false, TerminalMode::ControlTakeover, (800, 600), (640, 480)),
+            PaneResizePlan::ResizeAndPush
         );
     }
 

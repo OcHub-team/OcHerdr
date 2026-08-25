@@ -294,13 +294,19 @@ impl SessionPanes {
 }
 
 struct PaneRuntime {
-    /// Observe for every pane that is not selected; takeover for the selected
-    /// pane. Snapshot panes stay alive across tabs so hidden terminals keep
-    /// their Ghostty surface, last Metal frame, and observe stream.
+    /// Control (`--takeover`) for every pane of the visible tab, so each PTY
+    /// follows the grid OcHerdr renders for it; observe for panes of hidden
+    /// tabs, whose size Herdr keeps on its own. Snapshot panes stay alive
+    /// across tabs so hidden terminals keep their Ghostty surface, last
+    /// Metal frame, and stream.
     session: TerminalSession,
     terminal: Terminal,
     frame: Option<RenderedFrame>,
     mode: TerminalMode,
+    /// The selected pane: the only one that receives keyboard, IME, and
+    /// mouse input and reports terminal focus. Independent of `mode`, since
+    /// every visible pane holds a control stream.
+    focused: bool,
     size: (u16, u16),
     pixel_size: (u32, u32),
     frame_context: u64,
