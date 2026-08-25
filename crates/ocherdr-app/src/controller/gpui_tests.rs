@@ -1128,6 +1128,93 @@ fn empty_tab_strip_space_is_a_full_height_window_move_area(cx: &mut TestAppConte
     // `start_window_move` is `unimplemented!()`.
 }
 
+fn open_close_tab_dialog(view: &Entity<OcHerdrView>, cx: &mut VisualTestContext) {
+    view.update_in(cx, |this, window, cx| {
+        this.focus.focus(window, cx);
+        this.request_close(
+            crate::HierarchyTarget::Tab {
+                id: "t-a".into(),
+                label: "alpha".into(),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    view.update_in(cx, |this, window, _| {
+        assert!(matches!(this.overlay, crate::Overlay::ConfirmClose(_)));
+        assert!(
+            this.dialog_focus.is_focused(window),
+            "the dialog takes focus when it opens"
+        );
+        assert!(!this.focus.is_focused(window));
+    });
+    assert!(
+        cx.debug_bounds("confirm-close-target-hint-↩").is_some(),
+        "the primary button carries the return hint"
+    );
+    assert!(
+        cx.debug_bounds("cancel-close-target-hint-esc").is_some(),
+        "cancel carries the esc hint"
+    );
+}
+
+#[gpui::test]
+fn confirm_dialog_takes_focus_and_enter_runs_the_primary_action(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    open_close_tab_dialog(&view, cx);
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    view.update_in(cx, |this, window, _| {
+        assert!(matches!(this.overlay, crate::Overlay::None));
+        assert!(
+            this.focus.is_focused(window),
+            "focus returns to the terminal surface"
+        );
+    });
+    let closes = fake.requests_for("tab.close");
+    assert_eq!(closes.len(), 1, "enter closes the tab: {closes:?}");
+    assert_eq!(closes[0]["params"]["tab_id"], json!("t-a"));
+}
+
+#[gpui::test]
+fn confirm_dialog_escape_cancels_without_a_request(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    open_close_tab_dialog(&view, cx);
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.update_in(cx, |this, window, _| {
+        assert!(matches!(this.overlay, crate::Overlay::None));
+        assert!(this.focus.is_focused(window));
+    });
+    assert!(fake.requests_for("tab.close").is_empty());
+}
+
+/// The dialog focuses itself, so it does not depend on the terminal having
+/// been focused before it opened (a toolbar click does not focus the surface).
+#[gpui::test]
+fn confirm_dialog_receives_keys_even_when_nothing_was_focused(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    view.update_in(cx, |this, window, cx| {
+        window.blur();
+        this.request_close(
+            crate::HierarchyTarget::Tab {
+                id: "t-a".into(),
+                label: "alpha".into(),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(matches!(this.overlay, crate::Overlay::None))
+    });
+    assert_eq!(fake.requests_for("tab.close").len(), 1);
+}
+
 #[gpui::test]
 fn fixed_width_tab_hover_reveals_close_then_delayed_preview(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);

@@ -10,6 +10,7 @@ pub(crate) use appearance::AppearanceUi;
 
 impl Render for OcHerdrView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_pending_focus(window, cx);
         let chrome = self.chrome_a11y();
         let main = crate::a11y::apply_region(div().id(chrome.main.id), &chrome.main)
             .flex()

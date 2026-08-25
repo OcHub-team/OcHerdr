@@ -14,7 +14,7 @@ impl OcHerdrView {
         else {
             return div().into_any_element();
         };
-        let cancel = button(
+        let cancel = cancel_dialog_button(
             "cancel-switch-host",
             i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
@@ -22,7 +22,7 @@ impl OcHerdrView {
         )
         .on_click(cx.listener(|this, _, _window, cx| this.cancel_switch_profile(cx)))
         .into_any_element();
-        let confirm = button(
+        let confirm = confirm_dialog_button(
             "confirm-switch-host",
             i18n.text(k::COMMON_SWITCH),
             ButtonTone::Primary,
@@ -56,6 +56,7 @@ impl OcHerdrView {
         )
         .top_0()
         .left_0()
+        .track_focus(&self.dialog_focus)
         .on_key_down(cx.listener(|this, event, window, cx| {
             this.handle_overlay_key(event, window, cx);
         }))
@@ -73,7 +74,7 @@ impl OcHerdrView {
         else {
             return div().into_any_element();
         };
-        let cancel = button(
+        let cancel = cancel_dialog_button(
             "cancel-remove-node",
             i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
@@ -81,7 +82,7 @@ impl OcHerdrView {
         )
         .on_click(cx.listener(|this, _, _window, cx| this.cancel_remove_node(cx)))
         .into_any_element();
-        let remove = button(
+        let remove = confirm_dialog_button(
             "confirm-remove-node",
             i18n.text(k::HOSTS_REMOVE_NODE),
             ButtonTone::Danger,
@@ -115,6 +116,7 @@ impl OcHerdrView {
         )
         .top_0()
         .left_0()
+        .track_focus(&self.dialog_focus)
         .on_key_down(cx.listener(|this, event, window, cx| {
             this.handle_overlay_key(event, window, cx);
         }))
@@ -124,7 +126,7 @@ impl OcHerdrView {
     pub(super) fn render_bulk_remove(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
         let count = self.host_center.read(cx).bulk_selection_len();
-        let cancel = button(
+        let cancel = cancel_dialog_button(
             "cancel-bulk-remove",
             i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
@@ -132,7 +134,7 @@ impl OcHerdrView {
         )
         .on_click(cx.listener(|this, _, _window, cx| this.cancel_bulk_remove(cx)))
         .into_any_element();
-        let remove = button(
+        let remove = confirm_dialog_button(
             "confirm-bulk-remove",
             i18n.text(k::HOSTS_BULK_REMOVE),
             ButtonTone::Danger,
@@ -166,6 +168,7 @@ impl OcHerdrView {
         )
         .top_0()
         .left_0()
+        .track_focus(&self.dialog_focus)
         .on_key_down(cx.listener(|this, event, window, cx| {
             this.handle_overlay_key(event, window, cx);
         }))
@@ -179,7 +182,7 @@ impl OcHerdrView {
         let i18n = self.i18n;
         let kind = target.kind_key();
         let label = target.label().to_owned();
-        let cancel = button(
+        let cancel = cancel_dialog_button(
             "cancel-close-target",
             i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
@@ -187,7 +190,7 @@ impl OcHerdrView {
         )
         .on_click(cx.listener(|this, _, _window, cx| this.cancel_close(cx)))
         .into_any_element();
-        let close = button(
+        let close = confirm_dialog_button(
             "confirm-close-target",
             i18n.close_action(kind),
             ButtonTone::Danger,
@@ -217,6 +220,7 @@ impl OcHerdrView {
         )
         .top_0()
         .left_0()
+        .track_focus(&self.dialog_focus)
         .on_key_down(cx.listener(|this, event, window, cx| {
             this.handle_overlay_key(event, window, cx);
         }))
@@ -831,7 +835,7 @@ impl OcHerdrView {
                 i18n.text(k::WORKTREE_REMOVE_FORCE_ACTION),
             ),
         };
-        let cancel = button(
+        let cancel = cancel_dialog_button(
             "cancel-remove-worktree",
             i18n.text(k::COMMON_CANCEL),
             ButtonTone::Neutral,
@@ -839,7 +843,7 @@ impl OcHerdrView {
         )
         .on_click(cx.listener(|this, _, _window, cx| this.cancel_remove_worktree(cx)))
         .into_any_element();
-        let confirm = button(
+        let confirm = confirm_dialog_button(
             "confirm-remove-worktree",
             action,
             ButtonTone::Danger,
@@ -859,8 +863,51 @@ impl OcHerdrView {
         )
         .top_0()
         .left_0()
+        .track_focus(&self.dialog_focus)
         .on_key_down(cx.listener(|this, event, window, cx| {
             this.handle_overlay_key(event, window, cx);
         }))
     }
+}
+
+/// Glyph shown at the trailing edge of a dialog button for the key that
+/// triggers it: a muted secondary label after the button's own text.
+fn key_hint(glyph: &'static str) -> impl IntoElement {
+    div().ml(px(8.)).text_xs().opacity(0.65).child(glyph)
+}
+
+/// The dialog's primary action, hinted with `↩`: Enter triggers it.
+fn confirm_dialog_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    tone: ButtonTone,
+    size: ButtonSize,
+) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
+    dialog_button(id, label, tone, size, "↩")
+}
+
+/// The dialog's Cancel, hinted with `esc`.
+fn cancel_dialog_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    tone: ButtonTone,
+    size: ButtonSize,
+) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
+    dialog_button(id, label, tone, size, "esc")
+}
+
+/// [`button`] with a key hint; the accessible name stays the label alone.
+fn dialog_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    tone: ButtonTone,
+    size: ButtonSize,
+    glyph: &'static str,
+) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
+    button(id, label, tone, size)
+        .flex()
+        .flex_row()
+        .items_center()
+        .debug_selector(move || format!("{id}-hint-{glyph}"))
+        .child(key_hint(glyph))
 }

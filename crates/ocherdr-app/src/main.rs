@@ -674,6 +674,12 @@ struct OcHerdrView {
     operation: Option<SharedString>,
     notifications: Entity<NotificationHost>,
     focus: FocusHandle,
+    /// Focus for the confirm dialogs, so Enter/Esc reach them and nothing
+    /// leaks to the terminal underneath while one is open.
+    dialog_focus: FocusHandle,
+    /// Focus move requested by a context that has no `Window`; the next
+    /// render performs it.
+    pending_focus: Option<PendingFocus>,
     load_epoch: u64,
     /// Invalidates in-flight snapshot refreshes when the live session is replaced.
     event_epoch: u64,
@@ -845,7 +851,29 @@ enum WorktreeOpenState {
     },
 }
 
+/// Where focus goes on the next render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingFocus {
+    /// The confirm dialog that just opened.
+    Dialog,
+    /// The terminal surface, after a dialog closed.
+    Surface,
+}
+
 impl Overlay {
+    /// The confirm dialogs: one destructive/primary action, one Cancel, no
+    /// text input of their own. They share focus handling and key hints.
+    fn is_confirm_dialog(&self) -> bool {
+        matches!(
+            self,
+            Self::ConfirmClose(_)
+                | Self::ConfirmRemoveWorktree { .. }
+                | Self::ConfirmRemoveProfile(_)
+                | Self::ConfirmSwitchProfile { .. }
+                | Self::ConfirmBulkRemove
+        )
+    }
+
     fn host_center(&self) -> bool {
         matches!(
             self,

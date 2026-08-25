@@ -47,6 +47,7 @@ impl OcHerdrView {
                 .0
                 .pane_edge_relocation;
         let focus = cx.focus_handle();
+        let dialog_focus = cx.focus_handle();
         let host_center = cx.new(|cx| HostCenter::new(settings, i18n, focus.clone(), cx));
         let profiles = host_center.read(cx).profiles().to_vec();
         cx.subscribe(&host_center, |this, _center, event, cx| {
@@ -83,6 +84,8 @@ impl OcHerdrView {
             operation: None,
             notifications: cx.new(|_| NotificationHost::new()),
             focus,
+            dialog_focus,
+            pending_focus: None,
             load_epoch: 0,
             event_epoch: 0,
             snapshot_refreshing: false,
@@ -572,6 +575,13 @@ impl OcHerdrView {
             self.cancel_reorder_drag();
         }
         let leaving_host_center = self.overlay.host_center() && !overlay.host_center();
+        if overlay.is_confirm_dialog() {
+            self.pending_focus = Some(PendingFocus::Dialog);
+        } else if self.overlay.is_confirm_dialog() && matches!(overlay, Overlay::None) {
+            // The dialog element goes away with its focus; keys would then
+            // reach only the window root, so hand focus back to the surface.
+            self.pending_focus = Some(PendingFocus::Surface);
+        }
         let form = match overlay {
             Overlay::RemoteForm(form) => Some(form),
             _ => None,
@@ -1384,6 +1394,24 @@ impl OcHerdrView {
         if matches!(self.overlay, Overlay::ConfirmClose(_)) {
             self.set_overlay(Overlay::None, cx);
         }
+    }
+
+    /// Performs the focus move queued by `set_overlay`, from render where a
+    /// `Window` is at hand. Deferred so the dialog is in the rendered frame
+    /// before it is focused.
+    pub(super) fn apply_pending_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_focus.take() else {
+            return;
+        };
+        let handle = match pending {
+            PendingFocus::Dialog => self.dialog_focus.clone(),
+            PendingFocus::Surface => self.focus.clone(),
+        };
+        window.defer(cx, move |window, cx| {
+            if !handle.is_focused(window) {
+                window.focus(&handle, cx);
+            }
+        });
     }
 
     pub(super) fn handle_overlay_key(
