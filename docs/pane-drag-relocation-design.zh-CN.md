@@ -1,6 +1,6 @@
 # 窗格拖拽、交换与重排设计
 
-**状态：v2，已按 Herdr 源码核对，进入实现**
+**状态：v2，已按 Herdr 源码核对；阶段 1–3 已实现（75ba207 / b562db0 / 142536e / 59ab9f9）**
 **适用范围：OcHerdr macOS 客户端；Herdr 保持为未修改的公开发行版（≥ 0.7.0，protocol 14）**
 
 ## 1. 摘要
@@ -236,7 +236,7 @@ Parked(T_tmp)
 - **tab 编号跳号**：每次四边重排永久消耗一个公共 tab 编号。
 - **源 tab 的 zoom 被清除**：取走 pane 时 `zoomed=false`。四边落点已在 zoomed tab 上禁用，此处只影响并发的外部 zoom。
 - **源 tab 的 `root_pane` 可能改变**：拖走当时的 root pane 时 Herdr 会提升另一个 pane。对 OcHerdr 无可见影响，记录备查。
-- **PTY 尺寸**：只要 pane 是直连 attach（OcHerdr 默认如此），Herdr 不会在停靠期间 resize 它；未直连的 pane（异常路径）会经历"全 tab → 目标比例"两次 SIGWINCH。
+- **PTY 尺寸**：Herdr 只为 attach（control）流调整 PTY，observe 流的 resize 只记录视口。验收发现 OcHerdr 原本只对选中 pane 用 control 流，导致任何布局变化后非选中 pane 的 PTY 尺寸滞后、渲染错乱；修复为活动 tab 内所有可见 pane 均使用 control 流（输入与焦点仍只绑定选中 pane）。代价：同一会话打开第二个 OcHerdr 实例会互相接管全部可见 pane 的流（此前仅选中 pane）。
 - **非原子**：三条请求之间其他客户端/agent 可以修改布局，靠指纹检测而不是靠锁。
 
 ## 10. 动效规范
@@ -275,7 +275,7 @@ Parked(T_tmp)
 
 1. **P0**：§6.1、§6.2、§6.3、§8。纯逻辑，单元测试覆盖，不改 UI。
 2. **中心交换 + 分隔线挤压预览**：`SurfaceDrag::Pane`、把手、五区判定（仅中心可落）、`pane.swap`、Settling 动画、a11y/i18n。
-3. **四边重排（实验开关）**：§4.2 编排、§7 状态机、临时 tab 隐藏、Parked 恢复 UI；收集本地/SSH 延迟与失败率。
+3. **四边重排（实验开关）**：§4.2 编排、§7 状态机、临时 tab 隐藏、Parked 恢复 UI；收集本地/SSH 延迟与失败率。已实现：配置键 `pane-edge-relocation = true|false`（默认 false），需同时通过 §8 能力探测；键盘模式（前缀键后 `m`，方向键选目标，Tab 循环落点，Enter 确认）随同落地；比例预设（1/3、2/3）尚未提供，固定 0.5。
 4. **默认开启**：四边重排稳定后默认开启；不支持 `pane.move` 的连接继续走阶段 2 的能力。
 
 ## 14. 测试与验收
