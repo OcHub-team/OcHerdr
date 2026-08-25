@@ -28,6 +28,8 @@ pub(crate) enum FailureKind {
     RenderTerminal,
     TerminalStream,
     TerminalRuntime,
+    TerminalControlBusy,
+    TerminalControlTakenOver,
     CannotEditThisMac,
     NeedGroupOrTag,
     CannotRemoveActiveHost,
@@ -50,7 +52,9 @@ impl FailureKind {
             | Self::SshPortInvalid
             | Self::NoSessionSelected
             | Self::MissingTheme
-            | Self::AgentBlocked => NotificationLevel::Warning,
+            | Self::AgentBlocked
+            | Self::TerminalControlBusy
+            | Self::TerminalControlTakenOver => NotificationLevel::Warning,
             Self::DiscoverSessions
             | Self::RefreshSnapshot
             | Self::ApplyLiveUpdate
@@ -96,6 +100,8 @@ impl FailureKind {
             Self::RenderTerminal => k::NOTIFY_RENDER_TERMINAL,
             Self::TerminalStream => k::NOTIFY_TERMINAL_STREAM,
             Self::TerminalRuntime => k::NOTIFY_TERMINAL_RUNTIME,
+            Self::TerminalControlBusy => k::NOTIFY_TERMINAL_CONTROL_BUSY,
+            Self::TerminalControlTakenOver => k::NOTIFY_TERMINAL_CONTROL_TAKEN_OVER,
             Self::CannotEditThisMac => k::NOTIFY_CANNOT_EDIT_THIS_MAC,
             Self::NeedGroupOrTag => k::NOTIFY_CANNOT_APPLY_ORGANIZATION,
             Self::CannotRemoveActiveHost => k::NOTIFY_CANNOT_REMOVE_HOST,

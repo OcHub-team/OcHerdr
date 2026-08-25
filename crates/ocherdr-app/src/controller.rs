@@ -2045,7 +2045,6 @@ impl OcHerdrView {
             return;
         }
         let profile = self.current_profile();
-        let selected_pane = self.selection.pane_id.clone();
         let visible_tab_id = self.selection.tab_id.clone();
         let snapshot = self.snapshot.as_ref().expect("snapshot checked above");
         let live_pane_ids = snapshot_pane_ids(snapshot);
@@ -2054,7 +2053,6 @@ impl OcHerdrView {
             .iter()
             .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
             .collect::<HashMap<_, _>>();
-        let wanted = snapshot_runtime_targets(snapshot, selected_pane.as_deref());
         let incoming = SessionKey {
             profile_id: profile.id().to_owned(),
             session_name: session_name.clone(),
@@ -2073,6 +2071,11 @@ impl OcHerdrView {
         let mut spawned = HashSet::new();
         let mut pending_listens = Vec::new();
         {
+            let control = self
+                .session_panes
+                .as_ref()
+                .and_then(|session| session.control.clone());
+            let wanted = snapshot_runtime_targets(snapshot, control.as_ref());
             let panes = &mut self
                 .session_panes
                 .as_mut()
@@ -2122,7 +2125,7 @@ impl OcHerdrView {
                         );
                         match Terminal::new(cols, rows, 10_000, &palette) {
                             Ok(terminal) => {
-                                terminal.set_focus(*mode == TerminalMode::ControlTakeover);
+                                terminal.set_focus(mode.is_controlled());
                                 panes.insert(
                                     pane_id.clone(),
                                     PaneRuntime {
@@ -2181,6 +2184,79 @@ impl OcHerdrView {
         self.session_panes = None;
     }
 
+    pub(super) fn pane_control_action(&self, pane_id: &str) -> PaneControlAction {
+        let Some(session) = self.session_panes.as_ref() else {
+            return PaneControlAction::Take;
+        };
+        pane_control_action(
+            session.control.as_ref(),
+            session.control_conflict.as_deref(),
+            pane_id,
+        )
+    }
+
+    pub(super) fn run_pane_control_action(
+        &mut self,
+        pane_id: String,
+        action: PaneControlAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_panes.as_mut() else {
+            return;
+        };
+        match action {
+            PaneControlAction::Take | PaneControlAction::ForceTakeover => {
+                session.control = Some(TerminalControl {
+                    pane_id,
+                    mode: if action == PaneControlAction::ForceTakeover {
+                        TerminalMode::ControlTakeover
+                    } else {
+                        TerminalMode::Control
+                    },
+                });
+                session.control_conflict = None;
+            }
+            PaneControlAction::Release => {
+                if session
+                    .control
+                    .as_ref()
+                    .is_some_and(|control| control.pane_id == pane_id)
+                {
+                    session.control = None;
+                    session.control_conflict = None;
+                }
+            }
+        }
+        self.ensure_session_terminals(cx);
+        cx.notify();
+    }
+
+    fn demote_lost_terminal_control(
+        &mut self,
+        pane_id: &str,
+        loss: TerminalControlLoss,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.session_panes.as_mut() else {
+            return false;
+        };
+        if !demote_terminal_control(session, pane_id) {
+            return false;
+        }
+        let (kind, detail) = match loss {
+            TerminalControlLoss::Busy => (
+                FailureKind::TerminalControlBusy,
+                self.i18n.text(k::NOTIFY_DETAIL_TERMINAL_CONTROL_BUSY),
+            ),
+            TerminalControlLoss::TakenOver => (
+                FailureKind::TerminalControlTakenOver,
+                self.i18n.text(k::NOTIFY_DETAIL_TERMINAL_CONTROL_TAKEN_OVER),
+            ),
+        };
+        self.notify_failure(kind, detail, cx);
+        true
+    }
+
     fn listen_pane(
         pane_id: String,
         mut frames: UnboundedReceiver<std::result::Result<TerminalEvent, HerdrError>>,
@@ -2233,6 +2309,7 @@ impl OcHerdrView {
             visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
         let mut error = None;
         let mut hierarchy_changed = false;
+        let mut control_loss = None;
         let mut changed = false;
         let keep = {
             let Some(runtime) = self.pane_mut(pane_id) else {
@@ -2279,9 +2356,16 @@ impl OcHerdrView {
                             }) => runtime.terminal.set_mouse_capture(enabled, sgr_pixels),
                             Err(stream_error) => {
                                 runtime.exit_seen = true;
-                                hierarchy_changed = true;
+                                control_loss = runtime
+                                    .mode
+                                    .is_controlled()
+                                    .then(|| terminal_control_loss(&stream_error))
+                                    .flatten();
+                                hierarchy_changed = control_loss.is_none();
                                 closed = true;
-                                if !is_expected_terminal_exit(&stream_error) {
+                                if !is_expected_terminal_exit(&stream_error)
+                                    && control_loss.is_none()
+                                {
                                     error = Some((
                                         FailureKind::TerminalStream,
                                         stream_error.to_string(),
@@ -2317,6 +2401,12 @@ impl OcHerdrView {
         };
         if let Some((kind, detail)) = error {
             self.notify_failure(kind, detail, cx);
+        }
+        if let Some(loss) = control_loss
+            && self.demote_lost_terminal_control(pane_id, loss, cx)
+        {
+            self.ensure_session_terminals(cx);
+            cx.notify();
         }
         if hierarchy_changed {
             self.resync_snapshot(self.event_epoch, cx);
@@ -2416,7 +2506,7 @@ impl OcHerdrView {
                     runtime.frame_context,
                 );
                 let size = (resolved.columns, resolved.rows);
-                if runtime.mode == TerminalMode::ControlTakeover {
+                if runtime.mode.is_controlled() {
                     let _ = runtime.session.send(TerminalCommand::Resize {
                         cols: resolved.columns,
                         rows: resolved.rows,
@@ -3031,6 +3121,9 @@ impl OcHerdrView {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
             };
+            if !runtime.mode.is_controlled() {
+                return;
+            }
             if key.modifiers.platform && key.key == "v" {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     runtime.terminal.paste(&text);
@@ -3788,7 +3881,13 @@ impl OcHerdrView {
     }
 
     pub(super) fn accepts_ime(&self) -> bool {
-        key_goes_to_terminal(&self.overlay) && self.selection.pane_id.is_some()
+        key_goes_to_terminal(&self.overlay)
+            && self
+                .selection
+                .pane_id
+                .as_deref()
+                .and_then(|pane_id| self.pane(pane_id))
+                .is_some_and(|runtime| runtime.mode.is_controlled())
     }
 
     pub(super) fn commit_ime_text(
@@ -3808,6 +3907,9 @@ impl OcHerdrView {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
             };
+            if !runtime.mode.is_controlled() {
+                return;
+            }
             let closed = runtime
                 .session
                 .send(TerminalCommand::Input(text.as_bytes().to_vec()))
@@ -3899,20 +4001,46 @@ fn session_terminals_need_rebuild(
 
 fn snapshot_runtime_targets(
     snapshot: &HierarchySnapshot,
-    selected_pane: Option<&str>,
+    control: Option<&TerminalControl>,
 ) -> Vec<(String, TerminalMode)> {
     snapshot
         .panes
         .iter()
         .map(|pane| {
-            let mode = if selected_pane == Some(pane.pane_id.as_str()) {
-                TerminalMode::ControlTakeover
-            } else {
-                TerminalMode::Observe
-            };
+            let mode = control
+                .filter(|control| control.pane_id == pane.pane_id)
+                .map(|control| control.mode)
+                .unwrap_or(TerminalMode::Observe);
             (pane.pane_id.clone(), mode)
         })
         .collect()
+}
+
+fn pane_control_action(
+    control: Option<&TerminalControl>,
+    control_conflict: Option<&str>,
+    pane_id: &str,
+) -> PaneControlAction {
+    if control.is_some_and(|control| control.pane_id == pane_id) {
+        PaneControlAction::Release
+    } else if control_conflict == Some(pane_id) {
+        PaneControlAction::ForceTakeover
+    } else {
+        PaneControlAction::Take
+    }
+}
+
+fn demote_terminal_control(session: &mut SessionPanes, pane_id: &str) -> bool {
+    if session
+        .control
+        .as_ref()
+        .is_none_or(|control| control.pane_id != pane_id)
+    {
+        return false;
+    }
+    session.control = None;
+    session.control_conflict = Some(pane_id.to_owned());
+    true
 }
 
 fn should_flush_session_pane(
@@ -3982,7 +4110,28 @@ fn visible_pane_plan(
         None => VisiblePanePlan::Spawn,
         Some(current) if current == wanted => VisiblePanePlan::Keep,
         Some(TerminalMode::Observe) => VisiblePanePlan::PromoteToControl,
-        Some(TerminalMode::ControlTakeover) => VisiblePanePlan::DemoteToObserve,
+        Some(TerminalMode::Control | TerminalMode::ControlTakeover) => {
+            VisiblePanePlan::DemoteToObserve
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalControlLoss {
+    Busy,
+    TakenOver,
+}
+
+fn terminal_control_loss(error: &HerdrError) -> Option<TerminalControlLoss> {
+    let HerdrError::TerminalClosed(reason) = error else {
+        return None;
+    };
+    if reason.contains("already has an attached client") {
+        Some(TerminalControlLoss::Busy)
+    } else if reason == "terminal attach taken over" {
+        Some(TerminalControlLoss::TakenOver)
+    } else {
+        None
     }
 }
 
@@ -4752,9 +4901,7 @@ fn sync_pane_session(
     session_name: String,
     pane_id: String,
 ) -> Option<UnboundedReceiver<std::result::Result<TerminalEvent, HerdrError>>> {
-    runtime
-        .terminal
-        .set_focus(wanted == TerminalMode::ControlTakeover);
+    runtime.terminal.set_focus(wanted.is_controlled());
     if runtime.mode == wanted {
         return None;
     }
@@ -4770,7 +4917,7 @@ fn sync_pane_session(
     );
     runtime.session = session;
     runtime.mode = wanted;
-    if wanted == TerminalMode::ControlTakeover {
+    if wanted.is_controlled() {
         send_session_resize(runtime);
     }
     Some(frames)
@@ -4791,7 +4938,7 @@ fn send_session_resize(runtime: &PaneRuntime) {
 
 fn forward_terminal_input(runtime: &PaneRuntime) -> Result<(), ()> {
     while let Some(bytes) = runtime.terminal.try_input() {
-        if runtime.mode == TerminalMode::ControlTakeover
+        if runtime.mode.is_controlled()
             && runtime.session.send(TerminalCommand::Input(bytes)).is_err()
         {
             return Err(());
@@ -5284,22 +5431,31 @@ mod tests {
     }
 
     #[test]
-    fn session_targets_every_snapshot_pane_and_only_selects_one_control() {
+    fn session_targets_every_snapshot_pane_as_observers_by_default() {
         let snapshot = two_tab_snapshot();
-        let targets = snapshot_runtime_targets(&snapshot, Some("p-a"));
+        let targets = snapshot_runtime_targets(&snapshot, None);
         assert_eq!(
             targets,
             vec![
-                ("p-a".into(), TerminalMode::ControlTakeover),
+                ("p-a".into(), TerminalMode::Observe),
                 ("p-b".into(), TerminalMode::Observe),
             ]
         );
-        let switched = snapshot_runtime_targets(&snapshot, Some("p-b"));
+    }
+
+    #[test]
+    fn explicit_control_only_targets_the_requested_pane() {
+        let snapshot = two_tab_snapshot();
+        let control = TerminalControl {
+            pane_id: "p-b".into(),
+            mode: TerminalMode::Control,
+        };
+        let targets = snapshot_runtime_targets(&snapshot, Some(&control));
         assert_eq!(
-            switched,
+            targets,
             vec![
                 ("p-a".into(), TerminalMode::Observe),
-                ("p-b".into(), TerminalMode::ControlTakeover),
+                ("p-b".into(), TerminalMode::Control),
             ]
         );
         assert_eq!(
@@ -5340,27 +5496,15 @@ mod tests {
             VisiblePanePlan::Keep
         );
         assert_eq!(
-            visible_pane_plan(
-                Some(TerminalMode::ControlTakeover),
-                false,
-                TerminalMode::ControlTakeover
-            ),
+            visible_pane_plan(Some(TerminalMode::Control), false, TerminalMode::Control),
             VisiblePanePlan::Keep
         );
         assert_eq!(
-            visible_pane_plan(
-                Some(TerminalMode::Observe),
-                false,
-                TerminalMode::ControlTakeover
-            ),
+            visible_pane_plan(Some(TerminalMode::Observe), false, TerminalMode::Control),
             VisiblePanePlan::PromoteToControl
         );
         assert_eq!(
-            visible_pane_plan(
-                Some(TerminalMode::ControlTakeover),
-                false,
-                TerminalMode::Observe
-            ),
+            visible_pane_plan(Some(TerminalMode::Control), false, TerminalMode::Observe),
             VisiblePanePlan::DemoteToObserve
         );
         assert_eq!(
@@ -5368,19 +5512,11 @@ mod tests {
             VisiblePanePlan::Spawn
         );
         assert_ne!(
-            visible_pane_plan(
-                Some(TerminalMode::Observe),
-                false,
-                TerminalMode::ControlTakeover
-            ),
+            visible_pane_plan(Some(TerminalMode::Observe), false, TerminalMode::Control),
             VisiblePanePlan::Spawn
         );
         assert_ne!(
-            visible_pane_plan(
-                Some(TerminalMode::ControlTakeover),
-                false,
-                TerminalMode::Observe
-            ),
+            visible_pane_plan(Some(TerminalMode::Control), false, TerminalMode::Observe),
             VisiblePanePlan::Spawn
         );
     }
@@ -5416,11 +5552,7 @@ mod tests {
     #[test]
     fn a_closed_stream_is_respawned_instead_of_kept() {
         assert_eq!(
-            visible_pane_plan(
-                Some(TerminalMode::ControlTakeover),
-                true,
-                TerminalMode::ControlTakeover
-            ),
+            visible_pane_plan(Some(TerminalMode::Control), true, TerminalMode::Control),
             VisiblePanePlan::Spawn
         );
         assert_eq!(
@@ -5440,6 +5572,63 @@ mod tests {
         assert!(!is_expected_terminal_exit(&HerdrError::Protocol(
             "frame gap".into()
         )));
+    }
+
+    #[test]
+    fn control_conflict_offers_force_takeover_without_retrying_automatically() {
+        let control = TerminalControl {
+            pane_id: "p-a".into(),
+            mode: TerminalMode::Control,
+        };
+        assert_eq!(
+            pane_control_action(Some(&control), None, "p-a"),
+            PaneControlAction::Release
+        );
+        assert_eq!(
+            pane_control_action(None, Some("p-a"), "p-a"),
+            PaneControlAction::ForceTakeover
+        );
+        assert_eq!(
+            pane_control_action(None, Some("p-a"), "p-b"),
+            PaneControlAction::Take
+        );
+    }
+
+    #[test]
+    fn lost_control_demotes_the_pane_to_observe_before_any_reconnect() {
+        let mut session = SessionPanes::new(SessionKey {
+            profile_id: "local".into(),
+            session_name: "work".into(),
+        });
+        session.control = Some(TerminalControl {
+            pane_id: "p-a".into(),
+            mode: TerminalMode::Control,
+        });
+
+        assert!(demote_terminal_control(&mut session, "p-a"));
+        assert!(session.control.is_none());
+        assert_eq!(session.control_conflict.as_deref(), Some("p-a"));
+        assert!(!demote_terminal_control(&mut session, "p-a"));
+    }
+
+    #[test]
+    fn control_loss_reasons_are_distinguished_from_generic_stream_closure() {
+        assert_eq!(
+            terminal_control_loss(&HerdrError::TerminalClosed(
+                "terminal attach failed: terminal t1 already has an attached client; retry with --takeover".into()
+            )),
+            Some(TerminalControlLoss::Busy)
+        );
+        assert_eq!(
+            terminal_control_loss(&HerdrError::TerminalClosed(
+                "terminal attach taken over".into()
+            )),
+            Some(TerminalControlLoss::TakenOver)
+        );
+        assert_eq!(
+            terminal_control_loss(&HerdrError::TerminalClosed("terminal t1 exited".into())),
+            None
+        );
     }
 
     #[test]

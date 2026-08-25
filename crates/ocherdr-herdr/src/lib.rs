@@ -868,7 +868,20 @@ pub async fn next_batch<T>(rx: &mut UnboundedReceiver<T>) -> Option<Vec<T>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalMode {
     Observe,
+    /// Requests writable control but leaves an existing controller in place.
+    Control,
+    /// Replaces an existing controller after an explicit user confirmation.
     ControlTakeover,
+}
+
+impl TerminalMode {
+    pub const fn is_controlled(self) -> bool {
+        matches!(self, Self::Control | Self::ControlTakeover)
+    }
+
+    const fn takes_over(self) -> bool {
+        matches!(self, Self::ControlTakeover)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1007,29 +1020,7 @@ impl TerminalStream {
         cols: u16,
         rows: u16,
     ) -> Result<Self> {
-        let mut args = Vec::<String>::new();
-        if session_name != "default" {
-            args.extend(["--session".into(), session_name.into()]);
-        }
-        args.extend([
-            "terminal".into(),
-            "session".into(),
-            match mode {
-                TerminalMode::Observe => "observe",
-                TerminalMode::ControlTakeover => "control",
-            }
-            .into(),
-            target.into(),
-        ]);
-        if mode == TerminalMode::ControlTakeover {
-            args.push("--takeover".into());
-        }
-        args.extend([
-            "--cols".into(),
-            cols.max(1).to_string(),
-            "--rows".into(),
-            rows.max(1).to_string(),
-        ]);
+        let args = terminal_session_args(session_name, target, mode, cols, rows);
         let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         let mut command = command_for(profile, &refs)?;
         let mut child = command
@@ -1122,6 +1113,39 @@ impl TerminalStream {
         }
         Ok(())
     }
+}
+
+fn terminal_session_args(
+    session_name: &str,
+    target: &str,
+    mode: TerminalMode,
+    cols: u16,
+    rows: u16,
+) -> Vec<String> {
+    let mut args = Vec::<String>::new();
+    if session_name != "default" {
+        args.extend(["--session".into(), session_name.into()]);
+    }
+    args.extend([
+        "terminal".into(),
+        "session".into(),
+        match mode {
+            TerminalMode::Observe => "observe",
+            TerminalMode::Control | TerminalMode::ControlTakeover => "control",
+        }
+        .into(),
+        target.into(),
+    ]);
+    if mode.takes_over() {
+        args.push("--takeover".into());
+    }
+    args.extend([
+        "--cols".into(),
+        cols.max(1).to_string(),
+        "--rows".into(),
+        rows.max(1).to_string(),
+    ]);
+    args
 }
 
 impl Drop for TerminalStream {
@@ -1572,6 +1596,30 @@ mod tests {
         assert_eq!(value["type"], "terminal.input");
         assert_eq!(value["bytes"], "ABuA/w==");
         assert!(value.get("text").is_none());
+    }
+
+    #[test]
+    fn terminal_control_requires_an_explicit_takeover_mode() {
+        let control = terminal_session_args("work", "pane-1", TerminalMode::Control, 120, 40);
+        assert_eq!(
+            control,
+            [
+                "--session",
+                "work",
+                "terminal",
+                "session",
+                "control",
+                "pane-1",
+                "--cols",
+                "120",
+                "--rows",
+                "40",
+            ]
+        );
+
+        let takeover =
+            terminal_session_args("work", "pane-1", TerminalMode::ControlTakeover, 120, 40);
+        assert!(takeover.contains(&"--takeover".to_owned()));
     }
 
     #[test]

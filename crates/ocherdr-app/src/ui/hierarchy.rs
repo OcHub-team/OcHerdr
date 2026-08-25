@@ -1211,6 +1211,7 @@ impl OcHerdrView {
             let frame = self
                 .pane(&pane.pane_id)
                 .and_then(|runtime| runtime.frame.clone());
+            let control_action = self.pane_control_action(&pane.pane_id);
             let waiting = frame.is_none();
             let screen_text = if window.is_a11y_active() && !waiting {
                 self.pane(&pane.pane_id)
@@ -1222,40 +1223,51 @@ impl OcHerdrView {
             let scroll_pane_id = pane_id.clone();
             let mouse_pane_id = pane_id.clone();
             elements.push(
-                render_pane(pane, frame, fractions, a11y, i18n, view.clone())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event, window, cx| {
-                            this.pane_mouse_down(mouse_pane_id.clone(), event, window, cx);
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, event, window, cx| {
-                            this.pane_mouse_up(event, window, cx);
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(move |this, event, window, cx| {
-                            this.pane_mouse_up(event, window, cx);
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(move |this, event, window, cx| {
-                        this.pane_mouse_move(event, window, cx);
-                    }))
-                    .on_scroll_wheel(cx.listener(
-                        move |this, event: &ScrollWheelEvent, _window, cx| {
-                            this.scroll_pane(&scroll_pane_id, event, cx);
-                        },
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event, window, cx| {
-                            this.open_context_menu(pane_target.clone(), event, window, cx)
-                        }),
-                    )
-                    .into_any_element(),
+                render_pane(
+                    PaneRenderInput {
+                        pane,
+                        frame,
+                        fractions,
+                        a11y,
+                        control_action,
+                    },
+                    i18n,
+                    view.clone(),
+                    cx,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.pane_mouse_down(mouse_pane_id.clone(), event, window, cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.pane_mouse_up(event, window, cx);
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.pane_mouse_up(event, window, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, event, window, cx| {
+                    this.pane_mouse_move(event, window, cx);
+                }))
+                .on_scroll_wheel(
+                    cx.listener(move |this, event: &ScrollWheelEvent, _window, cx| {
+                        this.scroll_pane(&scroll_pane_id, event, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event, window, cx| {
+                        this.open_context_menu(pane_target.clone(), event, window, cx)
+                    }),
+                )
+                .into_any_element(),
             );
         }
         let split_handles = layout.as_ref().map(|layout| {
@@ -1776,19 +1788,41 @@ fn split_preview_line(
     })
 }
 
-fn render_pane(
+struct PaneRenderInput {
     pane: PaneInfo,
     frame: Option<RenderedFrame>,
     fractions: (f32, f32, f32, f32),
     a11y: crate::a11y::PaneA11y,
+    control_action: PaneControlAction,
+}
+
+fn render_pane(
+    input: PaneRenderInput,
     i18n: I18n,
     view: Entity<OcHerdrView>,
+    cx: &mut Context<OcHerdrView>,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
+    let PaneRenderInput {
+        pane,
+        frame,
+        fractions,
+        a11y,
+        control_action,
+    } = input;
     let (x, y, w, h) = fractions;
     let pane_name = a11y.name.clone();
     let selected = a11y.selected;
     let waiting_for_frame = frame.is_none();
     let measure_pane_id = pane.pane_id.clone();
+    let control_pane_id = pane.pane_id.clone();
+    let control_debug_id = pane.pane_id.clone();
+    let (control_label, control_tone) = match control_action {
+        PaneControlAction::Take => (i18n.text(k::TERMINAL_CONTROL_TAKE), ButtonTone::Primary),
+        PaneControlAction::ForceTakeover => {
+            (i18n.text(k::TERMINAL_CONTROL_FORCE), ButtonTone::Danger)
+        }
+        PaneControlAction::Release => (i18n.text(k::TERMINAL_CONTROL_RELEASE), ButtonTone::Ghost),
+    };
     div()
         .id(ochub_ui::gpui::ElementId::Name(
             format!("terminal-pane-{}", pane.pane_id).into(),
@@ -1839,7 +1873,31 @@ fn render_pane(
                         .text_xs()
                         .text_color(theme::subtext())
                         .child(status_dot(status_color(pane.agent_status)))
-                        .child(div().truncate().flex_1().child(pane_name)),
+                        .child(div().truncate().flex_1().child(pane_name))
+                        .when(selected, |header| {
+                            header.child(
+                                button(
+                                    ochub_ui::gpui::ElementId::Name(
+                                        format!("terminal-control-{control_pane_id}").into(),
+                                    ),
+                                    control_label,
+                                    control_tone,
+                                    ButtonSize::Sm,
+                                )
+                                .debug_selector(move || {
+                                    format!("terminal-control-{control_debug_id}")
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, _window, cx| {
+                                        this.run_pane_control_action(
+                                            control_pane_id.clone(),
+                                            control_action,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                        }),
                 )
                 .child(
                     div()
