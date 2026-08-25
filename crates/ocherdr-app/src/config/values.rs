@@ -31,7 +31,15 @@ pub fn is_known_key(key: &str) -> bool {
             | "appearance-mode"
             | "window-backdrop"
             | "language"
+            | "pane-edge-relocation"
     )
+}
+
+/// Experimental switches are read like any other key but survive
+/// `strip_known_keys` (restore-appearance-defaults must not silently turn
+/// them off).
+pub fn is_experimental_key(key: &str) -> bool {
+    matches!(key, "pane-edge-relocation")
 }
 
 /// Ghostty metric delta: `1`, `-2`, or `20%`.
@@ -173,6 +181,9 @@ pub struct AppConfig {
     pub appearance_mode: AppearanceMode,
     pub window_backdrop: BackdropMode,
     pub language: Language,
+    /// Design §13 step 3: four-edge pane relocation via the two-step
+    /// `pane.move` orchestration. Off until it graduates (step 4).
+    pub pane_edge_relocation: bool,
 }
 
 impl Default for AppConfig {
@@ -202,6 +213,7 @@ impl Default for AppConfig {
             appearance_mode: AppearanceMode::Dark,
             window_backdrop: BackdropMode::Blurred,
             language: Language::System,
+            pane_edge_relocation: false,
         }
     }
 }
@@ -244,6 +256,10 @@ fn apply_assignment(
         },
         "font-thicken" => match parse_bool(value) {
             Some(flag) => config.font_thicken = flag,
+            None => invalid(warnings, line, key, value),
+        },
+        "pane-edge-relocation" => match parse_bool(value) {
+            Some(flag) => config.pane_edge_relocation = flag,
             None => invalid(warnings, line, key, value),
         },
         "font-thicken-strength" => match value.parse::<u8>() {
@@ -339,6 +355,7 @@ fn reset_key(config: &mut AppConfig, key: &str) {
         "appearance-mode" => config.appearance_mode = default.appearance_mode,
         "window-backdrop" => config.window_backdrop = default.window_backdrop,
         "language" => config.language = default.language,
+        "pane-edge-relocation" => config.pane_edge_relocation = default.pane_edge_relocation,
         _ => {}
     }
 }
@@ -444,7 +461,7 @@ pub fn appearance_from_config(config: &AppConfig) -> AppearanceSettings {
 pub fn strip_known_keys(document: &mut super::document::ConfigDocument) {
     let keys: Vec<String> = document
         .assignments()
-        .filter(|(_, key, _)| is_known_key(key))
+        .filter(|(_, key, _)| is_known_key(key) && !is_experimental_key(key))
         .map(|(_, key, _)| key.to_owned())
         .collect();
     for key in keys {
@@ -637,6 +654,26 @@ language = en
         assert!(written.contains("mystery-option = wow"));
         assert!(!written.contains("font-size"));
         assert!(!written.contains("language"));
+    }
+
+    #[test]
+    fn pane_edge_relocation_defaults_off_parses_bools_and_survives_a_strip() {
+        let (config, warnings) = AppConfig::from_document(&ConfigDocument::parse(""));
+        assert!(!config.pane_edge_relocation);
+        assert!(warnings.is_empty());
+        let (config, warnings) =
+            AppConfig::from_document(&ConfigDocument::parse("pane-edge-relocation = true\n"));
+        assert!(config.pane_edge_relocation);
+        assert!(warnings.is_empty());
+        let (config, warnings) =
+            AppConfig::from_document(&ConfigDocument::parse("pane-edge-relocation = maybe\n"));
+        assert!(!config.pane_edge_relocation);
+        assert_eq!(warnings.len(), 1);
+        let mut document = ConfigDocument::parse("pane-edge-relocation = true\nfont-size = 12\n");
+        strip_known_keys(&mut document);
+        let written = document.serialize();
+        assert!(written.contains("pane-edge-relocation = true"));
+        assert!(!written.contains("font-size"));
     }
 
     #[test]

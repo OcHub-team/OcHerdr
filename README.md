@@ -20,7 +20,7 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - local and SSH-host session discovery;
 - an in-app host center for filtering, organizing, diagnosing, and switching SSH hosts;
 - live workspace, tab, pane, layout, and agent status rendering;
-- interactive `--takeover` control for the focused pane;
+- interactive `--takeover` control for every pane of the visible tab, input to the selected one;
 - read-only observation of the other panes in the selected tab;
 - workspace/tab creation, rename, close, and pane operations through the public API;
 - native context menus for workspace, tab, and pane actions;

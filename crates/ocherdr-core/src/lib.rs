@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent;
 pub mod event;
+pub mod relocation;
+pub mod split_drag;
 pub use agent::{
     AGENT_OUTPUT_SOURCE, AgentNameError, agent_output_should_refresh, parse_agent_name,
 };
@@ -18,6 +20,13 @@ pub use event::{
     agent_status_handoff_push, agent_status_handoff_take, agent_status_panes_after_stream_closed,
     agent_status_stream_should_rebuild, event_panes_after_failed_subscribe,
 };
+pub use relocation::{
+    DROP_ZONE_CENTER_FRACTION, DropEdge, DropZone, LayoutNode, LayoutTree, PredictedLayout,
+    PredictedPane, PredictedSplit, RelocationSteps, ZoneRect, drop_zone, layout_fingerprint,
+    predict_relocation, predict_relocation_steps, predict_swap, rebuild_tree, split_rect,
+    valid_split_ratio,
+};
+pub use split_drag::{apply_ratios, pinned_ratios};
 
 pub const MINIMUM_HERDR_VERSION: &str = "0.8.1";
 

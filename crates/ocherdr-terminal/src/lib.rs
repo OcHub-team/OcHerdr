@@ -39,6 +39,28 @@ mod ffi {
 
 static RUNTIME: OnceLock<Result<GhosttyRuntime, String>> = OnceLock::new();
 
+/// Configuration every Ghostty config OcHerdr loads starts with.
+///
+/// Option is Alt: Ghostty then prefixes ESC (or reports the alt modifier)
+/// instead of typing the macOS symbol, matching what OcHerdr sent before it
+/// used Ghostty's encoder.
+///
+/// Ghostty's default keybindings are application actions (tabs, splits,
+/// windows, font size, search, inspector…) that OcHerdr implements itself
+/// or does not offer; a bound key never reaches the pty. Clear them so every
+/// key OcHerdr does not claim is encoded for the pty, then restore the macOS
+/// defaults that *are* pty writes so ⌘/⌥ editing chords produce the same
+/// bytes as Ghostty.app.
+const BASE_CONFIG: &str = "\
+macos-option-as-alt = true
+keybind = clear
+keybind = super+left=text:\\x01
+keybind = super+right=text:\\x05
+keybind = super+backspace=text:\\x15
+keybind = alt+left=esc:b
+keybind = alt+right=esc:f
+";
+
 const MOUSE_REPORTING_RESET: &[u8] =
     b"\x1b[?1006l\x1b[?1016l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 const MOUSE_REPORTING_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
@@ -73,6 +95,15 @@ pub struct KeyModifiers {
     pub alt: bool,
     pub shift: bool,
     pub platform: bool,
+}
+
+/// What happened to a key, in Ghostty's terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    Press,
+    /// An auto-repeat of a held key.
+    Repeat,
+    Release,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,6 +501,7 @@ impl GhosttyRuntime {
             // Do not load the user's Ghostty config. That file is almost always
             // a dark terminal theme and would pin the embedded surface away
             // from OcHerdr's light/dark appearance.
+            load_base_config(config);
             ffi::ghostty_config_finalize(config);
 
             // Ghostty's embedded runtime treats clipboard callbacks as required
@@ -533,11 +565,27 @@ fn with_palette_config<T>(
                 "ghostty_config_new returned null".into(),
             ));
         }
+        load_base_config(config);
         ffi::ghostty_config_load_file(config, c_path.as_ptr());
         ffi::ghostty_config_finalize(config);
         let value = apply(config);
         ffi::ghostty_config_free(config);
         Ok(value)
+    }
+}
+
+/// # Safety
+/// `config` must be a live, not yet finalized Ghostty config.
+unsafe fn load_base_config(config: ffi::ghostty_config_t) {
+    let source = c"ocherdr-base";
+    // SAFETY: Ghostty copies both strings during the call.
+    unsafe {
+        ffi::ghostty_config_load_string(
+            config,
+            BASE_CONFIG.as_ptr().cast::<c_char>(),
+            BASE_CONFIG.len(),
+            source.as_ptr(),
+        );
     }
 }
 
@@ -892,44 +940,58 @@ impl Terminal {
         self.input.try_recv().ok()
     }
 
-    pub fn send_key(&self, key: &str, text: Option<&str>, modifiers: KeyModifiers) -> bool {
-        if !modifiers.control
-            && !modifiers.alt
-            && let Some(text) = text.filter(|text| !text.is_empty())
-        {
-            self.send_committed_text(text);
-            return true;
-        }
-
-        let keycode = ghostty_key(key);
-        if keycode == ffi::ghostty_input_key_e_GHOSTTY_KEY_UNIDENTIFIED {
-            if !modifiers.control
-                && !modifiers.alt
-                && let Some(text) = text.filter(|text| !text.is_empty())
-            {
-                self.send_committed_text(text);
-                return true;
-            }
+    /// Send a key event to the surface. `key` is GPUI's key name and `text`
+    /// the character it typed (GPUI's `key_char`); libghostty decides what
+    /// the pty receives from the key, its modifiers, the text, and the
+    /// terminal modes the running application enabled (kitty keyboard
+    /// protocol, modifyOtherKeys, application cursor keys). The bytes arrive
+    /// through [`Terminal::try_input`], the same queue as [`Terminal::paste`].
+    ///
+    /// Returns whether Ghostty handled the event at all. Releases are only
+    /// encoded when the application asked the kitty protocol to report them.
+    pub fn send_key(
+        &self,
+        action: KeyAction,
+        key: &str,
+        text: Option<&str>,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        // Ctrl/Alt chords are encoded from the key: `key_char` is the
+        // character macOS would type (Option+B gives "∫"), and Ghostty's
+        // own app hands its encoder the plain character too. Control
+        // characters GPUI attaches to Enter/Tab are not typed text either;
+        // the keycode carries them so the modifier protocols apply.
+        let chord = (modifiers.control || modifiers.alt).then(|| chord_text(key, modifiers.shift));
+        let text = match chord {
+            Some(chord) => chord,
+            None => text
+                .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+                .map(str::to_owned),
+        };
+        let keycode = macos_keycode(key);
+        if keycode == KEYCODE_UNIDENTIFIED && text.is_none() {
             return false;
         }
-        // Ctrl/Alt chords must be encoded from the key+mods, not from the
-        // printable `key_char` ("c" + Ctrl would type `c` instead of `^C`).
-        let text = if modifiers.control || modifiers.alt {
-            None
+        let unshifted_codepoint = single_char(key).map_or(0, u32::from);
+        // Shift that produced the typed text was consumed by translation,
+        // the same thing Ghostty's macOS app reports.
+        let consumed_mods = if modifiers.shift && text.is_some() {
+            ffi::ghostty_input_mods_e_GHOSTTY_MODS_SHIFT
         } else {
-            text.and_then(|text| CString::new(text).ok())
+            ffi::ghostty_input_mods_e_GHOSTTY_MODS_NONE
         };
+        let text = text.and_then(|text| CString::new(text).ok());
         let input = ffi::ghostty_input_key_s {
-            action: ffi::ghostty_input_action_e_GHOSTTY_ACTION_PRESS,
+            action: match action {
+                KeyAction::Press => ffi::ghostty_input_action_e_GHOSTTY_ACTION_PRESS,
+                KeyAction::Repeat => ffi::ghostty_input_action_e_GHOSTTY_ACTION_REPEAT,
+                KeyAction::Release => ffi::ghostty_input_action_e_GHOSTTY_ACTION_RELEASE,
+            },
             mods: ghostty_modifiers(modifiers),
-            consumed_mods: ffi::ghostty_input_mods_e_GHOSTTY_MODS_NONE,
+            consumed_mods,
             keycode,
             text: text.as_ref().map_or(std::ptr::null(), |text| text.as_ptr()),
-            unshifted_codepoint: key
-                .chars()
-                .next()
-                .filter(|_| key.chars().count() == 1)
-                .map_or(0, u32::from),
+            unshifted_codepoint,
             composing: false,
         };
         // SAFETY: key events are sent synchronously on GPUI's application thread.
@@ -1117,13 +1179,6 @@ impl Terminal {
         Some(take_ghostty_text(self.raw(), &mut result))
     }
 
-    fn send_committed_text(&self, text: &str) {
-        // SAFETY: Ghostty borrows the UTF-8 bytes only for this call.
-        unsafe {
-            ffi::ghostty_surface_text_input(self.raw(), text.as_ptr().cast::<c_char>(), text.len())
-        };
-    }
-
     fn raw(&self) -> ffi::ghostty_surface_t {
         let raw = self.surface.raw.load(Ordering::Acquire);
         debug_assert!(!raw.is_null());
@@ -1174,82 +1229,124 @@ fn ghostty_modifiers(modifiers: KeyModifiers) -> ffi::ghostty_input_mods_e {
     result
 }
 
-fn ghostty_key(key: &str) -> ffi::ghostty_input_key_e {
+fn single_char(key: &str) -> Option<char> {
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(character), None) => Some(character),
+        _ => None,
+    }
+}
+
+/// The character a Ctrl/Alt chord is built on: the key itself, shifted the
+/// way Ghostty's macOS app reports it (Ctrl+Shift+C carries "C").
+fn chord_text(key: &str, shift: bool) -> Option<String> {
+    if key == "space" {
+        return Some(" ".to_owned());
+    }
+    let character = single_char(key)?;
+    let character = if shift {
+        character.to_ascii_uppercase()
+    } else {
+        character
+    };
+    Some(character.to_string())
+}
+
+/// A key OcHerdr cannot name with a macOS virtual keycode. Ghostty then
+/// encodes the event from its text and unshifted codepoint alone.
+const KEYCODE_UNIDENTIFIED: u32 = u32::MAX;
+
+/// GPUI key name → macOS virtual keycode (`kVK_*`, US ANSI layout).
+///
+/// `ghostty_input_key_s.keycode` is the platform's physical keycode, exactly
+/// what Ghostty's own macOS app passes from `NSEvent.keyCode`; libghostty maps
+/// it to its W3C key through its keycode table. GPUI does not expose the
+/// hardware keycode, so the name is mapped back through the ANSI layout.
+fn macos_keycode(key: &str) -> u32 {
     match key.to_ascii_lowercase().as_str() {
-        "a" => ffi::ghostty_input_key_e_GHOSTTY_KEY_A,
-        "b" => ffi::ghostty_input_key_e_GHOSTTY_KEY_B,
-        "c" => ffi::ghostty_input_key_e_GHOSTTY_KEY_C,
-        "d" => ffi::ghostty_input_key_e_GHOSTTY_KEY_D,
-        "e" => ffi::ghostty_input_key_e_GHOSTTY_KEY_E,
-        "f" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F,
-        "g" => ffi::ghostty_input_key_e_GHOSTTY_KEY_G,
-        "h" => ffi::ghostty_input_key_e_GHOSTTY_KEY_H,
-        "i" => ffi::ghostty_input_key_e_GHOSTTY_KEY_I,
-        "j" => ffi::ghostty_input_key_e_GHOSTTY_KEY_J,
-        "k" => ffi::ghostty_input_key_e_GHOSTTY_KEY_K,
-        "l" => ffi::ghostty_input_key_e_GHOSTTY_KEY_L,
-        "m" => ffi::ghostty_input_key_e_GHOSTTY_KEY_M,
-        "n" => ffi::ghostty_input_key_e_GHOSTTY_KEY_N,
-        "o" => ffi::ghostty_input_key_e_GHOSTTY_KEY_O,
-        "p" => ffi::ghostty_input_key_e_GHOSTTY_KEY_P,
-        "q" => ffi::ghostty_input_key_e_GHOSTTY_KEY_Q,
-        "r" => ffi::ghostty_input_key_e_GHOSTTY_KEY_R,
-        "s" => ffi::ghostty_input_key_e_GHOSTTY_KEY_S,
-        "t" => ffi::ghostty_input_key_e_GHOSTTY_KEY_T,
-        "u" => ffi::ghostty_input_key_e_GHOSTTY_KEY_U,
-        "v" => ffi::ghostty_input_key_e_GHOSTTY_KEY_V,
-        "w" => ffi::ghostty_input_key_e_GHOSTTY_KEY_W,
-        "x" => ffi::ghostty_input_key_e_GHOSTTY_KEY_X,
-        "y" => ffi::ghostty_input_key_e_GHOSTTY_KEY_Y,
-        "z" => ffi::ghostty_input_key_e_GHOSTTY_KEY_Z,
-        "0" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_0,
-        "1" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_1,
-        "2" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_2,
-        "3" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_3,
-        "4" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_4,
-        "5" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_5,
-        "6" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_6,
-        "7" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_7,
-        "8" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_8,
-        "9" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DIGIT_9,
-        "`" => ffi::ghostty_input_key_e_GHOSTTY_KEY_BACKQUOTE,
-        "\\" => ffi::ghostty_input_key_e_GHOSTTY_KEY_BACKSLASH,
-        "[" => ffi::ghostty_input_key_e_GHOSTTY_KEY_BRACKET_LEFT,
-        "]" => ffi::ghostty_input_key_e_GHOSTTY_KEY_BRACKET_RIGHT,
-        "," => ffi::ghostty_input_key_e_GHOSTTY_KEY_COMMA,
-        "=" => ffi::ghostty_input_key_e_GHOSTTY_KEY_EQUAL,
-        "-" => ffi::ghostty_input_key_e_GHOSTTY_KEY_MINUS,
-        "." => ffi::ghostty_input_key_e_GHOSTTY_KEY_PERIOD,
-        "'" => ffi::ghostty_input_key_e_GHOSTTY_KEY_QUOTE,
-        ";" => ffi::ghostty_input_key_e_GHOSTTY_KEY_SEMICOLON,
-        "/" => ffi::ghostty_input_key_e_GHOSTTY_KEY_SLASH,
-        "space" | " " => ffi::ghostty_input_key_e_GHOSTTY_KEY_SPACE,
-        "enter" | "return" => ffi::ghostty_input_key_e_GHOSTTY_KEY_ENTER,
-        "tab" => ffi::ghostty_input_key_e_GHOSTTY_KEY_TAB,
-        "backspace" => ffi::ghostty_input_key_e_GHOSTTY_KEY_BACKSPACE,
-        "escape" => ffi::ghostty_input_key_e_GHOSTTY_KEY_ESCAPE,
-        "delete" => ffi::ghostty_input_key_e_GHOSTTY_KEY_DELETE,
-        "home" => ffi::ghostty_input_key_e_GHOSTTY_KEY_HOME,
-        "end" => ffi::ghostty_input_key_e_GHOSTTY_KEY_END,
-        "pageup" => ffi::ghostty_input_key_e_GHOSTTY_KEY_PAGE_UP,
-        "pagedown" => ffi::ghostty_input_key_e_GHOSTTY_KEY_PAGE_DOWN,
-        "up" => ffi::ghostty_input_key_e_GHOSTTY_KEY_ARROW_UP,
-        "down" => ffi::ghostty_input_key_e_GHOSTTY_KEY_ARROW_DOWN,
-        "left" => ffi::ghostty_input_key_e_GHOSTTY_KEY_ARROW_LEFT,
-        "right" => ffi::ghostty_input_key_e_GHOSTTY_KEY_ARROW_RIGHT,
-        "f1" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F1,
-        "f2" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F2,
-        "f3" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F3,
-        "f4" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F4,
-        "f5" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F5,
-        "f6" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F6,
-        "f7" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F7,
-        "f8" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F8,
-        "f9" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F9,
-        "f10" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F10,
-        "f11" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F11,
-        "f12" => ffi::ghostty_input_key_e_GHOSTTY_KEY_F12,
-        _ => ffi::ghostty_input_key_e_GHOSTTY_KEY_UNIDENTIFIED,
+        "a" => 0x00,
+        "s" => 0x01,
+        "d" => 0x02,
+        "f" => 0x03,
+        "h" => 0x04,
+        "g" => 0x05,
+        "z" => 0x06,
+        "x" => 0x07,
+        "c" => 0x08,
+        "v" => 0x09,
+        "b" => 0x0b,
+        "q" => 0x0c,
+        "w" => 0x0d,
+        "e" => 0x0e,
+        "r" => 0x0f,
+        "y" => 0x10,
+        "t" => 0x11,
+        "1" => 0x12,
+        "2" => 0x13,
+        "3" => 0x14,
+        "4" => 0x15,
+        "6" => 0x16,
+        "5" => 0x17,
+        "=" => 0x18,
+        "9" => 0x19,
+        "7" => 0x1a,
+        "-" => 0x1b,
+        "8" => 0x1c,
+        "0" => 0x1d,
+        "]" => 0x1e,
+        "o" => 0x1f,
+        "u" => 0x20,
+        "[" => 0x21,
+        "i" => 0x22,
+        "p" => 0x23,
+        "enter" | "return" => 0x24,
+        "l" => 0x25,
+        "j" => 0x26,
+        "'" => 0x27,
+        "k" => 0x28,
+        ";" => 0x29,
+        "\\" => 0x2a,
+        "," => 0x2b,
+        "/" => 0x2c,
+        "n" => 0x2d,
+        "m" => 0x2e,
+        "." => 0x2f,
+        "tab" => 0x30,
+        "space" | " " => 0x31,
+        "`" => 0x32,
+        "backspace" => 0x33,
+        "escape" => 0x35,
+        "f17" => 0x40,
+        "f18" => 0x4f,
+        "f19" => 0x50,
+        "f20" => 0x5a,
+        "f5" => 0x60,
+        "f6" => 0x61,
+        "f7" => 0x62,
+        "f3" => 0x63,
+        "f8" => 0x64,
+        "f9" => 0x65,
+        "f11" => 0x67,
+        "f13" => 0x69,
+        "f16" => 0x6a,
+        "f14" => 0x6b,
+        "f10" => 0x6d,
+        "f12" => 0x6f,
+        "f15" => 0x71,
+        "insert" => 0x72,
+        "home" => 0x73,
+        "pageup" => 0x74,
+        "delete" => 0x75,
+        "f4" => 0x76,
+        "end" => 0x77,
+        "f2" => 0x78,
+        "pagedown" => 0x79,
+        "f1" => 0x7a,
+        "left" => 0x7b,
+        "right" => 0x7c,
+        "down" => 0x7d,
+        "up" => 0x7e,
+        _ => KEYCODE_UNIDENTIFIED,
     }
 }
 
@@ -1258,20 +1355,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_navigation_and_printable_keys() {
-        assert_eq!(ghostty_key("a"), ffi::ghostty_input_key_e_GHOSTTY_KEY_A);
-        assert_eq!(
-            ghostty_key("pageup"),
-            ffi::ghostty_input_key_e_GHOSTTY_KEY_PAGE_UP
-        );
-        assert_eq!(
-            ghostty_key("return"),
-            ffi::ghostty_input_key_e_GHOSTTY_KEY_ENTER
-        );
-        assert_eq!(
-            ghostty_key("unknown"),
-            ffi::ghostty_input_key_e_GHOSTTY_KEY_UNIDENTIFIED
-        );
+    fn maps_key_names_to_macos_virtual_keycodes() {
+        assert_eq!(macos_keycode("a"), 0x00);
+        assert_eq!(macos_keycode("C"), 0x08);
+        assert_eq!(macos_keycode("pageup"), 0x74);
+        assert_eq!(macos_keycode("return"), 0x24);
+        assert_eq!(macos_keycode("enter"), 0x24);
+        assert_eq!(macos_keycode("up"), 0x7e);
+        assert_eq!(macos_keycode("unknown"), KEYCODE_UNIDENTIFIED);
+        assert_eq!(macos_keycode("ü"), KEYCODE_UNIDENTIFIED);
     }
 
     #[test]
@@ -1450,5 +1542,158 @@ mod tests {
         }];
         assert_eq!(clipboard_text_from_items(&contents), None);
         assert_eq!(clipboard_text_from_contents(std::ptr::null(), 2), None);
+    }
+
+    fn test_palette() -> TerminalPalette {
+        TerminalPalette {
+            dark: true,
+            background: 0x000000,
+            foreground: 0xffffff,
+            cursor: 0xffffff,
+            selection: 0x444444,
+            ansi: [0; 16],
+            font_family: String::new(),
+            font_size: 12,
+            font_features: Vec::new(),
+            thicken: false,
+            thicken_strength: 0,
+            cell_width: None,
+            cell_height: None,
+            padding_x: 0,
+            padding_y: 0,
+        }
+    }
+
+    /// Ghostty writes to the pty from its IO thread, so bytes follow a key
+    /// event asynchronously. Wait for the first bytes, then for the queue
+    /// to stay quiet so a multi-write sequence is read whole.
+    fn pty_bytes(terminal: &Terminal) -> Vec<u8> {
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut quiet = 0;
+        loop {
+            let _ = Terminal::tick_runtime();
+            let mut received = false;
+            while let Some(bytes) = terminal.try_input() {
+                out.extend(bytes);
+                received = true;
+            }
+            if received {
+                quiet = 0;
+            } else if !out.is_empty() {
+                quiet += 1;
+                if quiet >= 5 {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        out
+    }
+
+    fn press(
+        terminal: &Terminal,
+        key: &str,
+        text: Option<&str>,
+        modifiers: KeyModifiers,
+    ) -> Vec<u8> {
+        assert!(
+            terminal.send_key(KeyAction::Press, key, text, modifiers),
+            "Ghostty should handle {key} with {modifiers:?}"
+        );
+        pty_bytes(terminal)
+    }
+
+    const NONE: KeyModifiers = KeyModifiers {
+        control: false,
+        alt: false,
+        shift: false,
+        platform: false,
+    };
+    const SHIFT: KeyModifiers = KeyModifiers {
+        shift: true,
+        ..NONE
+    };
+    const CTRL: KeyModifiers = KeyModifiers {
+        control: true,
+        ..NONE
+    };
+    const ALT: KeyModifiers = KeyModifiers { alt: true, ..NONE };
+    const SUPER: KeyModifiers = KeyModifiers {
+        platform: true,
+        ..NONE
+    };
+
+    /// Real libghostty surface: the bytes are whatever Ghostty's encoder
+    /// produces, asserted from observation rather than assumption. GPUI
+    /// reports Enter/Tab with a control character in `key_char`, letters
+    /// with the typed character, and Ctrl/Alt chords without text.
+    #[test]
+    fn keys_are_encoded_by_ghostty_for_the_terminal_modes_in_effect() {
+        let terminal = Terminal::new(80, 24, 100, &test_palette()).expect("ghostty surface");
+        terminal.set_focus(true);
+
+        // Legacy encoding (no keyboard protocol negotiated).
+        assert_eq!(press(&terminal, "enter", Some("\n"), NONE), b"\r");
+        assert_eq!(
+            press(&terminal, "enter", Some("\n"), SHIFT),
+            b"\x1b[27;2;13~",
+            "Ghostty disambiguates Shift+Enter with the xterm modifyOtherKeys form"
+        );
+        assert_eq!(press(&terminal, "c", None, CTRL), [0x03]);
+        assert_eq!(press(&terminal, "b", None, ALT), b"\x1bb");
+        assert_eq!(press(&terminal, "up", None, NONE), b"\x1b[A");
+        assert_eq!(press(&terminal, "left", None, NONE), b"\x1b[D");
+        assert_eq!(press(&terminal, "tab", Some("\t"), SHIFT), b"\x1b[Z");
+        assert_eq!(press(&terminal, "tab", Some("\t"), NONE), b"\t");
+        assert_eq!(press(&terminal, "backspace", None, NONE), [0x7f]);
+        assert_eq!(press(&terminal, "a", Some("A"), SHIFT), b"A");
+        assert_eq!(press(&terminal, "ü", Some("ü"), NONE), "ü".as_bytes());
+        // macOS editing chords kept from Ghostty's defaults.
+        assert_eq!(press(&terminal, "left", None, SUPER), [0x01]);
+        assert_eq!(press(&terminal, "backspace", None, SUPER), [0x15]);
+        assert_eq!(press(&terminal, "left", None, ALT), b"\x1bb");
+        // Ghostty's own app shortcuts are cleared: nothing is swallowed and
+        // nothing is written for a ⌘ chord the legacy encoding cannot express.
+        assert!(!terminal.send_key(KeyAction::Press, "k", None, SUPER));
+        assert!(!terminal.send_key(KeyAction::Press, "d", None, SUPER));
+        assert!(!terminal.send_key(KeyAction::Press, "=", None, SUPER));
+        assert!(terminal.try_input().is_none());
+        // Releases are silent outside the kitty protocol.
+        assert!(!terminal.send_key(KeyAction::Release, "a", None, NONE));
+
+        // Application cursor keys.
+        terminal.apply_frame(b"\x1b[?1h", false);
+        assert_eq!(press(&terminal, "up", None, NONE), b"\x1bOA");
+        terminal.apply_frame(b"\x1b[?1l", false);
+
+        // Kitty keyboard protocol: disambiguate escape codes.
+        terminal.apply_frame(b"\x1b[>1u", false);
+        assert_eq!(press(&terminal, "enter", Some("\n"), SHIFT), b"\x1b[13;2u");
+        assert_eq!(press(&terminal, "enter", Some("\n"), NONE), b"\r");
+        assert_eq!(press(&terminal, "c", None, CTRL), b"\x1b[99;5u");
+        assert_eq!(press(&terminal, "b", None, ALT), b"\x1b[98;3u");
+        assert_eq!(press(&terminal, "tab", Some("\t"), SHIFT), b"\x1b[9;2u");
+        assert_eq!(press(&terminal, "up", None, NONE), b"\x1b[A");
+        assert_eq!(press(&terminal, "backspace", None, NONE), [0x7f]);
+        assert_eq!(press(&terminal, "a", Some("a"), NONE), b"a");
+        terminal.apply_frame(b"\x1b[<u", false);
+
+        // Kitty keyboard protocol with event types: releases are reported.
+        terminal.apply_frame(b"\x1b[>3u", false);
+        assert_eq!(press(&terminal, "c", None, CTRL), b"\x1b[99;5u");
+        assert!(terminal.send_key(KeyAction::Release, "c", None, CTRL));
+        assert_eq!(pty_bytes(&terminal), b"\x1b[99;5:3u");
+        terminal.apply_frame(b"\x1b[<u", false);
+
+        // xterm modifyOtherKeys = 2.
+        terminal.apply_frame(b"\x1b[>4;2m", false);
+        assert_eq!(
+            press(&terminal, "enter", Some("\n"), SHIFT),
+            b"\x1b[27;2;13~"
+        );
     }
 }

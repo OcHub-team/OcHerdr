@@ -42,11 +42,24 @@ impl OcHerdrView {
         let i18n = I18n::new(loaded.language);
         let appearance = loaded.appearance;
         let settings = loaded.settings;
+        let pane_edge_relocation =
+            crate::config::values::AppConfig::from_document(&loaded.document)
+                .0
+                .pane_edge_relocation;
         let focus = cx.focus_handle();
+        let dialog_focus = cx.focus_handle();
         let host_center = cx.new(|cx| HostCenter::new(settings, i18n, focus.clone(), cx));
         let profiles = host_center.read(cx).profiles().to_vec();
         cx.subscribe(&host_center, |this, _center, event, cx| {
             this.handle_host_center_event(event.clone(), cx);
+        })
+        .detach();
+        // Command released in another app never reaches this window as a
+        // modifiers change, so losing key status drops the hints.
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.set_command_held(false, cx);
+            }
         })
         .detach();
         cx.observe_window_appearance(window, |this, window, cx| {
@@ -64,6 +77,7 @@ impl OcHerdrView {
             sessions: Vec::new(),
             session_index: None,
             connection: None,
+            herdr_capabilities: HerdrCapabilities::default(),
             event_stream: EventStreamState::Idle,
             event_listen: None,
             agent_status_listen: None,
@@ -78,6 +92,8 @@ impl OcHerdrView {
             operation: None,
             notifications: cx.new(|_| NotificationHost::new()),
             focus,
+            dialog_focus,
+            pending_focus: None,
             load_epoch: 0,
             event_epoch: 0,
             snapshot_refreshing: false,
@@ -89,13 +105,27 @@ impl OcHerdrView {
             appearance_ui: Default::default(),
             tab_scroll: ScrollHandle::new(),
             hovered_tab_id: None,
+            pending_created_tab: None,
             tab_preview_task: None,
             tab_preview_id: None,
             tab_preview_goal: None,
             tab_preview_hovered: false,
             tab_close_reveals: HashMap::new(),
+            command_held: false,
+            shortcut_reveal: Transition::settled(0., TAB_SHORTCUT_ANIMATION),
             prefix_pending: false,
+            suppress_key_release: false,
             surface_drag: SurfaceDrag::Idle,
+            split_commit: None,
+            pane_drag_snapshot: None,
+            pane_relocations: HashMap::new(),
+            pane_drag_return: None,
+            pane_relocation_serial: 0,
+            pane_edge_relocation,
+            pane_keyboard_move: None,
+            parked_recovery: None,
+            #[cfg(test)]
+            headless_terminals: false,
             pending_reorder: None,
             reorder_metrics: ReorderMetrics::default(),
             terminal_surface_bounds: None,
@@ -203,7 +233,9 @@ impl OcHerdrView {
         self.agent_status_rebuild = None;
         self.agent_status_panes.clear();
         self.agent_status_handoff = None;
+        self.pending_created_tab = None;
         self.surface_drag = SurfaceDrag::Idle;
+        self.split_commit = None;
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
         self.abandon_worktree_list();
@@ -257,6 +289,11 @@ impl OcHerdrView {
                         this.session_index = loaded.selected;
                         this.connection = loaded.connection;
                         this.snapshot = loaded.snapshot;
+                        this.herdr_capabilities = this
+                            .snapshot
+                            .as_ref()
+                            .map(HerdrCapabilities::from_snapshot)
+                            .unwrap_or_default();
                         this.selection.connection_id = this.current_profile().id().into();
                         this.selection.session_name =
                             this.current_session().map(|s| s.name.clone());
@@ -283,6 +320,7 @@ impl OcHerdrView {
                         this.sessions.clear();
                         this.session_index = None;
                         this.connection = None;
+                        this.herdr_capabilities = HerdrCapabilities::default();
                         this.event_stream = EventStreamState::Idle;
                         this.event_listen = None;
                         this.agent_status_listen = None;
@@ -312,6 +350,7 @@ impl OcHerdrView {
         self.sessions.clear();
         self.session_index = None;
         self.connection = None;
+        self.herdr_capabilities = HerdrCapabilities::default();
         self.event_stream = EventStreamState::Idle;
         self.event_listen = None;
         self.agent_status_listen = None;
@@ -551,6 +590,13 @@ impl OcHerdrView {
             self.cancel_reorder_drag();
         }
         let leaving_host_center = self.overlay.host_center() && !overlay.host_center();
+        if overlay.is_confirm_dialog() {
+            self.pending_focus = Some(PendingFocus::Dialog);
+        } else if self.overlay.is_confirm_dialog() && matches!(overlay, Overlay::None) {
+            // The dialog element goes away with its focus; keys would then
+            // reach only the window root, so hand focus back to the surface.
+            self.pending_focus = Some(PendingFocus::Surface);
+        }
         let form = match overlay {
             Overlay::RemoteForm(form) => Some(form),
             _ => None,
@@ -622,11 +668,14 @@ impl OcHerdrView {
                     return false;
                 };
                 let mut items = items.into_iter();
-                apply_event_stream(snapshot, &mut self.selection, || match items.next() {
-                    Some(Ok(event)) => Ok(Some(event)),
-                    Some(Err(err)) => Err(err),
-                    None => Ok(None),
-                })
+                let action =
+                    apply_event_stream(snapshot, &mut self.selection, || match items.next() {
+                        Some(Ok(event)) => Ok(Some(event)),
+                        Some(Err(err)) => Err(err),
+                        None => Ok(None),
+                    });
+                self.pin_relocation_selection();
+                action
             }
         };
         let effects = effects_for(&action);
@@ -661,6 +710,7 @@ impl OcHerdrView {
             ) {
                 self.ensure_session_terminals(cx);
             }
+            self.settle_pending_created_tab(cx);
         }
         if effects.settle_reorder {
             self.pending_reorder = None;
@@ -670,10 +720,21 @@ impl OcHerdrView {
         }
         if matches!(action, EventPollAction::Disconnect(_)) {
             self.cancel_split_drag();
+            self.split_commit = None;
             self.cancel_reorder_drag();
+            self.cancel_pane_drag();
+            self.cancel_keyboard_pane_move();
+            self.pending_created_tab = None;
+            // Requests already sent cannot be cancelled; the reconnect
+            // snapshot is the authority for what actually happened.
+            self.abort_pane_relocations_for_disconnect();
         }
         self.reconcile_split_drag(cx);
+        self.reconcile_split_commit(cx);
         self.reconcile_reorder_drag(cx);
+        self.reconcile_pane_drag(cx);
+        self.reconcile_keyboard_pane_move(cx);
+        self.reconcile_pane_relocations(cx);
         if let Some(stream) = action.event_stream() {
             self.event_stream = stream;
             cx.notify();
@@ -801,6 +862,7 @@ impl OcHerdrView {
         {
             let mut events = events.into_iter();
             let action = apply_event_stream(snapshot, &mut self.selection, || Ok(events.next()));
+            self.pin_relocation_selection();
             let effects = effects_for(&action);
             if let Some(error) = effects.error {
                 self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
@@ -812,6 +874,9 @@ impl OcHerdrView {
         }
         self.reconcile_split_drag(cx);
         self.reconcile_reorder_drag(cx);
+        self.reconcile_pane_drag(cx);
+        self.reconcile_keyboard_pane_move(cx);
+        self.reconcile_pane_relocations(cx);
         if resync {
             self.resync_snapshot(self.event_epoch, cx);
         }
@@ -907,9 +972,14 @@ impl OcHerdrView {
                             .as_ref()
                             .map(snapshot_pane_ids)
                             .unwrap_or_default();
+                        this.herdr_capabilities = HerdrCapabilities::from_snapshot(&snapshot);
                         this.snapshot = Some(snapshot);
+                        this.restore_parked_recovery(cx);
                         this.reconcile_split_drag(cx);
                         this.reconcile_reorder_drag(cx);
+                        this.reconcile_pane_drag(cx);
+                        this.reconcile_keyboard_pane_move(cx);
+                        this.reconcile_pane_relocations(cx);
                         if worktree_open_target_is_missing(&this.overlay, this.snapshot.as_ref()) {
                             this.abandon_worktree_list();
                         }
@@ -931,6 +1001,7 @@ impl OcHerdrView {
                             ) {
                                 this.ensure_session_terminals(cx);
                             }
+                            this.settle_pending_created_tab(cx);
                         }
                         cx.notify();
                     }
@@ -1327,6 +1398,15 @@ impl OcHerdrView {
     }
 
     pub(super) fn request_close(&mut self, target: HierarchyTarget, cx: &mut Context<Self>) {
+        // Closing a pane out from under a pending relocation would leave the
+        // prediction pointing at a pane Herdr is about to drop.
+        if let HierarchyTarget::Pane { id, .. } = &target
+            && self
+                .pane_tab_id(id)
+                .is_some_and(|tab_id| self.tab_relocation_locked(&tab_id))
+        {
+            return;
+        }
         self.set_overlay(Overlay::ConfirmClose(target), cx);
     }
 
@@ -1334,6 +1414,33 @@ impl OcHerdrView {
         if matches!(self.overlay, Overlay::ConfirmClose(_)) {
             self.set_overlay(Overlay::None, cx);
         }
+    }
+
+    /// Tracks Command for the tab strip's ⌘N hints.
+    pub(super) fn set_command_held(&mut self, held: bool, cx: &mut Context<Self>) {
+        if self.command_held == held {
+            return;
+        }
+        self.command_held = held;
+        cx.notify();
+    }
+
+    /// Performs the focus move queued by `set_overlay`, from render where a
+    /// `Window` is at hand. Deferred so the dialog is in the rendered frame
+    /// before it is focused.
+    pub(super) fn apply_pending_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_focus.take() else {
+            return;
+        };
+        let handle = match pending {
+            PendingFocus::Dialog => self.dialog_focus.clone(),
+            PendingFocus::Surface => self.focus.clone(),
+        };
+        window.defer(cx, move |window, cx| {
+            if !handle.is_focused(window) {
+                window.focus(&handle, cx);
+            }
+        });
     }
 
     pub(super) fn handle_overlay_key(
@@ -1411,10 +1518,64 @@ impl OcHerdrView {
                 y: f32::from(event.position.y)
                     .min((f32::from(viewport.height) - 260.).max(8.))
                     .max(8.),
+                agent_details: false,
             }),
             cx,
         );
         cx.stop_propagation();
+    }
+
+    /// Secondary click on a sidebar agent row: the pane menu led by
+    /// "Details", which is how the row still reaches the agent panel.
+    pub(super) fn open_agent_context_menu(
+        &mut self,
+        pane_id: String,
+        event: &MouseDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.pane(&pane_id))
+            .map(|pane| pane.display_name().to_owned())
+            .unwrap_or_else(|| pane_id.clone());
+        self.open_context_menu(
+            HierarchyTarget::Pane { id: pane_id, label },
+            event,
+            window,
+            cx,
+        );
+        if let Overlay::ContextMenu(menu) = &mut self.overlay {
+            menu.agent_details = true;
+        }
+    }
+
+    /// Click on a sidebar agent row: select its workspace, tab and pane
+    /// locally (the same path as clicking the pane) and ask Herdr to focus
+    /// it, so the TUI and other clients follow too.
+    pub(super) fn jump_to_agent_pane(
+        &mut self,
+        pane_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((workspace_id, tab_id)) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.pane(&pane_id))
+            .map(|pane| (pane.workspace_id.clone(), pane.tab_id.clone()))
+        else {
+            return;
+        };
+        if self.selection.workspace_id.as_deref() != Some(workspace_id.as_str())
+            || self.selection.tab_id.as_deref() != Some(tab_id.as_str())
+        {
+            self.selection.workspace_id = Some(workspace_id);
+            self.select_tab(tab_id, cx);
+        }
+        self.select_pane(pane_id.clone(), window, cx);
+        self.invoke("agent.focus", json!({ "target": pane_id }), cx);
     }
 
     pub(super) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
@@ -1499,6 +1660,10 @@ impl OcHerdrView {
         self.session_index = Some(index);
         self.cancel_split_drag();
         self.cancel_reorder_drag();
+        self.cancel_pane_drag();
+        self.cancel_keyboard_pane_move();
+        self.pane_relocations.clear();
+        self.parked_recovery = None;
         self.reload(Some(session.name), cx);
     }
 
@@ -1522,6 +1687,7 @@ impl OcHerdrView {
     pub(super) fn select_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
         self.cancel_split_drag();
         self.cancel_reorder_drag();
+        self.cancel_pane_drag();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1545,6 +1711,8 @@ impl OcHerdrView {
     pub(super) fn select_tab(&mut self, tab_id: String, cx: &mut Context<Self>) {
         self.cancel_split_drag();
         self.cancel_reorder_drag();
+        self.cancel_pane_drag();
+        self.cancel_keyboard_pane_move();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -2046,6 +2214,7 @@ impl OcHerdrView {
         }
         let profile = self.current_profile();
         let visible_tab_id = self.selection.tab_id.clone();
+        let selected_pane_id = self.selection.pane_id.clone();
         let snapshot = self.snapshot.as_ref().expect("snapshot checked above");
         let live_pane_ids = snapshot_pane_ids(snapshot);
         let pane_tabs = snapshot
@@ -2075,20 +2244,28 @@ impl OcHerdrView {
                 .session_panes
                 .as_ref()
                 .and_then(|session| session.control.clone());
-            let wanted = snapshot_runtime_targets(snapshot, control.as_ref());
+            #[cfg_attr(not(test), allow(unused_mut))]
+            let mut wanted =
+                snapshot_runtime_targets(snapshot, control.as_ref(), selected_pane_id.as_deref());
+            #[cfg(test)]
+            if self.headless_terminals {
+                wanted.clear();
+            }
             let panes = &mut self
                 .session_panes
                 .as_mut()
                 .expect("live session adopted panes")
                 .panes;
             panes.retain(|pane_id, _| live_pane_ids.contains(pane_id));
-            for (pane_id, mode) in &wanted {
+            for target in &wanted {
+                let pane_id = &target.pane_id;
+                let mode = target.mode;
                 match visible_pane_plan(
                     panes.get(pane_id).map(|runtime| runtime.mode),
                     panes
                         .get(pane_id)
                         .is_some_and(|runtime| runtime.session.is_closed() || runtime.exit_seen),
-                    *mode,
+                    mode,
                 ) {
                     VisiblePanePlan::Keep
                     | VisiblePanePlan::PromoteToControl
@@ -2103,7 +2280,8 @@ impl OcHerdrView {
                             }
                             if let Some(frames) = sync_pane_session(
                                 runtime,
-                                *mode,
+                                mode,
+                                target.focused,
                                 profile.clone(),
                                 session_name.clone(),
                                 pane_id.clone(),
@@ -2119,20 +2297,21 @@ impl OcHerdrView {
                             profile.clone(),
                             session_name.clone(),
                             pane_id.clone(),
-                            *mode,
+                            mode,
                             cols,
                             rows,
                         );
                         match Terminal::new(cols, rows, 10_000, &palette) {
                             Ok(terminal) => {
-                                terminal.set_focus(mode.is_controlled());
+                                terminal.set_focus(target.focused);
                                 panes.insert(
                                     pane_id.clone(),
                                     PaneRuntime {
                                         session,
                                         terminal,
                                         frame: None,
-                                        mode: *mode,
+                                        mode,
+                                        focused: target.focused,
                                         size: (cols, rows),
                                         pixel_size: (0, 0),
                                         frame_context: 0,
@@ -2152,7 +2331,8 @@ impl OcHerdrView {
                     }
                 }
             }
-            for (pane_id, _) in &wanted {
+            for target in &wanted {
+                let pane_id = &target.pane_id;
                 let pane_tab = pane_tabs.get(pane_id).map(String::as_str);
                 if !should_flush_session_pane(
                     pane_tab,
@@ -2465,6 +2645,46 @@ impl OcHerdrView {
         keep
     }
 
+    /// Terminal grids stay put while the tab's geometry is only a preview
+    /// (design §5.4, §7.2): a pending relocation plan. They resize once,
+    /// when the authoritative layout is on screen.
+    pub(super) fn pane_resize_frozen(&self, pane_id: &str) -> bool {
+        self.pane_tab_id(pane_id).is_some_and(|tab_id| {
+            self.tab_relocation_locked(&tab_id) || self.tab_split_dragging(&tab_id)
+        }) || self.pane_relocations.values().any(|pending| {
+            pending.phase.locks_tab() && pending.plan.predicted_pane_ids().any(|id| id == pane_id)
+        })
+    }
+
+    /// A divider of this tab is being dragged, or its release batch of
+    /// `layout.set_split_ratio` is still landing: geometry is the squeeze
+    /// preview (design §5.4) until the authoritative layout carries every
+    /// ratio of the batch.
+    pub(super) fn tab_split_dragging(&self, tab_id: &str) -> bool {
+        matches!(&self.surface_drag, SurfaceDrag::Split(drag) if drag.tab_id == tab_id)
+            || self
+                .split_commit
+                .as_ref()
+                .is_some_and(|commit| commit.tab_id == tab_id)
+    }
+
+    /// The tab's geometry squeezed to the split drag's preview ratios (the
+    /// dragged split plus the nested dividers pinned to their cells), or
+    /// `None` when no divider of this tab is being dragged or committed.
+    pub(super) fn squeezed_tab_layout(&self, layout: &PaneLayout) -> Option<SqueezedLayout> {
+        if let SurfaceDrag::Split(drag) = &self.surface_drag
+            && drag.tab_id == layout.tab_id
+        {
+            let ratios = split_drag_ratios(layout, &drag.path, drag.preview_ratio);
+            return squeezed_layout(layout, &ratios);
+        }
+        let commit = self.split_commit.as_ref()?;
+        if commit.tab_id != layout.tab_id {
+            return None;
+        }
+        squeezed_layout(layout, &commit.ratios)
+    }
+
     pub(super) fn sync_measured_pane_body(
         &mut self,
         pane_id: &str,
@@ -2485,6 +2705,7 @@ impl OcHerdrView {
         let palette = current_terminal_palette(&self.appearance);
         let mut palette_error = None;
         let mut resized = false;
+        let frozen = self.pane_resize_frozen(pane_id);
         {
             let Some(runtime) = self.pane_mut(pane_id) else {
                 return;
@@ -2497,7 +2718,13 @@ impl OcHerdrView {
                 runtime.color_scheme_dark = palette.dark;
                 runtime.palette_signature = palette.signature();
             }
-            if runtime.pixel_size != (width_px, height_px) {
+            let plan = pane_resize_plan(
+                frozen,
+                runtime.mode,
+                runtime.pixel_size,
+                (width_px, height_px),
+            );
+            if plan != PaneResizePlan::Skip {
                 runtime.frame_context = runtime.frame_context.wrapping_add(1);
                 let resolved = runtime.terminal.resize_pixels(
                     width_px,
@@ -2506,7 +2733,7 @@ impl OcHerdrView {
                     runtime.frame_context,
                 );
                 let size = (resolved.columns, resolved.rows);
-                if runtime.mode.is_controlled() {
+                if plan == PaneResizePlan::ResizeAndPush {
                     let _ = runtime.session.send(TerminalCommand::Resize {
                         cols: resolved.columns,
                         rows: resolved.rows,
@@ -2571,7 +2798,50 @@ impl OcHerdrView {
     }
 
     pub(super) fn create_workspace(&mut self, cx: &mut Context<Self>) {
-        self.invoke("workspace.create", json!({ "focus": true, "env": {} }), cx);
+        self.invoke_with_response(
+            "workspace.create",
+            json!({ "focus": true, "env": {} }),
+            Self::follow_created_tab,
+            cx,
+        );
+    }
+
+    /// Switch to the tab a `*.create` / `worktree.open` response names, now
+    /// or once the matching events have been applied. `Selection::reconcile`
+    /// deliberately ignores `tab.focused` from other clients, so the tab
+    /// this client itself asked for has to be selected explicitly.
+    fn follow_created_tab(
+        &mut self,
+        result: std::result::Result<Value, HerdrError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(result) = result else {
+            return;
+        };
+        if let Some(tab_id) = created_tab_id(&result) {
+            self.pending_created_tab = Some(tab_id);
+            self.settle_pending_created_tab(cx);
+        }
+    }
+
+    /// Select the pending created tab if the snapshot has it and at least one
+    /// of its panes; otherwise keep waiting for the events.
+    fn settle_pending_created_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.pending_created_tab.clone() else {
+            return;
+        };
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(tab) = snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id) else {
+            return;
+        };
+        if snapshot.panes_for(&tab_id).next().is_none() {
+            return;
+        }
+        self.pending_created_tab = None;
+        self.selection.workspace_id = Some(tab.workspace_id.clone());
+        self.select_tab(tab_id, cx);
     }
 
     pub(super) fn open_worktree_create_for_selection(
@@ -2647,7 +2917,7 @@ impl OcHerdrView {
         );
         self.set_overlay(Overlay::None, cx);
         self.focus.focus(window, cx);
-        self.invoke("worktree.create", params, cx);
+        self.invoke_with_response("worktree.create", params, Self::follow_created_tab, cx);
     }
 
     pub(super) fn open_worktree_picker(&mut self, workspace_id: String, cx: &mut Context<Self>) {
@@ -2676,7 +2946,7 @@ impl OcHerdrView {
         };
         let params = worktree_open_params(source, &path);
         self.set_overlay(Overlay::None, cx);
-        self.invoke("worktree.open", params, cx);
+        self.invoke_with_response("worktree.open", params, Self::follow_created_tab, cx);
     }
 
     pub(super) fn request_remove_worktree(&mut self, workspace_id: String, cx: &mut Context<Self>) {
@@ -2867,9 +3137,10 @@ impl OcHerdrView {
 
     pub(super) fn create_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(workspace_id) = self.selection.workspace_id.clone() {
-            self.invoke(
+            self.invoke_with_response(
                 "tab.create",
                 json!({ "workspace_id": workspace_id, "focus": true, "env": {} }),
+                Self::follow_created_tab,
                 cx,
             );
         }
@@ -2882,8 +3153,10 @@ impl OcHerdrView {
         let Some(workspace_id) = self.selection.workspace_id.as_deref() else {
             return;
         };
+        let hidden = self.hidden_tab_ids();
         let tab_ids = snapshot
             .tabs_for(workspace_id)
+            .filter(|tab| !hidden.contains(&tab.tab_id))
             .map(|tab| tab.tab_id.clone())
             .collect::<Vec<_>>();
         if tab_ids.is_empty() {
@@ -2905,7 +3178,13 @@ impl OcHerdrView {
                 .workspace_id
                 .as_deref()
                 .and_then(|workspace_id| {
-                    tab_id_for_shortcut(snapshot.tabs_for(workspace_id), number)
+                    let hidden = self.hidden_tab_ids();
+                    tab_id_for_shortcut(
+                        snapshot
+                            .tabs_for(workspace_id)
+                            .filter(|tab| !hidden.contains(&tab.tab_id)),
+                        number,
+                    )
                 })
         });
         if let Some(tab_id) = tab_id {
@@ -2964,6 +3243,7 @@ impl OcHerdrView {
                     self.open_rename(target, window, cx);
                 }
             }
+            ("m", false) => self.enter_keyboard_pane_move(cx),
             ("h", false) => self.focus_pane_direction("left", cx),
             ("j", false) => self.focus_pane_direction("down", cx),
             ("k", false) => self.focus_pane_direction("up", cx),
@@ -3002,7 +3282,15 @@ impl OcHerdrView {
             self.handle_prefix_key(event, window, cx);
             return true;
         }
+        if self.pane_keyboard_move.is_some() && self.handle_keyboard_pane_move_key(event, cx) {
+            return true;
+        }
         if key == "escape" {
+            if matches!(self.surface_drag, SurfaceDrag::Pane(_)) {
+                self.cancel_pane_drag();
+                cx.notify();
+                return true;
+            }
             if matches!(self.overlay, Overlay::Appearance) {
                 self.close_appearance(window, cx);
                 return true;
@@ -3107,6 +3395,8 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) {
         if self.handle_app_shortcut(event, window, cx) {
+            // The matching key-up must not reach the terminal either.
+            self.suppress_key_release = true;
             cx.stop_propagation();
             return;
         }
@@ -3127,37 +3417,82 @@ impl OcHerdrView {
             if key.modifiers.platform && key.key == "v" {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     runtime.terminal.paste(&text);
-                    let _ = Terminal::tick_runtime();
-                    let closed = forward_terminal_input(runtime).is_err();
-                    if closed {
-                        runtime.exit_seen = true;
-                    }
                     cx.stop_propagation();
-                    closed
+                    drain_terminal_input(runtime)
                 } else {
                     false
                 }
             } else {
-                let modifiers = KeyModifiers {
-                    control: key.modifiers.control,
-                    alt: key.modifiers.alt,
-                    shift: key.modifiers.shift,
-                    platform: key.modifiers.platform,
+                // Ghostty encodes the key for the modes the application
+                // enabled (kitty keyboard protocol, modifyOtherKeys,
+                // application cursor keys) and queues the pty bytes.
+                let action = if event.is_held {
+                    KeyAction::Repeat
+                } else {
+                    KeyAction::Press
                 };
-                let Some(bytes) = encode_pty_bytes(&key.key, key.key_char.as_deref(), modifiers)
-                else {
+                if !runtime.terminal.send_key(
+                    action,
+                    &key.key,
+                    key.key_char.as_deref(),
+                    gpui_key_modifiers(key.modifiers),
+                ) {
                     return;
-                };
-                let closed = runtime.session.send(TerminalCommand::Input(bytes)).is_err();
-                if closed {
-                    runtime.exit_seen = true;
                 }
                 cx.stop_propagation();
-                closed
+                drain_terminal_input(runtime)
             }
         };
         if stream_closed {
             self.resync_snapshot(self.event_epoch, cx);
+        }
+    }
+
+    /// Key releases matter only to applications that asked the kitty
+    /// keyboard protocol to report them; Ghostty decides.
+    pub(super) fn send_key_release(
+        &mut self,
+        event: &ochub_ui::gpui::KeyUpEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if std::mem::take(&mut self.suppress_key_release)
+            || self.ime_marked.is_some()
+            || self.prefix_pending
+            || self.pane_keyboard_move.is_some()
+        {
+            return;
+        }
+        let Some(pane_id) = self.selection.pane_id.clone() else {
+            return;
+        };
+        let key = &event.keystroke;
+        let stream_closed = {
+            let Some(runtime) = self.pane_mut(&pane_id) else {
+                return;
+            };
+            if !runtime.terminal.send_key(
+                KeyAction::Release,
+                &key.key,
+                None,
+                gpui_key_modifiers(key.modifiers),
+            ) {
+                return;
+            }
+            drain_terminal_input(runtime)
+        };
+        if stream_closed {
+            self.resync_snapshot(self.event_epoch, cx);
+        }
+    }
+
+    /// Forward whatever Ghostty has queued for every pane's pty. Tests call
+    /// this in place of the frame and event polls that do it in production.
+    #[cfg(test)]
+    pub(super) fn pump_terminal_input(&mut self) {
+        if let Some(session) = self.session_panes.as_mut() {
+            for runtime in session.panes.values_mut() {
+                flush_pane_surface(runtime);
+            }
         }
     }
 
@@ -3170,7 +3505,7 @@ impl OcHerdrView {
     ) {
         if matches!(
             self.surface_drag,
-            SurfaceDrag::Split(_) | SurfaceDrag::Reorder(_)
+            SurfaceDrag::Split(_) | SurfaceDrag::Reorder(_) | SurfaceDrag::Pane(_)
         ) {
             return;
         }
@@ -3223,6 +3558,10 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
+        if self.update_pane_drag(mouse_point(event.position), cx) {
+            cx.stop_propagation();
+            return;
+        }
         let SurfaceDrag::Text { pane_id, .. } = &self.surface_drag else {
             return;
         };
@@ -3252,7 +3591,7 @@ impl OcHerdrView {
     pub(super) fn pane_mouse_up(
         &mut self,
         event: &MouseUpEvent,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.finish_split_drag(mouse_point(event.position), cx) {
@@ -3260,6 +3599,10 @@ impl OcHerdrView {
             return;
         }
         if self.finish_reorder_drag(mouse_point(event.position), cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.finish_pane_drag(mouse_point(event.position), window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -3297,6 +3640,12 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         };
+        // A pending relocation or split batch owns this tab's geometry
+        // until it settles.
+        if self.tab_relocation_locked(&tab_id) {
+            cx.stop_propagation();
+            return;
+        }
         let Some(drag) = self.snapshot.as_ref().and_then(|snapshot| {
             let layout = snapshot.layout_for(&tab_id)?;
             split_drag_from_press(tab_id, &split, layout, surface, mouse_point(event.position))
@@ -3306,6 +3655,7 @@ impl OcHerdrView {
         };
         self.end_text_drag();
         self.cancel_reorder_drag();
+        self.cancel_pane_drag();
         self.surface_drag = SurfaceDrag::Split(drag);
         cx.stop_propagation();
         cx.notify();
@@ -3412,18 +3762,1103 @@ impl OcHerdrView {
         else {
             return true;
         };
-        if (drag.preview_ratio - drag.start_ratio).abs() > f32::EPSILON {
-            self.invoke(
+        let ratios = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&drag.tab_id))
+            .map(|layout| split_drag_ratios(layout, &drag.path, drag.preview_ratio))
+            .unwrap_or_default();
+        let ratios = split_commit_ratios(ratios, drag.start_ratio);
+        if ratios.is_empty() {
+            return true;
+        }
+        let last_ratios = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&drag.tab_id))
+            .map(split_ratios_of)
+            .unwrap_or_default();
+        self.pane_relocation_serial = self.pane_relocation_serial.wrapping_add(1);
+        let serial = self.pane_relocation_serial;
+        self.split_commit = Some(PendingSplitCommit {
+            tab_id: drag.tab_id.clone(),
+            layout: drag.layout.clone(),
+            ratios: ratios.clone(),
+            serial,
+            outstanding: ratios.len(),
+            last_ratios,
+            layouts_seen: 0,
+        });
+        // The dragged split first, then the pinned descendants, back to back:
+        // Herdr applies them in order and emits one `layout.updated` each.
+        for (path, ratio) in ratios {
+            self.invoke_with_response(
                 "layout.set_split_ratio",
                 json!({
                     "tab_id": drag.tab_id,
-                    "path": drag.path,
-                    "ratio": drag.preview_ratio,
+                    "path": path,
+                    "ratio": ratio,
                 }),
+                move |this, result, cx| this.split_commit_responded(serial, result.is_ok(), cx),
                 cx,
             );
         }
         true
+    }
+
+    /// One `layout.set_split_ratio` of the release batch answered. An error
+    /// drops the preview (the authoritative layout is whatever Herdr kept);
+    /// otherwise the commit settles once the layout shows the ratios.
+    fn split_commit_responded(&mut self, serial: u64, ok: bool, cx: &mut Context<Self>) {
+        let Some(commit) = self.split_commit.as_mut() else {
+            return;
+        };
+        if commit.serial != serial {
+            return;
+        }
+        if !ok {
+            self.split_commit = None;
+            cx.notify();
+            return;
+        }
+        commit.outstanding = commit.outstanding.saturating_sub(1);
+        self.reconcile_split_commit(cx);
+    }
+
+    /// Drop the release batch's preview once the authoritative layout
+    /// carries it (or one layout per answered request came in), or when the
+    /// tab's split shape changed under it.
+    fn reconcile_split_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(commit) = self.split_commit.as_mut() else {
+            return;
+        };
+        let keep = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&commit.tab_id))
+            .is_some_and(|layout| {
+                split_layout_fingerprint(layout) == commit.layout && !commit.observe(layout)
+            });
+        if !keep {
+            self.split_commit = None;
+            cx.notify();
+        }
+    }
+
+    // ---- Pane drag: handle press, hover, release, cancel (design §5, §7) ----
+
+    /// The tab is locked while a relocation plan is pending: no split drag,
+    /// no second pane drag, no pane close, frozen terminal resizes.
+    pub(super) fn tab_relocation_locked(&self, tab_id: &str) -> bool {
+        self.pane_relocations
+            .get(tab_id)
+            .is_some_and(|pending| pending.phase.locks_tab())
+            || self
+                .split_commit
+                .as_ref()
+                .is_some_and(|commit| commit.tab_id == tab_id)
+    }
+
+    /// Whether the four edge zones accept drops on this connection: the
+    /// `pane-edge-relocation` flag and the `pane.move` capability (design
+    /// §8, §13 step 3).
+    pub(super) fn edge_drops_enabled(&self) -> bool {
+        self.pane_edge_relocation && self.pane_move_supported()
+    }
+
+    /// Temporary tabs of in-flight inserts, kept out of the tab strip and
+    /// tab navigation (design §7.2): the id the step-1 response named, plus
+    /// any tab the event stream added for the plan before or after that
+    /// response (`RelocationPlan::unlisted_temp_tabs`). A parked plan shows
+    /// its tab on purpose.
+    pub(super) fn hidden_tab_ids(&self) -> HashSet<String> {
+        let mut hidden: HashSet<String> = self
+            .pane_relocations
+            .values()
+            .filter_map(|pending| pending.phase.hidden_tab_id().map(str::to_owned))
+            .collect();
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            for pending in self
+                .pane_relocations
+                .values()
+                .filter(|pending| pending.phase.locks_tab())
+            {
+                hidden.extend(pending.plan.unlisted_temp_tabs(snapshot).map(str::to_owned));
+            }
+        }
+        hidden
+    }
+
+    /// Panes to draw in a tab. While an insert plan is pending the source
+    /// pane's record lives in the temporary tab, so the plan's pane set is
+    /// used instead of the snapshot's grouping.
+    pub(super) fn rendered_panes_for_tab(
+        &self,
+        snapshot: &HierarchySnapshot,
+        tab_id: &str,
+    ) -> Vec<PaneInfo> {
+        if let Some(pending) = self.pane_relocations.get(tab_id)
+            && pending.phase.locks_tab()
+        {
+            return pending
+                .plan
+                .predicted_pane_ids()
+                .filter_map(|pane_id| snapshot.pane(pane_id).cloned())
+                .collect();
+        }
+        snapshot.panes_for(tab_id).cloned().collect()
+    }
+
+    /// A pending insert keeps the source pane selected in its original tab
+    /// even while Herdr has it in the temporary tab (the record's `tab_id`
+    /// changes twice before the plan settles).
+    fn pin_relocation_selection(&mut self) {
+        let Some(tab_id) = self.selection.tab_id.clone() else {
+            return;
+        };
+        let Some(pending) = self.pane_relocations.get(&tab_id) else {
+            return;
+        };
+        if !matches!(pending.plan.intent, RelocationIntent::Insert { .. })
+            || !pending.phase.locks_tab()
+        {
+            return;
+        }
+        let source = pending.plan.source_pane_id.clone();
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.pane(&source).is_some())
+        {
+            self.selection.pane_id = Some(source);
+        }
+    }
+
+    /// Disconnect: nothing in flight can be cancelled. Remember a pane that
+    /// was already parked so the reconnect snapshot can offer recovery.
+    fn abort_pane_relocations_for_disconnect(&mut self) {
+        let parked = self
+            .pane_relocations
+            .values()
+            .find_map(|pending| match &pending.phase {
+                RelocationPhase::Inserting {
+                    temp_tab_id,
+                    moved_pane_id,
+                    ..
+                }
+                | RelocationPhase::Parked {
+                    temp_tab_id,
+                    moved_pane_id,
+                } => Some(ParkedRecovery {
+                    plan: pending.plan.clone(),
+                    temp_tab_id: temp_tab_id.clone(),
+                    moved_pane_id: moved_pane_id.clone(),
+                }),
+                _ => None,
+            });
+        self.pane_relocations.clear();
+        if parked.is_some() {
+            self.parked_recovery = parked;
+        }
+    }
+
+    /// Reconnect: if the temporary tab still holds the parked pane, show
+    /// the Parked notice again (design §7.3).
+    fn restore_parked_recovery(&mut self, cx: &mut Context<Self>) {
+        let Some(recovery) = self.parked_recovery.take() else {
+            return;
+        };
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let still_parked = snapshot
+            .pane(&recovery.moved_pane_id)
+            .is_some_and(|pane| pane.tab_id == recovery.temp_tab_id)
+            && snapshot.layout_for(&recovery.plan.source_tab_id).is_some();
+        if !still_parked
+            || self
+                .pane_relocations
+                .contains_key(&recovery.plan.source_tab_id)
+        {
+            return;
+        }
+        self.pane_relocations.insert(
+            recovery.plan.source_tab_id.clone(),
+            PendingPaneRelocation {
+                plan: recovery.plan,
+                phase: RelocationPhase::Parked {
+                    temp_tab_id: recovery.temp_tab_id,
+                    moved_pane_id: recovery.moved_pane_id,
+                },
+            },
+        );
+        cx.notify();
+    }
+
+    /// Top-left of the measured terminal surface in window pixels; zero
+    /// before the first layout pass.
+    pub(super) fn surface_origin(&self) -> (f32, f32) {
+        self.terminal_surface_bounds
+            .map(|surface| (surface.0, surface.1))
+            .unwrap_or((0., 0.))
+    }
+
+    fn pane_tab_id(&self, pane_id: &str) -> Option<String> {
+        self.snapshot
+            .as_ref()?
+            .pane(pane_id)
+            .map(|pane| pane.tab_id.clone())
+    }
+
+    /// Pane drag handle pressed. The gesture only becomes a drag once the
+    /// pointer travels more than `PANE_DRAG_SLOP_PX`; until then the release
+    /// is a plain click that selects the pane.
+    /// Mouse-down on a pane's drag handle. Stopping propagation keeps the
+    /// pane's own mouse-down (text selection) and the surface's focus-on-
+    /// click out of the gesture, so the surface is focused here explicitly:
+    /// Esc during the drag is handled by the root `on_key_down`, which GPUI
+    /// only dispatches along the focused element's ancestry, and with
+    /// nothing focused the window's root node alone receives the key.
+    pub(super) fn press_pane_handle(
+        &mut self,
+        pane_id: String,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus.is_focused(window) {
+            self.focus.focus(window, cx);
+        }
+        if self.begin_pane_drag(pane_id, mouse_point(event.position)) {
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    /// Returns `true` when a drag was armed. Refuses while any other gesture
+    /// is active, while the tab has a pending plan, when the tab has a single
+    /// pane, or when the pane rect cannot be measured yet.
+    pub(super) fn begin_pane_drag(&mut self, pane_id: String, pointer: (f32, f32)) -> bool {
+        if !matches!(self.overlay, Overlay::None) {
+            return false;
+        }
+        if !matches!(
+            self.surface_drag,
+            SurfaceDrag::Idle | SurfaceDrag::Text { .. }
+        ) {
+            return false;
+        }
+        let Some(surface) = self.terminal_surface_bounds else {
+            return false;
+        };
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let Some(pane) = snapshot.pane(&pane_id) else {
+            return false;
+        };
+        let (workspace_id, tab_id) = (pane.workspace_id.clone(), pane.tab_id.clone());
+        if self.tab_relocation_locked(&tab_id) {
+            return false;
+        }
+        let Some(layout) = snapshot.layout_for(&tab_id) else {
+            return false;
+        };
+        if layout.zoomed || layout.panes.len() < 2 {
+            return false;
+        }
+        let Some(source_rect) = pane_window_rect(layout, &pane_id, surface) else {
+            return false;
+        };
+        let fingerprint = layout_fingerprint(layout);
+        // Capture before anything dims or re-lays out the slot: the source
+        // body and the floating preview draw this when the runtime has no
+        // frame of its own on a given render.
+        self.pane_drag_snapshot = self
+            .pane(&pane_id)
+            .and_then(|runtime| runtime.frame.clone());
+        self.end_text_drag();
+        self.pane_drag_return = None;
+        self.surface_drag = SurfaceDrag::Pane(PaneDrag {
+            workspace_id,
+            tab_id,
+            pane_id,
+            fingerprint,
+            origin: pointer,
+            pointer,
+            grab_offset: (pointer.0 - source_rect.0, pointer.1 - source_rect.1),
+            source_rect,
+            hover: None,
+            edge_drops: self.edge_drops_enabled(),
+            pressed_at: Instant::now(),
+        });
+        true
+    }
+
+    fn take_pane_drag(&mut self) -> Option<PaneDrag> {
+        match std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle) {
+            SurfaceDrag::Pane(drag) => Some(drag),
+            other => {
+                self.surface_drag = other;
+                None
+            }
+        }
+    }
+
+    /// Esc, navigation, disconnect, or a structural layout change. The preview
+    /// flies back to its slot when it was already lifted.
+    pub(super) fn cancel_pane_drag(&mut self) {
+        if let Some(drag) = self.take_pane_drag()
+            && pane_drag_past_slop(&drag)
+        {
+            self.pane_drag_return = Some(PaneDragReturn {
+                pane_id: drag.pane_id.clone(),
+                from: pane_drag_preview_rect(&drag),
+                to: drag.source_rect,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    /// Snapshot changed: keep the drag only while the tab's structure is
+    /// exactly what it was at press.
+    fn reconcile_pane_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.take_pane_drag() else {
+            return;
+        };
+        let survives = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&drag.tab_id))
+            .is_some_and(|layout| layout_fingerprint(layout) == drag.fingerprint);
+        if survives {
+            self.surface_drag = SurfaceDrag::Pane(drag);
+        } else {
+            self.surface_drag = SurfaceDrag::Pane(drag);
+            self.cancel_pane_drag();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn update_pane_drag(&mut self, mouse: (f32, f32), cx: &mut Context<Self>) -> bool {
+        let Some(mut drag) = self.take_pane_drag() else {
+            return false;
+        };
+        drag.pointer = mouse;
+        let hover = if pane_drag_past_slop(&drag) {
+            self.pane_hover_for(&drag)
+        } else {
+            None
+        };
+        drag.hover = hover;
+        self.surface_drag = SurfaceDrag::Pane(drag);
+        cx.notify();
+        true
+    }
+
+    fn pane_hover_for(&self, drag: &PaneDrag) -> Option<PaneDropHover> {
+        let surface = self.terminal_surface_bounds?;
+        let layout = self.snapshot.as_ref()?.layout_for(&drag.tab_id)?;
+        pane_drop_hover(layout, &drag.pane_id, surface, drag.pointer)
+    }
+
+    /// Release. A click selects; a lifted preview over the centre zone
+    /// commits a swap; anything else returns home without a request.
+    pub(super) fn finish_pane_drag(
+        &mut self,
+        mouse: (f32, f32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mut drag) = self.take_pane_drag() else {
+            return false;
+        };
+        drag.pointer = mouse;
+        cx.notify();
+        if !pane_drag_past_slop(&drag) {
+            self.select_pane(drag.pane_id, window, cx);
+            return true;
+        }
+        drag.hover = self.pane_hover_for(&drag);
+        let droppable = drag
+            .hover
+            .as_ref()
+            .is_some_and(|hover| hover.droppable(drag.edge_drops));
+        let committed = droppable
+            && self.commit_pane_drop(
+                &PaneDropRequest {
+                    workspace_id: drag.workspace_id.clone(),
+                    tab_id: drag.tab_id.clone(),
+                    pane_id: drag.pane_id.clone(),
+                    fingerprint: drag.fingerprint,
+                    hover: drag.hover.clone().expect("droppable implies hover"),
+                    edge_drops: drag.edge_drops,
+                },
+                cx,
+            );
+        if !committed {
+            self.surface_drag = SurfaceDrag::Pane(drag);
+            self.cancel_pane_drag();
+        }
+        true
+    }
+
+    /// Build the `RelocationPlan`, render it, and send the first request:
+    /// exactly one `pane.swap` for the centre zone, or step 1 of the §4.2
+    /// orchestration for an edge. Returns `false` when the plan cannot be
+    /// built (the layout moved, the tab is locked, the zone is not
+    /// droppable), in which case nothing is sent.
+    fn commit_pane_drop(&mut self, request: &PaneDropRequest, cx: &mut Context<Self>) -> bool {
+        let hover = &request.hover;
+        if !hover.droppable(request.edge_drops) {
+            return false;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let Some(layout) = snapshot.layout_for(&request.tab_id) else {
+            return false;
+        };
+        if layout_fingerprint(layout) != request.fingerprint
+            || self.tab_relocation_locked(&request.tab_id)
+        {
+            return false;
+        }
+        let (intent, predicted_rects, insert_shapes) = match hover.zone.edge() {
+            None => (
+                RelocationIntent::Swap,
+                predict_swap(layout, &request.pane_id, &hover.target_pane_id),
+                None,
+            ),
+            Some(edge) => {
+                if !self.edge_drops_enabled() {
+                    return false;
+                }
+                let steps = predict_relocation_steps(
+                    layout,
+                    &request.pane_id,
+                    &hover.target_pane_id,
+                    edge,
+                    PANE_EDGE_DROP_RATIO,
+                );
+                (
+                    RelocationIntent::Insert {
+                        edge,
+                        ratio: PANE_EDGE_DROP_RATIO,
+                    },
+                    steps.as_ref().map(|steps| steps.final_layout.panes.clone()),
+                    steps.as_ref().map(InsertShapes::from_steps),
+                )
+            }
+        };
+        let Some(predicted_rects) = predicted_rects else {
+            return false;
+        };
+        self.pane_relocation_serial = self.pane_relocation_serial.wrapping_add(1);
+        let plan = RelocationPlan {
+            operation_id: self.pane_relocation_serial,
+            source_pane_id: request.pane_id.clone(),
+            source_tab_id: request.tab_id.clone(),
+            target_pane_id: hover.target_pane_id.clone(),
+            target_tab_id: request.tab_id.clone(),
+            intent,
+            fingerprint: request.fingerprint,
+            topology: split_layout_fingerprint(layout),
+            area: layout.area,
+            predicted_rects,
+            visual_snapshot: self
+                .pane(&request.pane_id)
+                .and_then(|runtime| runtime.frame.clone())
+                .or_else(|| self.pane_drag_snapshot.clone()),
+            workspace_id: request.workspace_id.clone(),
+            known_tab_ids: snapshot
+                .tabs_for(&request.workspace_id)
+                .map(|tab| tab.tab_id.clone())
+                .collect(),
+            insert_shapes,
+        };
+        if !plan.is_supported() {
+            return false;
+        }
+        let operation_id = plan.operation_id;
+        let tab_id = plan.source_tab_id.clone();
+        match intent {
+            RelocationIntent::Swap => {
+                let params = json!({
+                    "source_pane_id": plan.source_pane_id,
+                    "target_pane_id": plan.target_pane_id,
+                });
+                self.pane_relocations.insert(
+                    tab_id.clone(),
+                    PendingPaneRelocation {
+                        plan,
+                        phase: RelocationPhase::Swapping {
+                            responded: false,
+                            layout_seen: false,
+                        },
+                    },
+                );
+                self.invoke_with_response(
+                    "pane.swap",
+                    params,
+                    move |this, result, cx| {
+                        this.on_pane_swap_response(&tab_id, operation_id, result, cx);
+                    },
+                    cx,
+                );
+            }
+            RelocationIntent::Insert { .. } => {
+                self.pane_relocations.insert(
+                    tab_id.clone(),
+                    PendingPaneRelocation {
+                        plan,
+                        phase: RelocationPhase::Parking,
+                    },
+                );
+                self.send_park_request(&tab_id, operation_id, cx);
+            }
+        }
+        true
+    }
+
+    // ---- Insert orchestration (design §4.2, §7.2) ----
+    //
+    // Three strictly serial requests. Each next one is issued inside the
+    // previous response callback; nothing waits on events or snapshots.
+
+    /// Step 1: `pane.move { destination: new_tab }` with `focus: false`.
+    fn send_park_request(&mut self, tab_id: &str, operation_id: u64, cx: &mut Context<Self>) {
+        let Some(pending) = self.pane_relocations.get(tab_id) else {
+            return;
+        };
+        let params = json!({
+            "pane_id": pending.plan.source_pane_id,
+            "destination": {
+                "type": "new_tab",
+                "workspace_id": pending.plan.workspace_id,
+            },
+            "focus": false,
+        });
+        let tab_id = tab_id.to_owned();
+        self.invoke_with_response(
+            "pane.move",
+            params,
+            move |this, result, cx| {
+                let parked = result
+                    .ok()
+                    .and_then(|value| parked_pane_from_response(&value));
+                this.apply_relocation_signal(
+                    &tab_id,
+                    operation_id,
+                    RelocationSignal::Parked(parked),
+                    cx,
+                );
+            },
+            cx,
+        );
+    }
+
+    /// Step 2: `pane.move { destination: tab }` back beside the target with
+    /// the ids the step-1 response reported, `focus: true`.
+    fn send_insert_request(&mut self, tab_id: &str, operation_id: u64, cx: &mut Context<Self>) {
+        let Some(pending) = self.pane_relocations.get(tab_id) else {
+            return;
+        };
+        let RelocationPhase::Inserting { moved_pane_id, .. } = &pending.phase else {
+            return;
+        };
+        let RelocationIntent::Insert { edge, ratio } = pending.plan.intent else {
+            return;
+        };
+        let params = json!({
+            "pane_id": moved_pane_id,
+            "destination": {
+                "type": "tab",
+                "tab_id": pending.plan.target_tab_id,
+                "target_pane_id": pending.plan.target_pane_id,
+                "split": edge.split_direction(),
+                "ratio": edge.request_ratio(ratio),
+            },
+            "focus": true,
+        });
+        let tab_id = tab_id.to_owned();
+        self.invoke_with_response(
+            "pane.move",
+            params,
+            move |this, result, cx| {
+                let accepted = result.is_ok_and(|value| pane_move_changed(&value));
+                this.apply_relocation_signal(
+                    &tab_id,
+                    operation_id,
+                    RelocationSignal::Inserted(accepted),
+                    cx,
+                );
+            },
+            cx,
+        );
+    }
+
+    /// Step 3 (left/up): `pane.swap` so the moved pane becomes the first
+    /// child.
+    fn send_order_swap_request(&mut self, tab_id: &str, operation_id: u64, cx: &mut Context<Self>) {
+        let Some(pending) = self.pane_relocations.get(tab_id) else {
+            return;
+        };
+        let params = json!({
+            "source_pane_id": pending.plan.source_pane_id,
+            "target_pane_id": pending.plan.target_pane_id,
+        });
+        let tab_id = tab_id.to_owned();
+        self.invoke_with_response(
+            "pane.swap",
+            params,
+            move |this, result, cx| {
+                let accepted = result.is_ok_and(|value| pane_swap_changed(&value));
+                this.apply_relocation_signal(
+                    &tab_id,
+                    operation_id,
+                    RelocationSignal::Reordered(accepted),
+                    cx,
+                );
+            },
+            cx,
+        );
+    }
+
+    /// Feed one signal to the insert state machine of the plan on `tab_id`
+    /// and carry out the resulting action. `operation_id` guards against a
+    /// late response for a replaced plan (`None` for layout signals).
+    fn apply_relocation_signal(
+        &mut self,
+        tab_id: &str,
+        operation_id: u64,
+        signal: RelocationSignal,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pane_relocations.get_mut(tab_id) else {
+            return;
+        };
+        if pending.plan.operation_id != operation_id
+            || !matches!(pending.plan.intent, RelocationIntent::Insert { .. })
+        {
+            return;
+        }
+        let corrects_order = pending.plan.intent.corrects_order();
+        let phase = std::mem::replace(&mut pending.phase, RelocationPhase::Parking);
+        let (next, action) = advance_insert_phase(phase, signal, corrects_order);
+        match next {
+            Some(phase) => pending.phase = phase,
+            None => {
+                self.pane_relocations.remove(tab_id);
+            }
+        }
+        match action {
+            RelocationAction::None => {}
+            RelocationAction::SendInsert => self.send_insert_request(tab_id, operation_id, cx),
+            RelocationAction::SendSwap => self.send_order_swap_request(tab_id, operation_id, cx),
+            RelocationAction::Settle => self.settle_pane_relocation(tab_id, cx),
+            RelocationAction::Revert => {}
+            RelocationAction::Park => {
+                // The failure toast came from the invoke path; the inline
+                // notice with Retry / Go to tab is rendered from the phase.
+            }
+            RelocationAction::Misordered => {
+                self.notify_failure(
+                    FailureKind::PaneMisordered,
+                    self.i18n.text(k::NOTIFY_DETAIL_PANE_MISORDERED),
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Retry" on the parked notice: re-issue step 2 with the original plan.
+    pub(super) fn retry_parked_relocation(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(operation_id) = self
+            .pane_relocations
+            .get(tab_id)
+            .filter(|pending| matches!(pending.phase, RelocationPhase::Parked { .. }))
+            .map(|pending| pending.plan.operation_id)
+        else {
+            return;
+        };
+        self.apply_relocation_signal(tab_id, operation_id, RelocationSignal::Retry, cx);
+    }
+
+    /// "Go to tab" on the parked notice: drop the plan and focus the
+    /// temporary tab holding the pane.
+    pub(super) fn go_to_parked_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(temp_tab_id) = self
+            .pane_relocations
+            .get(tab_id)
+            .and_then(|pending| pending.phase.parked_tab_id().map(str::to_owned))
+        else {
+            return;
+        };
+        self.pane_relocations.remove(tab_id);
+        self.select_tab(temp_tab_id, cx);
+    }
+
+    /// The parked plan (if any) of this tab, for the inline notice.
+    pub(super) fn parked_relocation(&self, tab_id: &str) -> Option<&PendingPaneRelocation> {
+        self.pane_relocations
+            .get(tab_id)
+            .filter(|pending| matches!(pending.phase, RelocationPhase::Parked { .. }))
+    }
+
+    fn on_pane_swap_response(
+        &mut self,
+        tab_id: &str,
+        operation_id: u64,
+        result: std::result::Result<Value, HerdrError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pane_relocations.get_mut(tab_id) else {
+            return;
+        };
+        if pending.plan.operation_id != operation_id
+            || !matches!(pending.phase, RelocationPhase::Swapping { .. })
+        {
+            return;
+        }
+        let accepted = match &result {
+            Ok(value) => pane_swap_changed(value),
+            Err(_) => false,
+        };
+        if !accepted {
+            // Failure notice already posted by the invoke path. Drop the
+            // prediction: the authoritative snapshot is what is on screen.
+            self.pane_relocations.remove(tab_id);
+            cx.notify();
+            return;
+        }
+        if let RelocationPhase::Swapping { responded, .. } = &mut pending.phase {
+            *responded = true;
+        }
+        self.settle_pane_relocation_if_ready(tab_id, cx);
+    }
+
+    /// Snapshot changed: for each pending plan decide whether the
+    /// authoritative layout is the swap landing (settle), still the old one
+    /// (keep waiting), or something else (revert).
+    fn reconcile_pane_relocations(&mut self, cx: &mut Context<Self>) {
+        let tab_ids: Vec<String> = self.pane_relocations.keys().cloned().collect();
+        for tab_id in tab_ids {
+            let Some(pending) = self.pane_relocations.get_mut(&tab_id) else {
+                continue;
+            };
+            let layout = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.layout_for(&tab_id));
+            let is_insert = matches!(pending.plan.intent, RelocationIntent::Insert { .. });
+            match (&mut pending.phase, layout) {
+                (_, None) => {
+                    self.pane_relocations.remove(&tab_id);
+                    cx.notify();
+                }
+                (
+                    RelocationPhase::Parked {
+                        temp_tab_id,
+                        moved_pane_id,
+                    },
+                    Some(_),
+                ) => {
+                    // The notice is only meaningful while the pane really
+                    // sits in the temporary tab.
+                    let still_parked = self.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot
+                            .pane(moved_pane_id)
+                            .is_some_and(|pane| &pane.tab_id == temp_tab_id)
+                    });
+                    if !still_parked {
+                        self.pane_relocations.remove(&tab_id);
+                        cx.notify();
+                    }
+                }
+                (RelocationPhase::Swapping { layout_seen, .. }, Some(layout)) => {
+                    if layout_settles_plan(layout, &pending.plan) {
+                        *layout_seen = true;
+                        self.settle_pane_relocation_if_ready(&tab_id, cx);
+                    } else if !layout_still_matches_plan(layout, &pending.plan) {
+                        self.pane_relocations.remove(&tab_id);
+                        cx.notify();
+                    }
+                }
+                (RelocationPhase::Settling { .. }, Some(layout)) => {
+                    let settled = if is_insert {
+                        classify_insert_layout(layout, &pending.plan) == LayoutShape::Final
+                    } else {
+                        layout_settles_plan(layout, &pending.plan)
+                    };
+                    if !settled {
+                        self.pane_relocations.remove(&tab_id);
+                        cx.notify();
+                    }
+                }
+                (
+                    RelocationPhase::Parking
+                    | RelocationPhase::Inserting { .. }
+                    | RelocationPhase::CorrectingOrder { .. },
+                    Some(layout),
+                ) => {
+                    let shape = classify_insert_layout(layout, &pending.plan);
+                    let operation_id = pending.plan.operation_id;
+                    self.apply_relocation_signal(
+                        &tab_id,
+                        operation_id,
+                        RelocationSignal::Layout(shape),
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+
+    fn settle_pane_relocation_if_ready(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(pending) = self.pane_relocations.get_mut(tab_id) else {
+            return;
+        };
+        let RelocationPhase::Swapping {
+            responded: true,
+            layout_seen: true,
+        } = pending.phase
+        else {
+            return;
+        };
+        self.settle_pane_relocation(tab_id, cx);
+    }
+
+    /// Response and matching layout are both in: run the correction from
+    /// the predicted rects to the authoritative ones, or land at once under
+    /// reduce-motion. Selection returns to the moved pane.
+    fn settle_pane_relocation(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let reduce_motion = cx.reduce_motion();
+        let Some(pending) = self.pane_relocations.get_mut(tab_id) else {
+            return;
+        };
+        let source = pending.plan.source_pane_id.clone();
+        if reduce_motion {
+            self.pane_relocations.remove(tab_id);
+        } else {
+            pending.phase = RelocationPhase::Settling {
+                started: Instant::now(),
+                from: pending.plan.predicted_fractions(),
+            };
+        }
+        if self.selection.tab_id.as_deref() == Some(tab_id)
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.pane(&source).is_some())
+        {
+            self.selection.pane_id = Some(source);
+            self.ensure_session_terminals(cx);
+        }
+        cx.notify();
+    }
+
+    /// Render-time cleanup: drop settled plans and finished return flights.
+    pub(super) fn expire_pane_motion(&mut self, now: Instant, reduce_motion: bool) -> bool {
+        let before = self.pane_relocations.len() + usize::from(self.pane_drag_return.is_some());
+        self.pane_relocations
+            .retain(|_, pending| !pending.is_settled(now, reduce_motion));
+        if self.pane_drag_return.as_ref().is_some_and(|flight| {
+            reduce_motion
+                || now.saturating_duration_since(flight.started) >= PANE_DRAG_RETURN_ANIMATION
+        }) {
+            self.pane_drag_return = None;
+        }
+        if self.pane_drag_snapshot.is_some()
+            && !matches!(self.surface_drag, SurfaceDrag::Pane(_))
+            && self.pane_drag_return.is_none()
+            && self.pane_relocations.is_empty()
+        {
+            self.pane_drag_snapshot = None;
+        }
+        before != self.pane_relocations.len() + usize::from(self.pane_drag_return.is_some())
+    }
+
+    /// Fractions to draw a pane at: the pending plan's prediction (or its
+    /// settling correction) wins over the authoritative layout.
+    pub(super) fn displayed_pane_fractions(
+        &self,
+        layout: Option<&PaneLayout>,
+        pane_id: &str,
+        now: Instant,
+        reduce_motion: bool,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let layout = layout?;
+        if let Some(pending) = self.pane_relocations.get(&layout.tab_id)
+            && let Some(rect) = pending.display_fractions(pane_id, Some(layout), now, reduce_motion)
+        {
+            return Some(rect);
+        }
+        if let Some(squeezed) = self.squeezed_tab_layout(layout)
+            && let Some(rect) = squeezed.pane(pane_id)
+        {
+            return Some(rect);
+        }
+        let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+        layout_rect_fractions(layout.area, pane.rect)
+    }
+
+    // ---- Keyboard move mode (design §11) ----
+
+    /// Prefix `m`: lift the selected pane. Arrows pick a neighbour, Tab
+    /// cycles the zone, Enter commits, Esc cancels.
+    pub(super) fn enter_keyboard_pane_move(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.overlay, Overlay::None)
+            || !matches!(
+                self.surface_drag,
+                SurfaceDrag::Idle | SurfaceDrag::Text { .. }
+            )
+        {
+            return;
+        }
+        let Some(pane_id) = self.selection.pane_id.clone() else {
+            return;
+        };
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let Some(pane) = snapshot.pane(&pane_id) else {
+            return;
+        };
+        let (workspace_id, tab_id) = (pane.workspace_id.clone(), pane.tab_id.clone());
+        if self.tab_relocation_locked(&tab_id) {
+            return;
+        }
+        let Some(layout) = snapshot.layout_for(&tab_id) else {
+            return;
+        };
+        if layout.zoomed || layout.panes.len() < 2 {
+            return;
+        }
+        let fingerprint = layout_fingerprint(layout);
+        self.end_text_drag();
+        self.pane_keyboard_move = Some(KeyboardPaneMove {
+            workspace_id,
+            tab_id,
+            pane_id,
+            fingerprint,
+            target: None,
+            edge_drops: self.edge_drops_enabled(),
+        });
+        cx.notify();
+    }
+
+    pub(super) fn cancel_keyboard_pane_move(&mut self) {
+        self.pane_keyboard_move = None;
+    }
+
+    /// Snapshot changed: the mode survives only while the tab's structure is
+    /// what it was on entry.
+    fn reconcile_keyboard_pane_move(&mut self, cx: &mut Context<Self>) {
+        let Some(mode) = self.pane_keyboard_move.as_ref() else {
+            return;
+        };
+        let survives = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&mode.tab_id))
+            .is_some_and(|layout| layout_fingerprint(layout) == mode.fingerprint);
+        if !survives {
+            self.pane_keyboard_move = None;
+            cx.notify();
+        }
+    }
+
+    /// Returns `true` when the key belonged to the move mode.
+    pub(super) fn handle_keyboard_pane_move_key(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mut mode) = self.pane_keyboard_move.take() else {
+            return false;
+        };
+        let key = event.keystroke.key.as_str();
+        let direction = match key {
+            "left" => Some(DropEdge::Left),
+            "right" => Some(DropEdge::Right),
+            "up" => Some(DropEdge::Up),
+            "down" => Some(DropEdge::Down),
+            _ => None,
+        };
+        let handled = match (key, direction) {
+            ("escape", _) => {
+                cx.notify();
+                return true;
+            }
+            ("enter", _) => {
+                if let Some(hover) = mode.target.clone().filter(|_| mode.droppable()) {
+                    let request = PaneDropRequest {
+                        workspace_id: mode.workspace_id.clone(),
+                        tab_id: mode.tab_id.clone(),
+                        pane_id: mode.pane_id.clone(),
+                        fingerprint: mode.fingerprint,
+                        hover,
+                        edge_drops: mode.edge_drops,
+                    };
+                    self.commit_pane_drop(&request, cx);
+                }
+                cx.notify();
+                return true;
+            }
+            ("tab", _) => {
+                if let Some(target) = mode.target.as_mut() {
+                    target.zone = next_keyboard_zone(target.zone, mode.edge_drops);
+                }
+                true
+            }
+            (_, Some(direction)) => {
+                let target = self.snapshot.as_ref().and_then(|snapshot| {
+                    let layout = snapshot.layout_for(&mode.tab_id)?;
+                    let target_pane_id = keyboard_neighbour(layout, &mode.pane_id, direction)?;
+                    let target_rect = self
+                        .terminal_surface_bounds
+                        .and_then(|surface| pane_window_rect(layout, &target_pane_id, surface))
+                        .unwrap_or((0., 0., 0., 0.));
+                    Some(PaneDropHover {
+                        target_pane_id,
+                        zone: DropZone::Center,
+                        target_rect,
+                    })
+                });
+                if let Some(target) = target {
+                    mode.target = Some(target);
+                }
+                true
+            }
+            _ => false,
+        };
+        self.pane_keyboard_move = Some(mode);
+        if handled {
+            cx.notify();
+        }
+        handled
+    }
+
+    /// Context-menu swap with the neighbouring pane (design §11).
+    pub(super) fn swap_pane_direction(
+        &mut self,
+        pane_id: String,
+        direction: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pane_tab_id(&pane_id)
+            .is_some_and(|tab_id| self.tab_relocation_locked(&tab_id))
+        {
+            return;
+        }
+        self.invoke(
+            "pane.swap",
+            json!({ "pane_id": pane_id, "direction": direction }),
+            cx,
+        );
     }
 
     pub(super) fn press_workspace_row(
@@ -3840,12 +5275,41 @@ impl OcHerdrView {
         }
     }
 
+    /// Same request as `invoke`, but the whole `result` object (or the error)
+    /// is handed to `on_response` on the main thread once the socket answers.
+    /// Failure side effects (notice, reorder gate, worktree force-remove offer)
+    /// happen before the callback runs, so callers only chain the next step.
+    pub(super) fn invoke_with_response(
+        &mut self,
+        method: &'static str,
+        params: Value,
+        on_response: impl FnOnce(&mut Self, std::result::Result<Value, HerdrError>, &mut Context<Self>)
+        + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(request) =
+            self.spawn_invoke_inner(method, params, Some(Box::new(on_response)), cx)
+        {
+            request.detach();
+        }
+    }
+
     /// Same request as `invoke`, but the caller keeps the task so it can tie the
     /// request's lifetime to the state that request is allowed to block.
     fn spawn_invoke(
         &mut self,
         method: &'static str,
         params: Value,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<()>> {
+        self.spawn_invoke_inner(method, params, None, cx)
+    }
+
+    fn spawn_invoke_inner(
+        &mut self,
+        method: &'static str,
+        params: Value,
+        on_response: Option<InvokeResponseCallback>,
         cx: &mut Context<Self>,
     ) -> Option<Task<()>> {
         let connection = self.connection.as_ref()?;
@@ -3855,13 +5319,13 @@ impl OcHerdrView {
             let result = cx
                 .background_spawn({
                     let params = params.clone();
-                    async move { request_socket(&socket, method, params).map(|_| ()) }
+                    async move { request_socket(&socket, method, params) }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.operation = None;
-                match result {
-                    Ok(()) => {
+                match &result {
+                    Ok(_) => {
                         if command_needs_snapshot_resync(method) {
                             this.resync_snapshot(this.event_epoch, cx);
                         }
@@ -3870,14 +5334,37 @@ impl OcHerdrView {
                         // A rejected move never produces a `moved` event, so the
                         // gate has to open here or it would never open at all.
                         this.pending_reorder = None;
-                        this.maybe_offer_force_remove_worktree(&params, &error, cx);
+                        this.note_unsupported_method(method, error);
+                        this.maybe_offer_force_remove_worktree(&params, error, cx);
                         this.notify_command_failure(method, error, cx);
                     }
+                }
+                if let Some(on_response) = on_response {
+                    on_response(this, result, cx);
                 }
                 cx.notify();
             })
             .ok();
         }))
+    }
+
+    #[allow(dead_code)] // consumed by the pane drag drop-zone gating (design §8)
+    pub(super) fn pane_move_supported(&self) -> bool {
+        self.connection.is_some() && self.herdr_capabilities.pane_move
+    }
+
+    /// The snapshot said `pane.move` exists but Herdr rejected the method
+    /// itself: degrade to swap-only for the rest of this connection.
+    fn note_unsupported_method(&mut self, method: &str, error: &HerdrError) {
+        if method != "pane.move" || !self.herdr_capabilities.pane_move {
+            return;
+        }
+        if is_unknown_method_error(error) {
+            self.herdr_capabilities.pane_move = false;
+            eprintln!(
+                "ocherdr: Herdr rejected `pane.move` as an unknown method; disabling pane relocation for this connection ({error})"
+            );
+        }
     }
 
     pub(super) fn accepts_ime(&self) -> bool {
@@ -3981,6 +5468,50 @@ impl OcHerdrView {
     }
 }
 
+/// `pane.swap` answers `{ type: "pane_swap", swap: { changed, .. } }`. A
+/// `changed: false` (same pane, cross-tab) means nothing moved, so the
+/// prediction must not stay on screen. A result without the field is
+/// treated as accepted: older shapes still emit `layout.updated`.
+fn pane_swap_changed(result: &Value) -> bool {
+    let swap = result.get("swap").unwrap_or(result);
+    swap.get("changed").and_then(Value::as_bool).unwrap_or(true)
+}
+
+/// Herdr wraps `PaneMoveResult` as `{ type: "pane_move", move_result }`.
+fn pane_move_result(result: &Value) -> &Value {
+    result.get("move_result").unwrap_or(result)
+}
+
+fn pane_move_changed(result: &Value) -> bool {
+    pane_move_result(result)
+        .get("changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Step 1 of the insert must report the created tab and the (possibly
+/// re-aliased) pane id; anything else is treated as a failed park.
+fn parked_pane_from_response(result: &Value) -> Option<ParkedPane> {
+    let result = pane_move_result(result);
+    if !result
+        .get("changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let temp_tab_id = result
+        .get("created_tab")?
+        .get("tab_id")?
+        .as_str()?
+        .to_owned();
+    let pane_id = result.get("pane")?.get("pane_id")?.as_str()?.to_owned();
+    Some(ParkedPane {
+        temp_tab_id,
+        pane_id,
+    })
+}
+
 fn snapshot_pane_ids(snapshot: &HierarchySnapshot) -> HashSet<String> {
     snapshot.pane_ids()
 }
@@ -3999,10 +5530,22 @@ fn session_terminals_need_rebuild(
         || closed_stream
 }
 
+/// Stream and focus wanted for one snapshot pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneRuntimeTarget {
+    pane_id: String,
+    mode: TerminalMode,
+    focused: bool,
+}
+
+/// Panes observe by default. A user can explicitly grant exactly one pane a
+/// control stream; focus remains separate so the selected local surface gets
+/// native Ghostty key handling.
 fn snapshot_runtime_targets(
     snapshot: &HierarchySnapshot,
     control: Option<&TerminalControl>,
-) -> Vec<(String, TerminalMode)> {
+    selected_pane: Option<&str>,
+) -> Vec<PaneRuntimeTarget> {
     snapshot
         .panes
         .iter()
@@ -4011,7 +5554,12 @@ fn snapshot_runtime_targets(
                 .filter(|control| control.pane_id == pane.pane_id)
                 .map(|control| control.mode)
                 .unwrap_or(TerminalMode::Observe);
-            (pane.pane_id.clone(), mode)
+            let focused = selected_pane == Some(pane.pane_id.as_str());
+            PaneRuntimeTarget {
+                pane_id: pane.pane_id.clone(),
+                mode,
+                focused,
+            }
         })
         .collect()
 }
@@ -4041,6 +5589,35 @@ fn demote_terminal_control(session: &mut SessionPanes, pane_id: &str) -> bool {
     session.control = None;
     session.control_conflict = Some(pane_id.to_owned());
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneResizePlan {
+    /// Grid frozen by a pending relocation or split drag, or pixels unchanged.
+    Skip,
+    /// Refit the local Ghostty grid; the stream cannot size the PTY.
+    ResizeLocal,
+    /// Refit the local grid and push the new size down the control stream.
+    ResizeAndPush,
+}
+
+/// What a measured pane body means for the terminal: the grid follows the
+/// body once it is authoritative, and a control stream carries the size to
+/// Herdr so the PTY matches the grid on screen.
+fn pane_resize_plan(
+    frozen: bool,
+    mode: TerminalMode,
+    current_pixels: (u32, u32),
+    measured_pixels: (u32, u32),
+) -> PaneResizePlan {
+    if frozen || current_pixels == measured_pixels {
+        return PaneResizePlan::Skip;
+    }
+    if mode.is_controlled() {
+        PaneResizePlan::ResizeAndPush
+    } else {
+        PaneResizePlan::ResizeLocal
+    }
 }
 
 fn should_flush_session_pane(
@@ -4162,10 +5739,88 @@ fn snapshot_handoff_should_release(refreshing: bool) -> bool {
     !refreshing
 }
 
+type InvokeResponseCallback = Box<
+    dyn FnOnce(&mut OcHerdrView, std::result::Result<Value, HerdrError>, &mut Context<OcHerdrView>),
+>;
+
 // pane.rename emits nothing. pane.close can delete the parent tab and
-// reshuffle focus / tab numbers without emitting tab.closed.
+// reshuffle focus / tab numbers without emitting tab.closed. pane.move and
+// pane.swap both emit (`pane.moved` / `layout.updated`), so they stay out.
+/// The tab a `tab.create`, `workspace.create`, `worktree.create` or
+/// `worktree.open` result names: all four carry Herdr's `TabInfo` as `tab`.
+fn created_tab_id(result: &Value) -> Option<String> {
+    result
+        .get("tab")?
+        .get("tab_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn command_needs_snapshot_resync(method: &str) -> bool {
     matches!(method, "pane.rename" | "pane.close")
+}
+
+/// `pane.move` shipped in Herdr 0.7.0 / socket protocol 14.
+const PANE_MOVE_MIN_PROTOCOL: u32 = 14;
+const PANE_MOVE_MIN_VERSION: [u64; 3] = [0, 7, 0];
+
+/// Features the connected Herdr is known to support, read off the
+/// `version` / `protocol` metadata every `session.snapshot` carries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HerdrCapabilities {
+    pub pane_move: bool,
+}
+
+impl HerdrCapabilities {
+    pub(crate) fn from_snapshot(snapshot: &HierarchySnapshot) -> Self {
+        Self::detect(&snapshot.version, snapshot.protocol)
+    }
+
+    pub(crate) fn detect(version: &str, protocol: u32) -> Self {
+        Self {
+            pane_move: protocol >= PANE_MOVE_MIN_PROTOCOL
+                || parse_semver(version).is_some_and(|parsed| parsed >= PANE_MOVE_MIN_VERSION),
+        }
+    }
+}
+
+/// Lenient `major.minor.patch` extraction: tolerates a `herdr ` / `v` prefix
+/// and pre-release suffixes, returns `None` when no leading number exists.
+fn parse_semver(version: &str) -> Option<[u64; 3]> {
+    let token = version
+        .split_whitespace()
+        .find(|part| {
+            part.trim_start_matches('v')
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })?
+        .trim_start_matches('v');
+    let mut numbers = token
+        .split(['.', '-', '+'])
+        .take_while(|part| part.chars().all(|c| c.is_ascii_digit()))
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u64>().ok());
+    let major = numbers.next()??;
+    let minor = numbers.next().flatten().unwrap_or(0);
+    let patch = numbers.next().flatten().unwrap_or(0);
+    Some([major, minor, patch])
+}
+
+/// An older Herdr fails to deserialize the request enum for a method it does
+/// not know and answers `invalid_request` / "unknown variant `pane.move`".
+fn is_unknown_method_error(error: &HerdrError) -> bool {
+    let HerdrError::Api { code, message } = error else {
+        return false;
+    };
+    if matches!(code.as_str(), "unknown_method" | "method_not_found") {
+        return true;
+    }
+    let message = message.to_ascii_lowercase();
+    code == "invalid_request"
+        && (message.contains("unknown variant")
+            || message.contains("unknown method")
+            || message.contains("method not found"))
 }
 
 fn worktree_repo_params(workspace: &WorkspaceInfo) -> serde_json::Map<String, Value> {
@@ -4560,7 +6215,9 @@ fn split_drag_from_press(
     })
 }
 
-fn split_layout_fingerprint(layout: &ocherdr_core::PaneLayout) -> SplitLayoutFingerprint {
+pub(super) fn split_layout_fingerprint(
+    layout: &ocherdr_core::PaneLayout,
+) -> SplitLayoutFingerprint {
     SplitLayoutFingerprint {
         zoomed: layout.zoomed,
         splits: layout
@@ -4604,6 +6261,16 @@ fn split_drag_voided_by_pane(
             tab_id != drag.tab_id || workspace_id != drag.workspace_id
         }
         _ => true,
+    }
+}
+
+/// The requests a released drag sends: the `pinned_ratios` output (dragged
+/// split first) when the dragged split moved, nothing otherwise, since the
+/// descendants are only retuned for that move.
+fn split_commit_ratios(ratios: Vec<(Vec<bool>, f32)>, start_ratio: f32) -> Vec<(Vec<bool>, f32)> {
+    match ratios.first() {
+        Some((_, dragged)) if (dragged - start_ratio).abs() > f32::EPSILON => ratios,
+        _ => Vec::new(),
     }
 }
 
@@ -4897,11 +6564,15 @@ fn visible_pane_ids(snapshot: Option<&HierarchySnapshot>, tab_id: Option<&str>) 
 fn sync_pane_session(
     runtime: &mut PaneRuntime,
     wanted: TerminalMode,
+    focused: bool,
     profile: ConnectionProfile,
     session_name: String,
     pane_id: String,
 ) -> Option<UnboundedReceiver<std::result::Result<TerminalEvent, HerdrError>>> {
-    runtime.terminal.set_focus(wanted.is_controlled());
+    if runtime.focused != focused {
+        runtime.terminal.set_focus(focused);
+        runtime.focused = focused;
+    }
     if runtime.mode == wanted {
         return None;
     }
@@ -4947,86 +6618,15 @@ fn forward_terminal_input(runtime: &PaneRuntime) -> Result<(), ()> {
     Ok(())
 }
 
-fn control_letter_bytes(key: &str, modifiers: KeyModifiers) -> Option<Vec<u8>> {
-    if !modifiers.control || modifiers.alt || modifiers.platform {
-        return None;
+/// Hand Ghostty's queued pty writes to the pane's stream. Returns whether
+/// the stream is closed; the pane is then marked exited.
+fn drain_terminal_input(runtime: &mut PaneRuntime) -> bool {
+    let _ = Terminal::tick_runtime();
+    let closed = forward_terminal_input(runtime).is_err();
+    if closed {
+        runtime.exit_seen = true;
     }
-    let letter = key.chars().next()?;
-    if key.len() != letter.len_utf8() || !letter.is_ascii_alphabetic() {
-        return None;
-    }
-    Some(vec![letter as u8 & 0x1f])
-}
-
-fn encode_pty_bytes(key: &str, key_char: Option<&str>, modifiers: KeyModifiers) -> Option<Vec<u8>> {
-    let key = key.strip_prefix("ctrl-").unwrap_or(key);
-    if modifiers.platform && !modifiers.control {
-        return encode_super_edit_bytes(key);
-    }
-    if modifiers.control && !modifiers.alt && !modifiers.platform {
-        if let Some(bytes) = control_letter_bytes(
-            key,
-            KeyModifiers {
-                control: true,
-                ..KeyModifiers::default()
-            },
-        ) {
-            return Some(bytes);
-        }
-        return match key {
-            "[" => Some(vec![0x1b]),
-            "\\" => Some(vec![0x1c]),
-            "]" => Some(vec![0x1d]),
-            "6" | "^" => Some(vec![0x1e]),
-            "-" | "_" => Some(vec![0x1f]),
-            "/" | "?" => Some(vec![0x7f]),
-            "space" => Some(vec![0x00]),
-            "backspace" | "back" => Some(vec![0x08]),
-            _ => None,
-        };
-    }
-    if modifiers.alt && !modifiers.platform {
-        return encode_alt_edit_bytes(key, key_char);
-    }
-    if modifiers.shift && key == "tab" {
-        return Some(b"\x1b[Z".to_vec());
-    }
-    Some(match key {
-        "enter" | "return" => vec![b'\r'],
-        "tab" => vec![b'\t'],
-        "backspace" | "back" => vec![0x7f],
-        "delete" => b"\x1b[3~".to_vec(),
-        "escape" => vec![0x1b],
-        "up" => b"\x1b[A".to_vec(),
-        "down" => b"\x1b[B".to_vec(),
-        "right" => b"\x1b[C".to_vec(),
-        "left" => b"\x1b[D".to_vec(),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
-        "pageup" => b"\x1b[5~".to_vec(),
-        "pagedown" => b"\x1b[6~".to_vec(),
-        _ => {
-            if let Some(text) = key_char.filter(|text| !text.is_empty()) {
-                return Some(text.as_bytes().to_vec());
-            }
-            if key.chars().count() == 1 {
-                return Some(key.as_bytes().to_vec());
-            }
-            return None;
-        }
-    })
-}
-
-fn encode_super_edit_bytes(key: &str) -> Option<Vec<u8>> {
-    Some(match key {
-        "backspace" | "back" => vec![0x15],
-        "delete" => vec![0x0b],
-        "left" => vec![0x01],
-        "right" => vec![0x05],
-        "up" => b"\x1b[H".to_vec(),
-        "down" => b"\x1b[F".to_vec(),
-        _ => return None,
-    })
+    closed
 }
 
 fn merge_settings_persist(previous: SettingsPersist, next: SettingsPersist) -> SettingsPersist {
@@ -5124,29 +6724,6 @@ fn tab_id_for_shortcut<'a>(
     }
     tabs.get(number.saturating_sub(1))
         .map(|tab| tab.tab_id.clone())
-}
-
-fn encode_alt_edit_bytes(key: &str, key_char: Option<&str>) -> Option<Vec<u8>> {
-    Some(match key {
-        "backspace" | "back" => b"\x1b\x7f".to_vec(),
-        "delete" => b"\x1bd".to_vec(),
-        "left" => b"\x1bb".to_vec(),
-        "right" => b"\x1bf".to_vec(),
-        "up" => b"\x1b[1;3A".to_vec(),
-        "down" => b"\x1b[1;3B".to_vec(),
-        "enter" | "return" => b"\x1b\r".to_vec(),
-        other if other.chars().count() == 1 => {
-            let mut out = vec![0x1b];
-            out.extend(other.as_bytes());
-            out
-        }
-        _ => {
-            let text = key_char.filter(|text| !text.is_empty())?;
-            let mut out = vec![0x1b];
-            out.extend(text.as_bytes());
-            out
-        }
-    })
 }
 
 #[cfg(test)]
@@ -5430,15 +7007,23 @@ mod tests {
         assert!(incoming_frame_should_replace_grid((0, 0)));
     }
 
+    fn target(pane_id: &str, mode: TerminalMode, focused: bool) -> PaneRuntimeTarget {
+        PaneRuntimeTarget {
+            pane_id: pane_id.into(),
+            mode,
+            focused,
+        }
+    }
+
     #[test]
     fn session_targets_every_snapshot_pane_as_observers_by_default() {
         let snapshot = two_tab_snapshot();
-        let targets = snapshot_runtime_targets(&snapshot, None);
+        let targets = snapshot_runtime_targets(&snapshot, None, Some("p-a"));
         assert_eq!(
             targets,
             vec![
-                ("p-a".into(), TerminalMode::Observe),
-                ("p-b".into(), TerminalMode::Observe),
+                target("p-a", TerminalMode::Observe, true),
+                target("p-b", TerminalMode::Observe, false),
             ]
         );
     }
@@ -5450,12 +7035,12 @@ mod tests {
             pane_id: "p-b".into(),
             mode: TerminalMode::Control,
         };
-        let targets = snapshot_runtime_targets(&snapshot, Some(&control));
+        let targets = snapshot_runtime_targets(&snapshot, Some(&control), Some("p-b"));
         assert_eq!(
             targets,
             vec![
-                ("p-a".into(), TerminalMode::Observe),
-                ("p-b".into(), TerminalMode::Control),
+                target("p-a", TerminalMode::Observe, false),
+                target("p-b", TerminalMode::Control, true),
             ]
         );
         assert_eq!(
@@ -5464,6 +7049,71 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_control_keeps_nonowners_observing_and_focuses_selected_pane() {
+        let mut snapshot = two_tab_snapshot();
+        snapshot.panes.push(test_pane("p-a2", "t-a"));
+        let control = TerminalControl {
+            pane_id: "p-a".into(),
+            mode: TerminalMode::Control,
+        };
+        let targets = snapshot_runtime_targets(&snapshot, Some(&control), Some("p-a2"));
+        assert_eq!(
+            targets,
+            vec![
+                target("p-a", TerminalMode::Control, false),
+                target("p-b", TerminalMode::Observe, false),
+                target("p-a2", TerminalMode::Observe, true),
+            ]
+        );
+        assert_eq!(
+            targets.iter().filter(|target| target.focused).count(),
+            1,
+            "focus stays with the selected pane"
+        );
+        assert_eq!(
+            visible_pane_plan(Some(TerminalMode::Control), false, TerminalMode::Control),
+            VisiblePanePlan::Keep,
+            "changing focus must not respawn the owned stream"
+        );
+    }
+
+    #[test]
+    fn a_grid_change_pushes_the_size_down_every_control_stream() {
+        let panes = [
+            ("controlled", TerminalMode::Control),
+            ("takeover", TerminalMode::ControlTakeover),
+            ("hidden-tab", TerminalMode::Observe),
+        ];
+        let pushed = panes
+            .iter()
+            .filter(|(_, mode)| {
+                pane_resize_plan(false, *mode, (800, 600), (640, 480))
+                    == PaneResizePlan::ResizeAndPush
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        assert_eq!(pushed, ["controlled", "takeover"]);
+        assert_eq!(
+            pane_resize_plan(false, TerminalMode::Observe, (800, 600), (640, 480)),
+            PaneResizePlan::ResizeLocal
+        );
+        assert_eq!(
+            pane_resize_plan(false, TerminalMode::ControlTakeover, (800, 600), (800, 600)),
+            PaneResizePlan::Skip
+        );
+        // Frozen while a relocation or split drag previews geometry; the
+        // release re-measures and then pushes.
+        assert_eq!(
+            pane_resize_plan(true, TerminalMode::ControlTakeover, (800, 600), (640, 480)),
+            PaneResizePlan::Skip
+        );
+        assert_eq!(
+            pane_resize_plan(false, TerminalMode::ControlTakeover, (800, 600), (640, 480)),
+            PaneResizePlan::ResizeAndPush
         );
     }
 
@@ -5644,9 +7294,63 @@ mod tests {
     }
 
     #[test]
+    fn pane_move_capability_comes_from_protocol_or_version() {
+        assert!(HerdrCapabilities::detect("0.6.0", 14).pane_move);
+        assert!(HerdrCapabilities::detect("0.9.2", 20).pane_move);
+        assert!(HerdrCapabilities::detect("0.7.0", 0).pane_move);
+        assert!(HerdrCapabilities::detect("herdr 0.7.1", 0).pane_move);
+        assert!(HerdrCapabilities::detect("v1.0.0-beta.1", 0).pane_move);
+        assert!(!HerdrCapabilities::detect("0.6.9", 13).pane_move);
+        assert!(HerdrCapabilities::detect("0.7", 13).pane_move);
+        assert!(!HerdrCapabilities::detect("", 0).pane_move);
+        assert!(!HerdrCapabilities::detect("garbage", 0).pane_move);
+        assert!(!HerdrCapabilities::detect("x.y.z", 0).pane_move);
+        assert_eq!(
+            HerdrCapabilities::default(),
+            HerdrCapabilities { pane_move: false }
+        );
+    }
+
+    #[test]
+    fn semver_parsing_is_lenient_but_never_invents_numbers() {
+        assert_eq!(parse_semver("0.7.0"), Some([0, 7, 0]));
+        assert_eq!(parse_semver("herdr 0.8.1"), Some([0, 8, 1]));
+        assert_eq!(parse_semver("v1.2.3-rc.1+build"), Some([1, 2, 3]));
+        assert_eq!(parse_semver("2"), Some([2, 0, 0]));
+        assert_eq!(parse_semver(""), None);
+        assert_eq!(parse_semver("garbage"), None);
+    }
+
+    #[test]
+    fn unknown_method_errors_are_recognised_by_code_and_message() {
+        let api = |code: &str, message: &str| HerdrError::Api {
+            code: code.into(),
+            message: message.into(),
+        };
+        assert!(is_unknown_method_error(&api(
+            "invalid_request",
+            "invalid request: unknown variant `pane.move`, expected one of `pane.list`"
+        )));
+        assert!(is_unknown_method_error(&api("unknown_method", "nope")));
+        assert!(!is_unknown_method_error(&api(
+            "invalid_request",
+            "invalid request: missing field `target_pane_id`"
+        )));
+        assert!(!is_unknown_method_error(&api(
+            "not_found",
+            "pane p-9 not found"
+        )));
+        assert!(!is_unknown_method_error(&HerdrError::Protocol(
+            "empty".into()
+        )));
+    }
+
+    #[test]
     fn invoke_resyncs_only_commands_that_do_not_emit_events() {
         assert!(command_needs_snapshot_resync("pane.rename"));
         assert!(command_needs_snapshot_resync("pane.close"));
+        assert!(!command_needs_snapshot_resync("pane.move"));
+        assert!(!command_needs_snapshot_resync("pane.swap"));
         for method in [
             "workspace.create",
             "workspace.close",
@@ -6364,92 +8068,6 @@ mod tests {
             light: theme::OCHUB_LIGHT,
             dark,
         }
-    }
-
-    #[test]
-    fn control_letter_bytes_encode_ctrl_c() {
-        let ctrl = KeyModifiers {
-            control: true,
-            ..KeyModifiers::default()
-        };
-        assert_eq!(control_letter_bytes("c", ctrl), Some(vec![0x03]));
-        assert_eq!(control_letter_bytes("C", ctrl), Some(vec![0x03]));
-        assert_eq!(control_letter_bytes("d", ctrl), Some(vec![0x04]));
-        assert_eq!(control_letter_bytes("c", KeyModifiers::default()), None);
-        assert_eq!(
-            control_letter_bytes(
-                "c",
-                KeyModifiers {
-                    control: true,
-                    platform: true,
-                    ..KeyModifiers::default()
-                }
-            ),
-            None
-        );
-        assert_eq!(control_letter_bytes("enter", ctrl), None);
-    }
-
-    #[test]
-    fn encode_pty_bytes_pass_through_ctrl_c_and_q() {
-        let none = KeyModifiers::default();
-        let ctrl = KeyModifiers {
-            control: true,
-            ..KeyModifiers::default()
-        };
-        assert_eq!(encode_pty_bytes("c", Some("c"), ctrl), Some(vec![0x03]));
-        assert_eq!(encode_pty_bytes("ctrl-c", None, ctrl), Some(vec![0x03]));
-        assert_eq!(encode_pty_bytes("q", Some("q"), none), Some(b"q".to_vec()));
-        assert_eq!(encode_pty_bytes("enter", None, none), Some(vec![b'\r']));
-        assert_eq!(encode_pty_bytes("up", None, none), Some(b"\x1b[A".to_vec()));
-    }
-
-    #[test]
-    fn encode_pty_bytes_maps_macos_edit_shortcuts() {
-        let super_key = KeyModifiers {
-            platform: true,
-            ..KeyModifiers::default()
-        };
-        let alt = KeyModifiers {
-            alt: true,
-            ..KeyModifiers::default()
-        };
-        let shift = KeyModifiers {
-            shift: true,
-            ..KeyModifiers::default()
-        };
-        assert_eq!(
-            encode_pty_bytes("backspace", None, super_key),
-            Some(vec![0x15])
-        );
-        assert_eq!(
-            encode_pty_bytes("delete", None, super_key),
-            Some(vec![0x0b])
-        );
-        assert_eq!(encode_pty_bytes("left", None, super_key), Some(vec![0x01]));
-        assert_eq!(encode_pty_bytes("right", None, super_key), Some(vec![0x05]));
-        assert_eq!(
-            encode_pty_bytes("backspace", None, alt),
-            Some(b"\x1b\x7f".to_vec())
-        );
-        assert_eq!(encode_pty_bytes("left", None, alt), Some(b"\x1bb".to_vec()));
-        assert_eq!(
-            encode_pty_bytes("right", None, alt),
-            Some(b"\x1bf".to_vec())
-        );
-        assert_eq!(
-            encode_pty_bytes("delete", None, alt),
-            Some(b"\x1bd".to_vec())
-        );
-        assert_eq!(
-            encode_pty_bytes("tab", None, shift),
-            Some(b"\x1b[Z".to_vec())
-        );
-        assert_eq!(
-            encode_pty_bytes("v", Some("v"), super_key),
-            None,
-            "Cmd+V stays with the clipboard paste path"
-        );
     }
 
     #[test]

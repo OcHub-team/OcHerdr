@@ -10,6 +10,7 @@ pub(crate) use appearance::AppearanceUi;
 
 impl Render for OcHerdrView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_pending_focus(window, cx);
         let chrome = self.chrome_a11y();
         let main = crate::a11y::apply_region(div().id(chrome.main.id), &chrome.main)
             .flex()
@@ -41,6 +42,11 @@ impl Render for OcHerdrView {
             .w_full()
             .h_full()
             .bg(theme::window_base_background())
+            // Dispatched along the focused element's ancestry, so this fires
+            // whether the terminal surface or a dialog holds focus.
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _window, cx| {
+                this.set_command_held(event.modifiers.platform, cx);
+            }))
             .on_key_down(cx.listener(|this, event, window, cx| {
                 if this.handle_overlay_key(event, window, cx) {
                     return;
@@ -51,6 +57,11 @@ impl Render for OcHerdrView {
                 // #terminal-surface also calls send_key. Duplicate dispatch is
                 // GPUI bubbling: send_key stops propagation after handling.
                 this.send_key(event, window, cx);
+            }))
+            .on_key_up(cx.listener(|this, event, _window, cx| {
+                if key_goes_to_terminal(&this.overlay) {
+                    this.send_key_release(event, cx);
+                }
             }))
             .on_mouse_move(cx.listener(|this, event, window, cx| {
                 this.pane_mouse_move(event, window, cx);
