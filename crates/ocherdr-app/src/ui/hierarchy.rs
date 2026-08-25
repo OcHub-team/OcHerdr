@@ -248,7 +248,9 @@ impl OcHerdrView {
                 let debug_pane_id = pane_id.clone();
                 let menu_pane_id = pane_id.clone();
                 let status = row.agent_status;
-                let primary = row.primary.clone();
+                let selected = row.a11y.selected == Some(true);
+                let workspace_line = row.workspace_line.clone();
+                let pane_line = row.pane_line.clone();
                 let kind = row.kind.clone();
                 apply_control(
                     div().id(ochub_ui::gpui::ElementId::Name(
@@ -259,9 +261,15 @@ impl OcHerdrView {
                 .flex()
                 .items_center()
                 .gap_2()
-                .h(px(30.))
+                .h(px(AGENT_ROW_HEIGHT))
+                .flex_none()
                 .px_3()
                 .rounded(px(CORNER_COMPACT))
+                .bg(if selected {
+                    theme::sidebar_selected()
+                } else {
+                    theme::surface().alpha(0.)
+                })
                 .hover(|style| style.bg(theme::surface_hover()))
                 .cursor_pointer()
                 .debug_selector(move || format!("agent-{debug_pane_id}"))
@@ -281,29 +289,33 @@ impl OcHerdrView {
                         this.open_agent_context_menu(menu_pane_id.clone(), event, window, cx)
                     }),
                 )
-                .child(status_dot(status_color(status)))
+                .child(agent_state_dot(status))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .flex()
-                        .items_baseline()
-                        .gap_1()
-                        .child(div().truncate().text_sm().child(primary))
-                        .children(kind.map(|kind| {
+                        .flex_col()
+                        .gap(px(1.))
+                        .child(
                             div()
-                                .flex_none()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::sidebar_text())
+                                .child(workspace_line),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_baseline()
+                                .gap_1()
+                                .min_w_0()
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(kind)
-                        })),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme::muted())
-                        .child(i18n.agent_status(status)),
+                                .child(div().truncate().child(pane_line))
+                                .children(kind.map(|kind| div().flex_none().child(kind))),
+                        ),
                 )
                 .into_any_element()
             })
@@ -452,8 +464,7 @@ impl OcHerdrView {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::muted())
-                            .child(i18n.text(k::TERMINAL_AGENTS))
-                            .child(i18n.text(k::TERMINAL_STATUS)),
+                            .child(i18n.text(k::TERMINAL_AGENTS)),
                     )
                     .child(
                         apply_list(div().id(chrome.agents.id), &chrome.agents)
@@ -2609,6 +2620,25 @@ fn render_parked_notice(
         .into_any_element()
 }
 
+/// Sidebar agent rows are two lines tall (workspace, then pane label).
+const AGENT_ROW_HEIGHT: f32 = 44.;
+
+/// The TUI's `●`/`○` rule: a hollow ring once the agent is idle or done, a
+/// filled dot while it is working, blocked, or in an unknown state.
+pub(super) fn agent_dot_filled(status: AgentStatus) -> bool {
+    !matches!(status, AgentStatus::Idle | AgentStatus::Done)
+}
+
+fn agent_state_dot(status: AgentStatus) -> ochub_ui::gpui::Div {
+    let color = status_color(status);
+    let dot = div().w(px(8.)).h(px(8.)).flex_none().rounded_full();
+    if agent_dot_filled(status) {
+        dot.bg(color)
+    } else {
+        dot.border_1().border_color(color)
+    }
+}
+
 pub(super) fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
     match status {
         AgentStatus::Working => theme::teal(),
@@ -2621,8 +2651,19 @@ pub(super) fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::{TabStripPress, pane_fractions, tab_key_equivalent, tab_strip_press};
-    use ocherdr_core::{LayoutPane, LayoutRect, PaneLayout};
+    use super::{
+        TabStripPress, agent_dot_filled, pane_fractions, tab_key_equivalent, tab_strip_press,
+    };
+    use ocherdr_core::{AgentStatus, LayoutPane, LayoutRect, PaneLayout};
+
+    #[test]
+    fn agent_dot_is_hollow_when_idle_or_done_and_filled_otherwise() {
+        assert!(!agent_dot_filled(AgentStatus::Idle));
+        assert!(!agent_dot_filled(AgentStatus::Done));
+        assert!(agent_dot_filled(AgentStatus::Working));
+        assert!(agent_dot_filled(AgentStatus::Blocked));
+        assert!(agent_dot_filled(AgentStatus::Unknown));
+    }
 
     #[test]
     fn empty_strip_press_moves_the_window_and_a_double_click_zooms() {

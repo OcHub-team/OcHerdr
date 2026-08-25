@@ -51,16 +51,20 @@ pub struct WorkspaceRow {
 }
 
 /// One sidebar row per agent pane, mirroring the Herdr TUI's agent panel:
-/// `workspace[ · tab] · pane label`, the agent kind muted beside it when the
-/// pane label is something else (a custom agent name, a reported display
-/// name), and the status on the right.
+/// `workspace[ · tab]` on the first line, the pane label on the second with
+/// the agent kind muted beside it when the label is something else (a custom
+/// agent name, a reported display name). The state lives in the dot and in
+/// the a11y name; there is no status column.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRow {
     pub pane_id: String,
     pub agent_status: AgentStatus,
-    /// `workspace · pane label`, with the tab label in between when the
-    /// workspace has several tabs or the tab is named.
-    pub primary: String,
+    /// Line 1: the workspace label, then ` · ` + the tab label when the
+    /// workspace has several tabs or the tab is named (as the TUI shows it).
+    pub workspace_line: String,
+    /// Line 2: the pane label — a custom agent name (`grok-t31`), a reported
+    /// display name, else the agent kind (`codex`).
+    pub pane_line: String,
     /// The agent kind (`codex`, `claude`) when it is not already the pane label.
     pub kind: Option<String>,
     pub a11y: ControlA11y,
@@ -440,10 +444,10 @@ fn agent_rows(
                     continue;
                 };
                 let label = pane.display_agent.as_deref().unwrap_or(fallback);
-                let primary = if show_tab {
-                    format!("{} · {} · {}", workspace.label, tab.label, label)
+                let workspace_line = if show_tab {
+                    format!("{} · {}", workspace.label, tab.label)
                 } else {
-                    format!("{} · {}", workspace.label, label)
+                    workspace.label.clone()
                 };
                 let kind = kind.filter(|kind| *kind != label).map(str::to_owned);
                 items.push(AgentRow {
@@ -452,10 +456,14 @@ fn agent_rows(
                     a11y: list_control(
                         pane.pane_id.clone(),
                         Role::Button,
-                        format!("{primary} · {}", i18n.agent_status(pane.agent_status)),
+                        format!(
+                            "{workspace_line} · {label} · {}",
+                            i18n.agent_status(pane.agent_status)
+                        ),
                         selected_pane_id == Some(pane.pane_id.as_str()),
                     ),
-                    primary,
+                    workspace_line,
+                    pane_line: label.to_owned(),
                     kind,
                 });
             }
@@ -1104,17 +1112,19 @@ mod tests {
             rows.iter()
                 .map(|row| (
                     row.pane_id.as_str(),
-                    row.primary.as_str(),
+                    row.workspace_line.as_str(),
+                    row.pane_line.as_str(),
                     row.kind.as_deref()
                 ))
                 .collect::<Vec<_>>(),
             [
-                ("p-grok", "ocherdr · grok-t31", Some("grok")),
-                ("p-codex-a", "ocherdr · codex", None),
-                ("p-codex-b", "model-switch · codex", None),
-                ("p-claude", "notes · review · Claude Code", Some("claude")),
+                ("p-grok", "ocherdr", "grok-t31", Some("grok")),
+                ("p-codex-a", "ocherdr", "codex", None),
+                ("p-codex-b", "model-switch", "codex", None),
+                ("p-claude", "notes · review", "Claude Code", Some("claude")),
             ],
-            "every agent pane, in Herdr order, with no dedupe by kind"
+            "every agent pane, in Herdr order, with no dedupe by kind; the tab \
+             label joins line 1 only for a named or non-lone tab"
         );
         assert_eq!(rows[0].a11y.name, "ocherdr · grok-t31 · working");
         assert_eq!(rows[2].a11y.name, "model-switch · codex · blocked");

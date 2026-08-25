@@ -50,7 +50,6 @@
 "terminal.split.right" = "向右拆分"
 "terminal.split_pane.down" = "向下拆分窗格"
 "terminal.split_pane.right" = "向右拆分窗格"
-"terminal.status" = "状态"
 "terminal.status_bar" = "状态栏"
 "terminal.swap_pane.down" = "与下方窗格交换"
 "terminal.swap_pane.left" = "与左侧窗格交换"
