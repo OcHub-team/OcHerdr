@@ -62,6 +62,36 @@ Ghostty's native input encoder, and its exact output bytes are base64-encoded in
 Herdr's public `terminal.input` command. This preserves application-cursor mode,
 bracketed paste, modifier protocols, and other terminal modes.
 
+Key presses, repeats, and releases go through `ghostty_surface_key`. The surface runs
+in `GHOSTTY_SURFACE_IO_MANUAL_MIRROR` mode with an `io_write_cb`, so everything
+Ghostty wants to write to the pty (encoded keys, pastes, mouse reports, query
+replies) lands in one per-surface queue that `Terminal::try_input` drains; the
+controller forwards it to the selected pane's control stream after each key and on
+every frame and event poll. OcHerdr's own shortcuts (`handle_app_shortcut`: ⌘
+combos, the Ctrl+B prefix mode, overlay keys) are claimed before the terminal sees
+the key, and the matching key-up is swallowed too. IME-composed text keeps its own
+commit path and is written as-is.
+
+The event Ghostty receives mirrors what Ghostty.app builds from an `NSEvent`:
+`keycode` is the macOS virtual keycode (mapped back from GPUI's key name through the
+US ANSI layout, since GPUI does not expose the hardware code), `text` is GPUI's
+`key_char` for plain keys and the chord's own character for Ctrl/Alt chords,
+`unshifted_codepoint` is the key name when it is a single character, and Shift is
+reported as consumed when it produced the text. Ghostty then tracks the kitty
+keyboard protocol and modifyOtherKeys state itself, so Shift+Enter is
+`ESC [27;2;13~` in the legacy encoding and `ESC [13;2u` once an application such as
+Claude Code enables the kitty protocol.
+
+Ghostty's default keybindings are application actions (tabs, splits, windows, font
+size, search, inspector) that OcHerdr either implements itself or does not offer,
+and a bound key never reaches the pty. `ocherdr-terminal` therefore starts every
+Ghostty config it loads with `keybind = clear` and restores only the macOS defaults
+that are pty writes (`super+left/right/backspace` → `^A`/`^E`/`^U`,
+`alt+left/right` → `ESC b`/`ESC f`), so a key OcHerdr does not claim is encoded
+exactly as Ghostty would encode it with those bindings. The same base config sets
+`macos-option-as-alt = true`: Option is Alt, prefixing `ESC` rather than typing the
+macOS symbol, which is what OcHerdr sent before it used Ghostty's encoder.
+
 ## Agent status events
 
 OcHerdr opens two independent `events.subscribe` connections.

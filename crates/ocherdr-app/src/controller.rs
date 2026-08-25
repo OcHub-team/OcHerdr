@@ -114,6 +114,7 @@ impl OcHerdrView {
             command_held: false,
             shortcut_reveal: Transition::settled(0., TAB_SHORTCUT_ANIMATION),
             prefix_pending: false,
+            suppress_key_release: false,
             surface_drag: SurfaceDrag::Idle,
             split_commit: None,
             pane_drag_snapshot: None,
@@ -3306,6 +3307,8 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) {
         if self.handle_app_shortcut(event, window, cx) {
+            // The matching key-up must not reach the terminal either.
+            self.suppress_key_release = true;
             cx.stop_propagation();
             return;
         }
@@ -3323,37 +3326,82 @@ impl OcHerdrView {
             if key.modifiers.platform && key.key == "v" {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     runtime.terminal.paste(&text);
-                    let _ = Terminal::tick_runtime();
-                    let closed = forward_terminal_input(runtime).is_err();
-                    if closed {
-                        runtime.exit_seen = true;
-                    }
                     cx.stop_propagation();
-                    closed
+                    drain_terminal_input(runtime)
                 } else {
                     false
                 }
             } else {
-                let modifiers = KeyModifiers {
-                    control: key.modifiers.control,
-                    alt: key.modifiers.alt,
-                    shift: key.modifiers.shift,
-                    platform: key.modifiers.platform,
+                // Ghostty encodes the key for the modes the application
+                // enabled (kitty keyboard protocol, modifyOtherKeys,
+                // application cursor keys) and queues the pty bytes.
+                let action = if event.is_held {
+                    KeyAction::Repeat
+                } else {
+                    KeyAction::Press
                 };
-                let Some(bytes) = encode_pty_bytes(&key.key, key.key_char.as_deref(), modifiers)
-                else {
+                if !runtime.terminal.send_key(
+                    action,
+                    &key.key,
+                    key.key_char.as_deref(),
+                    gpui_key_modifiers(key.modifiers),
+                ) {
                     return;
-                };
-                let closed = runtime.session.send(TerminalCommand::Input(bytes)).is_err();
-                if closed {
-                    runtime.exit_seen = true;
                 }
                 cx.stop_propagation();
-                closed
+                drain_terminal_input(runtime)
             }
         };
         if stream_closed {
             self.resync_snapshot(self.event_epoch, cx);
+        }
+    }
+
+    /// Key releases matter only to applications that asked the kitty
+    /// keyboard protocol to report them; Ghostty decides.
+    pub(super) fn send_key_release(
+        &mut self,
+        event: &ochub_ui::gpui::KeyUpEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if std::mem::take(&mut self.suppress_key_release)
+            || self.ime_marked.is_some()
+            || self.prefix_pending
+            || self.pane_keyboard_move.is_some()
+        {
+            return;
+        }
+        let Some(pane_id) = self.selection.pane_id.clone() else {
+            return;
+        };
+        let key = &event.keystroke;
+        let stream_closed = {
+            let Some(runtime) = self.pane_mut(&pane_id) else {
+                return;
+            };
+            if !runtime.terminal.send_key(
+                KeyAction::Release,
+                &key.key,
+                None,
+                gpui_key_modifiers(key.modifiers),
+            ) {
+                return;
+            }
+            drain_terminal_input(runtime)
+        };
+        if stream_closed {
+            self.resync_snapshot(self.event_epoch, cx);
+        }
+    }
+
+    /// Forward whatever Ghostty has queued for every pane's pty. Tests call
+    /// this in place of the frame and event polls that do it in production.
+    #[cfg(test)]
+    pub(super) fn pump_terminal_input(&mut self) {
+        if let Some(session) = self.session_panes.as_mut() {
+            for runtime in session.panes.values_mut() {
+                flush_pane_surface(runtime);
+            }
         }
     }
 
@@ -6423,86 +6471,15 @@ fn forward_terminal_input(runtime: &PaneRuntime) -> Result<(), ()> {
     Ok(())
 }
 
-fn control_letter_bytes(key: &str, modifiers: KeyModifiers) -> Option<Vec<u8>> {
-    if !modifiers.control || modifiers.alt || modifiers.platform {
-        return None;
+/// Hand Ghostty's queued pty writes to the pane's stream. Returns whether
+/// the stream is closed; the pane is then marked exited.
+fn drain_terminal_input(runtime: &mut PaneRuntime) -> bool {
+    let _ = Terminal::tick_runtime();
+    let closed = forward_terminal_input(runtime).is_err();
+    if closed {
+        runtime.exit_seen = true;
     }
-    let letter = key.chars().next()?;
-    if key.len() != letter.len_utf8() || !letter.is_ascii_alphabetic() {
-        return None;
-    }
-    Some(vec![letter as u8 & 0x1f])
-}
-
-fn encode_pty_bytes(key: &str, key_char: Option<&str>, modifiers: KeyModifiers) -> Option<Vec<u8>> {
-    let key = key.strip_prefix("ctrl-").unwrap_or(key);
-    if modifiers.platform && !modifiers.control {
-        return encode_super_edit_bytes(key);
-    }
-    if modifiers.control && !modifiers.alt && !modifiers.platform {
-        if let Some(bytes) = control_letter_bytes(
-            key,
-            KeyModifiers {
-                control: true,
-                ..KeyModifiers::default()
-            },
-        ) {
-            return Some(bytes);
-        }
-        return match key {
-            "[" => Some(vec![0x1b]),
-            "\\" => Some(vec![0x1c]),
-            "]" => Some(vec![0x1d]),
-            "6" | "^" => Some(vec![0x1e]),
-            "-" | "_" => Some(vec![0x1f]),
-            "/" | "?" => Some(vec![0x7f]),
-            "space" => Some(vec![0x00]),
-            "backspace" | "back" => Some(vec![0x08]),
-            _ => None,
-        };
-    }
-    if modifiers.alt && !modifiers.platform {
-        return encode_alt_edit_bytes(key, key_char);
-    }
-    if modifiers.shift && key == "tab" {
-        return Some(b"\x1b[Z".to_vec());
-    }
-    Some(match key {
-        "enter" | "return" => vec![b'\r'],
-        "tab" => vec![b'\t'],
-        "backspace" | "back" => vec![0x7f],
-        "delete" => b"\x1b[3~".to_vec(),
-        "escape" => vec![0x1b],
-        "up" => b"\x1b[A".to_vec(),
-        "down" => b"\x1b[B".to_vec(),
-        "right" => b"\x1b[C".to_vec(),
-        "left" => b"\x1b[D".to_vec(),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
-        "pageup" => b"\x1b[5~".to_vec(),
-        "pagedown" => b"\x1b[6~".to_vec(),
-        _ => {
-            if let Some(text) = key_char.filter(|text| !text.is_empty()) {
-                return Some(text.as_bytes().to_vec());
-            }
-            if key.chars().count() == 1 {
-                return Some(key.as_bytes().to_vec());
-            }
-            return None;
-        }
-    })
-}
-
-fn encode_super_edit_bytes(key: &str) -> Option<Vec<u8>> {
-    Some(match key {
-        "backspace" | "back" => vec![0x15],
-        "delete" => vec![0x0b],
-        "left" => vec![0x01],
-        "right" => vec![0x05],
-        "up" => b"\x1b[H".to_vec(),
-        "down" => b"\x1b[F".to_vec(),
-        _ => return None,
-    })
+    closed
 }
 
 fn merge_settings_persist(previous: SettingsPersist, next: SettingsPersist) -> SettingsPersist {
@@ -6600,29 +6577,6 @@ fn tab_id_for_shortcut<'a>(
     }
     tabs.get(number.saturating_sub(1))
         .map(|tab| tab.tab_id.clone())
-}
-
-fn encode_alt_edit_bytes(key: &str, key_char: Option<&str>) -> Option<Vec<u8>> {
-    Some(match key {
-        "backspace" | "back" => b"\x1b\x7f".to_vec(),
-        "delete" => b"\x1bd".to_vec(),
-        "left" => b"\x1bb".to_vec(),
-        "right" => b"\x1bf".to_vec(),
-        "up" => b"\x1b[1;3A".to_vec(),
-        "down" => b"\x1b[1;3B".to_vec(),
-        "enter" | "return" => b"\x1b\r".to_vec(),
-        other if other.chars().count() == 1 => {
-            let mut out = vec![0x1b];
-            out.extend(other.as_bytes());
-            out
-        }
-        _ => {
-            let text = key_char.filter(|text| !text.is_empty())?;
-            let mut out = vec![0x1b];
-            out.extend(text.as_bytes());
-            out
-        }
-    })
 }
 
 #[cfg(test)]
@@ -7935,92 +7889,6 @@ mod tests {
             light: theme::OCHUB_LIGHT,
             dark,
         }
-    }
-
-    #[test]
-    fn control_letter_bytes_encode_ctrl_c() {
-        let ctrl = KeyModifiers {
-            control: true,
-            ..KeyModifiers::default()
-        };
-        assert_eq!(control_letter_bytes("c", ctrl), Some(vec![0x03]));
-        assert_eq!(control_letter_bytes("C", ctrl), Some(vec![0x03]));
-        assert_eq!(control_letter_bytes("d", ctrl), Some(vec![0x04]));
-        assert_eq!(control_letter_bytes("c", KeyModifiers::default()), None);
-        assert_eq!(
-            control_letter_bytes(
-                "c",
-                KeyModifiers {
-                    control: true,
-                    platform: true,
-                    ..KeyModifiers::default()
-                }
-            ),
-            None
-        );
-        assert_eq!(control_letter_bytes("enter", ctrl), None);
-    }
-
-    #[test]
-    fn encode_pty_bytes_pass_through_ctrl_c_and_q() {
-        let none = KeyModifiers::default();
-        let ctrl = KeyModifiers {
-            control: true,
-            ..KeyModifiers::default()
-        };
-        assert_eq!(encode_pty_bytes("c", Some("c"), ctrl), Some(vec![0x03]));
-        assert_eq!(encode_pty_bytes("ctrl-c", None, ctrl), Some(vec![0x03]));
-        assert_eq!(encode_pty_bytes("q", Some("q"), none), Some(b"q".to_vec()));
-        assert_eq!(encode_pty_bytes("enter", None, none), Some(vec![b'\r']));
-        assert_eq!(encode_pty_bytes("up", None, none), Some(b"\x1b[A".to_vec()));
-    }
-
-    #[test]
-    fn encode_pty_bytes_maps_macos_edit_shortcuts() {
-        let super_key = KeyModifiers {
-            platform: true,
-            ..KeyModifiers::default()
-        };
-        let alt = KeyModifiers {
-            alt: true,
-            ..KeyModifiers::default()
-        };
-        let shift = KeyModifiers {
-            shift: true,
-            ..KeyModifiers::default()
-        };
-        assert_eq!(
-            encode_pty_bytes("backspace", None, super_key),
-            Some(vec![0x15])
-        );
-        assert_eq!(
-            encode_pty_bytes("delete", None, super_key),
-            Some(vec![0x0b])
-        );
-        assert_eq!(encode_pty_bytes("left", None, super_key), Some(vec![0x01]));
-        assert_eq!(encode_pty_bytes("right", None, super_key), Some(vec![0x05]));
-        assert_eq!(
-            encode_pty_bytes("backspace", None, alt),
-            Some(b"\x1b\x7f".to_vec())
-        );
-        assert_eq!(encode_pty_bytes("left", None, alt), Some(b"\x1bb".to_vec()));
-        assert_eq!(
-            encode_pty_bytes("right", None, alt),
-            Some(b"\x1bf".to_vec())
-        );
-        assert_eq!(
-            encode_pty_bytes("delete", None, alt),
-            Some(b"\x1bd".to_vec())
-        );
-        assert_eq!(
-            encode_pty_bytes("tab", None, shift),
-            Some(b"\x1b[Z".to_vec())
-        );
-        assert_eq!(
-            encode_pty_bytes("v", Some("v"), super_key),
-            None,
-            "Cmd+V stays with the clipboard paste path"
-        );
     }
 
     #[test]

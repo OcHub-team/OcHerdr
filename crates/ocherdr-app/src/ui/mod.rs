@@ -58,6 +58,11 @@ impl Render for OcHerdrView {
                 // GPUI bubbling: send_key stops propagation after handling.
                 this.send_key(event, window, cx);
             }))
+            .on_key_up(cx.listener(|this, event, _window, cx| {
+                if key_goes_to_terminal(&this.overlay) {
+                    this.send_key_release(event, cx);
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event, window, cx| {
                 this.pane_mouse_move(event, window, cx);
             }))

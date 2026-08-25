@@ -232,10 +232,14 @@ impl FakeHerdr {
             ]
         });
         let herdr_path = dir.path().join("herdr");
+        // `terminal session control|observe <pane> …` streams control
+        // commands on stdin: log them per pane so tests can read what the
+        // view sent, and hold the stream open the way Herdr would.
+        let log_dir = dir.path().display();
         std::fs::write(
             &herdr_path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"session\" ] && [ \"$2\" = \"list\" ]; then\ncat <<'EOF'\n{sessions}\nEOF\nexit 0\nfi\necho \"unexpected: $*\" >&2\nexit 1\n"
+                "#!/bin/sh\nif [ \"$1\" = \"session\" ] && [ \"$2\" = \"list\" ]; then\ncat <<'EOF'\n{sessions}\nEOF\nexit 0\nfi\nwhile [ $# -gt 0 ] && [ \"$1\" != \"terminal\" ]; do shift; done\nif [ \"$1\" = \"terminal\" ]; then\ncat >> \"{log_dir}/terminal-$4.jsonl\"\nexit 0\nfi\necho \"unexpected: $*\" >&2\nexit 1\n"
             ),
         )
         .expect("write fake herdr");
@@ -257,6 +261,20 @@ impl FakeHerdr {
             server: Some(server),
             _dir: dir,
         }
+    }
+
+    /// Base64 payloads of every `terminal.input` the view wrote to the
+    /// pane's control stream, in order.
+    fn terminal_inputs(&self, pane_id: &str) -> Vec<String> {
+        let path = self._dir.path().join(format!("terminal-{pane_id}.jsonl"));
+        let Ok(log) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|command| command["type"] == json!("terminal.input"))
+            .filter_map(|command| command["bytes"].as_str().map(str::to_owned))
+            .collect()
     }
 
     fn socket_path(&self) -> PathBuf {
@@ -3398,6 +3416,43 @@ fn key(name: &str, control: bool) -> gpui::KeyDownEvent {
         is_held: false,
         prefer_character_input: false,
     }
+}
+
+/// Real Ghostty surfaces (not `headless_terminals`): the key is encoded by
+/// libghostty and its bytes go to the selected pane's control stream only.
+#[gpui::test]
+fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update_in(cx, |this, window, cx| {
+        assert_eq!(this.selection.pane_id.as_deref(), Some("p-left"));
+        assert!(
+            this.pane("p-left").is_some(),
+            "the visible tab spawns a Ghostty surface"
+        );
+        assert!(this.pane("p-right").is_some());
+        let mut shift_enter = key("enter", false);
+        shift_enter.keystroke.modifiers.shift = true;
+        shift_enter.keystroke.key_char = Some("\n".into());
+        this.send_key(&shift_enter, window, cx);
+    });
+    // Ghostty writes to the pty from its IO thread; production drains the
+    // queue on every frame and event poll, the test pumps it by hand.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.terminal_inputs("p-left").is_empty() {
+        assert!(Instant::now() < deadline, "Ghostty never wrote the key");
+        view.update(cx, |this, _| this.pump_terminal_input());
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Ghostty's legacy encoding of Shift+Enter, base64 as Herdr receives it.
+    assert_eq!(
+        fake.terminal_inputs("p-left"),
+        vec!["G1syNzsyOzEzfg==".to_owned()]
+    );
+    assert!(fake.terminal_inputs("p-right").is_empty());
 }
 
 #[gpui::test]

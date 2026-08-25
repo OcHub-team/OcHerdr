@@ -18,7 +18,7 @@ use ocherdr_herdr::{
     TerminalMode, TerminalSession, attach_command, discover_sessions, open_system_terminal,
     request_socket,
 };
-use ocherdr_terminal::{KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
+use ocherdr_terminal::{KeyAction, KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
 use ochub_ui::anim::Transition;
 use ochub_ui::components::{
     ButtonSize, ButtonTone, busy_button, button, context_menu, context_menu_item, disabled_button,
@@ -715,6 +715,8 @@ struct OcHerdrView {
     /// Opacity of the ⌘N hints, eased toward `command_held`.
     shortcut_reveal: Transition,
     prefix_pending: bool,
+    /// The last key-down was an OcHerdr shortcut; swallow its key-up.
+    suppress_key_release: bool,
     surface_drag: SurfaceDrag,
     /// A released divider drag whose `layout.set_split_ratio` batch is still
     /// landing: the squeeze preview stays on and the tab stays locked until
