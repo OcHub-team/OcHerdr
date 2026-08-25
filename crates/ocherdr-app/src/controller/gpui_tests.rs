@@ -2292,13 +2292,17 @@ fn a_split_drag_squeezes_the_preview_and_sends_one_set_split_ratio(cx: &mut Test
         assert!((right.2 - 0.3).abs() < 1e-3, "{right:?}");
         assert!(this.finish_split_drag(release, cx));
         assert!(matches!(this.surface_drag, crate::SurfaceDrag::Idle));
-        assert!(!this.pane_resize_frozen("p-left"), "release unfreezes");
-        let back = this
-            .displayed_pane_fractions(Some(layout), "p-left", Instant::now(), false)
-            .expect("authoritative rect");
         assert!(
-            (back.2 - 0.5).abs() < 1e-6,
-            "authority until layout.updated"
+            this.pane_resize_frozen("p-left"),
+            "release keeps the freeze until the ratio lands"
+        );
+        assert!(this.tab_relocation_locked("t-a"), "the batch locks the tab");
+        let kept = this
+            .displayed_pane_fractions(Some(layout), "p-left", Instant::now(), false)
+            .expect("preview rect");
+        assert!(
+            (kept.2 - 0.7).abs() < 1e-3,
+            "the preview stays until layout.updated: {kept:?}"
         );
     });
     cx.run_until_parked();
@@ -2306,6 +2310,176 @@ fn a_split_drag_squeezes_the_preview_and_sends_one_set_split_ratio(cx: &mut Test
     assert_eq!(requests.len(), 1, "one request on release: {requests:?}");
     let ratio = requests[0]["params"]["ratio"].as_f64().expect("ratio");
     assert!((ratio - 0.7).abs() < 1e-3, "{ratio}");
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.pane_resize_frozen("p-left"),
+            "the ok response alone does not end the preview"
+        );
+    });
+    let mut landed = two_pane_layout("p-left", "p-right");
+    landed.splits[0].ratio = ratio as f32;
+    landed.panes[0].rect = layout_rect(0, 0, 84, 40);
+    landed.panes[1].rect = layout_rect(84, 0, 36, 40);
+    send_events(&fake, vec![layout_event(landed)], cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.split_commit.is_none(), "the matching layout settles");
+        assert!(!this.pane_resize_frozen("p-left"), "settling unfreezes");
+        assert!(!this.tab_relocation_locked("t-a"));
+    });
+}
+
+/// `t-a` holds `right[ right[p1, p2] | p3 ]` over a 120×40 area with the
+/// given ratios; rects follow Herdr's rounding.
+fn nested_three_pane_layout(outer: f32, inner: f32) -> ocherdr_core::PaneLayout {
+    let area = layout_rect(0, 0, 120, 40);
+    let (left, right) = ocherdr_core::split_rect(area, ocherdr_core::SplitDirection::Right, outer);
+    let (p1, p2) = ocherdr_core::split_rect(left, ocherdr_core::SplitDirection::Right, inner);
+    ocherdr_core::PaneLayout {
+        workspace_id: "w".into(),
+        tab_id: "t-a".into(),
+        zoomed: false,
+        area,
+        focused_pane_id: "p1".into(),
+        panes: vec![
+            ocherdr_core::LayoutPane {
+                pane_id: "p1".into(),
+                focused: true,
+                rect: p1,
+            },
+            ocherdr_core::LayoutPane {
+                pane_id: "p2".into(),
+                focused: false,
+                rect: p2,
+            },
+            ocherdr_core::LayoutPane {
+                pane_id: "p3".into(),
+                focused: false,
+                rect: right,
+            },
+        ],
+        splits: vec![
+            ocherdr_core::LayoutSplit {
+                id: "split_0_root".into(),
+                direction: ocherdr_core::SplitDirection::Right,
+                ratio: outer,
+                rect: area,
+            },
+            ocherdr_core::LayoutSplit {
+                id: "split_1_0".into(),
+                direction: ocherdr_core::SplitDirection::Right,
+                ratio: inner,
+                rect: left,
+            },
+        ],
+    }
+}
+
+#[gpui::test]
+fn dragging_the_outer_divider_keeps_the_inner_one_pinned_and_sends_both_ratios(
+    cx: &mut TestAppContext,
+) {
+    let mut snapshot = pane_move_capable_snapshot();
+    snapshot.focused_pane_id = Some("p1".into());
+    snapshot.panes = vec![
+        split_pane("p1", true),
+        split_pane("p2", false),
+        split_pane("p3", false),
+    ];
+    snapshot.layouts = vec![nested_three_pane_layout(0.5, 0.5)];
+    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, _| this.headless_terminals = true);
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update(cx, |this, _| this.terminal_surface_bounds = Some(SURFACE));
+    // Outer divider at x = 300 px (cell 60) dragged to 0.7 (cell 84); the
+    // inner divider sits on cell 30 and must stay there: 30 / 84.
+    let press = (SURFACE.0 + 300., SURFACE.1 + 100.);
+    let release = (SURFACE.0 + 420., SURFACE.1 + 100.);
+    let inner_expected = 30. / 84.;
+    view.update(cx, |this, cx| {
+        let snapshot = this.snapshot.clone().expect("snapshot");
+        let layout = snapshot.layout_for("t-a").expect("layout");
+        let outer = layout.splits[0].clone();
+        let drag = super::split_drag_from_press("t-a".into(), &outer, layout, SURFACE, press)
+            .expect("split drag");
+        this.surface_drag = crate::SurfaceDrag::Split(drag);
+        assert!(this.update_split_drag(release, cx));
+        let squeezed = this.squeezed_tab_layout(layout).expect("squeezed preview");
+        let (_, outer_line) = squeezed.split(&[]).expect("outer divider");
+        let (_, inner_line) = squeezed.split(&[false]).expect("inner divider");
+        assert!((outer_line - 0.7).abs() < 1e-6, "{outer_line}");
+        assert!(
+            (inner_line - 0.25).abs() < 1e-6,
+            "the inner divider keeps its x: {inner_line}"
+        );
+        let p2 = squeezed.pane("p2").expect("p2");
+        assert!(
+            (p2.0 - 0.25).abs() < 1e-6 && (p2.2 - 0.45).abs() < 1e-6,
+            "{p2:?}"
+        );
+        let p1 = squeezed.pane("p1").expect("p1");
+        assert!((p1.2 - 0.25).abs() < 1e-6, "p1 is untouched: {p1:?}");
+        assert!(this.finish_split_drag(release, cx));
+        let kept = this
+            .squeezed_tab_layout(layout)
+            .expect("preview kept after release");
+        assert!((kept.split(&[false]).expect("inner").1 - 0.25).abs() < 1e-6);
+    });
+    cx.run_until_parked();
+    let requests = fake.requests_for("layout.set_split_ratio");
+    assert_eq!(requests.len(), 2, "outer then inner: {requests:?}");
+    assert_eq!(requests[0]["params"]["tab_id"], json!("t-a"));
+    assert_eq!(requests[0]["params"]["path"], json!([]));
+    let outer_ratio = requests[0]["params"]["ratio"].as_f64().expect("ratio");
+    assert!((outer_ratio - 0.7).abs() < 1e-3, "{outer_ratio}");
+    assert_eq!(requests[1]["params"]["tab_id"], json!("t-a"));
+    assert_eq!(requests[1]["params"]["path"], json!([false]));
+    let inner_ratio = requests[1]["params"]["ratio"].as_f64().expect("ratio");
+    assert!((inner_ratio - inner_expected).abs() < 1e-4, "{inner_ratio}");
+
+    // Herdr answers with one layout per request: the first (outer moved,
+    // inner still 0.5) must not flash; the second settles the batch.
+    send_events(
+        &fake,
+        vec![layout_event(nested_three_pane_layout(
+            outer_ratio as f32,
+            0.5,
+        ))],
+        cx,
+    );
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.split_commit.is_some(),
+            "intermediate layout keeps the preview"
+        );
+        let layout = this
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for("t-a"))
+            .expect("layout");
+        let squeezed = this.squeezed_tab_layout(layout).expect("preview");
+        assert!((squeezed.split(&[false]).expect("inner").1 - 0.25).abs() < 1e-6);
+        assert!(this.pane_resize_frozen("p2"));
+    });
+    send_events(
+        &fake,
+        vec![layout_event(nested_three_pane_layout(
+            outer_ratio as f32,
+            inner_ratio as f32,
+        ))],
+        cx,
+    );
+    view.read_with(cx, |this, _| {
+        assert!(this.split_commit.is_none(), "the last layout settles");
+        assert!(!this.pane_resize_frozen("p2"));
+        let layout = this
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for("t-a"))
+            .expect("layout");
+        assert_eq!(layout.panes[1].rect, layout_rect(30, 0, 54, 40));
+    });
 }
 
 // ---- Edge relocation (design §4.2, §7, phase 3) ----

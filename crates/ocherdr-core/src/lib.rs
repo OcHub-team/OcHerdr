@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub mod event;
 pub mod relocation;
+pub mod split_drag;
 pub use agent::{
     AGENT_OUTPUT_SOURCE, AgentNameError, agent_output_should_refresh, parse_agent_name,
 };
@@ -25,6 +26,7 @@ pub use relocation::{
     predict_relocation, predict_relocation_steps, predict_swap, rebuild_tree, split_rect,
     valid_split_ratio,
 };
+pub use split_drag::{apply_ratios, pinned_ratios};
 
 pub const MINIMUM_HERDR_VERSION: &str = "0.8.1";
 
