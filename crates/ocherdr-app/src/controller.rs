@@ -105,6 +105,7 @@ impl OcHerdrView {
             appearance_ui: Default::default(),
             tab_scroll: ScrollHandle::new(),
             hovered_tab_id: None,
+            pending_created_tab: None,
             tab_preview_task: None,
             tab_preview_id: None,
             tab_preview_goal: None,
@@ -231,6 +232,7 @@ impl OcHerdrView {
         self.agent_status_rebuild = None;
         self.agent_status_panes.clear();
         self.agent_status_handoff = None;
+        self.pending_created_tab = None;
         self.surface_drag = SurfaceDrag::Idle;
         self.split_commit = None;
         self.snapshot_refreshing = false;
@@ -707,6 +709,7 @@ impl OcHerdrView {
             ) {
                 self.ensure_session_terminals(cx);
             }
+            self.settle_pending_created_tab(cx);
         }
         if effects.settle_reorder {
             self.pending_reorder = None;
@@ -720,6 +723,7 @@ impl OcHerdrView {
             self.cancel_reorder_drag();
             self.cancel_pane_drag();
             self.cancel_keyboard_pane_move();
+            self.pending_created_tab = None;
             // Requests already sent cannot be cancelled; the reconnect
             // snapshot is the authority for what actually happened.
             self.abort_pane_relocations_for_disconnect();
@@ -996,6 +1000,7 @@ impl OcHerdrView {
                             ) {
                                 this.ensure_session_terminals(cx);
                             }
+                            this.settle_pending_created_tab(cx);
                         }
                         cx.notify();
                     }
@@ -2650,7 +2655,50 @@ impl OcHerdrView {
     }
 
     pub(super) fn create_workspace(&mut self, cx: &mut Context<Self>) {
-        self.invoke("workspace.create", json!({ "focus": true, "env": {} }), cx);
+        self.invoke_with_response(
+            "workspace.create",
+            json!({ "focus": true, "env": {} }),
+            Self::follow_created_tab,
+            cx,
+        );
+    }
+
+    /// Switch to the tab a `*.create` / `worktree.open` response names, now
+    /// or once the matching events have been applied. `Selection::reconcile`
+    /// deliberately ignores `tab.focused` from other clients, so the tab
+    /// this client itself asked for has to be selected explicitly.
+    fn follow_created_tab(
+        &mut self,
+        result: std::result::Result<Value, HerdrError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(result) = result else {
+            return;
+        };
+        if let Some(tab_id) = created_tab_id(&result) {
+            self.pending_created_tab = Some(tab_id);
+            self.settle_pending_created_tab(cx);
+        }
+    }
+
+    /// Select the pending created tab if the snapshot has it and at least one
+    /// of its panes; otherwise keep waiting for the events.
+    fn settle_pending_created_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.pending_created_tab.clone() else {
+            return;
+        };
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(tab) = snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id) else {
+            return;
+        };
+        if snapshot.panes_for(&tab_id).next().is_none() {
+            return;
+        }
+        self.pending_created_tab = None;
+        self.selection.workspace_id = Some(tab.workspace_id.clone());
+        self.select_tab(tab_id, cx);
     }
 
     pub(super) fn open_worktree_create_for_selection(
@@ -2726,7 +2774,7 @@ impl OcHerdrView {
         );
         self.set_overlay(Overlay::None, cx);
         self.focus.focus(window, cx);
-        self.invoke("worktree.create", params, cx);
+        self.invoke_with_response("worktree.create", params, Self::follow_created_tab, cx);
     }
 
     pub(super) fn open_worktree_picker(&mut self, workspace_id: String, cx: &mut Context<Self>) {
@@ -2755,7 +2803,7 @@ impl OcHerdrView {
         };
         let params = worktree_open_params(source, &path);
         self.set_overlay(Overlay::None, cx);
-        self.invoke("worktree.open", params, cx);
+        self.invoke_with_response("worktree.open", params, Self::follow_created_tab, cx);
     }
 
     pub(super) fn request_remove_worktree(&mut self, workspace_id: String, cx: &mut Context<Self>) {
@@ -2946,9 +2994,10 @@ impl OcHerdrView {
 
     pub(super) fn create_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(workspace_id) = self.selection.workspace_id.clone() {
-            self.invoke(
+            self.invoke_with_response(
                 "tab.create",
                 json!({ "workspace_id": workspace_id, "focus": true, "env": {} }),
+                Self::follow_created_tab,
                 cx,
             );
         }
@@ -5037,7 +5086,6 @@ impl OcHerdrView {
     /// is handed to `on_response` on the main thread once the socket answers.
     /// Failure side effects (notice, reorder gate, worktree force-remove offer)
     /// happen before the callback runs, so callers only chain the next step.
-    #[allow(dead_code)] // consumed by the pane relocation transaction (design §7)
     pub(super) fn invoke_with_response(
         &mut self,
         method: &'static str,
@@ -5449,6 +5497,16 @@ type InvokeResponseCallback = Box<
 // pane.rename emits nothing. pane.close can delete the parent tab and
 // reshuffle focus / tab numbers without emitting tab.closed. pane.move and
 // pane.swap both emit (`pane.moved` / `layout.updated`), so they stay out.
+/// The tab a `tab.create`, `workspace.create`, `worktree.create` or
+/// `worktree.open` result names: all four carry Herdr's `TabInfo` as `tab`.
+fn created_tab_id(result: &Value) -> Option<String> {
+    result
+        .get("tab")?
+        .get("tab_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn command_needs_snapshot_resync(method: &str) -> bool {
     matches!(method, "pane.rename" | "pane.close")
 }

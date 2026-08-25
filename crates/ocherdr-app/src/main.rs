@@ -694,6 +694,10 @@ struct OcHerdrView {
     appearance_ui: ui::AppearanceUi,
     tab_scroll: ScrollHandle,
     hovered_tab_id: Option<String>,
+    /// Tab this client asked Herdr to create and has not switched to yet:
+    /// the response can land before `tab.created` / `pane.created` are
+    /// applied, so the switch waits until the tab and a pane exist locally.
+    pending_created_tab: Option<String>,
     /// Dropping this cancels a pending show or hide.
     tab_preview_task: Option<Task<()>>,
     /// Tab whose preview is currently painted, after `TAB_PREVIEW_DELAY`.
