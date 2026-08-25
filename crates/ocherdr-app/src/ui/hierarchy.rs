@@ -2273,6 +2273,7 @@ fn render_pane(
                 .min_h_0()
                 .min_w_0()
                 .overflow_hidden()
+                .rounded(px(CORNER_COMPACT))
                 .border_1()
                 .when(source_slot, |body| body.border_dashed())
                 .border_color(if selected {
