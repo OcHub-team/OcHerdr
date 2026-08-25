@@ -1495,7 +1495,9 @@ impl OcHerdrView {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            .bg(theme::content_background())
+            // The gaps around rounded panes are part of the terminal canvas,
+            // so they must use the same background as each terminal frame.
+            .bg(theme::current().bg.rgba())
             .children(elements)
             .child(
                 canvas(
