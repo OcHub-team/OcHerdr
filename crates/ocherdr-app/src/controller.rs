@@ -114,6 +114,7 @@ impl OcHerdrView {
             shortcut_reveal: Transition::settled(0., TAB_SHORTCUT_ANIMATION),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
+            split_commit: None,
             pane_drag_snapshot: None,
             pane_relocations: HashMap::new(),
             pane_drag_return: None,
@@ -231,6 +232,7 @@ impl OcHerdrView {
         self.agent_status_panes.clear();
         self.agent_status_handoff = None;
         self.surface_drag = SurfaceDrag::Idle;
+        self.split_commit = None;
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
         self.abandon_worktree_list();
@@ -714,6 +716,7 @@ impl OcHerdrView {
         }
         if matches!(action, EventPollAction::Disconnect(_)) {
             self.cancel_split_drag();
+            self.split_commit = None;
             self.cancel_reorder_drag();
             self.cancel_pane_drag();
             self.cancel_keyboard_pane_move();
@@ -722,6 +725,7 @@ impl OcHerdrView {
             self.abort_pane_relocations_for_disconnect();
         }
         self.reconcile_split_drag(cx);
+        self.reconcile_split_commit(cx);
         self.reconcile_reorder_drag(cx);
         self.reconcile_pane_drag(cx);
         self.reconcile_keyboard_pane_move(cx);
@@ -2504,23 +2508,33 @@ impl OcHerdrView {
         })
     }
 
-    /// A divider of this tab is being dragged: geometry is the squeeze
-    /// preview (design §5.4) until the single `layout.set_split_ratio` on
-    /// release brings the authoritative layout.
+    /// A divider of this tab is being dragged, or its release batch of
+    /// `layout.set_split_ratio` is still landing: geometry is the squeeze
+    /// preview (design §5.4) until the authoritative layout carries every
+    /// ratio of the batch.
     pub(super) fn tab_split_dragging(&self, tab_id: &str) -> bool {
         matches!(&self.surface_drag, SurfaceDrag::Split(drag) if drag.tab_id == tab_id)
+            || self
+                .split_commit
+                .as_ref()
+                .is_some_and(|commit| commit.tab_id == tab_id)
     }
 
-    /// The tab's geometry squeezed to the split drag's preview ratio, or
-    /// `None` when no divider of this tab is being dragged.
+    /// The tab's geometry squeezed to the split drag's preview ratios (the
+    /// dragged split plus the nested dividers pinned to their cells), or
+    /// `None` when no divider of this tab is being dragged or committed.
     pub(super) fn squeezed_tab_layout(&self, layout: &PaneLayout) -> Option<SqueezedLayout> {
-        let SurfaceDrag::Split(drag) = &self.surface_drag else {
-            return None;
-        };
-        if drag.tab_id != layout.tab_id {
+        if let SurfaceDrag::Split(drag) = &self.surface_drag
+            && drag.tab_id == layout.tab_id
+        {
+            let ratios = split_drag_ratios(layout, &drag.path, drag.preview_ratio);
+            return squeezed_layout(layout, &ratios);
+        }
+        let commit = self.split_commit.as_ref()?;
+        if commit.tab_id != layout.tab_id {
             return None;
         }
-        squeezed_layout(layout, &drag.path, drag.preview_ratio)
+        squeezed_layout(layout, &commit.ratios)
     }
 
     pub(super) fn sync_measured_pane_body(
@@ -3384,7 +3398,8 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         };
-        // A pending relocation owns this tab's geometry until it settles.
+        // A pending relocation or split batch owns this tab's geometry
+        // until it settles.
         if self.tab_relocation_locked(&tab_id) {
             cx.stop_propagation();
             return;
@@ -3505,18 +3520,87 @@ impl OcHerdrView {
         else {
             return true;
         };
-        if (drag.preview_ratio - drag.start_ratio).abs() > f32::EPSILON {
-            self.invoke(
+        let ratios = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&drag.tab_id))
+            .map(|layout| split_drag_ratios(layout, &drag.path, drag.preview_ratio))
+            .unwrap_or_default();
+        let ratios = split_commit_ratios(ratios, drag.start_ratio);
+        if ratios.is_empty() {
+            return true;
+        }
+        let last_ratios = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&drag.tab_id))
+            .map(split_ratios_of)
+            .unwrap_or_default();
+        self.pane_relocation_serial = self.pane_relocation_serial.wrapping_add(1);
+        let serial = self.pane_relocation_serial;
+        self.split_commit = Some(PendingSplitCommit {
+            tab_id: drag.tab_id.clone(),
+            layout: drag.layout.clone(),
+            ratios: ratios.clone(),
+            serial,
+            outstanding: ratios.len(),
+            last_ratios,
+            layouts_seen: 0,
+        });
+        // The dragged split first, then the pinned descendants, back to back:
+        // Herdr applies them in order and emits one `layout.updated` each.
+        for (path, ratio) in ratios {
+            self.invoke_with_response(
                 "layout.set_split_ratio",
                 json!({
                     "tab_id": drag.tab_id,
-                    "path": drag.path,
-                    "ratio": drag.preview_ratio,
+                    "path": path,
+                    "ratio": ratio,
                 }),
+                move |this, result, cx| this.split_commit_responded(serial, result.is_ok(), cx),
                 cx,
             );
         }
         true
+    }
+
+    /// One `layout.set_split_ratio` of the release batch answered. An error
+    /// drops the preview (the authoritative layout is whatever Herdr kept);
+    /// otherwise the commit settles once the layout shows the ratios.
+    fn split_commit_responded(&mut self, serial: u64, ok: bool, cx: &mut Context<Self>) {
+        let Some(commit) = self.split_commit.as_mut() else {
+            return;
+        };
+        if commit.serial != serial {
+            return;
+        }
+        if !ok {
+            self.split_commit = None;
+            cx.notify();
+            return;
+        }
+        commit.outstanding = commit.outstanding.saturating_sub(1);
+        self.reconcile_split_commit(cx);
+    }
+
+    /// Drop the release batch's preview once the authoritative layout
+    /// carries it (or one layout per answered request came in), or when the
+    /// tab's split shape changed under it.
+    fn reconcile_split_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(commit) = self.split_commit.as_mut() else {
+            return;
+        };
+        let keep = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&commit.tab_id))
+            .is_some_and(|layout| {
+                split_layout_fingerprint(layout) == commit.layout && !commit.observe(layout)
+            });
+        if !keep {
+            self.split_commit = None;
+            cx.notify();
+        }
     }
 
     // ---- Pane drag: handle press, hover, release, cancel (design §5, §7) ----
@@ -3527,6 +3611,10 @@ impl OcHerdrView {
         self.pane_relocations
             .get(tab_id)
             .is_some_and(|pending| pending.phase.locks_tab())
+            || self
+                .split_commit
+                .as_ref()
+                .is_some_and(|commit| commit.tab_id == tab_id)
     }
 
     /// Whether the four edge zones accept drops on this connection: the
@@ -5866,6 +5954,16 @@ fn split_drag_voided_by_pane(
             tab_id != drag.tab_id || workspace_id != drag.workspace_id
         }
         _ => true,
+    }
+}
+
+/// The requests a released drag sends: the `pinned_ratios` output (dragged
+/// split first) when the dragged split moved, nothing otherwise, since the
+/// descendants are only retuned for that move.
+fn split_commit_ratios(ratios: Vec<(Vec<bool>, f32)>, start_ratio: f32) -> Vec<(Vec<bool>, f32)> {
+    match ratios.first() {
+        Some((_, dragged)) if (dragged - start_ratio).abs() > f32::EPSILON => ratios,
+        _ => Vec::new(),
     }
 }
 
