@@ -3490,12 +3490,26 @@ impl OcHerdrView {
     }
 
     /// Temporary tabs of in-flight inserts, kept out of the tab strip and
-    /// tab navigation (design §7.2).
+    /// tab navigation (design §7.2): the id the step-1 response named, plus
+    /// any tab the event stream added for the plan before or after that
+    /// response (`RelocationPlan::unlisted_temp_tabs`). A parked plan shows
+    /// its tab on purpose.
     pub(super) fn hidden_tab_ids(&self) -> HashSet<String> {
-        self.pane_relocations
+        let mut hidden: HashSet<String> = self
+            .pane_relocations
             .values()
             .filter_map(|pending| pending.phase.hidden_tab_id().map(str::to_owned))
-            .collect()
+            .collect();
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            for pending in self
+                .pane_relocations
+                .values()
+                .filter(|pending| pending.phase.locks_tab())
+            {
+                hidden.extend(pending.plan.unlisted_temp_tabs(snapshot).map(str::to_owned));
+            }
+        }
+        hidden
     }
 
     /// Panes to draw in a tab. While an insert plan is pending the source
@@ -3870,6 +3884,10 @@ impl OcHerdrView {
                 .and_then(|runtime| runtime.frame.clone())
                 .or_else(|| self.pane_drag_snapshot.clone()),
             workspace_id: request.workspace_id.clone(),
+            known_tab_ids: snapshot
+                .tabs_for(&request.workspace_id)
+                .map(|tab| tab.tab_id.clone())
+                .collect(),
             insert_shapes,
         };
         if !plan.is_supported() {

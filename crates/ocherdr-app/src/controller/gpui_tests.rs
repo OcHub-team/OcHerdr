@@ -70,6 +70,32 @@ struct FakeHerdr {
 struct PaneMoveScript {
     park_failures: AtomicUsize,
     insert_failures: AtomicUsize,
+    /// Events the fake broadcasts on the live subscription *before* it
+    /// writes the next step-1 response: events ride their own socket, so
+    /// in production they can beat the response that names the temp tab.
+    events_before_park_response: Mutex<Vec<Value>>,
+    /// The live subscription's queue, filled in by the constructor.
+    event_queue: Mutex<Option<Sender<QueuedEvent>>>,
+}
+
+impl PaneMoveScript {
+    /// Push `events` to the subscribed stream and wait until each one is
+    /// flushed, the same proof `FakeHerdr::send_event` demands.
+    fn broadcast(&self, events: Vec<Value>) {
+        let queue = self.event_queue.lock().expect("event queue");
+        let Some(queue) = queue.as_ref() else {
+            return;
+        };
+        for payload in events {
+            let (written, observed) = mpsc::sync_channel(0);
+            queue
+                .send(QueuedEvent { payload, written })
+                .expect("queue fake Herdr event");
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("fake Herdr event must be flushed to the subscribed stream");
+        }
+    }
 }
 
 impl PaneMoveScript {
@@ -154,6 +180,7 @@ impl FakeHerdr {
         let (events, receiver) = mpsc::channel();
         let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let log = requests.clone();
+        *script.event_queue.lock().expect("event queue") = Some(events.clone());
         let script = Arc::new(script);
         let server_script = script.clone();
         let mut fake = Self::start(Some(events), move |listener, stop| {
@@ -583,6 +610,18 @@ fn serve_snapshot_with_live_events(
                                 }),
                             );
                             continue;
+                        }
+                        let early = std::mem::take(
+                            &mut *script
+                                .events_before_park_response
+                                .lock()
+                                .expect("early park events"),
+                        );
+                        if !early.is_empty() {
+                            script.broadcast(early);
+                            // Let the client's reader thread queue them before
+                            // the response can be read.
+                            thread::sleep(Duration::from_millis(60));
                         }
                         let pane_id = request["params"]["pane_id"].clone();
                         write_fake_response(
@@ -2519,6 +2558,91 @@ fn a_right_drop_issues_two_pane_moves_back_to_back_and_settles_without_a_resync(
         "the incremental pane.moved apply never resyncs"
     );
     assert_eq!(fake.requests_for("pane.move").len(), 2);
+}
+
+fn visible_tab_ids(view: &crate::OcHerdrView) -> Vec<String> {
+    view.chrome_a11y()
+        .tabs
+        .items
+        .iter()
+        .map(|row| row.a11y.id.clone())
+        .collect()
+}
+
+/// Events and responses ride different sockets: `tab.created` for the
+/// temporary tab can be applied while the plan is still `Parking`, before
+/// the step-1 response names the tab. The strip must hide it at every step
+/// of the executor, not only once the response has been applied.
+#[gpui::test]
+fn the_temporary_tab_is_hidden_before_the_park_response_names_it(cx: &mut TestAppContext) {
+    let script = PaneMoveScript {
+        events_before_park_response: Mutex::new(park_events()),
+        ..PaneMoveScript::default()
+    };
+    let (fake, view, cx) = connect_edge_view(cx, script);
+    drag_left_pane_to(&view, RIGHT_EDGE, cx);
+
+    // Step the executor one task at a time. The fake answers step 1 only
+    // after the four step-1 events are on the wire, so the event task and
+    // the response continuation are both runnable after the request.
+    let mut parking_with_temp_tab = false;
+    let mut ticks = 0;
+    loop {
+        let ran = cx.executor().tick();
+        view.read_with(cx, |this, _| {
+            assert!(
+                !visible_tab_ids(this).iter().any(|id| id == "t-tmp"),
+                "tick {ticks}: the temp tab reached the strip"
+            );
+            let temp_tab_known = this
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp"));
+            if temp_tab_known
+                && this.pane_relocations.get("t-a").map(|p| &p.phase)
+                    == Some(&crate::RelocationPhase::Parking)
+            {
+                parking_with_temp_tab = true;
+                assert!(this.hidden_tab_ids().contains("t-tmp"));
+            }
+        });
+        ticks += 1;
+        if !ran {
+            if fake.requests_for("pane.move").len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+            assert!(ticks < 2_000, "step 2 never went out");
+        }
+    }
+    assert!(
+        parking_with_temp_tab,
+        "the race was exercised: the temp tab was in the snapshot while Parking"
+    );
+    view.update(cx, |this, cx| {
+        assert!(matches!(
+            this.pane_relocations.get("t-a").map(|p| &p.phase),
+            Some(crate::RelocationPhase::Inserting { temp_tab_id, .. }) if temp_tab_id == "t-tmp"
+        ));
+        assert_eq!(visible_tab_ids(this), vec!["t-a", "t-b", "t-c"]);
+        this.cycle_tab(-1, cx);
+        assert_eq!(
+            this.selection.tab_id.as_deref(),
+            Some("t-c"),
+            "tab navigation wraps past the hidden tab"
+        );
+        this.select_tab_number(1, cx);
+        assert_eq!(this.selection.tab_id.as_deref(), Some("t-a"));
+    });
+
+    send_events(&fake, insert_events(), cx);
+    thread::sleep(Duration::from_millis(220));
+    view.update(cx, |this, _| {
+        this.expire_pane_motion(Instant::now(), false);
+        assert!(!this.tab_relocation_locked("t-a"));
+        assert_eq!(visible_tab_ids(this), vec!["t-a", "t-b", "t-c"]);
+        assert!(this.hidden_tab_ids().is_empty());
+    });
 }
 
 #[gpui::test]

@@ -1125,6 +1125,12 @@ struct RelocationPlan {
     visual_snapshot: Option<RenderedFrame>,
     /// Workspace of the source tab: `pane.move`'s `new_tab` destination.
     workspace_id: String,
+    /// Tabs of that workspace at release. Step 1 creates one more; events
+    /// travel on their own socket, so `tab.created` can land before the
+    /// step-1 response names it and `tab.closed` after the step-2 response.
+    /// A tab outside this set that holds nothing but the source pane is the
+    /// temporary tab whatever the phase knows (see `unlisted_temp_tabs`).
+    known_tab_ids: HashSet<String>,
     /// Intermediate shapes of an insert; `None` for a swap.
     insert_shapes: Option<InsertShapes>,
 }
@@ -1702,6 +1708,27 @@ fn layout_still_matches_plan(layout: &PaneLayout, plan: &RelocationPlan) -> bool
 }
 
 impl RelocationPlan {
+    /// Temporary tabs of an insert as the event stream reports them: tabs of
+    /// the plan's workspace that did not exist at release and hold nothing
+    /// but the source pane. Hidden from the tab strip and tab navigation
+    /// alongside the id the step-1 response names (design §7.2), so the
+    /// tab never flashes for the frames between the event and the response.
+    fn unlisted_temp_tabs<'a>(
+        &'a self,
+        snapshot: &'a HierarchySnapshot,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        let inserting = matches!(self.intent, RelocationIntent::Insert { .. });
+        snapshot
+            .tabs_for(&self.workspace_id)
+            .filter(move |tab| inserting && !self.known_tab_ids.contains(&tab.tab_id))
+            .filter(|tab| {
+                snapshot
+                    .panes_for(&tab.tab_id)
+                    .all(|pane| pane.pane_id == self.source_pane_id)
+            })
+            .map(|tab| tab.tab_id.as_str())
+    }
+
     /// Both intents are same-tab only: the drop model never offers a pane
     /// of another tab as a target.
     fn is_supported(&self) -> bool {
@@ -2670,6 +2697,7 @@ mod tests {
             predicted_rects: predict_swap(layout, "a", "b").unwrap(),
             visual_snapshot: None,
             workspace_id: "w".into(),
+            known_tab_ids: HashSet::from(["t".to_owned()]),
             insert_shapes: None,
         }
     }
@@ -3319,6 +3347,7 @@ mod tests {
             predicted_rects: steps.final_layout.panes.clone(),
             visual_snapshot: None,
             workspace_id: "w".into(),
+            known_tab_ids: HashSet::from(["t".to_owned()]),
             insert_shapes: Some(InsertShapes::from_steps(&steps)),
         }
     }
@@ -3600,6 +3629,58 @@ mod tests {
         assert_eq!(parked.phase.parked_tab_id(), Some("t-tmp"));
         assert_eq!(inserting(false, false).hidden_tab_id(), Some("t-tmp"));
         assert_eq!(parked.phase.hidden_tab_id(), None, "parked tabs are shown");
+    }
+
+    /// The event stream can name the temporary tab before (or keep it after)
+    /// the responses do: an unknown tab of the workspace holding only the
+    /// source pane is the temporary tab; anything else stays visible.
+    #[test]
+    fn an_unlisted_tab_holding_only_the_source_pane_is_the_temp_tab() {
+        let layout = two_pane_layout();
+        let plan = insert_plan(&layout, DropEdge::Right);
+        let pane = |pane_id: &str, tab_id: &str| {
+            json!({
+                "pane_id": pane_id,
+                "terminal_id": pane_id,
+                "workspace_id": "w",
+                "tab_id": tab_id,
+                "focused": false,
+            })
+        };
+        let tab = |tab_id: &str, number: usize| {
+            json!({
+                "tab_id": tab_id,
+                "workspace_id": "w",
+                "number": number,
+                "label": tab_id,
+                "focused": false,
+                "pane_count": 1,
+            })
+        };
+        let snapshot: HierarchySnapshot = serde_json::from_value(json!({
+            "version": "0.9.0",
+            "protocol": 14,
+            "tabs": [tab("t", 1), tab("t-tmp", 2), tab("t-other", 3), tab("t-empty", 4)],
+            "panes": [
+                pane("b", "t"),
+                pane("a", "t-tmp"),
+                pane("c", "t-other"),
+            ],
+        }))
+        .unwrap();
+        let hidden: Vec<&str> = plan.unlisted_temp_tabs(&snapshot).collect();
+        assert_eq!(
+            hidden,
+            vec!["t-tmp", "t-empty"],
+            "the tab with the source pane and a pane-less newcomer are hidden; \
+             a foreign tab and the known tab are not"
+        );
+        let swap = swap_plan(&layout);
+        assert_eq!(
+            swap.unlisted_temp_tabs(&snapshot).count(),
+            0,
+            "a swap creates no tab and hides nothing"
+        );
     }
 
     #[test]
