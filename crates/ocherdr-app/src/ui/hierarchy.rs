@@ -1922,16 +1922,20 @@ fn rect_fractions(
     ))
 }
 
+/// Where the divider of a settled split sits: on the far edge of the first
+/// child as Herdr rounds it to cells, the same boundary the pane frames
+/// use, so the line and the frames never disagree by a fraction of a cell.
 fn split_line_fraction(
     area: ocherdr_core::LayoutRect,
     rect: ocherdr_core::LayoutRect,
     direction: SplitDirection,
     ratio: f32,
 ) -> Option<f32> {
-    let (x, y, w, h) = rect_fractions(area, rect)?;
+    let (first, _) = ocherdr_core::split_rect(rect, direction, ratio);
+    let (x, y, w, h) = rect_fractions(area, first)?;
     Some(match direction {
-        SplitDirection::Right => x + w * ratio,
-        SplitDirection::Down => y + h * ratio,
+        SplitDirection::Right => x + w,
+        SplitDirection::Down => y + h,
     })
 }
 

@@ -11,7 +11,7 @@ use ocherdr_core::{
     PaneLayout, PredictedLayout, PredictedPane, ReorderHover, Selection, SessionSummary,
     SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, ZoneRect, drop_zone,
     layout_fingerprint, predict_relocation_steps, predict_swap, rebuild_tree, reorder_insert_index,
-    split_ratio_from_drag,
+    split_ratio_from_drag, split_rect, valid_split_ratio,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -1550,8 +1550,11 @@ fn pane_drag_preview_rect(drag: &PaneDrag) -> (f32, f32, f32, f32) {
 
 /// Pane and split geometry of a tab as surface fractions, with the split at
 /// `path` drawn at `ratio` instead of its authoritative value (design §5.4).
-/// Continuous, unlike Herdr's cell-rounded rects, so the squeeze preview
-/// follows the pointer without stepping.
+/// Rects are laid out exactly as Herdr will lay them out for that ratio
+/// (`split_rect`: whole cells, first child rounded), so the frame the
+/// preview shows at release is the frame the authoritative `layout.updated`
+/// brings back; a continuous preview sat up to half a cell away from it and
+/// jumped on release.
 #[derive(Clone, Debug, PartialEq)]
 struct SqueezedLayout {
     panes: Vec<(String, (f32, f32, f32, f32))>,
@@ -1584,16 +1587,20 @@ impl SqueezedLayout {
 
 fn squeezed_layout(layout: &PaneLayout, path: &[bool], ratio: f32) -> Option<SqueezedLayout> {
     let tree = rebuild_tree(layout)?;
+    if layout.area.width == 0 || layout.area.height == 0 {
+        return None;
+    }
     let mut out = SqueezedLayout {
         panes: Vec::new(),
         splits: Vec::new(),
     };
     squeeze_node(
         &tree.root,
-        (0., 0., 1., 1.),
+        layout.area,
+        layout.area,
         &mut Vec::new(),
         path,
-        ratio,
+        valid_split_ratio(ratio),
         &mut out,
     );
     Some(out)
@@ -1601,14 +1608,17 @@ fn squeezed_layout(layout: &PaneLayout, path: &[bool], ratio: f32) -> Option<Squ
 
 fn squeeze_node(
     node: &LayoutNode,
-    rect: (f32, f32, f32, f32),
+    rect: LayoutRect,
+    area: LayoutRect,
     current: &mut Vec<bool>,
     override_path: &[bool],
     override_ratio: f32,
     out: &mut SqueezedLayout,
 ) {
+    // `area` is non-empty (checked by the caller), so the fractions exist.
+    let fractions = |rect| layout_rect_fractions(area, rect).unwrap_or((0., 0., 0., 0.));
     match node {
-        LayoutNode::Pane(pane_id) => out.panes.push((pane_id.clone(), rect)),
+        LayoutNode::Pane(pane_id) => out.panes.push((pane_id.clone(), fractions(rect))),
         LayoutNode::Split {
             direction,
             ratio,
@@ -1620,28 +1630,22 @@ fn squeeze_node(
             } else {
                 *ratio
             };
-            let (x, y, w, h) = rect;
-            let (first_rect, second_rect, line) = match direction {
-                SplitDirection::Right => (
-                    (x, y, w * ratio, h),
-                    (x + w * ratio, y, w * (1. - ratio), h),
-                    x + w * ratio,
-                ),
-                SplitDirection::Down => (
-                    (x, y, w, h * ratio),
-                    (x, y + h * ratio, w, h * (1. - ratio)),
-                    y + h * ratio,
-                ),
+            let (first_rect, second_rect) = split_rect(rect, *direction, ratio);
+            let (fx, fy, fw, fh) = fractions(first_rect);
+            let line = match direction {
+                SplitDirection::Right => fx + fw,
+                SplitDirection::Down => fy + fh,
             };
             out.splits.push(SqueezedSplit {
                 path: current.clone(),
-                rect,
+                rect: fractions(rect),
                 line,
             });
             current.push(false);
             squeeze_node(
                 first,
                 first_rect,
+                area,
                 current,
                 override_path,
                 override_ratio,
@@ -1652,6 +1656,7 @@ fn squeeze_node(
             squeeze_node(
                 second,
                 second_rect,
+                area,
                 current,
                 override_path,
                 override_ratio,
@@ -2607,16 +2612,17 @@ mod tests {
         }
     }
 
+    fn close(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+        (a.0 - b.0).abs() < 1e-6
+            && (a.1 - b.1).abs() < 1e-6
+            && (a.2 - b.2).abs() < 1e-6
+            && (a.3 - b.3).abs() < 1e-6
+    }
+
     #[test]
-    fn a_squeezed_layout_follows_the_preview_ratio_continuously() {
+    fn a_squeezed_layout_follows_the_preview_ratio_in_whole_cells() {
         let layout = two_pane_layout();
         let squeezed = squeezed_layout(&layout, &[], 0.7).unwrap();
-        let close = |a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)| {
-            (a.0 - b.0).abs() < 1e-6
-                && (a.1 - b.1).abs() < 1e-6
-                && (a.2 - b.2).abs() < 1e-6
-                && (a.3 - b.3).abs() < 1e-6
-        };
         assert!(close(squeezed.pane("a").unwrap(), (0., 0., 0.7, 1.)));
         assert!(close(squeezed.pane("b").unwrap(), (0.7, 0., 0.3, 1.)));
         let (rect, line) = squeezed.split(&[]).unwrap();
@@ -2625,9 +2631,128 @@ mod tests {
         // A path that is not in the tree leaves everything authoritative.
         let untouched = squeezed_layout(&layout, &[true], 0.7).unwrap();
         assert!(close(untouched.pane("a").unwrap(), (0., 0., 0.5, 1.)));
-        // Nothing is rounded to cells: 0.333 stays 0.333.
+        // Cells, like Herdr: 0.333 of 100 columns is 33 columns, and the
+        // divider sits on that column, not at 33.3.
         let fine = squeezed_layout(&layout, &[], 0.333).unwrap();
-        assert!((fine.pane("a").unwrap().2 - 0.333).abs() < 1e-6);
+        assert!((fine.pane("a").unwrap().2 - 0.33).abs() < 1e-6);
+        assert!((fine.split(&[]).unwrap().1 - 0.33).abs() < 1e-6);
+        // Out-of-range ratios are clamped the way Herdr clamps them.
+        let clamped = squeezed_layout(&layout, &[], 0.01).unwrap();
+        assert!((clamped.pane("a").unwrap().2 - 0.1).abs() < 1e-6);
+    }
+
+    /// The squeeze preview and the settled render must agree: for any ratio
+    /// the preview's rects equal the rects the normal renderer produces for
+    /// the authoritative layout Herdr returns for that ratio. An odd-sized
+    /// nested `Down` split is the case that jumped half a cell on release.
+    #[test]
+    fn the_squeeze_preview_matches_the_settled_layout_for_the_same_ratio() {
+        let rect = |x, y, width, height| LayoutRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let area = rect(0, 0, 101, 41);
+        // a | (b / c)
+        let tree = LayoutNode::Split {
+            direction: SplitDirection::Right,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane("a".into())),
+            second: Box::new(LayoutNode::Split {
+                direction: SplitDirection::Down,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::Pane("b".into())),
+                second: Box::new(LayoutNode::Pane("c".into())),
+            }),
+        };
+        let settled = |tree: &LayoutNode| -> PaneLayout {
+            let predicted = ocherdr_core::LayoutTree {
+                root: tree.clone(),
+                area,
+            };
+            PaneLayout {
+                workspace_id: "w".into(),
+                tab_id: "t".into(),
+                zoomed: false,
+                area,
+                focused_pane_id: "a".into(),
+                panes: predicted
+                    .pane_rects()
+                    .iter()
+                    .map(|pane| ocherdr_core::LayoutPane {
+                        pane_id: pane.pane_id.clone(),
+                        focused: pane.pane_id == "a",
+                        rect: pane.rect,
+                    })
+                    .collect(),
+                splits: predicted
+                    .splits()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, split)| LayoutSplit {
+                        id: split_path_id(index, &split.path),
+                        direction: split.direction,
+                        ratio: split.ratio,
+                        rect: split.rect,
+                    })
+                    .collect(),
+            }
+        };
+        let before = settled(&tree);
+        for (path, ratio) in [(vec![true], 0.5_f32), (vec![true], 0.37), (vec![], 0.61)] {
+            let squeezed = squeezed_layout(&before, &path, ratio).unwrap();
+            let mut retuned = tree.clone();
+            set_ratio_at(&mut retuned, &path, ratio);
+            let after = settled(&retuned);
+            for pane in &after.panes {
+                let rendered = layout_rect_fractions(after.area, pane.rect).unwrap();
+                let preview = squeezed.pane(&pane.pane_id).unwrap();
+                assert!(
+                    close(preview, rendered),
+                    "{} at {path:?}={ratio}: preview {preview:?} vs settled {rendered:?}",
+                    pane.pane_id
+                );
+            }
+            for split in &after.splits {
+                let split_path = split.path().unwrap();
+                let (first, _) = split_rect(split.rect, split.direction, split.ratio);
+                let (fx, fy, fw, fh) = layout_rect_fractions(after.area, first).unwrap();
+                let edge = match split.direction {
+                    SplitDirection::Right => fx + fw,
+                    SplitDirection::Down => fy + fh,
+                };
+                let (_, line) = squeezed.split(&split_path).unwrap();
+                assert!(
+                    (line - edge).abs() < 1e-6,
+                    "divider {split_path:?}: preview {line} vs pane edge {edge}"
+                );
+            }
+        }
+    }
+
+    fn split_path_id(index: usize, path: &[bool]) -> String {
+        if path.is_empty() {
+            return format!("split_{index}_root");
+        }
+        let steps: String = path.iter().map(|s| if *s { '1' } else { '0' }).collect();
+        format!("split_{index}_{steps}")
+    }
+
+    fn set_ratio_at(node: &mut LayoutNode, path: &[bool], new_ratio: f32) {
+        if let LayoutNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } = node
+        {
+            match path.split_first() {
+                None => *ratio = new_ratio,
+                Some((true, rest)) => set_ratio_at(second, rest, new_ratio),
+                Some((false, rest)) => set_ratio_at(first, rest, new_ratio),
+            }
+        }
     }
 
     #[test]
