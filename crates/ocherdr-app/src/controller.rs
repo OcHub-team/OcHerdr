@@ -3636,12 +3636,22 @@ impl OcHerdrView {
     /// Pane drag handle pressed. The gesture only becomes a drag once the
     /// pointer travels more than `PANE_DRAG_SLOP_PX`; until then the release
     /// is a plain click that selects the pane.
+    /// Mouse-down on a pane's drag handle. Stopping propagation keeps the
+    /// pane's own mouse-down (text selection) and the surface's focus-on-
+    /// click out of the gesture, so the surface is focused here explicitly:
+    /// Esc during the drag is handled by the root `on_key_down`, which GPUI
+    /// only dispatches along the focused element's ancestry, and with
+    /// nothing focused the window's root node alone receives the key.
     pub(super) fn press_pane_handle(
         &mut self,
         pane_id: String,
         event: &MouseDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.focus.is_focused(window) {
+            self.focus.focus(window, cx);
+        }
         if self.begin_pane_drag(pane_id, mouse_point(event.position)) {
             cx.notify();
         }

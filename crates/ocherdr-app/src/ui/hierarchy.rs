@@ -1272,8 +1272,8 @@ impl OcHerdrView {
                 render_pane_drag_handle(&pane, selected, i18n)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, event, _window, cx| {
-                            this.press_pane_handle(handle_pane_id.clone(), event, cx);
+                        cx.listener(move |this, event, window, cx| {
+                            this.press_pane_handle(handle_pane_id.clone(), event, window, cx);
                         }),
                     )
                     .into_any_element()

@@ -2111,6 +2111,55 @@ fn escape_cancels_a_pane_drag_without_a_request(cx: &mut TestAppContext) {
     view.read_with(cx, |this, _| assert!(this.pane_relocations.is_empty()));
 }
 
+/// Esc is handled by the root `on_key_down`, which GPUI dispatches along
+/// the focused element's ancestry; with nothing focused only the window's
+/// root node (the view wrapper, above our root div) receives the key. The
+/// handle press stops propagation, so it cannot rely on the surface's
+/// focus-on-click: it focuses the surface itself, and Esc then reaches the
+/// drag whether or not anything was focused before the grab.
+#[gpui::test]
+fn escape_reaches_the_drag_through_window_dispatch_regardless_of_focus(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    let grab = (SURFACE.0 + 12., SURFACE.1 + 12.);
+    let press = gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: gpui::point(gpui::px(grab.0), gpui::px(grab.1)),
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    };
+    for surface_focused_before in [false, true] {
+        view.update_in(cx, |this, window, cx| {
+            if surface_focused_before {
+                this.focus.focus(window, cx);
+            } else {
+                window.blur();
+            }
+            assert_eq!(this.focus.is_focused(window), surface_focused_before);
+            this.press_pane_handle("p-left".into(), &press, window, cx);
+            assert!(
+                this.focus.is_focused(window),
+                "the grab focuses the surface"
+            );
+            assert!(this.update_pane_drag((550., 250.), cx));
+            assert!(matches!(this.surface_drag, crate::SurfaceDrag::Pane(_)));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update(cx, |this, _| {
+            assert!(
+                matches!(this.surface_drag, crate::SurfaceDrag::Idle),
+                "Esc cancels with surface_focused_before={surface_focused_before}"
+            );
+            assert!(this.pane_drag_return.is_some(), "the preview flies back");
+            this.pane_drag_return = None;
+        });
+    }
+    assert!(fake.requests_for("pane.swap").is_empty());
+    assert!(fake.requests_for("pane.move").is_empty());
+}
+
 #[gpui::test]
 fn a_layout_that_does_not_match_the_plan_reverts_to_authority(cx: &mut TestAppContext) {
     let (fake, view, cx) = connect_two_pane_view(cx);
