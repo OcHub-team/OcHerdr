@@ -2421,8 +2421,28 @@ impl OcHerdrView {
     /// (design §5.4, §7.2): a pending relocation plan. They resize once,
     /// when the authoritative layout is on screen.
     pub(super) fn pane_resize_frozen(&self, pane_id: &str) -> bool {
-        self.pane_tab_id(pane_id)
-            .is_some_and(|tab_id| self.tab_relocation_locked(&tab_id))
+        self.pane_tab_id(pane_id).is_some_and(|tab_id| {
+            self.tab_relocation_locked(&tab_id) || self.tab_split_dragging(&tab_id)
+        })
+    }
+
+    /// A divider of this tab is being dragged: geometry is the squeeze
+    /// preview (design §5.4) until the single `layout.set_split_ratio` on
+    /// release brings the authoritative layout.
+    pub(super) fn tab_split_dragging(&self, tab_id: &str) -> bool {
+        matches!(&self.surface_drag, SurfaceDrag::Split(drag) if drag.tab_id == tab_id)
+    }
+
+    /// The tab's geometry squeezed to the split drag's preview ratio, or
+    /// `None` when no divider of this tab is being dragged.
+    pub(super) fn squeezed_tab_layout(&self, layout: &PaneLayout) -> Option<SqueezedLayout> {
+        let SurfaceDrag::Split(drag) = &self.surface_drag else {
+            return None;
+        };
+        if drag.tab_id != layout.tab_id {
+            return None;
+        }
+        squeezed_layout(layout, &drag.path, drag.preview_ratio)
     }
 
     pub(super) fn sync_measured_pane_body(
@@ -3781,6 +3801,11 @@ impl OcHerdrView {
         let layout = layout?;
         if let Some(pending) = self.pane_relocations.get(&layout.tab_id)
             && let Some(rect) = pending.display_fractions(pane_id, Some(layout), now, reduce_motion)
+        {
+            return Some(rect);
+        }
+        if let Some(squeezed) = self.squeezed_tab_layout(layout)
+            && let Some(rect) = squeezed.pane(pane_id)
         {
             return Some(rect);
         }

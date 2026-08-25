@@ -7,10 +7,10 @@ use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
     AgentInfo, AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, DropZone,
-    HerdrEvent, HierarchySnapshot, LayoutRect, LayoutSplit, PaneInfo, PaneLayout, PredictedPane,
-    ReorderHover, Selection, SessionSummary, SnapshotUpdate, SplitDirection, WorktreeInfo,
-    WorktreeSourceInfo, ZoneRect, drop_zone, layout_fingerprint, predict_swap,
-    reorder_insert_index, split_ratio_from_drag,
+    HerdrEvent, HierarchySnapshot, LayoutNode, LayoutRect, LayoutSplit, PaneInfo, PaneLayout,
+    PredictedPane, ReorderHover, Selection, SessionSummary, SnapshotUpdate, SplitDirection,
+    WorktreeInfo, WorktreeSourceInfo, ZoneRect, drop_zone, layout_fingerprint, predict_swap,
+    rebuild_tree, reorder_insert_index, split_ratio_from_drag,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -1031,6 +1031,120 @@ fn pane_drag_preview_rect(drag: &PaneDrag) -> (f32, f32, f32, f32) {
     )
 }
 
+/// Pane and split geometry of a tab as surface fractions, with the split at
+/// `path` drawn at `ratio` instead of its authoritative value (design §5.4).
+/// Continuous, unlike Herdr's cell-rounded rects, so the squeeze preview
+/// follows the pointer without stepping.
+#[derive(Clone, Debug, PartialEq)]
+struct SqueezedLayout {
+    panes: Vec<(String, (f32, f32, f32, f32))>,
+    splits: Vec<SqueezedSplit>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SqueezedSplit {
+    path: Vec<bool>,
+    rect: (f32, f32, f32, f32),
+    /// Divider position along the split axis, as a surface fraction.
+    line: f32,
+}
+
+impl SqueezedLayout {
+    fn pane(&self, pane_id: &str) -> Option<(f32, f32, f32, f32)> {
+        self.panes
+            .iter()
+            .find(|(id, _)| id == pane_id)
+            .map(|(_, rect)| *rect)
+    }
+
+    fn split(&self, path: &[bool]) -> Option<((f32, f32, f32, f32), f32)> {
+        self.splits
+            .iter()
+            .find(|split| split.path == path)
+            .map(|split| (split.rect, split.line))
+    }
+}
+
+fn squeezed_layout(layout: &PaneLayout, path: &[bool], ratio: f32) -> Option<SqueezedLayout> {
+    let tree = rebuild_tree(layout)?;
+    let mut out = SqueezedLayout {
+        panes: Vec::new(),
+        splits: Vec::new(),
+    };
+    squeeze_node(
+        &tree.root,
+        (0., 0., 1., 1.),
+        &mut Vec::new(),
+        path,
+        ratio,
+        &mut out,
+    );
+    Some(out)
+}
+
+fn squeeze_node(
+    node: &LayoutNode,
+    rect: (f32, f32, f32, f32),
+    current: &mut Vec<bool>,
+    override_path: &[bool],
+    override_ratio: f32,
+    out: &mut SqueezedLayout,
+) {
+    match node {
+        LayoutNode::Pane(pane_id) => out.panes.push((pane_id.clone(), rect)),
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let ratio = if current.as_slice() == override_path {
+                override_ratio
+            } else {
+                *ratio
+            };
+            let (x, y, w, h) = rect;
+            let (first_rect, second_rect, line) = match direction {
+                SplitDirection::Right => (
+                    (x, y, w * ratio, h),
+                    (x + w * ratio, y, w * (1. - ratio), h),
+                    x + w * ratio,
+                ),
+                SplitDirection::Down => (
+                    (x, y, w, h * ratio),
+                    (x, y + h * ratio, w, h * (1. - ratio)),
+                    y + h * ratio,
+                ),
+            };
+            out.splits.push(SqueezedSplit {
+                path: current.clone(),
+                rect,
+                line,
+            });
+            current.push(false);
+            squeeze_node(
+                first,
+                first_rect,
+                current,
+                override_path,
+                override_ratio,
+                out,
+            );
+            current.pop();
+            current.push(true);
+            squeeze_node(
+                second,
+                second_rect,
+                current,
+                override_path,
+                override_ratio,
+                out,
+            );
+            current.pop();
+        }
+    }
+}
+
 fn lerp_rect(from: (f32, f32, f32, f32), to: (f32, f32, f32, f32), t: f32) -> (f32, f32, f32, f32) {
     (
         from.0 + (to.0 - from.0) * t,
@@ -1940,6 +2054,29 @@ mod tests {
             edge_drops: false,
             pressed_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn a_squeezed_layout_follows_the_preview_ratio_continuously() {
+        let layout = two_pane_layout();
+        let squeezed = squeezed_layout(&layout, &[], 0.7).unwrap();
+        let close = |a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)| {
+            (a.0 - b.0).abs() < 1e-6
+                && (a.1 - b.1).abs() < 1e-6
+                && (a.2 - b.2).abs() < 1e-6
+                && (a.3 - b.3).abs() < 1e-6
+        };
+        assert!(close(squeezed.pane("a").unwrap(), (0., 0., 0.7, 1.)));
+        assert!(close(squeezed.pane("b").unwrap(), (0.7, 0., 0.3, 1.)));
+        let (rect, line) = squeezed.split(&[]).unwrap();
+        assert!(close(rect, (0., 0., 1., 1.)));
+        assert!((line - 0.7).abs() < 1e-6);
+        // A path that is not in the tree leaves everything authoritative.
+        let untouched = squeezed_layout(&layout, &[true], 0.7).unwrap();
+        assert!(close(untouched.pane("a").unwrap(), (0., 0., 0.5, 1.)));
+        // Nothing is rounded to cells: 0.333 stays 0.333.
+        let fine = squeezed_layout(&layout, &[], 0.333).unwrap();
+        assert!((fine.pane("a").unwrap().2 - 0.333).abs() < 1e-6);
     }
 
     #[test]

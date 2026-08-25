@@ -2057,3 +2057,54 @@ fn a_locked_tab_refuses_a_second_drag_and_pane_close(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(fake.requests_for("pane.swap").len(), 1);
 }
+
+// ---- Split drag: squeeze preview (design §5.4) ----
+
+#[gpui::test]
+fn a_split_drag_squeezes_the_preview_and_sends_one_set_split_ratio(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    // The divider sits at x = SURFACE.0 + 300 (ratio 0.5 of 600 px); the
+    // pointer lands at 0.7.
+    let press = (SURFACE.0 + 300., SURFACE.1 + 100.);
+    let release = (SURFACE.0 + 420., SURFACE.1 + 100.);
+    view.update(cx, |this, cx| {
+        let snapshot = this.snapshot.clone().expect("snapshot");
+        let layout = snapshot.layout_for("t-a").expect("layout");
+        let split = layout.splits[0].clone();
+        let drag = super::split_drag_from_press("t-a".into(), &split, layout, SURFACE, press)
+            .expect("split drag");
+        this.surface_drag = crate::SurfaceDrag::Split(drag);
+        assert!(this.update_split_drag(release, cx));
+        assert!(
+            this.pane_resize_frozen("p-left") && this.pane_resize_frozen("p-right"),
+            "terminal surfaces are not resized while the divider is dragged"
+        );
+        let left = this
+            .displayed_pane_fractions(Some(layout), "p-left", Instant::now(), false)
+            .expect("left rect");
+        let right = this
+            .displayed_pane_fractions(Some(layout), "p-right", Instant::now(), false)
+            .expect("right rect");
+        assert!((left.2 - 0.7).abs() < 1e-3, "left shell squeezes: {left:?}");
+        assert!(
+            (right.0 - 0.7).abs() < 1e-3,
+            "right shell follows: {right:?}"
+        );
+        assert!((right.2 - 0.3).abs() < 1e-3, "{right:?}");
+        assert!(this.finish_split_drag(release, cx));
+        assert!(matches!(this.surface_drag, crate::SurfaceDrag::Idle));
+        assert!(!this.pane_resize_frozen("p-left"), "release unfreezes");
+        let back = this
+            .displayed_pane_fractions(Some(layout), "p-left", Instant::now(), false)
+            .expect("authoritative rect");
+        assert!(
+            (back.2 - 0.5).abs() < 1e-6,
+            "authority until layout.updated"
+        );
+    });
+    cx.run_until_parked();
+    let requests = fake.requests_for("layout.set_split_ratio");
+    assert_eq!(requests.len(), 1, "one request on release: {requests:?}");
+    let ratio = requests[0]["params"]["ratio"].as_f64().expect("ratio");
+    assert!((ratio - 0.7).abs() < 1e-3, "{ratio}");
+}

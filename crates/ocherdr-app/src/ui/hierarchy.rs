@@ -1309,18 +1309,44 @@ impl OcHerdrView {
                     .into_any_element(),
             );
         }
+        let squeezed = layout
+            .as_ref()
+            .and_then(|layout| self.squeezed_tab_layout(layout));
+        let dragged_split = match &self.surface_drag {
+            SurfaceDrag::Split(drag) if drag.tab_id == tab_id => Some(drag.path.clone()),
+            _ => None,
+        };
         let split_handles = layout.as_ref().map(|layout| {
             layout
                 .splits
                 .iter()
                 .filter_map(|split| {
-                    render_split_handle(split, layout.area, layout.tab_id.clone(), i18n, cx)
+                    let path = split.path()?;
+                    // While a divider is dragged every handle in the tab
+                    // follows the squeeze preview, including nested ones
+                    // whose rects the dragged split moves.
+                    let geometry = squeezed
+                        .as_ref()
+                        .and_then(|squeezed| squeezed.split(&path))
+                        .or_else(|| {
+                            Some((
+                                rect_fractions(layout.area, split.rect)?,
+                                split_line_fraction(
+                                    layout.area,
+                                    split.rect,
+                                    split.direction,
+                                    split.ratio,
+                                )?,
+                            ))
+                        })?;
+                    let dragging = dragged_split.as_deref() == Some(path.as_slice());
+                    render_split_handle(split, geometry, dragging, layout.tab_id.clone(), i18n, cx)
                 })
                 .collect::<Vec<_>>()
         });
-        let split_overlay = match (&self.surface_drag, layout.as_ref()) {
-            (SurfaceDrag::Split(drag), Some(layout)) if drag.tab_id == layout.tab_id => {
-                Some(render_split_drag_overlay(layout.area, drag, cx))
+        let split_overlay = match &self.surface_drag {
+            SurfaceDrag::Split(drag) if drag.tab_id == tab_id => {
+                Some(render_split_drag_overlay(drag, cx))
             }
             _ => None,
         };
@@ -1850,19 +1876,27 @@ fn split_line_fraction(
     })
 }
 
+/// Divider of one split (design §5.4): a 10 px hit strip around a 4 px
+/// neutral line that turns accent on hover and stays accent while dragged.
+/// `geometry` is the split rect and divider line as surface fractions,
+/// already squeezed to the preview ratio during a drag.
 fn render_split_handle(
     split: &LayoutSplit,
-    area: ocherdr_core::LayoutRect,
+    geometry: ((f32, f32, f32, f32), f32),
+    dragging: bool,
     tab_id: String,
     i18n: I18n,
     cx: &mut Context<OcHerdrView>,
 ) -> Option<ochub_ui::gpui::AnyElement> {
-    split.path()?;
-    let (x, y, w, h) = rect_fractions(area, split.rect)?;
-    let line = split_line_fraction(area, split.rect, split.direction, split.ratio)?;
+    let ((x, y, w, h), line) = geometry;
     let split = split.clone();
     let label = i18n.text(k::TERMINAL_RESIZE_SPLIT);
     let group = SharedString::from(format!("split-handle-{}", split.id));
+    let line_color = if dragging {
+        theme::accent()
+    } else {
+        theme::border()
+    };
     // Mouse-only. A tab-reachable splitter would fight terminal key
     // forwarding. Keyboard resize is the Herdr TUI and `herdr pane resize`.
     let handle = match split.direction {
@@ -1888,7 +1922,8 @@ fn render_split_handle(
                 div()
                     .w(px(SPLIT_HANDLE_VISUAL_PX))
                     .h_full()
-                    .group_hover(group, |style| style.bg(theme::accent().alpha(0.45))),
+                    .bg(line_color)
+                    .group_hover(group, |style| style.bg(theme::accent())),
             ),
         SplitDirection::Down => div()
             .id(ochub_ui::gpui::ElementId::Name(
@@ -1911,7 +1946,8 @@ fn render_split_handle(
                 div()
                     .h(px(SPLIT_HANDLE_VISUAL_PX))
                     .w_full()
-                    .group_hover(group, |style| style.bg(theme::accent().alpha(0.45))),
+                    .bg(line_color)
+                    .group_hover(group, |style| style.bg(theme::accent())),
             ),
     };
     Some(
@@ -1937,8 +1973,9 @@ fn render_split_handle(
     )
 }
 
+/// Captures the pointer while a divider is dragged. The divider itself is
+/// drawn by its handle, which already sits at the preview ratio.
 fn render_split_drag_overlay(
-    area: ocherdr_core::LayoutRect,
     drag: &SplitDrag,
     cx: &mut Context<OcHerdrView>,
 ) -> ochub_ui::gpui::AnyElement {
@@ -1961,36 +1998,7 @@ fn render_split_drag_overlay(
             MouseButton::Left,
             cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
         )
-        .when_some(split_preview_line(area, drag), |overlay, line| {
-            overlay.child(line)
-        })
         .into_any_element()
-}
-
-fn split_preview_line(
-    area: ocherdr_core::LayoutRect,
-    drag: &SplitDrag,
-) -> Option<ochub_ui::gpui::Div> {
-    let (x, y, w, h) = rect_fractions(area, drag.rect)?;
-    let line = split_line_fraction(area, drag.rect, drag.direction, drag.preview_ratio)?;
-    Some(match drag.direction {
-        SplitDirection::Right => div()
-            .absolute()
-            .left(relative(line))
-            .top(relative(y))
-            .h(relative(h))
-            .w(px(SPLIT_HANDLE_VISUAL_PX))
-            .ml(px(-SPLIT_HANDLE_VISUAL_PX / 2.))
-            .bg(theme::accent()),
-        SplitDirection::Down => div()
-            .absolute()
-            .left(relative(x))
-            .top(relative(line))
-            .w(relative(w))
-            .h(px(SPLIT_HANDLE_VISUAL_PX))
-            .mt(px(-SPLIT_HANDLE_VISUAL_PX / 2.))
-            .bg(theme::accent()),
-    })
 }
 
 /// How a pane shell is drawn this frame, beyond its snapshot data.
