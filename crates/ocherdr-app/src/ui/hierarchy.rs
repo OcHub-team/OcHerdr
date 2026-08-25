@@ -1235,6 +1235,12 @@ impl OcHerdrView {
                 .pane(&pane.pane_id)
                 .and_then(|runtime| runtime.frame.clone())
                 .or_else(|| {
+                    drag_source_id
+                        .as_deref()
+                        .filter(|source| *source == pane.pane_id)
+                        .and_then(|_| self.pane_drag_snapshot.clone())
+                })
+                .or_else(|| {
                     self.pane_relocations
                         .get(tab_id)
                         .and_then(|pending| pending.plan.frame_for(&pane.pane_id))
@@ -1379,7 +1385,9 @@ impl OcHerdrView {
                     &snapshot,
                     &flight,
                     origin,
-                    self.pane(&flight.pane_id),
+                    self.pane(&flight.pane_id)
+                        .and_then(|runtime| runtime.frame.clone())
+                        .or_else(|| self.pane_drag_snapshot.clone()),
                     i18n,
                 )
             });
@@ -1480,7 +1488,11 @@ impl OcHerdrView {
         let highlight = mode
             .target
             .as_ref()
-            .map(|hover| render_drop_highlight(hover, droppable, origin, reduce_motion, i18n));
+            .map(|hover| render_drop_highlight(hover, droppable, origin, reduce_motion));
+        let zone_label = mode
+            .target
+            .as_ref()
+            .map(|hover| render_drop_zone_label(hover, droppable, origin, reduce_motion, i18n));
         let source_name = snapshot
             .pane(&mode.pane_id)
             .map(|pane| pane.display_name().to_owned())
@@ -1495,6 +1507,7 @@ impl OcHerdrView {
             .left_0()
             .size_full()
             .children(highlight)
+            .children(zone_label)
             .child(
                 div()
                     .absolute()
@@ -1539,11 +1552,20 @@ impl OcHerdrView {
             .hover
             .as_ref()
             .filter(|_| droppable)
-            .map(|hover| render_drop_highlight(hover, true, origin, reduce_motion, i18n));
+            .map(|hover| render_drop_highlight(hover, true, origin, reduce_motion));
+        // The zone label goes above the preview: the floating card follows
+        // the pointer, which sits inside the target, so a label drawn in the
+        // highlight itself would be hidden under the card.
+        let zone_label = drag
+            .hover
+            .as_ref()
+            .filter(|_| droppable)
+            .map(|hover| render_drop_zone_label(hover, true, origin, reduce_motion, i18n));
         let pane = snapshot.pane(&drag.pane_id).cloned();
         let frame = self
             .pane(&drag.pane_id)
-            .and_then(|runtime| runtime.frame.clone());
+            .and_then(|runtime| runtime.frame.clone())
+            .or_else(|| self.pane_drag_snapshot.clone());
         let opacity = if drag.hover.is_some() && !droppable {
             PANE_DRAG_INVALID_OPACITY
         } else {
@@ -1607,6 +1629,7 @@ impl OcHerdrView {
             )
             .children(highlight)
             .children(preview)
+            .children(zone_label)
             .into_any_element()
     }
 
@@ -2304,11 +2327,10 @@ fn render_pane_drag_return(
     snapshot: &HierarchySnapshot,
     flight: &PaneDragReturn,
     origin: (f32, f32),
-    runtime: Option<&PaneRuntime>,
+    frame: Option<RenderedFrame>,
     i18n: I18n,
 ) -> Option<ochub_ui::gpui::AnyElement> {
     let pane = snapshot.pane(&flight.pane_id)?.clone();
-    let frame = runtime.and_then(|runtime| runtime.frame.clone());
     let (from, to) = (
         surface_local(flight.from, origin),
         surface_local(flight.to, origin),
@@ -2333,24 +2355,22 @@ fn render_pane_drag_return(
 
 /// Accent outline, translucent fill and zone label over the target pane
 /// (design §5.2); fades in over `PANE_DROP_ZONE_ANIMATION`.
+fn drop_zone_tone(droppable: bool) -> ochub_ui::gpui::Rgba {
+    if droppable {
+        theme::accent()
+    } else {
+        theme::border_strong()
+    }
+}
+
 fn render_drop_highlight(
     hover: &PaneDropHover,
     droppable: bool,
     origin: (f32, f32),
     reduce_motion: bool,
-    i18n: I18n,
 ) -> ochub_ui::gpui::AnyElement {
     let (x, y, w, h) = surface_local(hover.target_rect, origin);
-    let label = if droppable {
-        drop_zone_label(hover.zone, i18n)
-    } else {
-        i18n.text(k::TERMINAL_DROP_INVALID)
-    };
-    let tone = if droppable {
-        theme::accent()
-    } else {
-        theme::border_strong()
-    };
+    let tone = drop_zone_tone(droppable);
     let card = div()
         .absolute()
         .left(px(x))
@@ -2361,23 +2381,9 @@ fn render_drop_highlight(
         .child(
             div()
                 .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
                 .border_2()
                 .border_color(tone)
-                .bg(tone.alpha(0.14))
-                .child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .rounded(px(CORNER_CONTROL))
-                        .bg(tone)
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::current().bg.rgba())
-                        .child(label),
-                ),
+                .bg(tone.alpha(0.14)),
         );
     if reduce_motion {
         card.into_any_element()
@@ -2388,6 +2394,62 @@ fn render_drop_highlight(
             ),
             Animation::new(PANE_DROP_ZONE_ANIMATION).with_easing(ease_out_quint()),
             |card, t| card.opacity(t),
+        )
+        .into_any_element()
+    }
+}
+
+/// The zone's name, centred along the top edge of the target highlight, in
+/// the target's title-bar band. Painted after the floating preview so the
+/// card cannot cover it while the pointer rests inside the target.
+fn render_drop_zone_label(
+    hover: &PaneDropHover,
+    droppable: bool,
+    origin: (f32, f32),
+    reduce_motion: bool,
+    i18n: I18n,
+) -> ochub_ui::gpui::AnyElement {
+    let (x, y, w, _) = surface_local(hover.target_rect, origin);
+    let label = if droppable {
+        drop_zone_label(hover.zone, i18n)
+    } else {
+        i18n.text(k::TERMINAL_DROP_INVALID)
+    };
+    let tone = drop_zone_tone(droppable);
+    let band = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y + 2.))
+        .w(px(w))
+        .h(px(PANE_HEADER_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .px_3()
+                .py_1()
+                .rounded(px(CORNER_CONTROL))
+                .bg(tone)
+                .shadow_md()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::current().bg.rgba())
+                .child(label),
+        );
+    if reduce_motion {
+        band.into_any_element()
+    } else {
+        band.with_animation(
+            ElementId::Name(
+                format!(
+                    "pane-drop-zone-label-{}-{:?}",
+                    hover.target_pane_id, hover.zone
+                )
+                .into(),
+            ),
+            Animation::new(PANE_DROP_ZONE_ANIMATION).with_easing(ease_out_quint()),
+            |band, t| band.opacity(t),
         )
         .into_any_element()
     }

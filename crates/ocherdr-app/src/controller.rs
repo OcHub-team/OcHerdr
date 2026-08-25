@@ -101,6 +101,7 @@ impl OcHerdrView {
             tab_close_reveals: HashMap::new(),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
+            pane_drag_snapshot: None,
             pane_relocations: HashMap::new(),
             pane_drag_return: None,
             pane_relocation_serial: 0,
@@ -3669,6 +3670,12 @@ impl OcHerdrView {
             return false;
         };
         let fingerprint = layout_fingerprint(layout);
+        // Capture before anything dims or re-lays out the slot: the source
+        // body and the floating preview draw this when the runtime has no
+        // frame of its own on a given render.
+        self.pane_drag_snapshot = self
+            .pane(&pane_id)
+            .and_then(|runtime| runtime.frame.clone());
         self.end_text_drag();
         self.pane_drag_return = None;
         self.surface_drag = SurfaceDrag::Pane(PaneDrag {
@@ -3860,7 +3867,8 @@ impl OcHerdrView {
             predicted_rects,
             visual_snapshot: self
                 .pane(&request.pane_id)
-                .and_then(|runtime| runtime.frame.clone()),
+                .and_then(|runtime| runtime.frame.clone())
+                .or_else(|| self.pane_drag_snapshot.clone()),
             workspace_id: request.workspace_id.clone(),
             insert_shapes,
         };
@@ -4256,6 +4264,13 @@ impl OcHerdrView {
                 || now.saturating_duration_since(flight.started) >= PANE_DRAG_RETURN_ANIMATION
         }) {
             self.pane_drag_return = None;
+        }
+        if self.pane_drag_snapshot.is_some()
+            && !matches!(self.surface_drag, SurfaceDrag::Pane(_))
+            && self.pane_drag_return.is_none()
+            && self.pane_relocations.is_empty()
+        {
+            self.pane_drag_snapshot = None;
         }
         before != self.pane_relocations.len() + usize::from(self.pane_drag_return.is_some())
     }

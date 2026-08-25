@@ -695,6 +695,11 @@ struct OcHerdrView {
     tab_close_reveals: HashMap<String, Transition>,
     prefix_pending: bool,
     surface_drag: SurfaceDrag,
+    /// The dragged pane's last rendered frame, captured at press before the
+    /// source slot is dimmed: the slot body, the floating preview, and the
+    /// relocation plan fall back to it on a render where the runtime has no
+    /// frame. Dropped once no drag, return flight, or plan needs it.
+    pane_drag_snapshot: Option<RenderedFrame>,
     pending_reorder: Option<PendingReorder>,
     /// Optimistic pane relocations keyed by tab. While one is set the tab is
     /// locked: no split drag, no pane drag, no pane close, frozen resizes.
