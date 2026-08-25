@@ -2676,6 +2676,10 @@ impl OcHerdrView {
         let palette = current_terminal_palette(&self.appearance);
         let mut palette_error = None;
         let mut resized = false;
+        let mut replacement_frames = None;
+        let observer_reconnect = self
+            .current_session()
+            .map(|session| (self.current_profile(), session.name.clone()));
         let frozen = self.pane_resize_frozen(pane_id);
         {
             let Some(runtime) = self.pane_mut(pane_id) else {
@@ -2699,19 +2703,44 @@ impl OcHerdrView {
                     runtime.frame_context,
                 );
                 let size = (resolved.columns, resolved.rows);
+                let restart_observer = observer_session_needs_measured_restart(
+                    runtime.viewport_ready,
+                    runtime.mode,
+                    runtime.size,
+                    size,
+                );
                 // Herdr distinguishes the stream mode: a controller resize
                 // changes the shared PTY, while an observer resize updates
                 // only that observer's render viewport. Both must follow the
                 // pane's measured grid.
-                let _ = runtime.session.send(TerminalCommand::Resize {
-                    cols: resolved.columns,
-                    rows: resolved.rows,
-                    cell_width_px: resolved.cell_width_px,
-                    cell_height_px: resolved.cell_height_px,
-                });
                 runtime.size = size;
                 runtime.pixel_size = (width_px, height_px);
                 runtime.viewport_ready = width_px > 0 && height_px > 0;
+                if restart_observer
+                    && let Some((profile, session_name)) = observer_reconnect.as_ref()
+                {
+                    // Some older Herdr servers accept an observer resize but
+                    // do not repaint it. Reopen only the bootstrap observer
+                    // with the measured grid so its first frame is usable.
+                    let (session, frames) = TerminalSession::spawn(
+                        profile.clone(),
+                        session_name.clone(),
+                        pane_id.to_owned(),
+                        TerminalMode::Observe,
+                        resolved.columns,
+                        resolved.rows,
+                    );
+                    runtime.listen = None;
+                    runtime.session = session;
+                    replacement_frames = Some(frames);
+                } else {
+                    let _ = runtime.session.send(TerminalCommand::Resize {
+                        cols: resolved.columns,
+                        rows: resolved.rows,
+                        cell_width_px: resolved.cell_width_px,
+                        cell_height_px: resolved.cell_height_px,
+                    });
+                }
                 resized = true;
             }
         }
@@ -2720,6 +2749,12 @@ impl OcHerdrView {
         }
         if resized {
             cx.notify();
+        }
+        if let Some(frames) = replacement_frames {
+            let task = Self::listen_pane(pane_id.to_owned(), frames, cx);
+            if let Some(runtime) = self.pane_mut(pane_id) {
+                runtime.listen = Some(task);
+            }
         }
     }
 
@@ -5611,6 +5646,18 @@ fn incoming_frame_should_apply(
     viewport_ready && local_grid == frame_grid
 }
 
+/// The first observer starts before GPUI has measured its pane and therefore
+/// uses 80×24. Reopen it with the measured grid instead of waiting for an
+/// observe-resize repaint that older Herdr servers do not produce.
+fn observer_session_needs_measured_restart(
+    viewport_ready: bool,
+    mode: TerminalMode,
+    stream_grid: (u16, u16),
+    measured_grid: (u16, u16),
+) -> bool {
+    !viewport_ready && mode == TerminalMode::Observe && stream_grid != measured_grid
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionPanesPlan {
     Keep,
@@ -6963,6 +7010,34 @@ mod tests {
         assert!(!incoming_frame_should_apply(false, (80, 24), (80, 24)));
         assert!(!incoming_frame_should_apply(true, (120, 40), (80, 24)));
         assert!(incoming_frame_should_apply(true, (120, 40), (120, 40)));
+    }
+
+    #[test]
+    fn bootstrap_observer_reopens_with_the_first_measured_grid() {
+        assert!(observer_session_needs_measured_restart(
+            false,
+            TerminalMode::Observe,
+            (80, 24),
+            (120, 40),
+        ));
+        assert!(!observer_session_needs_measured_restart(
+            true,
+            TerminalMode::Observe,
+            (80, 24),
+            (120, 40),
+        ));
+        assert!(!observer_session_needs_measured_restart(
+            false,
+            TerminalMode::Control,
+            (80, 24),
+            (120, 40),
+        ));
+        assert!(!observer_session_needs_measured_restart(
+            false,
+            TerminalMode::Observe,
+            (80, 24),
+            (80, 24),
+        ));
     }
 
     fn target(pane_id: &str, mode: TerminalMode, focused: bool) -> PaneRuntimeTarget {
