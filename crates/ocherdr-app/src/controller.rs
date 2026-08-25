@@ -54,6 +54,14 @@ impl OcHerdrView {
             this.handle_host_center_event(event.clone(), cx);
         })
         .detach();
+        // Command released in another app never reaches this window as a
+        // modifiers change, so losing key status drops the hints.
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.set_command_held(false, cx);
+            }
+        })
+        .detach();
         cx.observe_window_appearance(window, |this, window, cx| {
             if this.appearance.mode != AppearanceMode::System {
                 return;
@@ -102,6 +110,8 @@ impl OcHerdrView {
             tab_preview_goal: None,
             tab_preview_hovered: false,
             tab_close_reveals: HashMap::new(),
+            command_held: false,
+            shortcut_reveal: Transition::settled(0., TAB_SHORTCUT_ANIMATION),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
             pane_drag_snapshot: None,
@@ -1394,6 +1404,15 @@ impl OcHerdrView {
         if matches!(self.overlay, Overlay::ConfirmClose(_)) {
             self.set_overlay(Overlay::None, cx);
         }
+    }
+
+    /// Tracks Command for the tab strip's ⌘N hints.
+    pub(super) fn set_command_held(&mut self, held: bool, cx: &mut Context<Self>) {
+        if self.command_held == held {
+            return;
+        }
+        self.command_held = held;
+        cx.notify();
     }
 
     /// Performs the focus move queued by `set_overlay`, from render where a

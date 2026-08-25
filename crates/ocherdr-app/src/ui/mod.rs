@@ -42,6 +42,11 @@ impl Render for OcHerdrView {
             .w_full()
             .h_full()
             .bg(theme::window_base_background())
+            // Dispatched along the focused element's ancestry, so this fires
+            // whether the terminal surface or a dialog holds focus.
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _window, cx| {
+                this.set_command_held(event.modifiers.platform, cx);
+            }))
             .on_key_down(cx.listener(|this, event, window, cx| {
                 if this.handle_overlay_key(event, window, cx) {
                     return;

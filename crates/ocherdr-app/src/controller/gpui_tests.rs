@@ -1216,6 +1216,65 @@ fn confirm_dialog_receives_keys_even_when_nothing_was_focused(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn tab_shortcut_hints_show_only_while_command_is_held(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    view.update_in(cx, |this, window, cx| {
+        this.snapshot = Some(three_tab_snapshot());
+        this.selection = Selection {
+            connection_id: "local".into(),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-a".into()),
+            ..Default::default()
+        };
+        this.focus.focus(window, cx);
+        cx.notify();
+    });
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(500.)));
+    cx.run_until_parked();
+    assert_eq!(cx.debug_bounds("tab-shortcut-t-a"), None, "hidden at rest");
+    let title_at_rest = cx.debug_bounds("tab-title-t-a").expect("title");
+
+    let command = gpui::Modifiers {
+        platform: true,
+        ..Default::default()
+    };
+    cx.simulate_modifiers_change(command);
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| assert!(this.command_held));
+    let hint = cx
+        .debug_bounds("tab-shortcut-t-a")
+        .expect("hint appears while Command is down");
+    let tab = cx.debug_bounds("tab-t-a").unwrap();
+    assert!(tab.contains(&hint.center()));
+    assert_eq!(
+        cx.debug_bounds("tab-title-t-a").unwrap(),
+        title_at_rest,
+        "the hint must not move the title"
+    );
+
+    cx.simulate_modifiers_change(gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| assert!(!this.command_held));
+    assert_eq!(
+        cx.debug_bounds("tab-shortcut-t-a"),
+        None,
+        "hidden on release"
+    );
+
+    // Cmd-Tab away: the release happens in another app, so losing key
+    // status must drop the hints on its own.
+    view.update_in(cx, |_, window, _| window.activate_window());
+    cx.run_until_parked();
+    cx.simulate_modifiers_change(command);
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| assert!(this.command_held));
+    cx.deactivate_window();
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| assert!(!this.command_held));
+}
+
+#[gpui::test]
 fn fixed_width_tab_hover_reveals_close_then_delayed_preview(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);
     cx.update(|_, cx| cx.set_reduce_motion(true));

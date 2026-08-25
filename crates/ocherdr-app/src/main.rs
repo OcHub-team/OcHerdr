@@ -28,11 +28,11 @@ use ochub_ui::components::{
 use ochub_ui::gpui::{
     Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context,
     ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Task,
-    TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
-    WindowBounds, WindowOptions, canvas, div, ease_out_quint, linear_color_stop, linear_gradient,
-    point, prelude::*, px, relative, size, surface,
+    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Task, TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window,
+    WindowAppearance, WindowBounds, WindowOptions, canvas, div, ease_out_quint, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
@@ -70,6 +70,8 @@ const REORDER_SLOP_PX: f32 = 4.;
 const TAB_REORDER_GAP_PX: f32 = 4.;
 const REORDER_ANIMATION: Duration = Duration::from_millis(180);
 const TAB_CLOSE_ANIMATION: Duration = Duration::from_millis(150);
+/// Fade of the ⌘N tab hints when Command is pressed or released.
+const TAB_SHORTCUT_ANIMATION: Duration = Duration::from_millis(100);
 const TAB_PILL_WIDTH: f32 = 160.;
 const TAB_TITLE_ACTION_WELL: f32 = 32.;
 const TAB_TITLE_FADE_WIDTH: f32 = 16.;
@@ -701,6 +703,10 @@ struct OcHerdrView {
     /// Mouse is over the preview overlay, so leaving the tab must not hide it.
     tab_preview_hovered: bool,
     tab_close_reveals: HashMap<String, Transition>,
+    /// Command is down: the tab strip shows its ⌘N hints.
+    command_held: bool,
+    /// Opacity of the ⌘N hints, eased toward `command_held`.
+    shortcut_reveal: Transition,
     prefix_pending: bool,
     surface_drag: SurfaceDrag,
     /// The dragged pane's last rendered frame, captured at press before the

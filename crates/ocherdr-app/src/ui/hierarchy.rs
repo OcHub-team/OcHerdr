@@ -535,6 +535,12 @@ impl OcHerdrView {
                 reveal.value(now, reduce_motion)
             })
             .collect::<Vec<_>>();
+        self.shortcut_reveal
+            .retarget(if self.command_held { 1. } else { 0. }, now, reduce_motion);
+        if self.shortcut_reveal.is_animating(now, reduce_motion) {
+            window.request_animation_frame();
+        }
+        let shortcut_reveal = self.shortcut_reveal.value(now, reduce_motion);
         let drag = match &self.surface_drag {
             SurfaceDrag::Reorder(drag) => Some(drag),
             _ => None,
@@ -602,6 +608,7 @@ impl OcHerdrView {
                 let debug_title_id = tab_id.clone();
                 let debug_close_id = tab_id.clone();
                 let debug_fade_id = tab_id.clone();
+                let debug_shortcut_id = tab_id.clone();
                 let measure_view = view.clone();
                 let tab_hover_group: SharedString = format!("tab-hover-{tab_id}").into();
                 let tab_target = HierarchyTarget::Tab {
@@ -636,6 +643,11 @@ impl OcHerdrView {
                         (false, index, (0., 0.), (0., 0.), None)
                     };
                 let tab = apply_control(div().id(("main-tab", row.number)), &row.a11y)
+                    // The hint is visual only; assistive tech hears the
+                    // shortcut whether or not Command is down.
+                    .when_some(shortcut.as_deref(), |tab, shortcut| {
+                        tab.aria_label(format!("{}, {shortcut}", row.a11y.name))
+                    })
                     .relative()
                     .flex()
                     .items_center()
@@ -717,6 +729,8 @@ impl OcHerdrView {
                             .debug_selector(move || format!("tab-title-{debug_title_id}"))
                             .child(row.a11y.name.clone()),
                     )
+                    // Absolutely positioned, so showing or hiding the hint
+                    // never moves the title.
                     .when_some(shortcut, |tab_row, shortcut| {
                         tab_row.child(
                             div()
@@ -726,6 +740,13 @@ impl OcHerdrView {
                                 .bottom_0()
                                 .flex()
                                 .items_center()
+                                .opacity(shortcut_reveal)
+                                .when(shortcut_reveal <= f32::EPSILON, |hint| hint.invisible())
+                                .when(shortcut_reveal > f32::EPSILON, |hint| {
+                                    hint.debug_selector(move || {
+                                        format!("tab-shortcut-{debug_shortcut_id}")
+                                    })
+                                })
                                 .text_xs()
                                 .text_color(if selected {
                                     theme::text()
