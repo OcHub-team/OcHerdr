@@ -20,8 +20,8 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - local and SSH-host session discovery;
 - an in-app host center for filtering, organizing, diagnosing, and switching SSH hosts;
 - live workspace, tab, pane, layout, and agent status rendering;
-- interactive `--takeover` control for every pane of the visible tab, input to the selected one;
-- read-only observation of the other panes in the selected tab;
+- independent `--takeover` control for each visible pane after a click, wheel, or input action;
+- read-only observation of untouched panes and panes on hidden tabs;
 - workspace/tab creation, rename, close, and pane operations through the public API;
 - native context menus for workspace, tab, and pane actions;
 - macOS shortcuts plus Herdr's `Ctrl+B` prefix workflow;
@@ -62,9 +62,11 @@ This checks the toolchain, runs the same format/Clippy/test gate as CI, creates 
 ad-hoc signed `target/qa/OcHerdr.app`, and opens a fresh instance. Use `just --list`
 for the shorter development commands.
 
-The left sidebar names its top-level Herdr endpoints **Connections**. Interface
-language can be changed without restarting under Appearance → Language; the choice
-is stored alongside the existing connection and appearance settings.
+The left sidebar starts directly with Herdr workspaces. OcHerdr automatically prefers
+the running `default` session on each host; if it is unavailable, it falls back to the
+first running session. Interface language can be changed without restarting under
+Appearance → Language; the choice is stored alongside the existing connection and
+appearance settings.
 
 Start Herdr first if no running session appears:
 

@@ -6,8 +6,8 @@
 use std::collections::HashSet;
 
 use ocherdr_core::{
-    AgentStatus, DropZone, HierarchySnapshot, PaneInfo, Selection, SessionSummary, TabInfo,
-    WorkspaceInfo, WorkspaceWorktreeInfo,
+    AgentStatus, DropZone, HierarchySnapshot, PaneInfo, Selection, TabInfo, WorkspaceInfo,
+    WorkspaceWorktreeInfo,
 };
 use ochub_ui::gpui::{Div, Role, Stateful, Toggled, prelude::*};
 
@@ -33,13 +33,6 @@ pub struct ControlA11y {
     pub toggled: Option<bool>,
     /// Explicit tab-stop, independent of GPUI's Role::Button default.
     pub tab_stop: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SessionRow {
-    pub index: usize,
-    pub running: bool,
-    pub a11y: ControlA11y,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,7 +110,6 @@ pub struct ChromeA11y {
     pub sidebar: RegionA11y,
     pub main: RegionA11y,
     pub status: RegionA11y,
-    pub connections: ListA11y<SessionRow>,
     pub workspaces: ListA11y<WorkspaceRow>,
     pub agents: ListA11y<AgentRow>,
     pub tabs: ListA11y<TabRow>,
@@ -140,8 +132,6 @@ pub struct PaneA11y {
 }
 
 pub struct ChromeA11yInput<'a> {
-    pub sessions: &'a [SessionSummary],
-    pub session_index: Option<usize>,
     pub snapshot: Option<&'a HierarchySnapshot>,
     pub selection: &'a Selection,
     pub i18n: I18n,
@@ -158,12 +148,6 @@ pub struct ChromeA11yInput<'a> {
 
 pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
     let i18n = input.i18n;
-    let connections = ListA11y {
-        id: "connections-list",
-        role: Role::List,
-        name: i18n.text(k::TERMINAL_SESSIONS).to_owned(),
-        items: connection_rows(input.sessions, input.session_index, i18n),
-    };
     let (workspaces, agents, tabs) = if let Some(snapshot) = input.snapshot {
         let workspaces = workspace_rows(
             &snapshot.workspaces,
@@ -203,7 +187,6 @@ pub fn chrome_a11y(input: ChromeA11yInput<'_>) -> ChromeA11y {
             role: Role::Toolbar,
             name: i18n.text(k::TERMINAL_STATUS_BAR).to_owned(),
         },
-        connections,
         workspaces: ListA11y {
             id: "workspaces-list",
             role: Role::List,
@@ -373,29 +356,6 @@ pub fn apply_dialog(
     title: impl Into<ochub_ui::gpui::SharedString>,
 ) -> Stateful<Div> {
     element.id(id).role(Role::Dialog).aria_label(title)
-}
-
-fn connection_rows(
-    sessions: &[SessionSummary],
-    session_index: Option<usize>,
-    i18n: I18n,
-) -> Vec<SessionRow> {
-    sessions
-        .iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let (id, name) = if session.default {
-                ("default".into(), i18n.text(k::COMMON_DEFAULT).to_owned())
-            } else {
-                (session.name.clone(), session.display_name().to_owned())
-            };
-            SessionRow {
-                index,
-                running: session.running,
-                a11y: list_control(id, Role::Button, name, session_index == Some(index)),
-            }
-        })
-        .collect()
 }
 
 fn workspace_rows(workspaces: &[WorkspaceInfo], selected_id: Option<&str>) -> Vec<WorkspaceRow> {
@@ -592,8 +552,6 @@ impl OcHerdrView {
         let profile_label = profile_display_label(&profile, self.i18n);
         let hidden_tab_ids = self.hidden_tab_ids();
         chrome_a11y(ChromeA11yInput {
-            sessions: &self.sessions,
-            session_index: self.session_index,
             snapshot: self.snapshot.as_ref(),
             selection: &self.selection,
             i18n: self.i18n,
@@ -611,7 +569,6 @@ impl OcHerdrView {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::sync::LazyLock;
 
     static HIDDEN_NONE: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
@@ -712,25 +669,6 @@ mod tests {
         }
     }
 
-    fn sample_sessions() -> Vec<SessionSummary> {
-        vec![
-            SessionSummary {
-                name: "default".into(),
-                default: true,
-                running: true,
-                socket_path: PathBuf::new(),
-                session_dir: PathBuf::new(),
-            },
-            SessionSummary {
-                name: "other".into(),
-                default: false,
-                running: false,
-                socket_path: PathBuf::new(),
-                session_dir: PathBuf::new(),
-            },
-        ]
-    }
-
     fn sample_selection() -> Selection {
         Selection {
             connection_id: "local".into(),
@@ -742,14 +680,11 @@ mod tests {
     }
 
     fn sample_input<'a>(
-        sessions: &'a [SessionSummary],
         snapshot: &'a HierarchySnapshot,
         selection: &'a Selection,
         event_stream: &'a EventStreamState,
     ) -> ChromeA11yInput<'a> {
         ChromeA11yInput {
-            sessions,
-            session_index: Some(0),
             snapshot: Some(snapshot),
             selection,
             i18n: I18n::new(Language::English),
@@ -767,11 +702,10 @@ mod tests {
     fn hidden_temporary_tabs_are_left_out_of_the_tab_list() {
         let mut snapshot = sample_snapshot();
         snapshot.tabs.push(tab("t-tmp", "w1", 7, "tmp", false));
-        let sessions = sample_sessions();
         let selection = sample_selection();
         let event_stream = live_event_stream();
         let hidden: HashSet<String> = ["t-tmp".to_owned()].into_iter().collect();
-        let mut input = sample_input(&sessions, &snapshot, &selection, &event_stream);
+        let mut input = sample_input(&snapshot, &selection, &event_stream);
         input.hidden_tab_ids = &hidden;
         let chrome = chrome_a11y(input);
         let ids: Vec<&str> = chrome
@@ -819,15 +753,9 @@ mod tests {
             tab("t2", "w1", 2, "logs", false),
             tab("t1", "w1", 1, "1", true),
         ];
-        let sessions = sample_sessions();
         let selection = sample_selection();
         let event_stream = live_event_stream();
-        let chrome = chrome_a11y(sample_input(
-            &sessions,
-            &snapshot,
-            &selection,
-            &event_stream,
-        ));
+        let chrome = chrome_a11y(sample_input(&snapshot, &selection, &event_stream));
         assert_eq!(
             chrome
                 .tabs
@@ -898,11 +826,10 @@ mod tests {
 
     #[test]
     fn chrome_a11y_announces_a_lost_event_stream() {
-        let sessions = sample_sessions();
         let snapshot = sample_snapshot();
         let selection = sample_selection();
         let stream = EventStreamState::Lost("event worker stopped".into());
-        let chrome = chrome_a11y(sample_input(&sessions, &snapshot, &selection, &stream));
+        let chrome = chrome_a11y(sample_input(&snapshot, &selection, &stream));
         assert_eq!(
             chrome.status_value,
             "Live updates disconnected — click to reconnect"
@@ -913,11 +840,10 @@ mod tests {
 
     #[test]
     fn chrome_a11y_names_roles_selected_state_and_regions() {
-        let sessions = sample_sessions();
         let snapshot = sample_snapshot();
         let selection = sample_selection();
         let stream = live_event_stream();
-        let chrome = chrome_a11y(sample_input(&sessions, &snapshot, &selection, &stream));
+        let chrome = chrome_a11y(sample_input(&snapshot, &selection, &stream));
 
         assert_eq!(chrome.sidebar.role, Role::Toolbar);
         assert_eq!(chrome.sidebar.name, "Spaces");
@@ -934,19 +860,6 @@ mod tests {
         assert_eq!(chrome.status_message.role, Role::Button);
         assert!(!chrome.status_message.tab_stop);
         assert_eq!(chrome.status_message.name, chrome.status_value);
-
-        assert_eq!(chrome.connections.role, Role::List);
-        assert_eq!(chrome.connections.name, "SESSIONS");
-        let default = &chrome.connections.items[0];
-        assert_eq!(default.a11y.role, Role::Button);
-        assert!(!default.a11y.tab_stop);
-        assert_eq!(default.a11y.id, "default");
-        assert_eq!(default.a11y.name, "Default");
-        assert_eq!(default.a11y.selected, Some(true));
-        let other = &chrome.connections.items[1];
-        assert_eq!(other.a11y.id, "other");
-        assert_eq!(other.a11y.name, "other");
-        assert_eq!(other.a11y.selected, Some(false));
 
         assert_eq!(chrome.workspaces.role, Role::List);
         assert_eq!(chrome.workspaces.name, "WORKSPACES");
@@ -1014,11 +927,10 @@ mod tests {
         assert_eq!(chrome.open_worktree.name, "Open worktree");
 
         for control in chrome
-            .connections
+            .workspaces
             .items
             .iter()
             .map(|row| &row.a11y)
-            .chain(chrome.workspaces.items.iter().map(|row| &row.a11y))
             .chain(chrome.agents.items.iter().map(|row| &row.a11y))
             .chain(chrome.tabs.items.iter().map(|row| &row.a11y))
         {
@@ -1140,8 +1052,6 @@ mod tests {
         let i18n = I18n::new(Language::English);
         let selection = Selection::default();
         let chrome = chrome_a11y(ChromeA11yInput {
-            sessions: &[],
-            session_index: None,
             snapshot: None,
             selection: &selection,
             i18n,
@@ -1162,7 +1072,6 @@ mod tests {
         assert_eq!(chrome.status_value, "No Herdr session");
         assert_eq!(chrome.status_profile.name, "This Mac");
         assert_eq!(chrome.status_message.name, "No Herdr session");
-        assert!(chrome.connections.items.is_empty());
         assert!(chrome.workspaces.items.is_empty());
         assert!(chrome.agents.items.is_empty());
         assert!(chrome.tabs.items.is_empty());

@@ -1,6 +1,6 @@
 # 窗格拖拽、交换与重排设计
 
-**状态：v2，已按 Herdr 源码核对；阶段 1–3 已实现（75ba207 / b562db0 / 142536e / 59ab9f9）**
+**状态：v2，已按 Herdr 源码核对；阶段 1–3 与拖动中实时草稿布局已实现（75ba207 / b562db0 / 142536e / 59ab9f9）**
 **适用范围：OcHerdr macOS 客户端；Herdr 保持为未修改的公开发行版（≥ 0.7.0，protocol 14）**
 
 ## 1. 摘要
@@ -89,6 +89,12 @@ pane.swap { source_pane_id, target_pane_id }
 
 保持现状：拖动期间只做本地预览，松手时发一次 `layout.set_split_ratio { tab_id, path, ratio }`。
 
+### 4.4 布局模板重建
+
+Pane 拖拽超过阈值后，终端画布顶部中央显示与当前 pane 数量匹配的 2/3/4-pane 常用布局。缩略图的每个叶子都是落点；悬停时直接用目标二叉树预测整个 tab，松手前不发送请求。
+
+Herdr 没有保留进程的原子 `layout.apply`，因此提交按目标树的逆向叶子裁剪计划串行执行：保留一个锚点 pane，将其余 pane 分别以 `focus:false` 暂存到临时 tab，再按树的构造顺序以 `pane.move` 的 `right` / `down` split 插回原 tab。构造算法只裁剪父节点的第二叶子，因此无需额外 `pane.swap`，并能精确还原目标方向和比例。整个批次保持预测布局、隐藏临时 tab、冻结终端网格；最后一个响应和匹配的 `layout.updated` 到达后才释放。
+
 ## 5. 交互规范
 
 ### 5.1 抓取区域
@@ -103,9 +109,12 @@ pane.swap { source_pane_id, target_pane_id }
 ### 5.2 拖拽中的视觉状态
 
 - **拖拽预览**：pane 标题、状态和最近一帧 `RenderedFrame`；相对鼠标保持抓取偏移，透明度 0.92、缩放 1.015、低对比度阴影。只复用当前帧，不截图、不复制 IOSurface。
-- **原位置空槽**：源 pane 留在原位，透明度 0.22，弱虚线边框。
+- **实时草稿布局**：进入有效落点后立即运行与提交时相同的 `predict_swap` / `predict_relocation`；其他 pane 壳层挤压到预测矩形，源 pane 的壳层成为目标位置的半透明虚线占位槽。浮动预览继续跟随指针，不连续 resize 终端网格。
+- **无落点状态**：尚未进入有效落点时，源 pane 仍在原位显示透明度 0.22 的弱虚线空槽；离开有效落点后，所有壳层一起回到权威布局。
 - **目标反馈**：有效目标显示强调色描边与半透明覆盖；中心落点标签"交换"，四边落点标签"移至左侧/右侧/上方/下方"。
 - **无效区域**：预览透明度 0.55；松开回原位，不发请求。
+
+命中几何与显示几何分离：五区判定始终使用拖动开始时的权威布局，草稿布局只用于渲染；因此 pane 被挤压后不会反过来改变鼠标下的落点。切换落点时壳层以 140 ms `ease_out_quint` 过渡；同一落点内的连续 mouse move 不重启动画。拖动期间隐藏权威 split handle，避免其与尚未提交的草稿树拓扑错位。开启"减少动态效果"时直接显示草稿终态，仍保留占位槽与落点文字。
 
 ### 5.3 落点模型
 
@@ -122,6 +131,8 @@ pane.swap { source_pane_id, target_pane_id }
 split handle 热区保持 10 px。hover 时分隔线由 4 px 中性线过渡到强调色；按下后：预览线跟随指针；该 split 子树内 pane 的外框与遮罩按预览比例挤压/扩展；终端表面不连续 resize；松开只发一次 `layout.set_split_ratio`。
 
 "挤压"是空间预览：边框、背景和可用区域连续变化，终端最后一帧在裁剪区域内保持稳定；收到权威布局后 Ghostty surface 一次性以最终尺寸重绘。
+
+冻结结束后的第一帧必须主动用缓存的最终 body bounds 重新排队一次 terminal resize，并立即 `refresh` / `try_frame`。预测终态与权威终态通常拥有完全相同的矩形，GPUI 此时不会再次触发 canvas measure；若只解除冻结而不主动刷新，surface 会保持空白直到下一次点击或输入。canvas 测量只记录最新尺寸，连续的启动帧、动画帧和过期回调会在 120 ms 稳定窗口内合并；稳定后才真正 resize Ghostty 或替换 bootstrap observer，避免同一个 pane 因瞬态尺寸反复白屏、reflow 和重连。
 
 实现注记：Herdr 的 `split_rect` 给第一子节点 `round(size × ratio)` 个整格，所以预览按整格步进而不是连续像素跟随（否则松手时会出现最多半格的跳动，真机验收测得 12 px）。预览与最终布局使用同一套 `split_rect` + chrome 管线。
 
@@ -238,7 +249,7 @@ Parked(T_tmp)
 - **tab 编号跳号**：每次四边重排永久消耗一个公共 tab 编号。
 - **源 tab 的 zoom 被清除**：取走 pane 时 `zoomed=false`。四边落点已在 zoomed tab 上禁用，此处只影响并发的外部 zoom。
 - **源 tab 的 `root_pane` 可能改变**：拖走当时的 root pane 时 Herdr 会提升另一个 pane。对 OcHerdr 无可见影响，记录备查。
-- **PTY 尺寸**：Herdr 只为 attach（control）流调整 PTY，observe 流的 resize 只记录视口。验收发现 OcHerdr 原本只对选中 pane 用 control 流，导致任何布局变化后非选中 pane 的 PTY 尺寸滞后、渲染错乱；修复为活动 tab 内所有可见 pane 均使用 control 流（输入与焦点仍只绑定选中 pane）。代价：同一会话打开第二个 OcHerdr 实例会互相接管全部可见 pane 的流（此前仅选中 pane）。
+- **PTY 尺寸与 control**：Herdr 只为 attach（control）流调整 PTY，observe 流的 resize 只记录该 observer 的视口。Pane 初始 observe；点击、滚轮或输入只把交互目标提升为 control，且不释放本机已控制的其他可见 pane。切到隐藏 tab 或被另一客户端 takeover 时，仅对应 pane 降回 observe；再次交互才重新取得 control。键盘输入与焦点仍只绑定选中 pane，滚轮绑定鼠标所在 pane。
 - **非原子**：三条请求之间其他客户端/agent 可以修改布局，靠指纹检测而不是靠锁。
 
 ## 10. 动效规范

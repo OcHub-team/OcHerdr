@@ -1,17 +1,17 @@
 # Known issues
 
-## One OcHerdr instance per session
+## Control ownership follows interaction
 
-Every pane of the visible tab holds a `terminal session control --takeover`
-stream, so its PTY is sized from the grid OcHerdr renders for it (Herdr only
-resizes the PTY for attached clients; an observe stream just records the
-viewport). Takeover is per terminal and unconditional: a second OcHerdr, or
-any other `--takeover` client, on the same session takes those streams away
-from the first, whose panes then stop updating until it re-attaches. Before
-this change the same was true of the selected pane alone; now it covers the
-whole visible tab. Also see the "multiple instances fight" note in the
-project memory: two instances make Herdr's PTY sizes flip between the two
-layouts, which looks like a rendering regression and is not.
+Panes start as observers. A click, wheel gesture, or terminal input promotes
+only that visible pane to `terminal session control --takeover`; other panes
+already controlled by the same OcHerdr stay controlled. Panes on hidden tabs
+return to observe mode.
+
+Herdr still permits only one controller per terminal. If another OcHerdr or
+terminal-session client takes over a pane, this instance demotes only that
+pane to observe and keeps its other control streams. Interacting with the
+observed pane takes it back, so two clients repeatedly operating the same pane
+can still make its PTY size follow whichever client interacted last.
 
 ## Debug builds spin in `HashMap` unless the whole dev profile is optimised
 

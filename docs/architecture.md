@@ -18,11 +18,11 @@ bincode protocol.
 4. Bootstrap state with `session.snapshot`; unknown fields are ignored for forward
    compatibility.
 5. Use public API methods for Workspace, Tab, Pane, and layout mutations.
-6. Open `terminal session control --takeover` for every pane of the visible tab and
-   `observe` for panes of hidden tabs. Only the selected pane receives input and
-   terminal focus; the other control streams exist so Herdr sizes each PTY from the
-   grid OcHerdr renders for it (an observe stream only records the viewport). Release
-   and terminate every bridge when the visible tab or connection changes.
+6. Open every pane as `observe`. A click, wheel gesture, or terminal input replaces
+   that visible pane's bridge with `terminal session control --takeover` without
+   releasing other controlled panes. Only the selected pane receives keyboard/IME
+   input and terminal focus; wheel input targets the pane under the pointer. Hidden
+   panes return to observe. Release every bridge when the connection changes.
 7. Feed decoded ANSI bytes into Ghostty's `manualMirror` surface. Ghostty owns VT
    state, shaping, glyph/image rendering, and produces a leased BGRA IOSurface.
 8. Wrap that IOSurface as a CoreVideo pixel buffer without copying it and without
@@ -46,15 +46,15 @@ forwarded public socket instead of through a shell.
 
 ## Terminal policy
 
-Only one controller may own a terminal. OcHerdr requests takeover for every pane of
-the visible tab, so each PTY follows its on-screen grid after a window resize, divider
-drag, or relocation; panes of hidden tabs are observers and Herdr keeps their size.
-Stream mode is separate from focus: keyboard, IME, and mouse input and focus-in/out
-reporting go to the selected pane only. Because takeover is per pane, a second
-OcHerdr on the same session takes every visible pane's stream away from the first
-(see `known-issues.md`). A sequence gap in a delta
-frame invalidates the local terminal state and requires a fresh bridge. A full frame is
-an ANSI redraw and is applied to the existing Ghostty surface; it does not destroy or
+Only one controller may own one terminal, but a single OcHerdr may independently
+control multiple terminals. Panes begin as observers and direct interaction promotes
+the target pane while preserving the other controlled panes. Stream mode is separate
+from focus: keyboard, IME, and focus-in/out reporting go to the selected pane, while
+wheel input goes to the pane under the pointer. A takeover by another client demotes
+only the affected pane locally; it is promoted again only by another direct
+interaction. Panes on hidden tabs are observers. A sequence gap in a delta frame
+invalidates the local terminal state and requires a fresh bridge. A full frame is an
+ANSI redraw and is applied to the existing Ghostty surface; it does not destroy or
 recreate renderer state.
 
 Terminal input follows the reverse path: GPUI key or committed-text events enter
@@ -98,14 +98,12 @@ OcHerdr opens two independent `events.subscribe` connections.
 
 The session-wide EventHub types are subscribed once at connect and never
 rebuilt. Herdr starts those at sequence 0 and, after the subscribe ACK,
-replays retained history. There is no replay-complete marker and no
-snapshot watermark, so OcHerdr cannot tell replayed history from live
-events. A historical `pane.agent_detected` release then detect can land
-*after* the post-connect snapshot and leave a pane as agent=X,
-status=Unknown, presentation empty. An authoritative snapshot taken
-after EventHub replay has drained would correct that. The client
-limitation is that it cannot tell when replay has drained, so it
-cannot wait for that snapshot.
+replays retained history. OcHerdr never applies that startup burst to the
+rendered snapshot: every batch extends a short quiet-period deadline. Once
+the stream is quiet, OcHerdr fetches and installs one authoritative snapshot.
+Events arriving while that snapshot is in flight request another snapshot,
+so historical `layout.updated` states are never presented as a startup
+animation and a concurrent live change is not silently lost.
 
 The per-pane `pane.agent_status_changed` subscription is rebuilt when the
 snapshot pane set changes. Herdr starts those parameterized entries at the
@@ -122,12 +120,12 @@ current agent as `Resync`. That catches cross-subscription reordering of
 event can apply to the new generation and stay until the next status event
 or a resync; it is not necessarily brief.
 
-Known limitation (session replay vs snapshot): OcHerdr cannot close this
-race itself. Herdr needs to provide either a replay-complete / barrier
-event after EventHub history is sent, or a monotonic sequence on every
-event with `session.snapshot` atomically returning the matching EventHub
-watermark, so the client can ignore history that belongs before the
-snapshot it just installed. OcHerdr does not invent a local barrier.
+Known limitation (session replay vs snapshot): the quiet-period deadline is a
+presentation barrier, not a protocol watermark. It prevents retained history
+from being rendered and converges through a final snapshot, but a continuously
+busy stream can postpone startup convergence. Herdr should still provide
+either a replay-complete event or monotonic event sequences with an atomic
+snapshot watermark for an exact protocol-level barrier.
 
 A complete fix for cross-stream reordering still needs Herdr to provide a
 globally sequenced aggregate subscription and a snapshot barrier. Until

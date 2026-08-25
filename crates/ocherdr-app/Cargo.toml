@@ -12,6 +12,7 @@ anyhow.workspace = true
 core-foundation = "0.10"
 dirs.workspace = true
 futures.workspace = true
+gpui.workspace = true
 gpui-platform.workspace = true
 ochub-ui.workspace = true
 ocherdr-core = { path = "../ocherdr-core" }
