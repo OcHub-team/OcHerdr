@@ -148,6 +148,7 @@ fn command_title_key(method: &str) -> Key {
         "pane.rename" => k::NOTIFY_PANE_RENAME,
         "pane.split" => k::NOTIFY_PANE_SPLIT,
         "pane.zoom" => k::NOTIFY_PANE_ZOOM,
+        "pane.swap" => k::NOTIFY_PANE_SWAP,
         "pane.focus_direction" => k::NOTIFY_PANE_FOCUS,
         "agent.prompt" => k::NOTIFY_AGENT_PROMPT,
         "agent.read" => k::NOTIFY_AGENT_READ,

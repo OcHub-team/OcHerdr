@@ -6,10 +6,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
-    AgentInfo, AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, HerdrEvent,
-    HierarchySnapshot, LayoutRect, LayoutSplit, PaneInfo, ReorderHover, Selection, SessionSummary,
-    SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, reorder_insert_index,
-    split_ratio_from_drag,
+    AgentInfo, AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, DropZone,
+    HerdrEvent, HierarchySnapshot, LayoutRect, LayoutSplit, PaneInfo, PaneLayout, PredictedPane,
+    ReorderHover, Selection, SessionSummary, SnapshotUpdate, SplitDirection, WorktreeInfo,
+    WorktreeSourceInfo, ZoneRect, drop_zone, layout_fingerprint, predict_swap,
+    reorder_insert_index, split_ratio_from_drag,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -77,6 +78,18 @@ const TAB_PREVIEW_WIDTH: f32 = 320.;
 const TAB_PREVIEW_HEIGHT: f32 = 180.;
 const TAB_PREVIEW_GAP: f32 = 6.;
 const TAB_PREVIEW_MARGIN: f32 = 8.;
+// Pane drag (design §5, §10).
+const PANE_DRAG_HANDLE_WIDTH: f32 = 20.;
+const PANE_DRAG_HANDLE_HEIGHT: f32 = 24.;
+const PANE_DRAG_SLOP_PX: f32 = 6.;
+const PANE_DRAG_PREVIEW_OPACITY: f32 = 0.92;
+const PANE_DRAG_INVALID_OPACITY: f32 = 0.55;
+const PANE_DRAG_PREVIEW_SCALE: f32 = 1.015;
+const PANE_DRAG_SOURCE_OPACITY: f32 = 0.22;
+const PANE_DRAG_LIFT_ANIMATION: Duration = Duration::from_millis(120);
+const PANE_DROP_ZONE_ANIMATION: Duration = Duration::from_millis(100);
+const PANE_DRAG_RETURN_ANIMATION: Duration = Duration::from_millis(120);
+const PANE_SETTLE_ANIMATION: Duration = Duration::from_millis(160);
 // macOS-style corner hierarchy: compact controls stay tight while sheets and
 // panels step up evenly instead of using exaggerated capsule radii.
 const CORNER_MODAL: f32 = 14.;
@@ -673,6 +686,20 @@ struct OcHerdrView {
     prefix_pending: bool,
     surface_drag: SurfaceDrag,
     pending_reorder: Option<PendingReorder>,
+    /// Optimistic pane relocations keyed by tab. While one is set the tab is
+    /// locked: no split drag, no pane drag, no pane close, frozen resizes.
+    pane_relocations: HashMap<String, PendingPaneRelocation>,
+    /// A cancelled or invalid pane drag flying back to its slot.
+    pane_drag_return: Option<PaneDragReturn>,
+    /// Operation ids for `RelocationPlan`, so a late response cannot settle a
+    /// plan that was replaced.
+    pane_relocation_serial: u64,
+    /// Tests that only exercise layout and gestures must not spin up
+    /// GhosttyKit: its runtime is single-instance and main-thread bound, so
+    /// `Terminal::new` from parallel test threads segfaults and from a lone
+    /// test thread hangs in `ghostty_app_update_config`.
+    #[cfg(test)]
+    headless_terminals: bool,
     reorder_metrics: ReorderMetrics,
     terminal_surface_bounds: Option<(f32, f32, f32, f32)>,
     ime_marked: Option<String>,
@@ -817,6 +844,333 @@ enum SurfaceDrag {
     Text { pane_id: String, captured: bool },
     Split(SplitDrag),
     Reorder(ReorderDrag),
+    Pane(PaneDrag),
+}
+
+/// A pane grabbed by its title-bar handle (design §5).
+#[derive(Clone, Debug, PartialEq)]
+struct PaneDrag {
+    workspace_id: String,
+    tab_id: String,
+    pane_id: String,
+    /// `layout_fingerprint` of the tab at press. Any structural change to the
+    /// tab while dragging cancels the gesture.
+    fingerprint: u64,
+    origin: (f32, f32),
+    pointer: (f32, f32),
+    /// Where inside the source pane rect the pointer grabbed it.
+    grab_offset: (f32, f32),
+    /// Source pane rect in window coordinates at press.
+    source_rect: (f32, f32, f32, f32),
+    hover: Option<PaneDropHover>,
+    /// Whether the four edge zones accept drops. Always `false` until phase 3
+    /// ships the `pane.move` orchestration; the zones are still computed so
+    /// the model (and its tests) already cover them.
+    edge_drops: bool,
+    pressed_at: Instant,
+}
+
+/// The pane and zone under the pointer during a pane drag.
+#[derive(Clone, Debug, PartialEq)]
+struct PaneDropHover {
+    target_pane_id: String,
+    zone: DropZone,
+    /// Window rect of the target pane, for the highlight.
+    target_rect: (f32, f32, f32, f32),
+}
+
+impl PaneDropHover {
+    fn droppable(&self, edge_drops: bool) -> bool {
+        match self.zone {
+            DropZone::Center => true,
+            DropZone::Left | DropZone::Right | DropZone::Up | DropZone::Down => edge_drops,
+        }
+    }
+}
+
+/// Where a released-but-not-dropped preview flies back from (design §10:
+/// "invalid drop / cancel → preview returns to the source rect, 120 ms").
+#[derive(Clone, Debug, PartialEq)]
+struct PaneDragReturn {
+    pane_id: String,
+    from: (f32, f32, f32, f32),
+    to: (f32, f32, f32, f32),
+    started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelocationIntent {
+    Swap,
+}
+
+/// Immutable plan built at release (design §7.1). `predicted_rects` only
+/// drives rendering and motion; Herdr's layout stays authoritative.
+#[derive(Clone)]
+struct RelocationPlan {
+    operation_id: u64,
+    source_pane_id: String,
+    source_tab_id: String,
+    target_pane_id: String,
+    target_tab_id: String,
+    intent: RelocationIntent,
+    /// `layout_fingerprint` of the target tab at release.
+    fingerprint: u64,
+    /// Split topology at release. The authoritative `layout.updated` must
+    /// keep the same shape and pane set (only leaves swap) to settle.
+    topology: SplitLayoutFingerprint,
+    /// Area the predicted rects are expressed in.
+    area: LayoutRect,
+    predicted_rects: Vec<PredictedPane>,
+    visual_snapshot: Option<RenderedFrame>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RelocationPhase {
+    /// `pane.swap` sent. Needs both the response and a matching
+    /// `layout.updated` before the correction runs.
+    Swapping { responded: bool, layout_seen: bool },
+    /// Shells and borders move from the predicted rects to the authoritative
+    /// ones (design §10: 120–180 ms, `ease_out_quint`).
+    Settling {
+        started: Instant,
+        from: Vec<(String, (f32, f32, f32, f32))>,
+    },
+}
+
+#[derive(Clone)]
+struct PendingPaneRelocation {
+    plan: RelocationPlan,
+    phase: RelocationPhase,
+}
+
+fn pane_drag_past_slop(drag: &PaneDrag) -> bool {
+    (drag.pointer.0 - drag.origin.0).abs() > PANE_DRAG_SLOP_PX
+        || (drag.pointer.1 - drag.origin.1).abs() > PANE_DRAG_SLOP_PX
+}
+
+/// Pane rect in window coordinates from its layout fractions.
+fn pane_window_rect(
+    layout: &PaneLayout,
+    pane_id: &str,
+    surface: (f32, f32, f32, f32),
+) -> Option<(f32, f32, f32, f32)> {
+    let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+    let (fx, fy, fw, fh) = layout_rect_fractions(layout.area, pane.rect)?;
+    Some(fractions_to_window(surface, (fx, fy, fw, fh)))
+}
+
+fn fractions_to_window(
+    surface: (f32, f32, f32, f32),
+    fractions: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    (
+        surface.0 + fractions.0 * surface.2,
+        surface.1 + fractions.1 * surface.3,
+        fractions.2 * surface.2,
+        fractions.3 * surface.3,
+    )
+}
+
+fn layout_rect_fractions(area: LayoutRect, rect: LayoutRect) -> Option<(f32, f32, f32, f32)> {
+    let area_w = f32::from(area.width);
+    let area_h = f32::from(area.height);
+    if area_w == 0. || area_h == 0. {
+        return None;
+    }
+    Some((
+        (f32::from(rect.x) - f32::from(area.x)) / area_w,
+        (f32::from(rect.y) - f32::from(area.y)) / area_h,
+        f32::from(rect.width) / area_w,
+        f32::from(rect.height) / area_h,
+    ))
+}
+
+/// Five-zone hit test over every other pane of the tab (design §5.3).
+/// The source pane itself is never a target.
+fn pane_drop_hover(
+    layout: &PaneLayout,
+    source_pane_id: &str,
+    surface: (f32, f32, f32, f32),
+    pointer: (f32, f32),
+) -> Option<PaneDropHover> {
+    layout
+        .panes
+        .iter()
+        .filter(|pane| pane.pane_id != source_pane_id)
+        .find_map(|pane| {
+            let rect = pane_window_rect(layout, &pane.pane_id, surface)?;
+            let zone = drop_zone(
+                ZoneRect {
+                    x: rect.0,
+                    y: rect.1,
+                    width: rect.2,
+                    height: rect.3,
+                },
+                pointer.0,
+                pointer.1,
+            )?;
+            Some(PaneDropHover {
+                target_pane_id: pane.pane_id.clone(),
+                zone,
+                target_rect: rect,
+            })
+        })
+}
+
+/// Top-left of the floating preview: the pointer keeps its grab offset, and
+/// the 1.015 scale grows the card around its centre.
+fn pane_drag_preview_rect(drag: &PaneDrag) -> (f32, f32, f32, f32) {
+    let (w, h) = (drag.source_rect.2, drag.source_rect.3);
+    let scaled_w = w * PANE_DRAG_PREVIEW_SCALE;
+    let scaled_h = h * PANE_DRAG_PREVIEW_SCALE;
+    (
+        drag.pointer.0 - drag.grab_offset.0 - (scaled_w - w) / 2.,
+        drag.pointer.1 - drag.grab_offset.1 - (scaled_h - h) / 2.,
+        scaled_w,
+        scaled_h,
+    )
+}
+
+fn lerp_rect(from: (f32, f32, f32, f32), to: (f32, f32, f32, f32), t: f32) -> (f32, f32, f32, f32) {
+    (
+        from.0 + (to.0 - from.0) * t,
+        from.1 + (to.1 - from.1) * t,
+        from.2 + (to.2 - from.2) * t,
+        from.3 + (to.3 - from.3) * t,
+    )
+}
+
+/// Whether the authoritative layout is the one the plan predicted: same
+/// split shape, same pane set, and the fingerprint has moved on from the
+/// release-time value (so a ratio-only `layout.updated` is not mistaken for
+/// the swap landing).
+fn layout_settles_plan(layout: &PaneLayout, plan: &RelocationPlan) -> bool {
+    if layout_fingerprint(layout) == plan.fingerprint {
+        return false;
+    }
+    if layout.zoomed != plan.topology.zoomed {
+        return false;
+    }
+    let splits: Vec<(Vec<bool>, SplitDirection)> = layout
+        .splits
+        .iter()
+        .filter_map(|split| Some((split.path()?, split.direction)))
+        .collect();
+    if splits != plan.topology.splits {
+        return false;
+    }
+    let mut live: Vec<&str> = layout
+        .panes
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect();
+    let mut expected: Vec<&str> = plan.topology.panes.iter().map(String::as_str).collect();
+    live.sort_unstable();
+    expected.sort_unstable();
+    live == expected
+}
+
+/// Whether the tab still looks like it did when the plan was made, i.e. the
+/// authoritative event has not arrived yet.
+fn layout_still_matches_plan(layout: &PaneLayout, plan: &RelocationPlan) -> bool {
+    layout_fingerprint(layout) == plan.fingerprint
+}
+
+impl RelocationPlan {
+    /// Phase 2 only ships same-tab swaps; a plan spanning tabs would need
+    /// the `pane.move` orchestration of phase 3.
+    fn is_supported(&self) -> bool {
+        match self.intent {
+            RelocationIntent::Swap => self.source_tab_id == self.target_tab_id,
+        }
+    }
+
+    /// Frame to show for the source pane while the plan is pending, when the
+    /// runtime has none of its own yet.
+    fn frame_for(&self, pane_id: &str) -> Option<RenderedFrame> {
+        (pane_id == self.source_pane_id)
+            .then(|| self.visual_snapshot.clone())
+            .flatten()
+    }
+
+    fn predicted_fractions(&self) -> Vec<(String, (f32, f32, f32, f32))> {
+        self.predicted_rects
+            .iter()
+            .filter_map(|pane| {
+                Some((
+                    pane.pane_id.clone(),
+                    layout_rect_fractions(self.area, pane.rect)?,
+                ))
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+struct SettlingSeed {
+    plan: RelocationPlan,
+    from: Vec<(String, (f32, f32, f32, f32))>,
+}
+
+#[cfg(test)]
+impl SettlingSeed {
+    fn into_settling(self, started: Instant) -> PendingPaneRelocation {
+        PendingPaneRelocation {
+            plan: self.plan,
+            phase: RelocationPhase::Settling {
+                started,
+                from: self.from,
+            },
+        }
+    }
+}
+
+impl PendingPaneRelocation {
+    /// Pane fractions to render for this tab right now, or `None` when the
+    /// pane is not part of the plan.
+    fn display_fractions(
+        &self,
+        pane_id: &str,
+        layout: Option<&PaneLayout>,
+        now: Instant,
+        reduce_motion: bool,
+    ) -> Option<(f32, f32, f32, f32)> {
+        match &self.phase {
+            RelocationPhase::Swapping { .. } => self
+                .plan
+                .predicted_fractions()
+                .into_iter()
+                .find(|(id, _)| id == pane_id)
+                .map(|(_, rect)| rect),
+            RelocationPhase::Settling { started, from } => {
+                let from = from.iter().find(|(id, _)| id == pane_id).map(|(_, r)| *r)?;
+                let to = layout.and_then(|layout| {
+                    let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+                    layout_rect_fractions(layout.area, pane.rect)
+                })?;
+                let progress = ochub_ui::anim::linear_progress(
+                    *started,
+                    PANE_SETTLE_ANIMATION,
+                    now,
+                    reduce_motion,
+                );
+                Some(lerp_rect(
+                    from,
+                    to,
+                    ochub_ui::anim::ease_out_quint(progress),
+                ))
+            }
+        }
+    }
+
+    fn is_settled(&self, now: Instant, reduce_motion: bool) -> bool {
+        match &self.phase {
+            RelocationPhase::Swapping { .. } => false,
+            RelocationPhase::Settling { started, .. } => {
+                reduce_motion || now.saturating_duration_since(*started) >= PANE_SETTLE_ANIMATION
+            }
+        }
+    }
 }
 
 /// A reorder Herdr has accepted but not yet confirmed with a `moved` event.
@@ -1532,6 +1886,206 @@ mod tests {
             },
             released_origin: (640., 18.),
         }
+    }
+
+    fn two_pane_layout() -> PaneLayout {
+        let rect = |x, y, width, height| LayoutRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        PaneLayout {
+            workspace_id: "w".into(),
+            tab_id: "t".into(),
+            zoomed: false,
+            area: rect(0, 0, 100, 50),
+            focused_pane_id: "a".into(),
+            panes: vec![
+                ocherdr_core::LayoutPane {
+                    pane_id: "a".into(),
+                    focused: true,
+                    rect: rect(0, 0, 50, 50),
+                },
+                ocherdr_core::LayoutPane {
+                    pane_id: "b".into(),
+                    focused: false,
+                    rect: rect(50, 0, 50, 50),
+                },
+            ],
+            splits: vec![LayoutSplit {
+                id: "split_0_root".into(),
+                direction: SplitDirection::Right,
+                ratio: 0.5,
+                rect: rect(0, 0, 100, 50),
+            }],
+        }
+    }
+
+    const PANE_SURFACE: (f32, f32, f32, f32) = (10., 20., 400., 200.);
+
+    fn pane_drag_at(pointer: (f32, f32)) -> PaneDrag {
+        let layout = two_pane_layout();
+        let source_rect = pane_window_rect(&layout, "a", PANE_SURFACE).unwrap();
+        PaneDrag {
+            workspace_id: "w".into(),
+            tab_id: "t".into(),
+            pane_id: "a".into(),
+            fingerprint: layout_fingerprint(&layout),
+            origin: pointer,
+            pointer,
+            grab_offset: (pointer.0 - source_rect.0, pointer.1 - source_rect.1),
+            source_rect,
+            hover: None,
+            edge_drops: false,
+            pressed_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_pane_drag_starts_only_past_six_pixels() {
+        let mut drag = pane_drag_at((30., 40.));
+        drag.pointer = (36., 40.);
+        assert!(!pane_drag_past_slop(&drag), "6 px is still a click");
+        drag.pointer = (36.5, 40.);
+        assert!(pane_drag_past_slop(&drag));
+        drag.pointer = (30., 33.);
+        assert!(pane_drag_past_slop(&drag), "either axis counts");
+    }
+
+    #[test]
+    fn the_preview_keeps_the_grab_offset_and_grows_around_its_centre() {
+        let mut drag = pane_drag_at((30., 40.));
+        assert_eq!(drag.source_rect, (10., 20., 200., 200.));
+        assert_eq!(drag.grab_offset, (20., 20.));
+        drag.pointer = (130., 90.);
+        let (x, y, w, h) = pane_drag_preview_rect(&drag);
+        assert!((w - 203.).abs() < 1e-3 && (h - 203.).abs() < 1e-3);
+        assert!((x - (110. - 1.5)).abs() < 1e-3, "{x}");
+        assert!((y - (70. - 1.5)).abs() < 1e-3, "{y}");
+    }
+
+    #[test]
+    fn drop_hover_uses_the_core_five_zones_and_never_targets_the_source() {
+        let layout = two_pane_layout();
+        // Centre of pane b.
+        let hover = pane_drop_hover(&layout, "a", PANE_SURFACE, (310., 120.)).unwrap();
+        assert_eq!(hover.target_pane_id, "b");
+        assert_eq!(hover.zone, DropZone::Center);
+        assert!(hover.droppable(false));
+        // Right edge of pane b.
+        let hover = pane_drop_hover(&layout, "a", PANE_SURFACE, (405., 120.)).unwrap();
+        assert_eq!(hover.zone, DropZone::Right);
+        assert!(!hover.droppable(false), "edges wait for phase 3");
+        assert!(hover.droppable(true));
+        // Top edge of pane b.
+        let hover = pane_drop_hover(&layout, "a", PANE_SURFACE, (310., 24.)).unwrap();
+        assert_eq!(hover.zone, DropZone::Up);
+        // Over the source pane itself: nothing.
+        assert!(pane_drop_hover(&layout, "a", PANE_SURFACE, (100., 120.)).is_none());
+        // Outside the surface: nothing.
+        assert!(pane_drop_hover(&layout, "a", PANE_SURFACE, (500., 120.)).is_none());
+    }
+
+    fn swap_plan(layout: &PaneLayout) -> RelocationPlan {
+        RelocationPlan {
+            operation_id: 1,
+            source_pane_id: "a".into(),
+            source_tab_id: "t".into(),
+            target_pane_id: "b".into(),
+            target_tab_id: "t".into(),
+            intent: RelocationIntent::Swap,
+            fingerprint: layout_fingerprint(layout),
+            topology: SplitLayoutFingerprint {
+                zoomed: layout.zoomed,
+                splits: layout
+                    .splits
+                    .iter()
+                    .filter_map(|split| Some((split.path()?, split.direction)))
+                    .collect(),
+                panes: layout.panes.iter().map(|p| p.pane_id.clone()).collect(),
+            },
+            area: layout.area,
+            predicted_rects: predict_swap(layout, "a", "b").unwrap(),
+            visual_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn a_plan_settles_on_the_swapped_layout_and_is_invalidated_by_anything_else() {
+        let layout = two_pane_layout();
+        let plan = swap_plan(&layout);
+        assert!(layout_still_matches_plan(&layout, &plan));
+        assert!(!layout_settles_plan(&layout, &plan), "nothing landed yet");
+
+        let mut swapped = layout.clone();
+        swapped.panes.swap(0, 1);
+        swapped.focused_pane_id = "a".into();
+        assert!(!layout_still_matches_plan(&swapped, &plan));
+        assert!(layout_settles_plan(&swapped, &plan));
+
+        let mut ratio_only = layout.clone();
+        ratio_only.splits[0].ratio = 0.7;
+        assert!(
+            layout_still_matches_plan(&ratio_only, &plan),
+            "a divider move keeps the plan waiting"
+        );
+
+        let mut extra_pane = swapped.clone();
+        extra_pane.panes.push(ocherdr_core::LayoutPane {
+            pane_id: "c".into(),
+            focused: false,
+            rect: LayoutRect::default(),
+        });
+        assert!(!layout_settles_plan(&extra_pane, &plan));
+        assert!(!layout_still_matches_plan(&extra_pane, &plan));
+
+        let mut zoomed = swapped.clone();
+        zoomed.zoomed = true;
+        assert!(!layout_settles_plan(&zoomed, &plan));
+
+        let predicted = plan.predicted_fractions();
+        assert_eq!(predicted[0].0, "a");
+        assert!(
+            (predicted[0].1.0 - 0.5).abs() < 1e-6,
+            "a is predicted on the right"
+        );
+    }
+
+    #[test]
+    fn settling_moves_from_the_prediction_to_authority_and_lands_at_once_under_reduce_motion() {
+        let layout = two_pane_layout();
+        let plan = swap_plan(&layout);
+        let mut swapped = layout.clone();
+        swapped.panes.swap(0, 1);
+        // Authority put the split at 0.6 while we predicted 0.5.
+        swapped.panes[0].rect.width = 60;
+        swapped.panes[1].rect.x = 60;
+        swapped.panes[1].rect.width = 40;
+        let started = Instant::now();
+        let pending = SettlingSeed {
+            from: plan.predicted_fractions(),
+            plan,
+        }
+        .into_settling(started);
+        let at_start = pending
+            .display_fractions("a", Some(&swapped), started, false)
+            .unwrap();
+        assert!((at_start.0 - 0.5).abs() < 1e-6, "starts on the prediction");
+        let at_end = pending
+            .display_fractions("a", Some(&swapped), started + PANE_SETTLE_ANIMATION, false)
+            .unwrap();
+        assert!((at_end.0 - 0.6).abs() < 1e-6, "ends on authority");
+        assert!(pending.is_settled(started + PANE_SETTLE_ANIMATION, false));
+        assert!(!pending.is_settled(started, false));
+        let reduced = pending
+            .display_fractions("a", Some(&swapped), started, true)
+            .unwrap();
+        assert!(
+            (reduced.0 - 0.6).abs() < 1e-6,
+            "reduce motion lands immediately"
+        );
+        assert!(pending.is_settled(started, true));
     }
 
     #[test]

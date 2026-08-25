@@ -6,8 +6,8 @@
 use std::collections::HashSet;
 
 use ocherdr_core::{
-    AgentStatus, HierarchySnapshot, PaneInfo, Selection, SessionSummary, TabInfo, WorkspaceInfo,
-    WorkspaceWorktreeInfo,
+    AgentStatus, DropZone, HierarchySnapshot, PaneInfo, Selection, SessionSummary, TabInfo,
+    WorkspaceInfo, WorkspaceWorktreeInfo,
 };
 use ochub_ui::gpui::{Div, Role, Stateful, Toggled, prelude::*};
 
@@ -268,6 +268,21 @@ pub fn pane_a11y(
         name: pane.display_name().to_owned(),
         selected,
         value: terminal_a11y_value(screen_text, waiting, i18n),
+    }
+}
+
+/// Accessible name of the title-bar drag handle (design §11).
+pub fn pane_drag_handle_name(pane: &PaneInfo, i18n: I18n) -> String {
+    i18n.drag_pane_handle(pane.display_name())
+}
+
+/// What the drag would do if released now, for the drag overlay's
+/// accessible value. Edge zones read as invalid until phase 3 makes them
+/// droppable.
+pub fn pane_drag_state_text(zone: Option<DropZone>, droppable: bool, i18n: I18n) -> &'static str {
+    match zone {
+        Some(DropZone::Center) if droppable => i18n.text(k::TERMINAL_DROP_SWAP),
+        _ => i18n.text(k::TERMINAL_DROP_INVALID),
     }
 }
 

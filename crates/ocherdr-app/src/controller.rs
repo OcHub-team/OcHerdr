@@ -97,6 +97,11 @@ impl OcHerdrView {
             tab_close_reveals: HashMap::new(),
             prefix_pending: false,
             surface_drag: SurfaceDrag::Idle,
+            pane_relocations: HashMap::new(),
+            pane_drag_return: None,
+            pane_relocation_serial: 0,
+            #[cfg(test)]
+            headless_terminals: false,
             pending_reorder: None,
             reorder_metrics: ReorderMetrics::default(),
             terminal_surface_bounds: None,
@@ -679,9 +684,15 @@ impl OcHerdrView {
         if matches!(action, EventPollAction::Disconnect(_)) {
             self.cancel_split_drag();
             self.cancel_reorder_drag();
+            self.cancel_pane_drag();
+            // Requests already sent cannot be cancelled; the reconnect
+            // snapshot is the authority for what actually happened.
+            self.pane_relocations.clear();
         }
         self.reconcile_split_drag(cx);
         self.reconcile_reorder_drag(cx);
+        self.reconcile_pane_drag(cx);
+        self.reconcile_pane_relocations(cx);
         if let Some(stream) = action.event_stream() {
             self.event_stream = stream;
             cx.notify();
@@ -820,6 +831,8 @@ impl OcHerdrView {
         }
         self.reconcile_split_drag(cx);
         self.reconcile_reorder_drag(cx);
+        self.reconcile_pane_drag(cx);
+        self.reconcile_pane_relocations(cx);
         if resync {
             self.resync_snapshot(self.event_epoch, cx);
         }
@@ -919,6 +932,8 @@ impl OcHerdrView {
                         this.snapshot = Some(snapshot);
                         this.reconcile_split_drag(cx);
                         this.reconcile_reorder_drag(cx);
+                        this.reconcile_pane_drag(cx);
+                        this.reconcile_pane_relocations(cx);
                         if worktree_open_target_is_missing(&this.overlay, this.snapshot.as_ref()) {
                             this.abandon_worktree_list();
                         }
@@ -1336,6 +1351,15 @@ impl OcHerdrView {
     }
 
     pub(super) fn request_close(&mut self, target: HierarchyTarget, cx: &mut Context<Self>) {
+        // Closing a pane out from under a pending relocation would leave the
+        // prediction pointing at a pane Herdr is about to drop.
+        if let HierarchyTarget::Pane { id, .. } = &target
+            && self
+                .pane_tab_id(id)
+                .is_some_and(|tab_id| self.tab_relocation_locked(&tab_id))
+        {
+            return;
+        }
         self.set_overlay(Overlay::ConfirmClose(target), cx);
     }
 
@@ -1508,6 +1532,8 @@ impl OcHerdrView {
         self.session_index = Some(index);
         self.cancel_split_drag();
         self.cancel_reorder_drag();
+        self.cancel_pane_drag();
+        self.pane_relocations.clear();
         self.reload(Some(session.name), cx);
     }
 
@@ -1531,6 +1557,7 @@ impl OcHerdrView {
     pub(super) fn select_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
         self.cancel_split_drag();
         self.cancel_reorder_drag();
+        self.cancel_pane_drag();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1554,6 +1581,7 @@ impl OcHerdrView {
     pub(super) fn select_tab(&mut self, tab_id: String, cx: &mut Context<Self>) {
         self.cancel_split_drag();
         self.cancel_reorder_drag();
+        self.cancel_pane_drag();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -2063,7 +2091,12 @@ impl OcHerdrView {
             .iter()
             .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
             .collect::<HashMap<_, _>>();
-        let wanted = snapshot_runtime_targets(snapshot, selected_pane.as_deref());
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut wanted = snapshot_runtime_targets(snapshot, selected_pane.as_deref());
+        #[cfg(test)]
+        if self.headless_terminals {
+            wanted.clear();
+        }
         let incoming = SessionKey {
             profile_id: profile.id().to_owned(),
             session_name: session_name.clone(),
@@ -2384,6 +2417,14 @@ impl OcHerdrView {
         keep
     }
 
+    /// Terminal grids stay put while the tab's geometry is only a preview
+    /// (design §5.4, §7.2): a pending relocation plan. They resize once,
+    /// when the authoritative layout is on screen.
+    pub(super) fn pane_resize_frozen(&self, pane_id: &str) -> bool {
+        self.pane_tab_id(pane_id)
+            .is_some_and(|tab_id| self.tab_relocation_locked(&tab_id))
+    }
+
     pub(super) fn sync_measured_pane_body(
         &mut self,
         pane_id: &str,
@@ -2404,6 +2445,7 @@ impl OcHerdrView {
         let palette = current_terminal_palette(&self.appearance);
         let mut palette_error = None;
         let mut resized = false;
+        let frozen = self.pane_resize_frozen(pane_id);
         {
             let Some(runtime) = self.pane_mut(pane_id) else {
                 return;
@@ -2416,7 +2458,7 @@ impl OcHerdrView {
                 runtime.color_scheme_dark = palette.dark;
                 runtime.palette_signature = palette.signature();
             }
-            if runtime.pixel_size != (width_px, height_px) {
+            if !frozen && runtime.pixel_size != (width_px, height_px) {
                 runtime.frame_context = runtime.frame_context.wrapping_add(1);
                 let resolved = runtime.terminal.resize_pixels(
                     width_px,
@@ -2922,6 +2964,11 @@ impl OcHerdrView {
             return true;
         }
         if key == "escape" {
+            if matches!(self.surface_drag, SurfaceDrag::Pane(_)) {
+                self.cancel_pane_drag();
+                cx.notify();
+                return true;
+            }
             if matches!(self.overlay, Overlay::Appearance) {
                 self.close_appearance(window, cx);
                 return true;
@@ -3086,7 +3133,7 @@ impl OcHerdrView {
     ) {
         if matches!(
             self.surface_drag,
-            SurfaceDrag::Split(_) | SurfaceDrag::Reorder(_)
+            SurfaceDrag::Split(_) | SurfaceDrag::Reorder(_) | SurfaceDrag::Pane(_)
         ) {
             return;
         }
@@ -3139,6 +3186,10 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
+        if self.update_pane_drag(mouse_point(event.position), cx) {
+            cx.stop_propagation();
+            return;
+        }
         let SurfaceDrag::Text { pane_id, .. } = &self.surface_drag else {
             return;
         };
@@ -3168,7 +3219,7 @@ impl OcHerdrView {
     pub(super) fn pane_mouse_up(
         &mut self,
         event: &MouseUpEvent,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.finish_split_drag(mouse_point(event.position), cx) {
@@ -3176,6 +3227,10 @@ impl OcHerdrView {
             return;
         }
         if self.finish_reorder_drag(mouse_point(event.position), cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.finish_pane_drag(mouse_point(event.position), window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -3213,6 +3268,11 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         };
+        // A pending relocation owns this tab's geometry until it settles.
+        if self.tab_relocation_locked(&tab_id) {
+            cx.stop_propagation();
+            return;
+        }
         let Some(drag) = self.snapshot.as_ref().and_then(|snapshot| {
             let layout = snapshot.layout_for(&tab_id)?;
             split_drag_from_press(tab_id, &split, layout, surface, mouse_point(event.position))
@@ -3222,6 +3282,7 @@ impl OcHerdrView {
         };
         self.end_text_drag();
         self.cancel_reorder_drag();
+        self.cancel_pane_drag();
         self.surface_drag = SurfaceDrag::Split(drag);
         cx.stop_propagation();
         cx.notify();
@@ -3340,6 +3401,411 @@ impl OcHerdrView {
             );
         }
         true
+    }
+
+    // ---- Pane drag: handle press, hover, release, cancel (design §5, §7) ----
+
+    /// The tab is locked while a relocation plan is pending: no split drag,
+    /// no second pane drag, no pane close, frozen terminal resizes.
+    pub(super) fn tab_relocation_locked(&self, tab_id: &str) -> bool {
+        self.pane_relocations.contains_key(tab_id)
+    }
+
+    /// Top-left of the measured terminal surface in window pixels; zero
+    /// before the first layout pass.
+    pub(super) fn surface_origin(&self) -> (f32, f32) {
+        self.terminal_surface_bounds
+            .map(|surface| (surface.0, surface.1))
+            .unwrap_or((0., 0.))
+    }
+
+    fn pane_tab_id(&self, pane_id: &str) -> Option<String> {
+        self.snapshot
+            .as_ref()?
+            .pane(pane_id)
+            .map(|pane| pane.tab_id.clone())
+    }
+
+    /// Pane drag handle pressed. The gesture only becomes a drag once the
+    /// pointer travels more than `PANE_DRAG_SLOP_PX`; until then the release
+    /// is a plain click that selects the pane.
+    pub(super) fn press_pane_handle(
+        &mut self,
+        pane_id: String,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.begin_pane_drag(pane_id, mouse_point(event.position)) {
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    /// Returns `true` when a drag was armed. Refuses while any other gesture
+    /// is active, while the tab has a pending plan, when the tab has a single
+    /// pane, or when the pane rect cannot be measured yet.
+    pub(super) fn begin_pane_drag(&mut self, pane_id: String, pointer: (f32, f32)) -> bool {
+        if !matches!(self.overlay, Overlay::None) {
+            return false;
+        }
+        if !matches!(
+            self.surface_drag,
+            SurfaceDrag::Idle | SurfaceDrag::Text { .. }
+        ) {
+            return false;
+        }
+        let Some(surface) = self.terminal_surface_bounds else {
+            return false;
+        };
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let Some(pane) = snapshot.pane(&pane_id) else {
+            return false;
+        };
+        let (workspace_id, tab_id) = (pane.workspace_id.clone(), pane.tab_id.clone());
+        if self.tab_relocation_locked(&tab_id) {
+            return false;
+        }
+        let Some(layout) = snapshot.layout_for(&tab_id) else {
+            return false;
+        };
+        if layout.zoomed || layout.panes.len() < 2 {
+            return false;
+        }
+        let Some(source_rect) = pane_window_rect(layout, &pane_id, surface) else {
+            return false;
+        };
+        let fingerprint = layout_fingerprint(layout);
+        self.end_text_drag();
+        self.pane_drag_return = None;
+        self.surface_drag = SurfaceDrag::Pane(PaneDrag {
+            workspace_id,
+            tab_id,
+            pane_id,
+            fingerprint,
+            origin: pointer,
+            pointer,
+            grab_offset: (pointer.0 - source_rect.0, pointer.1 - source_rect.1),
+            source_rect,
+            hover: None,
+            edge_drops: false,
+            pressed_at: Instant::now(),
+        });
+        true
+    }
+
+    fn take_pane_drag(&mut self) -> Option<PaneDrag> {
+        match std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle) {
+            SurfaceDrag::Pane(drag) => Some(drag),
+            other => {
+                self.surface_drag = other;
+                None
+            }
+        }
+    }
+
+    /// Esc, navigation, disconnect, or a structural layout change. The preview
+    /// flies back to its slot when it was already lifted.
+    pub(super) fn cancel_pane_drag(&mut self) {
+        if let Some(drag) = self.take_pane_drag()
+            && pane_drag_past_slop(&drag)
+        {
+            self.pane_drag_return = Some(PaneDragReturn {
+                pane_id: drag.pane_id.clone(),
+                from: pane_drag_preview_rect(&drag),
+                to: drag.source_rect,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    /// Snapshot changed: keep the drag only while the tab's structure is
+    /// exactly what it was at press.
+    fn reconcile_pane_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.take_pane_drag() else {
+            return;
+        };
+        let survives = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout_for(&drag.tab_id))
+            .is_some_and(|layout| layout_fingerprint(layout) == drag.fingerprint);
+        if survives {
+            self.surface_drag = SurfaceDrag::Pane(drag);
+        } else {
+            self.surface_drag = SurfaceDrag::Pane(drag);
+            self.cancel_pane_drag();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn update_pane_drag(&mut self, mouse: (f32, f32), cx: &mut Context<Self>) -> bool {
+        let Some(mut drag) = self.take_pane_drag() else {
+            return false;
+        };
+        drag.pointer = mouse;
+        let hover = if pane_drag_past_slop(&drag) {
+            self.pane_hover_for(&drag)
+        } else {
+            None
+        };
+        drag.hover = hover;
+        self.surface_drag = SurfaceDrag::Pane(drag);
+        cx.notify();
+        true
+    }
+
+    fn pane_hover_for(&self, drag: &PaneDrag) -> Option<PaneDropHover> {
+        let surface = self.terminal_surface_bounds?;
+        let layout = self.snapshot.as_ref()?.layout_for(&drag.tab_id)?;
+        pane_drop_hover(layout, &drag.pane_id, surface, drag.pointer)
+    }
+
+    /// Release. A click selects; a lifted preview over the centre zone
+    /// commits a swap; anything else returns home without a request.
+    pub(super) fn finish_pane_drag(
+        &mut self,
+        mouse: (f32, f32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mut drag) = self.take_pane_drag() else {
+            return false;
+        };
+        drag.pointer = mouse;
+        cx.notify();
+        if !pane_drag_past_slop(&drag) {
+            self.select_pane(drag.pane_id, window, cx);
+            return true;
+        }
+        drag.hover = self.pane_hover_for(&drag);
+        let droppable = drag
+            .hover
+            .as_ref()
+            .is_some_and(|hover| hover.droppable(drag.edge_drops));
+        let committed = droppable
+            && matches!(
+                drag.hover.as_ref().map(|hover| hover.zone),
+                Some(DropZone::Center)
+            )
+            && self.commit_pane_swap(&drag, cx);
+        if !committed {
+            self.surface_drag = SurfaceDrag::Pane(drag);
+            self.cancel_pane_drag();
+        }
+        true
+    }
+
+    /// Build the `RelocationPlan`, render it, and send exactly one
+    /// `pane.swap`. Returns `false` when the plan cannot be built (the layout
+    /// moved under the pointer), in which case nothing is sent.
+    fn commit_pane_swap(&mut self, drag: &PaneDrag, cx: &mut Context<Self>) -> bool {
+        let Some(hover) = drag.hover.as_ref() else {
+            return false;
+        };
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let Some(layout) = snapshot.layout_for(&drag.tab_id) else {
+            return false;
+        };
+        if layout_fingerprint(layout) != drag.fingerprint
+            || self.tab_relocation_locked(&drag.tab_id)
+        {
+            return false;
+        }
+        let Some(predicted_rects) = predict_swap(layout, &drag.pane_id, &hover.target_pane_id)
+        else {
+            return false;
+        };
+        self.pane_relocation_serial = self.pane_relocation_serial.wrapping_add(1);
+        let plan = RelocationPlan {
+            operation_id: self.pane_relocation_serial,
+            source_pane_id: drag.pane_id.clone(),
+            source_tab_id: drag.tab_id.clone(),
+            target_pane_id: hover.target_pane_id.clone(),
+            target_tab_id: drag.tab_id.clone(),
+            intent: RelocationIntent::Swap,
+            fingerprint: drag.fingerprint,
+            topology: split_layout_fingerprint(layout),
+            area: layout.area,
+            predicted_rects,
+            visual_snapshot: self
+                .pane(&drag.pane_id)
+                .and_then(|runtime| runtime.frame.clone()),
+        };
+        if !plan.is_supported() {
+            return false;
+        }
+        let operation_id = plan.operation_id;
+        let tab_id = plan.source_tab_id.clone();
+        let params = json!({
+            "source_pane_id": plan.source_pane_id,
+            "target_pane_id": plan.target_pane_id,
+        });
+        self.pane_relocations.insert(
+            tab_id.clone(),
+            PendingPaneRelocation {
+                plan,
+                phase: RelocationPhase::Swapping {
+                    responded: false,
+                    layout_seen: false,
+                },
+            },
+        );
+        self.invoke_with_response(
+            "pane.swap",
+            params,
+            move |this, result, cx| {
+                this.on_pane_swap_response(&tab_id, operation_id, result, cx);
+            },
+            cx,
+        );
+        true
+    }
+
+    fn on_pane_swap_response(
+        &mut self,
+        tab_id: &str,
+        operation_id: u64,
+        result: std::result::Result<Value, HerdrError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pane_relocations.get_mut(tab_id) else {
+            return;
+        };
+        if pending.plan.operation_id != operation_id {
+            return;
+        }
+        let accepted = match &result {
+            Ok(value) => pane_swap_changed(value),
+            Err(_) => false,
+        };
+        if !accepted {
+            // Failure notice already posted by the invoke path. Drop the
+            // prediction: the authoritative snapshot is what is on screen.
+            self.pane_relocations.remove(tab_id);
+            cx.notify();
+            return;
+        }
+        if let RelocationPhase::Swapping { responded, .. } = &mut pending.phase {
+            *responded = true;
+        }
+        self.settle_pane_relocation_if_ready(tab_id, cx);
+    }
+
+    /// Snapshot changed: for each pending plan decide whether the
+    /// authoritative layout is the swap landing (settle), still the old one
+    /// (keep waiting), or something else (revert).
+    fn reconcile_pane_relocations(&mut self, cx: &mut Context<Self>) {
+        let tab_ids: Vec<String> = self.pane_relocations.keys().cloned().collect();
+        for tab_id in tab_ids {
+            let Some(pending) = self.pane_relocations.get_mut(&tab_id) else {
+                continue;
+            };
+            let layout = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.layout_for(&tab_id));
+            match (&mut pending.phase, layout) {
+                (_, None) => {
+                    self.pane_relocations.remove(&tab_id);
+                    cx.notify();
+                }
+                (RelocationPhase::Swapping { layout_seen, .. }, Some(layout)) => {
+                    if layout_settles_plan(layout, &pending.plan) {
+                        *layout_seen = true;
+                        self.settle_pane_relocation_if_ready(&tab_id, cx);
+                    } else if !layout_still_matches_plan(layout, &pending.plan) {
+                        self.pane_relocations.remove(&tab_id);
+                        cx.notify();
+                    }
+                }
+                (RelocationPhase::Settling { .. }, Some(layout)) => {
+                    if !layout_settles_plan(layout, &pending.plan) {
+                        self.pane_relocations.remove(&tab_id);
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    fn settle_pane_relocation_if_ready(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let reduce_motion = cx.reduce_motion();
+        let Some(pending) = self.pane_relocations.get_mut(tab_id) else {
+            return;
+        };
+        let RelocationPhase::Swapping {
+            responded: true,
+            layout_seen: true,
+        } = pending.phase
+        else {
+            return;
+        };
+        if reduce_motion {
+            self.pane_relocations.remove(tab_id);
+        } else {
+            pending.phase = RelocationPhase::Settling {
+                started: Instant::now(),
+                from: pending.plan.predicted_fractions(),
+            };
+        }
+        cx.notify();
+    }
+
+    /// Render-time cleanup: drop settled plans and finished return flights.
+    pub(super) fn expire_pane_motion(&mut self, now: Instant, reduce_motion: bool) -> bool {
+        let before = self.pane_relocations.len() + usize::from(self.pane_drag_return.is_some());
+        self.pane_relocations
+            .retain(|_, pending| !pending.is_settled(now, reduce_motion));
+        if self.pane_drag_return.as_ref().is_some_and(|flight| {
+            reduce_motion
+                || now.saturating_duration_since(flight.started) >= PANE_DRAG_RETURN_ANIMATION
+        }) {
+            self.pane_drag_return = None;
+        }
+        before != self.pane_relocations.len() + usize::from(self.pane_drag_return.is_some())
+    }
+
+    /// Fractions to draw a pane at: the pending plan's prediction (or its
+    /// settling correction) wins over the authoritative layout.
+    pub(super) fn displayed_pane_fractions(
+        &self,
+        layout: Option<&PaneLayout>,
+        pane_id: &str,
+        now: Instant,
+        reduce_motion: bool,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let layout = layout?;
+        if let Some(pending) = self.pane_relocations.get(&layout.tab_id)
+            && let Some(rect) = pending.display_fractions(pane_id, Some(layout), now, reduce_motion)
+        {
+            return Some(rect);
+        }
+        let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+        layout_rect_fractions(layout.area, pane.rect)
+    }
+
+    /// Context-menu swap with the neighbouring pane (design §11).
+    pub(super) fn swap_pane_direction(
+        &mut self,
+        pane_id: String,
+        direction: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pane_tab_id(&pane_id)
+            .is_some_and(|tab_id| self.tab_relocation_locked(&tab_id))
+        {
+            return;
+        }
+        self.invoke(
+            "pane.swap",
+            json!({ "pane_id": pane_id, "direction": direction }),
+            cx,
+        );
     }
 
     pub(super) fn press_workspace_row(
@@ -3939,6 +4405,15 @@ impl OcHerdrView {
             size: size(px(w.max(1.)), px(h.max(1.))),
         })
     }
+}
+
+/// `pane.swap` answers `{ type: "pane_swap", swap: { changed, .. } }`. A
+/// `changed: false` (same pane, cross-tab) means nothing moved, so the
+/// prediction must not stay on screen. A result without the field is
+/// treated as accepted: older shapes still emit `layout.updated`.
+fn pane_swap_changed(result: &Value) -> bool {
+    let swap = result.get("swap").unwrap_or(result);
+    swap.get("changed").and_then(Value::as_bool).unwrap_or(true)
 }
 
 fn snapshot_pane_ids(snapshot: &HierarchySnapshot) -> HashSet<String> {

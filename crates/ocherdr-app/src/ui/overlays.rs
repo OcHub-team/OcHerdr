@@ -473,6 +473,30 @@ impl OcHerdrView {
                         .into_any_element(),
                     );
                 }
+                for (suffix, label) in [
+                    ("left", i18n.text(k::TERMINAL_SWAP_PANE_LEFT)),
+                    ("right", i18n.text(k::TERMINAL_SWAP_PANE_RIGHT)),
+                    ("up", i18n.text(k::TERMINAL_SWAP_PANE_UP)),
+                    ("down", i18n.text(k::TERMINAL_SWAP_PANE_DOWN)),
+                ] {
+                    let pane_id = id.clone();
+                    items.push(
+                        context_menu_item(
+                            ochub_ui::gpui::ElementId::Name(
+                                format!("pane-menu-swap-{suffix}").into(),
+                            ),
+                            label,
+                            None::<&str>,
+                            Some(IconName::DragHandle),
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.overlay = Overlay::None;
+                            this.swap_pane_direction(pane_id.clone(), suffix, cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
                 let pane_id = id.clone();
                 items.push(
                     context_menu_item(

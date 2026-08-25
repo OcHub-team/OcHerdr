@@ -5,7 +5,7 @@
 //! introduce a second status type or a test-only controller.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -55,6 +55,8 @@ fn open_view(cx: &mut TestAppContext) -> (Entity<OcHerdrView>, &mut VisualTestCo
 struct FakeHerdr {
     herdr_path: PathBuf,
     events: Option<Sender<QueuedEvent>>,
+    /// Every request the live-events server answered, in arrival order.
+    requests: Arc<Mutex<Vec<Value>>>,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
     _dir: tempfile::TempDir,
@@ -125,9 +127,23 @@ impl FakeHerdr {
 
     fn snapshot_with_live_events(snapshot: HierarchySnapshot) -> Self {
         let (events, receiver) = mpsc::channel();
-        Self::start(Some(events), move |listener, stop| {
-            serve_snapshot_with_live_events(listener, stop, snapshot, receiver);
-        })
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
+        let mut fake = Self::start(Some(events), move |listener, stop| {
+            serve_snapshot_with_live_events(listener, stop, snapshot, receiver, log);
+        });
+        fake.requests = requests;
+        fake
+    }
+
+    fn requests_for(&self, method: &str) -> Vec<Value> {
+        self.requests
+            .lock()
+            .expect("fake herdr request log")
+            .iter()
+            .filter(|request| request.get("method") == Some(&json!(method)))
+            .cloned()
+            .collect()
     }
 
     fn start(
@@ -167,6 +183,7 @@ impl FakeHerdr {
         Self {
             herdr_path,
             events,
+            requests: Arc::new(Mutex::new(Vec::new())),
             stop,
             server: Some(server),
             _dir: dir,
@@ -418,21 +435,39 @@ fn serve_snapshot_with_live_events(
     stop: Arc<AtomicBool>,
     snapshot: HierarchySnapshot,
     events: Receiver<QueuedEvent>,
+    requests: Arc<Mutex<Vec<Value>>>,
 ) {
     let mut events = Some(events);
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Accepted streams inherit the listener's non-blocking mode;
+                // a request that has not fully arrived yet must block, not
+                // kill the server thread with `WouldBlock`.
+                let _ = stream.set_nonblocking(false);
                 let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
                 let mut line = String::new();
-                reader.read_line(&mut line).expect("read fake request");
+                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    continue;
+                }
                 let request: Value = serde_json::from_str(&line).expect("parse fake request");
+                requests
+                    .lock()
+                    .expect("fake herdr request log")
+                    .push(request.clone());
                 let id = request.get("id").cloned().unwrap_or(json!(""));
                 match request.get("method").and_then(Value::as_str) {
-                    Some("events.subscribe") => {
-                        let receiver = events.take().expect("one live event subscription");
-                        thread::spawn(move || stream_fake_events(stream, id, receiver));
-                    }
+                    Some("events.subscribe") => match events.take() {
+                        Some(receiver) => {
+                            thread::spawn(move || stream_fake_events(stream, id, receiver));
+                        }
+                        // A snapshot with panes makes the view open a second
+                        // subscription for agent status: acknowledge it and
+                        // hold the stream open without ever emitting.
+                        None => {
+                            thread::spawn(move || hold_fake_subscription(stream, id));
+                        }
+                    },
                     Some("session.snapshot") => write_fake_response(
                         stream,
                         json!({
@@ -440,11 +475,42 @@ fn serve_snapshot_with_live_events(
                             "result": { "snapshot": snapshot },
                         }),
                     ),
-                    Some("tab.move") => write_fake_response(
+                    Some("tab.move") | Some("layout.set_split_ratio") => write_fake_response(
                         stream,
                         json!({
                             "id": id,
                             "result": { "type": "ok" },
+                        }),
+                    ),
+                    // A swap against `reject` plays a Herdr that refuses (for
+                    // example a zoomed tab); anything else is accepted and the
+                    // test injects the matching `layout.updated` itself.
+                    Some("pane.swap") if request["params"]["target_pane_id"] == json!("reject") => {
+                        write_fake_response(
+                            stream,
+                            json!({
+                                "id": id,
+                                "error": {
+                                    "code": "zoomed_tab",
+                                    "message": "cannot swap panes in a zoomed tab",
+                                },
+                            }),
+                        )
+                    }
+                    Some("pane.swap") => write_fake_response(
+                        stream,
+                        json!({
+                            "id": id,
+                            "result": {
+                                "type": "pane_swap",
+                                "swap": {
+                                    "changed": true,
+                                    "source_pane_id": request["params"]["source_pane_id"],
+                                    "target_pane_id": request["params"]["target_pane_id"],
+                                    "focused_pane_id": request["params"]["source_pane_id"],
+                                    "layout": Value::Null,
+                                },
+                            },
                         }),
                     ),
                     // The fixture plays an old Herdr when asked to move into
@@ -513,6 +579,19 @@ fn stream_fake_events(mut stream: UnixStream, id: Value, events: Receiver<Queued
             .send(())
             .expect("confirm fake Herdr event write");
     }
+}
+
+fn hold_fake_subscription(mut stream: UnixStream, id: Value) {
+    write_fake_response(
+        stream.try_clone().expect("clone event stream"),
+        json!({
+            "id": id,
+            "result": { "type": "subscription_started" },
+        }),
+    );
+    // Blocks until the client drops its end.
+    let mut byte = [0u8; 1];
+    let _ = stream.read(&mut byte);
 }
 
 fn serve_stale_pane_subscribe(
@@ -1487,6 +1566,15 @@ fn connect_view_to_fake_and_resync(
         );
         this.sessions = vec![session];
         this.session_index = Some(0);
+        // Subscribe the way `reload` does, so injected fake events reach the
+        // production `apply_event_batch` path.
+        let subscription = this
+            .connection
+            .as_ref()
+            .expect("connected above")
+            .subscribe_background()
+            .expect("subscribe to fake herdr events");
+        this.event_listen = Some(OcHerdrView::listen_events(subscription, cx));
         this.event_stream = EventStreamState::Live;
         let epoch = this.event_epoch;
         this.resync_snapshot(epoch, cx);
@@ -1601,4 +1689,371 @@ fn a_snapshot_without_pane_move_metadata_leaves_the_capability_off(cx: &mut Test
         assert!(this.connection.is_some());
         assert!(!this.pane_move_supported());
     });
+}
+
+// ---- Pane drag: centre swap (design §5, §7, §14.2) ----
+
+fn layout_rect(x: u16, y: u16, width: u16, height: u16) -> ocherdr_core::LayoutRect {
+    ocherdr_core::LayoutRect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn split_pane(pane_id: &str, focused: bool) -> PaneInfo {
+    PaneInfo {
+        pane_id: pane_id.into(),
+        terminal_id: format!("term-{pane_id}"),
+        workspace_id: "w".into(),
+        tab_id: "t-a".into(),
+        focused,
+        cwd: None,
+        foreground_cwd: None,
+        label: Some(pane_id.to_uppercase()),
+        agent: None,
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        display_agent: None,
+        agent_status: AgentStatus::Idle,
+        state_labels: HashMap::new(),
+        tokens: HashMap::new(),
+        revision: 1,
+    }
+}
+
+/// `t-a` holds `p-left | p-right` split down the middle of a 120×40 area.
+fn two_pane_layout(left: &str, right: &str) -> ocherdr_core::PaneLayout {
+    ocherdr_core::PaneLayout {
+        workspace_id: "w".into(),
+        tab_id: "t-a".into(),
+        zoomed: false,
+        area: layout_rect(0, 0, 120, 40),
+        focused_pane_id: left.into(),
+        panes: vec![
+            ocherdr_core::LayoutPane {
+                pane_id: left.into(),
+                focused: true,
+                rect: layout_rect(0, 0, 60, 40),
+            },
+            ocherdr_core::LayoutPane {
+                pane_id: right.into(),
+                focused: false,
+                rect: layout_rect(60, 0, 60, 40),
+            },
+        ],
+        splits: vec![ocherdr_core::LayoutSplit {
+            id: "split_0_root".into(),
+            direction: ocherdr_core::SplitDirection::Right,
+            ratio: 0.5,
+            rect: layout_rect(0, 0, 120, 40),
+        }],
+    }
+}
+
+fn two_pane_snapshot() -> HierarchySnapshot {
+    let mut snapshot = pane_move_capable_snapshot();
+    snapshot.focused_pane_id = Some("p-left".into());
+    snapshot.panes = vec![split_pane("p-left", true), split_pane("p-right", false)];
+    snapshot.layouts = vec![two_pane_layout("p-left", "p-right")];
+    snapshot
+}
+
+/// Surface the panes are laid out into, in window pixels: the same numbers
+/// the canvas measures in production, set directly so the gesture math is
+/// deterministic and independent of the test window's size.
+const SURFACE: (f32, f32, f32, f32) = (100., 50., 600., 400.);
+
+fn connect_two_pane_view(
+    cx: &mut TestAppContext,
+) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, _| this.headless_terminals = true);
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update(cx, |this, _| {
+        this.terminal_surface_bounds = Some(SURFACE);
+        assert_eq!(this.selection.tab_id.as_deref(), Some("t-a"));
+    });
+    (fake, view, cx)
+}
+
+/// Grab `p-left` by its handle and drop it at `release` (window pixels).
+fn drag_left_pane_to(view: &Entity<OcHerdrView>, release: (f32, f32), cx: &mut VisualTestContext) {
+    let grab = (SURFACE.0 + 12., SURFACE.1 + 12.);
+    view.update_in(cx, |this, window, cx| {
+        assert!(
+            this.begin_pane_drag("p-left".into(), grab),
+            "the handle arms a drag"
+        );
+        assert!(this.update_pane_drag((grab.0 + 40., grab.1 + 30.), cx));
+        assert!(this.update_pane_drag(release, cx));
+        assert!(this.finish_pane_drag(release, window, cx));
+    });
+}
+
+fn swapped_layout_event() -> Value {
+    json!({
+        "event": "layout_updated",
+        "data": {
+            "type": "layout_updated",
+            "layout": two_pane_layout("p-right", "p-left"),
+        }
+    })
+}
+
+#[gpui::test]
+fn a_centre_drop_sends_one_pane_swap_and_settles_on_the_matching_layout(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    // Centre of the right pane: x = 100 + 600 * 0.75, y = 50 + 200.
+    drag_left_pane_to(&view, (550., 250.), cx);
+    view.read_with(cx, |this, _| {
+        assert!(matches!(this.surface_drag, crate::SurfaceDrag::Idle));
+        assert!(
+            this.tab_relocation_locked("t-a"),
+            "the plan locks the tab while the swap is in flight"
+        );
+        let pending = this.pane_relocations.get("t-a").expect("plan pending");
+        assert_eq!(pending.plan.source_pane_id, "p-left");
+        assert_eq!(pending.plan.target_pane_id, "p-right");
+        let predicted = this
+            .displayed_pane_fractions(
+                this.snapshot.as_ref().and_then(|s| s.layout_for("t-a")),
+                "p-left",
+                Instant::now(),
+                false,
+            )
+            .expect("predicted rect");
+        assert!(
+            (predicted.0 - 0.5).abs() < 1e-6,
+            "the source pane is drawn on the right immediately: {predicted:?}"
+        );
+    });
+    cx.run_until_parked();
+
+    let swaps = fake.requests_for("pane.swap");
+    assert_eq!(swaps.len(), 1, "exactly one pane.swap: {swaps:?}");
+    assert_eq!(swaps[0]["params"]["source_pane_id"], json!("p-left"));
+    assert_eq!(swaps[0]["params"]["target_pane_id"], json!("p-right"));
+    view.read_with(cx, |this, _| {
+        let pending = this
+            .pane_relocations
+            .get("t-a")
+            .expect("still waiting for layout");
+        assert_eq!(
+            pending.phase,
+            crate::RelocationPhase::Swapping {
+                responded: true,
+                layout_seen: false
+            }
+        );
+    });
+
+    fake.send_event(swapped_layout_event());
+    thread::sleep(Duration::from_millis(20));
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        let pending = this.pane_relocations.get("t-a");
+        assert!(
+            pending.is_none()
+                || matches!(
+                    pending.map(|p| &p.phase),
+                    Some(crate::RelocationPhase::Settling { .. })
+                ),
+            "response + matching layout.updated moves the plan into Settling"
+        );
+    });
+    thread::sleep(Duration::from_millis(220));
+    view.update(cx, |this, _| {
+        this.expire_pane_motion(Instant::now(), false);
+        assert!(
+            !this.tab_relocation_locked("t-a"),
+            "the settle animation releases the tab"
+        );
+        let layout = this
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.layout_for("t-a"))
+            .expect("layout");
+        assert_eq!(
+            layout.panes[0].pane_id, "p-right",
+            "authoritative layout on screen"
+        );
+    });
+    assert_eq!(fake.requests_for("pane.swap").len(), 1);
+}
+
+#[gpui::test]
+fn an_invalid_drop_sends_nothing_and_returns_home(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    // Well outside every pane.
+    drag_left_pane_to(&view, (SURFACE.0 + SURFACE.2 + 80., 20.), cx);
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(matches!(this.surface_drag, crate::SurfaceDrag::Idle));
+        assert!(
+            this.pane_relocations.is_empty(),
+            "no plan without a drop zone"
+        );
+        assert_eq!(
+            this.pane_drag_return.as_ref().map(|flight| flight.to),
+            Some((SURFACE.0, SURFACE.1, SURFACE.2 / 2., SURFACE.3)),
+            "the preview flies back to the source slot"
+        );
+    });
+    assert!(fake.requests_for("pane.swap").is_empty());
+}
+
+#[gpui::test]
+fn an_edge_drop_is_not_droppable_in_phase_two(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    // Far right edge of the right pane: zone Right, computed but not droppable.
+    let grab = (SURFACE.0 + 12., SURFACE.1 + 12.);
+    let edge = (SURFACE.0 + SURFACE.2 - 6., SURFACE.1 + 200.);
+    view.update_in(cx, |this, window, cx| {
+        assert!(this.begin_pane_drag("p-left".into(), grab));
+        this.update_pane_drag(edge, cx);
+        let crate::SurfaceDrag::Pane(drag) = &this.surface_drag else {
+            panic!("dragging");
+        };
+        let hover = drag.hover.as_ref().expect("hover over the right pane");
+        assert_eq!(hover.target_pane_id, "p-right");
+        assert_eq!(hover.zone, ocherdr_core::DropZone::Right);
+        assert!(!hover.droppable(drag.edge_drops));
+        this.finish_pane_drag(edge, window, cx);
+        assert!(this.pane_relocations.is_empty());
+    });
+    cx.run_until_parked();
+    assert!(fake.requests_for("pane.swap").is_empty());
+}
+
+#[gpui::test]
+fn escape_cancels_a_pane_drag_without_a_request(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    let grab = (SURFACE.0 + 12., SURFACE.1 + 12.);
+    view.update_in(cx, |this, window, cx| {
+        assert!(this.begin_pane_drag("p-left".into(), grab));
+        this.update_pane_drag((550., 250.), cx);
+        assert!(matches!(this.surface_drag, crate::SurfaceDrag::Pane(_)));
+        let escape = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: Default::default(),
+                key: "escape".into(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert!(this.handle_app_shortcut(&escape, window, cx));
+        assert!(matches!(this.surface_drag, crate::SurfaceDrag::Idle));
+        assert!(
+            this.pane_drag_return.is_some(),
+            "the lifted preview returns"
+        );
+        // Releasing afterwards is a no-op: nothing is dragging any more.
+        assert!(!this.finish_pane_drag((550., 250.), window, cx));
+    });
+    cx.run_until_parked();
+    assert!(fake.requests_for("pane.swap").is_empty());
+    view.read_with(cx, |this, _| assert!(this.pane_relocations.is_empty()));
+}
+
+#[gpui::test]
+fn a_layout_that_does_not_match_the_plan_reverts_to_authority(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    drag_left_pane_to(&view, (550., 250.), cx);
+    cx.run_until_parked();
+    assert_eq!(fake.requests_for("pane.swap").len(), 1);
+
+    // Someone else split the tab before our swap landed: the pane set no
+    // longer matches the plan.
+    let mut layout = two_pane_layout("p-right", "p-left");
+    layout.panes.push(ocherdr_core::LayoutPane {
+        pane_id: "p-new".into(),
+        focused: false,
+        rect: layout_rect(60, 20, 60, 20),
+    });
+    layout.panes[1].rect = layout_rect(60, 0, 60, 20);
+    layout.splits.push(ocherdr_core::LayoutSplit {
+        id: "split_1_1".into(),
+        direction: ocherdr_core::SplitDirection::Down,
+        ratio: 0.5,
+        rect: layout_rect(60, 0, 60, 40),
+    });
+    fake.send_event(json!({
+        "event": "layout_updated",
+        "data": { "type": "layout_updated", "layout": layout }
+    }));
+    thread::sleep(Duration::from_millis(20));
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.pane_relocations.is_empty(),
+            "a mismatching layout.updated drops the prediction"
+        );
+        let rect = this
+            .displayed_pane_fractions(
+                this.snapshot.as_ref().and_then(|s| s.layout_for("t-a")),
+                "p-left",
+                Instant::now(),
+                false,
+            )
+            .expect("authoritative rect");
+        assert!(
+            (rect.3 - 0.5).abs() < 1e-6,
+            "authoritative geometry wins: {rect:?}"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_rejected_swap_drops_the_plan_and_unlocks_the_tab(cx: &mut TestAppContext) {
+    let mut snapshot = two_pane_snapshot();
+    snapshot.panes[1].pane_id = "reject".into();
+    snapshot.layouts = vec![two_pane_layout("p-left", "reject")];
+    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, _| this.headless_terminals = true);
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update(cx, |this, _| this.terminal_surface_bounds = Some(SURFACE));
+    drag_left_pane_to(&view, (550., 250.), cx);
+    view.read_with(cx, |this, _| assert!(this.tab_relocation_locked("t-a")));
+    cx.run_until_parked();
+    assert_eq!(fake.requests_for("pane.swap").len(), 1);
+    view.read_with(cx, |this, _| {
+        assert!(
+            !this.tab_relocation_locked("t-a"),
+            "the error response releases the lock"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_locked_tab_refuses_a_second_drag_and_pane_close(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    drag_left_pane_to(&view, (550., 250.), cx);
+    view.update(cx, |this, cx| {
+        assert!(
+            !this.begin_pane_drag("p-right".into(), (SURFACE.0 + 400., SURFACE.1 + 12.)),
+            "one plan per tab"
+        );
+        this.request_close(
+            crate::HierarchyTarget::Pane {
+                id: "p-right".into(),
+                label: "P-RIGHT".into(),
+            },
+            cx,
+        );
+        assert!(
+            matches!(this.overlay, crate::Overlay::None),
+            "pane close is refused while the plan is pending"
+        );
+        assert!(this.pane_resize_frozen("p-right"), "grids are frozen");
+    });
+    cx.run_until_parked();
+    assert_eq!(fake.requests_for("pane.swap").len(), 1);
 }

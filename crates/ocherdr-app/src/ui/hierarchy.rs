@@ -1,7 +1,7 @@
 use super::super::*;
 use crate::a11y::{
     ChromeA11y, apply_control, apply_list, apply_region, event_stream_lost_copy,
-    event_stream_status_copy, pane_a11y,
+    event_stream_status_copy, pane_a11y, pane_drag_handle_name, pane_drag_state_text,
 };
 
 impl OcHerdrView {
@@ -1175,7 +1175,7 @@ impl OcHerdrView {
                 ))
                 .into_any_element();
         };
-        let Some(tab_id) = self.selection.tab_id.as_deref() else {
+        let Some(tab_id) = self.selection.tab_id.clone() else {
             return div()
                 .id("empty-tabs")
                 .role(ochub_ui::gpui::Role::Button)
@@ -1193,14 +1193,29 @@ impl OcHerdrView {
                 ))
                 .into_any_element();
         };
+        let tab_id = tab_id.as_str();
         let layout = snapshot.layout_for(tab_id).cloned();
         let panes = snapshot.panes_for(tab_id).cloned().collect::<Vec<_>>();
         let view = cx.entity();
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        if self.expire_pane_motion(now, reduce_motion) {
+            cx.notify();
+        }
+        let scale = window.scale_factor();
+        let pane_drag = match &self.surface_drag {
+            SurfaceDrag::Pane(drag) if pane_drag_past_slop(drag) => Some(drag.clone()),
+            _ => None,
+        };
+        let drag_source_id = pane_drag.as_ref().map(|drag| drag.pane_id.clone());
+        let draggable = layout
+            .as_ref()
+            .is_some_and(|layout| !layout.zoomed && layout.panes.len() > 1)
+            && !self.tab_relocation_locked(tab_id);
         let mut elements = Vec::new();
         for pane in panes {
-            let fractions = layout
-                .as_ref()
-                .and_then(|layout| pane_fractions(layout, &pane.pane_id))
+            let fractions = self
+                .displayed_pane_fractions(layout.as_ref(), &pane.pane_id, now, reduce_motion)
                 .unwrap_or((0., 0., 1., 1.));
             let selected = self.selection.pane_id.as_deref() == Some(&pane.pane_id);
             let pane_id = pane.pane_id.clone();
@@ -1210,7 +1225,12 @@ impl OcHerdrView {
             };
             let frame = self
                 .pane(&pane.pane_id)
-                .and_then(|runtime| runtime.frame.clone());
+                .and_then(|runtime| runtime.frame.clone())
+                .or_else(|| {
+                    self.pane_relocations
+                        .get(tab_id)
+                        .and_then(|pending| pending.plan.frame_for(&pane.pane_id))
+                });
             let waiting = frame.is_none();
             let screen_text = if window.is_a11y_active() && !waiting {
                 self.pane(&pane.pane_id)
@@ -1219,10 +1239,41 @@ impl OcHerdrView {
                 None
             };
             let a11y = pane_a11y(&pane, selected, screen_text.as_deref(), waiting, i18n);
+            // A frozen grid keeps its rendered size inside the clipped body so
+            // the last frame stays put while only the shell moves.
+            let frozen = if self.pane_resize_frozen(&pane.pane_id) {
+                self.pane(&pane.pane_id).and_then(|runtime| {
+                    (runtime.pixel_size.0 > 0 && runtime.pixel_size.1 > 0).then(|| {
+                        (
+                            runtime.pixel_size.0 as f32 / scale,
+                            runtime.pixel_size.1 as f32 / scale,
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+            let handle = draggable.then(|| {
+                let handle_pane_id = pane_id.clone();
+                render_pane_drag_handle(&pane, selected, i18n)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, _window, cx| {
+                            this.press_pane_handle(handle_pane_id.clone(), event, cx);
+                        }),
+                    )
+                    .into_any_element()
+            });
+            let presentation = PanePresentation {
+                fractions,
+                source_slot: drag_source_id.as_deref() == Some(pane_id.as_str()),
+                frozen,
+                handle,
+            };
             let scroll_pane_id = pane_id.clone();
             let mouse_pane_id = pane_id.clone();
             elements.push(
-                render_pane(pane, frame, fractions, a11y, i18n, view.clone())
+                render_pane(pane, frame, presentation, a11y, i18n, view.clone())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event, window, cx| {
@@ -1273,6 +1324,32 @@ impl OcHerdrView {
             }
             _ => None,
         };
+        let pane_drag_overlay = pane_drag
+            .as_ref()
+            .filter(|drag| drag.tab_id == tab_id)
+            .map(|drag| self.render_pane_drag_overlay(&snapshot, drag, reduce_motion, cx));
+        let origin = self.surface_origin();
+        let pane_return = self
+            .pane_drag_return
+            .clone()
+            .filter(|_| !reduce_motion)
+            .and_then(|flight| {
+                window.request_animation_frame();
+                render_pane_drag_return(
+                    &snapshot,
+                    &flight,
+                    origin,
+                    self.pane(&flight.pane_id),
+                    i18n,
+                )
+            });
+        if self
+            .pane_relocations
+            .get(tab_id)
+            .is_some_and(|pending| matches!(pending.phase, RelocationPhase::Settling { .. }))
+        {
+            window.request_animation_frame();
+        }
         let ime_view = cx.entity();
         let ime_focus = self.focus.clone();
         let surface_view = cx.entity();
@@ -1328,6 +1405,146 @@ impl OcHerdrView {
             )
             .children(split_handles.into_iter().flatten())
             .children(split_overlay)
+            .children(pane_drag_overlay)
+            .children(pane_return)
+            .into_any_element()
+    }
+
+    /// Everything painted above the panes while one is lifted: the target
+    /// highlight and the floating preview (design §5.2).
+    fn render_pane_drag_overlay(
+        &self,
+        snapshot: &HierarchySnapshot,
+        drag: &PaneDrag,
+        reduce_motion: bool,
+        cx: &mut Context<Self>,
+    ) -> ochub_ui::gpui::AnyElement {
+        let i18n = self.i18n;
+        // Gesture math lives in window pixels; this overlay is a child of the
+        // `relative()` surface, so everything painted here is surface-local.
+        let origin = self.surface_origin();
+        let droppable = drag
+            .hover
+            .as_ref()
+            .is_some_and(|hover| hover.droppable(drag.edge_drops));
+        let zone = drag.hover.as_ref().map(|hover| hover.zone);
+        let state_text = pane_drag_state_text(zone, droppable, i18n);
+        let highlight = drag.hover.as_ref().filter(|_| droppable).map(|hover| {
+            let (x, y, w, h) = surface_local(hover.target_rect, origin);
+            let label = match hover.zone {
+                DropZone::Center => i18n.text(k::TERMINAL_DROP_SWAP),
+                DropZone::Left | DropZone::Right | DropZone::Up | DropZone::Down => {
+                    i18n.text(k::TERMINAL_DROP_INVALID)
+                }
+            };
+            let card = div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(w))
+                .h(px(h))
+                .p(px(2.))
+                .child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_2()
+                        .border_color(theme::accent())
+                        .bg(theme::accent().alpha(0.14))
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded(px(CORNER_CONTROL))
+                                .bg(theme::accent())
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::current().bg.rgba())
+                                .child(label),
+                        ),
+                );
+            if reduce_motion {
+                card.into_any_element()
+            } else {
+                card.with_animation(
+                    ElementId::Name(
+                        format!("pane-drop-zone-{}-{:?}", hover.target_pane_id, hover.zone).into(),
+                    ),
+                    Animation::new(PANE_DROP_ZONE_ANIMATION).with_easing(ease_out_quint()),
+                    |card, t| card.opacity(t),
+                )
+                .into_any_element()
+            }
+        });
+        let pane = snapshot.pane(&drag.pane_id).cloned();
+        let frame = self
+            .pane(&drag.pane_id)
+            .and_then(|runtime| runtime.frame.clone());
+        let opacity = if drag.hover.is_some() && !droppable {
+            PANE_DRAG_INVALID_OPACITY
+        } else {
+            PANE_DRAG_PREVIEW_OPACITY
+        };
+        let lifted = surface_local(pane_drag_preview_rect(drag), origin);
+        let resting = surface_local(
+            (
+                drag.pointer.0 - drag.grab_offset.0,
+                drag.pointer.1 - drag.grab_offset.1,
+                drag.source_rect.2,
+                drag.source_rect.3,
+            ),
+            origin,
+        );
+        let preview = pane.map(|pane| {
+            let card = pane_preview_card(&pane, frame, lifted, opacity, i18n);
+            if reduce_motion {
+                card.into_any_element()
+            } else {
+                card.with_animation(
+                    "pane-drag-lift",
+                    Animation::new(PANE_DRAG_LIFT_ANIMATION).with_easing(ease_out_quint()),
+                    move |card, t| {
+                        let (x, y, w, h) = lerp_rect(resting, lifted, t);
+                        card.left(px(x))
+                            .top(px(y))
+                            .w(px(w))
+                            .h(px(h))
+                            .opacity(1. + (opacity - 1.) * t)
+                    },
+                )
+                .into_any_element()
+            }
+        });
+        div()
+            .id("pane-drag-overlay")
+            .role(ochub_ui::gpui::Role::Status)
+            .aria_label(
+                i18n.drag_pane_handle(
+                    snapshot
+                        .pane(&drag.pane_id)
+                        .map(|pane| pane.display_name())
+                        .unwrap_or(&drag.pane_id),
+                ),
+            )
+            .aria_value(state_text)
+            .absolute()
+            .size_full()
+            .cursor_grabbing()
+            .on_mouse_move(cx.listener(|this, event, window, cx| {
+                this.pane_mouse_move(event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+            )
+            .children(highlight)
+            .children(preview)
             .into_any_element()
     }
 
@@ -1776,23 +1993,74 @@ fn split_preview_line(
     })
 }
 
+/// How a pane shell is drawn this frame, beyond its snapshot data.
+struct PanePresentation {
+    fractions: (f32, f32, f32, f32),
+    /// The pane is the lifted source of a drag: dimmed, dashed border.
+    source_slot: bool,
+    /// Logical size of the frozen terminal grid; the frame is drawn at that
+    /// size and clipped instead of being refitted to the shell.
+    frozen: Option<(f32, f32)>,
+    handle: Option<ochub_ui::gpui::AnyElement>,
+}
+
+/// 20×24 grab area at the left of the title bar (design §5.1). Shown on
+/// hover or when the pane is selected; mouse-only, like the split handle,
+/// so it never competes with terminal key forwarding.
+fn render_pane_drag_handle(
+    pane: &PaneInfo,
+    selected: bool,
+    i18n: I18n,
+) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
+    let group = SharedString::from(format!("terminal-pane-group-{}", pane.pane_id));
+    div()
+        .id(ochub_ui::gpui::ElementId::Name(
+            format!("pane-drag-handle-{}", pane.pane_id).into(),
+        ))
+        .role(ochub_ui::gpui::Role::Button)
+        .tab_stop(false)
+        .aria_label(pane_drag_handle_name(pane, i18n))
+        .flex_none()
+        .w(px(PANE_DRAG_HANDLE_WIDTH))
+        .h(px(PANE_DRAG_HANDLE_HEIGHT))
+        .ml(px(-6.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(CORNER_COMPACT))
+        .cursor_grab()
+        .occlude()
+        .opacity(if selected { 1. } else { 0. })
+        .group_hover(group, |style| style.opacity(1.))
+        .hover(|style| style.bg(theme::border()))
+        .child(icon(IconName::DragHandle, theme::subtext(), 12.))
+}
+
 fn render_pane(
     pane: PaneInfo,
     frame: Option<RenderedFrame>,
-    fractions: (f32, f32, f32, f32),
+    presentation: PanePresentation,
     a11y: crate::a11y::PaneA11y,
     i18n: I18n,
     view: Entity<OcHerdrView>,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
+    let PanePresentation {
+        fractions,
+        source_slot,
+        frozen,
+        handle,
+    } = presentation;
     let (x, y, w, h) = fractions;
     let pane_name = a11y.name.clone();
     let selected = a11y.selected;
     let waiting_for_frame = frame.is_none();
     let measure_pane_id = pane.pane_id.clone();
+    let group = SharedString::from(format!("terminal-pane-group-{}", pane.pane_id));
     div()
         .id(ochub_ui::gpui::ElementId::Name(
             format!("terminal-pane-{}", pane.pane_id).into(),
         ))
+        .group(group)
         .role(a11y.role)
         .aria_label(a11y.name.clone())
         .aria_selected(selected)
@@ -1805,6 +2073,7 @@ fn render_pane(
         .p(px(2.))
         .flex()
         .flex_col()
+        .when(source_slot, |shell| shell.opacity(PANE_DRAG_SOURCE_OPACITY))
         .child(
             div()
                 .flex()
@@ -1814,6 +2083,7 @@ fn render_pane(
                 .min_w_0()
                 .overflow_hidden()
                 .border_1()
+                .when(source_slot, |body| body.border_dashed())
                 .border_color(if selected {
                     theme::accent()
                 } else {
@@ -1838,6 +2108,7 @@ fn render_pane(
                         })
                         .text_xs()
                         .text_color(theme::subtext())
+                        .children(handle)
                         .child(status_dot(status_color(pane.agent_status)))
                         .child(div().truncate().flex_1().child(pane_name)),
                 )
@@ -1870,13 +2141,19 @@ fn render_pane(
                             .size_full(),
                         )
                         .when_some(frame, |container, frame| {
-                            container.child(
-                                surface(frame.pixel_buffer)
-                                    .with_frame_lifetime(frame.lifetime)
-                                    .object_fit(ObjectFit::Contain)
-                                    .w_full()
-                                    .h_full(),
-                            )
+                            let surface = surface(frame.pixel_buffer)
+                                .with_frame_lifetime(frame.lifetime)
+                                .object_fit(ObjectFit::Contain);
+                            container.child(match frozen {
+                                Some((fw, fh)) => surface
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .w(px(fw))
+                                    .h(px(fh))
+                                    .into_any_element(),
+                                None => surface.w_full().h_full().into_any_element(),
+                            })
                         })
                         .when(waiting_for_frame, |container| {
                             container.child(
@@ -1888,6 +2165,126 @@ fn render_pane(
                         }),
                 ),
         )
+}
+
+/// Floating copy of a pane: title bar plus its last rendered frame. Reuses
+/// the current `RenderedFrame`; no screenshot, no IOSurface copy.
+fn pane_preview_card(
+    pane: &PaneInfo,
+    frame: Option<RenderedFrame>,
+    rect: (f32, f32, f32, f32),
+    opacity: f32,
+    i18n: I18n,
+) -> ochub_ui::gpui::Div {
+    let (x, y, w, h) = rect;
+    div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(w))
+        .h(px(h))
+        .opacity(opacity)
+        .p(px(2.))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_hidden()
+                .rounded(px(CORNER_COMPACT))
+                .border_1()
+                .border_color(theme::accent())
+                .shadow_lg()
+                .bg(theme::current().bg.rgba())
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .h(px(PANE_HEADER_HEIGHT))
+                        .px_2()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(theme::border())
+                        .bg(theme::selection())
+                        .text_xs()
+                        .text_color(theme::subtext())
+                        .child(status_dot(status_color(pane.agent_status)))
+                        .child(
+                            div()
+                                .truncate()
+                                .flex_1()
+                                .child(pane.display_name().to_owned()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme::muted())
+                                .child(i18n.agent_status(pane.agent_status)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .when_some(frame, |body, frame| {
+                            body.child(
+                                surface(frame.pixel_buffer)
+                                    .with_frame_lifetime(frame.lifetime)
+                                    .object_fit(ObjectFit::Contain)
+                                    .w_full()
+                                    .h_full(),
+                            )
+                        }),
+                ),
+        )
+}
+
+/// Window-space rect expressed relative to the terminal surface's origin.
+fn surface_local(rect: (f32, f32, f32, f32), origin: (f32, f32)) -> (f32, f32, f32, f32) {
+    (rect.0 - origin.0, rect.1 - origin.1, rect.2, rect.3)
+}
+
+/// Cancelled or invalid drop: the preview flies back to its slot over
+/// `PANE_DRAG_RETURN_ANIMATION` (design §10).
+fn render_pane_drag_return(
+    snapshot: &HierarchySnapshot,
+    flight: &PaneDragReturn,
+    origin: (f32, f32),
+    runtime: Option<&PaneRuntime>,
+    i18n: I18n,
+) -> Option<ochub_ui::gpui::AnyElement> {
+    let pane = snapshot.pane(&flight.pane_id)?.clone();
+    let frame = runtime.and_then(|runtime| runtime.frame.clone());
+    let (from, to) = (
+        surface_local(flight.from, origin),
+        surface_local(flight.to, origin),
+    );
+    let card = pane_preview_card(&pane, frame, from, PANE_DRAG_PREVIEW_OPACITY, i18n);
+    Some(
+        card.with_animation(
+            ElementId::Name(format!("pane-drag-return-{}", flight.pane_id).into()),
+            Animation::new(PANE_DRAG_RETURN_ANIMATION).with_easing(ease_out_quint()),
+            move |card, t| {
+                let (x, y, w, h) = lerp_rect(from, to, t);
+                card.left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .h(px(h))
+                    .opacity(PANE_DRAG_PREVIEW_OPACITY + (1. - PANE_DRAG_PREVIEW_OPACITY) * t)
+            },
+        )
+        .into_any_element(),
+    )
 }
 
 pub(super) fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
