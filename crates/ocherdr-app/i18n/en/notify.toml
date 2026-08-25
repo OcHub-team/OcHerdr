@@ -46,7 +46,6 @@
 "notify.remove_host" = "Could not remove host"
 "notify.remove_hosts" = "Could not remove hosts"
 "notify.render_terminal" = "Could not render the terminal"
-"notify.resize_terminal" = "Could not resize the terminal"
 "notify.running" = "Running {method}…"
 "notify.save_appearance" = "Could not save appearance"
 "notify.save_host" = "Could not save host"

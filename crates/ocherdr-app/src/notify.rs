@@ -21,7 +21,6 @@ pub(crate) enum FailureKind {
     OpenTerminal,
     ApplyPalette,
     SpawnTerminal,
-    ResizeTerminal,
     SetSplitRatio,
     MoveWorkspace,
     MoveTab,
@@ -72,7 +71,6 @@ impl FailureKind {
             | Self::OpenTerminal
             | Self::ApplyPalette
             | Self::SpawnTerminal
-            | Self::ResizeTerminal
             | Self::SetSplitRatio
             | Self::MoveWorkspace
             | Self::MoveTab
@@ -97,7 +95,6 @@ impl FailureKind {
             Self::OpenTerminal => k::NOTIFY_OPEN_TERMINAL,
             Self::ApplyPalette => k::NOTIFY_APPLY_PALETTE,
             Self::SpawnTerminal => k::NOTIFY_SPAWN_TERMINAL,
-            Self::ResizeTerminal => k::NOTIFY_RESIZE_TERMINAL,
             Self::SetSplitRatio => k::NOTIFY_SET_SPLIT_RATIO,
             Self::MoveWorkspace => k::NOTIFY_WORKSPACE_MOVE,
             Self::MoveTab => k::NOTIFY_TAB_MOVE,

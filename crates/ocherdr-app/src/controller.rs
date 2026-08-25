@@ -2314,6 +2314,7 @@ impl OcHerdrView {
                                         focused: target.focused,
                                         size: (cols, rows),
                                         pixel_size: (0, 0),
+                                        viewport_ready: false,
                                         frame_context: 0,
                                         color_scheme_dark,
                                         palette_signature: palette.signature(),
@@ -2479,22 +2480,19 @@ impl OcHerdrView {
                     for item in items {
                         match item {
                             Ok(TerminalEvent::Frame(frame)) => {
-                                if runtime.size != (frame.width, frame.height)
-                                    && incoming_frame_should_replace_grid(runtime.pixel_size)
-                                {
-                                    match runtime.terminal.set_grid_size(frame.width, frame.height)
-                                    {
-                                        Ok(resolved) => {
-                                            runtime.size = (resolved.columns, resolved.rows);
-                                            runtime.pixel_size = (0, 0);
-                                        }
-                                        Err(resize_error) => {
-                                            error = Some((
-                                                FailureKind::ResizeTerminal,
-                                                resize_error.to_string(),
-                                            ))
-                                        }
-                                    }
+                                let frame_size = (frame.width, frame.height);
+                                if !incoming_frame_should_apply(
+                                    runtime.viewport_ready,
+                                    runtime.size,
+                                    frame_size,
+                                ) {
+                                    // A stream reconnected at its bootstrap size can deliver a
+                                    // full frame before Herdr applies this pane's measured
+                                    // viewport. Before the initial measurement, or while waiting
+                                    // for a new viewport-sized frame, keep the last compatible
+                                    // frame instead of painting a stale grid into the upper-left
+                                    // corner.
+                                    continue;
                                 }
                                 runtime.terminal.apply_frame(&frame.bytes, frame.full);
                                 if selected_pane.as_deref() == Some(pane_id)
@@ -2691,12 +2689,7 @@ impl OcHerdrView {
                 runtime.color_scheme_dark = palette.dark;
                 runtime.palette_signature = palette.signature();
             }
-            let plan = pane_resize_plan(
-                frozen,
-                runtime.mode,
-                runtime.pixel_size,
-                (width_px, height_px),
-            );
+            let plan = pane_resize_plan(frozen, runtime.pixel_size, (width_px, height_px));
             if plan != PaneResizePlan::Skip {
                 runtime.frame_context = runtime.frame_context.wrapping_add(1);
                 let resolved = runtime.terminal.resize_pixels(
@@ -2706,16 +2699,19 @@ impl OcHerdrView {
                     runtime.frame_context,
                 );
                 let size = (resolved.columns, resolved.rows);
-                if plan == PaneResizePlan::ResizeAndPush {
-                    let _ = runtime.session.send(TerminalCommand::Resize {
-                        cols: resolved.columns,
-                        rows: resolved.rows,
-                        cell_width_px: resolved.cell_width_px,
-                        cell_height_px: resolved.cell_height_px,
-                    });
-                }
+                // Herdr distinguishes the stream mode: a controller resize
+                // changes the shared PTY, while an observer resize updates
+                // only that observer's render viewport. Both must follow the
+                // pane's measured grid.
+                let _ = runtime.session.send(TerminalCommand::Resize {
+                    cols: resolved.columns,
+                    rows: resolved.rows,
+                    cell_width_px: resolved.cell_width_px,
+                    cell_height_px: resolved.cell_height_px,
+                });
                 runtime.size = size;
                 runtime.pixel_size = (width_px, height_px);
+                runtime.viewport_ready = width_px > 0 && height_px > 0;
                 resized = true;
             }
         }
@@ -5556,29 +5552,24 @@ fn demote_terminal_control(session: &mut SessionPanes, pane_id: &str) -> bool {
 enum PaneResizePlan {
     /// Grid frozen by a pending relocation or split drag, or pixels unchanged.
     Skip,
-    /// Refit the local Ghostty grid; the stream cannot size the PTY.
-    ResizeLocal,
-    /// Refit the local grid and push the new size down the control stream.
-    ResizeAndPush,
+    /// Refit the local grid and report it to the stream. Herdr uses this as
+    /// either the control PTY size or an observer's independent viewport.
+    ResizeAndReport,
 }
 
 /// What a measured pane body means for the terminal: the grid follows the
-/// body once it is authoritative, and a control stream carries the size to
-/// Herdr so the PTY matches the grid on screen.
+/// body once it is authoritative, and every stream receives the size. Herdr
+/// applies it to the shared PTY only for control streams; observe streams get
+/// their own render viewport.
 fn pane_resize_plan(
     frozen: bool,
-    mode: TerminalMode,
     current_pixels: (u32, u32),
     measured_pixels: (u32, u32),
 ) -> PaneResizePlan {
     if frozen || current_pixels == measured_pixels {
         return PaneResizePlan::Skip;
     }
-    if mode.is_controlled() {
-        PaneResizePlan::ResizeAndPush
-    } else {
-        PaneResizePlan::ResizeLocal
-    }
+    PaneResizePlan::ResizeAndReport
 }
 
 fn should_flush_session_pane(
@@ -5608,11 +5599,16 @@ fn cmd_w_close_target(
     })
 }
 
-fn incoming_frame_should_replace_grid(pixel_size: (u32, u32)) -> bool {
-    // Once layout has sized the local Metal surface, incoming 80×24 observe
-    // (or takeover) frames must not shrink it. That shrink-then-grow is the
-    // flash seen when clicking another pane.
-    pixel_size == (0, 0)
+/// A measured local grid owns the on-screen surface. Until Herdr sends a
+/// frame for that same client viewport, retain the last compatible frame;
+/// applying an earlier 80×24 bootstrap frame would only paint its upper-left
+/// corner. The initial frame waits for a measured viewport at the call site.
+fn incoming_frame_should_apply(
+    viewport_ready: bool,
+    local_grid: (u16, u16),
+    frame_grid: (u16, u16),
+) -> bool {
+    viewport_ready && local_grid == frame_grid
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6963,9 +6959,10 @@ mod tests {
     }
 
     #[test]
-    fn observe_frames_do_not_replace_the_local_display_grid() {
-        assert!(!incoming_frame_should_replace_grid((800, 600)));
-        assert!(incoming_frame_should_replace_grid((0, 0)));
+    fn stale_observe_frames_do_not_replace_or_paint_the_local_display_grid() {
+        assert!(!incoming_frame_should_apply(false, (80, 24), (80, 24)));
+        assert!(!incoming_frame_should_apply(true, (120, 40), (80, 24)));
+        assert!(incoming_frame_should_apply(true, (120, 40), (120, 40)));
     }
 
     fn target(pane_id: &str, mode: TerminalMode, focused: bool) -> PaneRuntimeTarget {
@@ -7043,38 +7040,29 @@ mod tests {
     }
 
     #[test]
-    fn a_grid_change_pushes_the_size_down_every_control_stream() {
-        let panes = [
-            ("controlled", TerminalMode::Control),
-            ("takeover", TerminalMode::ControlTakeover),
-            ("hidden-tab", TerminalMode::Observe),
-        ];
-        let pushed = panes
+    fn a_grid_change_reports_the_size_for_every_terminal_stream() {
+        let panes = ["controlled", "takeover", "observer"];
+        let reported = panes
             .iter()
-            .filter(|(_, mode)| {
-                pane_resize_plan(false, *mode, (800, 600), (640, 480))
-                    == PaneResizePlan::ResizeAndPush
+            .filter(|_| {
+                pane_resize_plan(false, (800, 600), (640, 480)) == PaneResizePlan::ResizeAndReport
             })
-            .map(|(id, _)| *id)
+            .copied()
             .collect::<Vec<_>>();
-        assert_eq!(pushed, ["controlled", "takeover"]);
+        assert_eq!(reported, panes);
         assert_eq!(
-            pane_resize_plan(false, TerminalMode::Observe, (800, 600), (640, 480)),
-            PaneResizePlan::ResizeLocal
-        );
-        assert_eq!(
-            pane_resize_plan(false, TerminalMode::ControlTakeover, (800, 600), (800, 600)),
+            pane_resize_plan(false, (800, 600), (800, 600)),
             PaneResizePlan::Skip
         );
         // Frozen while a relocation or split drag previews geometry; the
         // release re-measures and then pushes.
         assert_eq!(
-            pane_resize_plan(true, TerminalMode::ControlTakeover, (800, 600), (640, 480)),
+            pane_resize_plan(true, (800, 600), (640, 480)),
             PaneResizePlan::Skip
         );
         assert_eq!(
-            pane_resize_plan(false, TerminalMode::ControlTakeover, (800, 600), (640, 480)),
-            PaneResizePlan::ResizeAndPush
+            pane_resize_plan(false, (800, 600), (640, 480)),
+            PaneResizePlan::ResizeAndReport
         );
     }
 

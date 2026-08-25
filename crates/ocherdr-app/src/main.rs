@@ -320,6 +320,9 @@ struct PaneRuntime {
     focused: bool,
     size: (u16, u16),
     pixel_size: (u32, u32),
+    /// True after this pane's body has supplied an actual local viewport.
+    /// Bootstrap frames use 80×24 and must not reach the Metal surface first.
+    viewport_ready: bool,
     frame_context: u64,
     color_scheme_dark: bool,
     palette_signature: u64,

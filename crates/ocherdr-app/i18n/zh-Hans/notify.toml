@@ -46,7 +46,6 @@
 "notify.remove_host" = "无法移除主机"
 "notify.remove_hosts" = "无法移除所选主机"
 "notify.render_terminal" = "无法渲染终端"
-"notify.resize_terminal" = "无法调整终端尺寸"
 "notify.running" = "正在执行 {method}…"
 "notify.save_appearance" = "无法保存外观设置"
 "notify.save_host" = "无法保存主机"
