@@ -601,6 +601,56 @@ fn a_closed_event_poll_marks_the_stream_lost_and_stops_rescheduling(cx: &mut Tes
 }
 
 #[gpui::test]
+fn startup_replay_batch_refreshes_the_visible_current_snapshot_immediately(
+    cx: &mut TestAppContext,
+) {
+    let current = two_pane_snapshot();
+    let fake = FakeHerdr::snapshot_with_live_events(current.clone());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+
+    view.update(cx, |this, cx| {
+        let session = SessionSummary {
+            name: "alpha".into(),
+            running: true,
+            socket_path: fake.socket_path(),
+            session_dir: fake._dir.path().join("alpha"),
+            default: false,
+        };
+        this.connection = Some(
+            SessionConnection::connect(&this.profiles[0], &session).expect("connect fake Herdr"),
+        );
+        this.sessions = vec![session];
+        this.session_index = Some(0);
+        let mut stale = current;
+        stale.panes.retain(|pane| pane.pane_id != "p-right");
+        this.snapshot = Some(stale);
+        this.startup_replay_sync = Some(crate::StartupReplaySync::Draining { serial: 1 });
+
+        assert!(this.apply_event_batch(
+            Some(vec![Ok(ocherdr_core::HerdrEvent::LayoutUpdated {
+                layout: two_pane_layout("p-right", "p-left"),
+            })]),
+            cx,
+        ));
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.pane("p-right").is_some()),
+            "the first replay batch must fetch current state instead of waiting for replay quiet"
+        );
+    });
+    assert!(
+        !fake.requests_for("session.snapshot").is_empty(),
+        "the replay invalidation must issue an authoritative refresh"
+    );
+}
+
+#[gpui::test]
 fn reload_writes_a_rejected_subscription_as_lost_instead_of_idle(cx: &mut TestAppContext) {
     let fake = FakeHerdr::snapshot_ok_subscribe_rejected();
     let (view, cx) = open_view(cx);
@@ -622,36 +672,6 @@ fn reload_writes_a_rejected_subscription_as_lost_instead_of_idle(cx: &mut TestAp
             Some("alpha"),
             "the rejected subscribe still selected a running session"
         );
-    });
-}
-
-#[gpui::test]
-fn startup_replay_layout_events_never_mutate_the_rendered_snapshot(cx: &mut TestAppContext) {
-    let (view, cx) = open_view(cx);
-    view.update(cx, |this, cx| {
-        this.snapshot = Some(two_pane_snapshot());
-        this.startup_event_replay = Some(crate::StartupEventReplay::Draining { serial: 1 });
-
-        assert!(this.apply_event_batch(
-            Some(vec![Ok(HerdrEvent::LayoutUpdated {
-                layout: two_pane_layout("p-right", "p-left"),
-            })]),
-            cx,
-        ));
-
-        let layout = this
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.layout_for("t-a"))
-            .expect("initial authoritative layout remains visible");
-        assert_eq!(
-            layout.panes[0].pane_id, "p-left",
-            "historical layout.updated is quarantined instead of rendered"
-        );
-        assert!(matches!(
-            this.startup_event_replay,
-            Some(crate::StartupEventReplay::Draining { serial }) if serial != 1
-        ));
     });
 }
 
@@ -761,16 +781,13 @@ fn a_conflicting_tab_moved_event_replaces_the_pending_projection_with_authority(
         this.reload(None, cx);
     });
     cx.run_until_parked();
-    // This test exercises steady-state reorder events, so let reload's
-    // retained-history presentation barrier install its final snapshot first.
     cx.executor()
-        .advance_clock(crate::STARTUP_EVENT_REPLAY_SETTLE_DELAY);
+        .advance_clock(crate::STARTUP_REPLAY_QUIET_DELAY);
     cx.run_until_parked();
     view.read_with(cx, |this, _| {
-        assert_eq!(this.startup_event_replay, None);
+        assert_eq!(this.startup_replay_sync, None);
         assert!(!this.snapshot_refreshing);
     });
-
     let original = ["t-a", "t-b", "t-c"].map(str::to_owned).to_vec();
     let list = ReorderList::Tabs {
         workspace_id: "w".into(),

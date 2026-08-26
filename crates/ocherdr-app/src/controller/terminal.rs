@@ -38,8 +38,14 @@ impl OcHerdrView {
         let mut spawn_error = None;
         let mut spawned = HashSet::new();
         let mut pending_listens = Vec::new();
+        let optimistic_visible = self.optimistic_visible_pane_ids();
+        self.pane_viewports
+            .retain(|pane_id, _| optimistic_visible.contains(pane_id));
+        let measured_viewports = self.pane_viewports.clone();
+        let mut too_small = Vec::new();
+        let mut mounted = 0usize;
+        let mut mount_more = false;
         {
-            let visible_pane_ids = visible_pane_ids(Some(snapshot), visible_tab_id.as_deref());
             let controls = {
                 let session = self
                     .session_panes
@@ -47,7 +53,7 @@ impl OcHerdrView {
                     .expect("live session adopted panes");
                 session
                     .controls
-                    .retain(|pane_id, _| visible_pane_ids.contains(pane_id));
+                    .retain(|pane_id, _| optimistic_visible.contains(pane_id));
                 session.controls.clone()
             };
             #[cfg_attr(not(test), allow(unused_mut))]
@@ -57,6 +63,18 @@ impl OcHerdrView {
                 visible_tab_id.as_deref(),
                 selected_pane_id.as_deref(),
             );
+            wanted.retain(|target| optimistic_visible.contains(&target.pane_id));
+            wanted.sort_by_key(|target| !target.focused);
+            // A template rebuild temporarily moves panes through hidden tabs.
+            // Keep the streams users are still looking at in their current
+            // control modes instead of reconnecting them midway.
+            for target in &mut wanted {
+                if optimistic_visible.contains(&target.pane_id)
+                    && let Some(mode) = controls.get(&target.pane_id)
+                {
+                    target.mode = *mode;
+                }
+            }
             #[cfg(test)]
             if self.headless_terminals {
                 wanted.clear();
@@ -66,7 +84,9 @@ impl OcHerdrView {
                 .as_mut()
                 .expect("live session adopted panes")
                 .panes;
-            panes.retain(|pane_id, _| live_pane_ids.contains(pane_id));
+            panes.retain(|pane_id, _| {
+                live_pane_ids.contains(pane_id) && optimistic_visible.contains(pane_id)
+            });
             for target in &wanted {
                 let pane_id = &target.pane_id;
                 let mode = target.mode;
@@ -101,18 +121,40 @@ impl OcHerdrView {
                         }
                     }
                     VisiblePanePlan::Spawn => {
+                        let Some(viewport) =
+                            measured_viewports.get(pane_id).copied().filter(|viewport| {
+                                viewport.mountable && viewport.pixels.0 > 0 && viewport.pixels.1 > 0
+                            })
+                        else {
+                            continue;
+                        };
+                        if mounted >= PANE_MOUNT_BATCH_SIZE {
+                            mount_more = true;
+                            continue;
+                        }
                         let cols = 80;
                         let rows = 24;
-                        let (session, frames) = TerminalSession::spawn(
-                            profile.clone(),
-                            session_name.clone(),
-                            pane_id.clone(),
-                            mode,
-                            cols,
-                            rows,
-                        );
                         match Terminal::new(cols, rows, 10_000, &palette) {
                             Ok(terminal) => {
+                                let frame_context = 1;
+                                let resolved = terminal.resize_pixels(
+                                    viewport.pixels.0,
+                                    viewport.pixels.1,
+                                    viewport.scale_factor,
+                                    frame_context,
+                                );
+                                if !pane_grid_mountable(resolved.columns, resolved.rows) {
+                                    too_small.push(pane_id.clone());
+                                    continue;
+                                }
+                                let (session, frames) = TerminalSession::spawn(
+                                    profile.clone(),
+                                    session_name.clone(),
+                                    pane_id.clone(),
+                                    mode,
+                                    resolved.columns,
+                                    resolved.rows,
+                                );
                                 terminal.set_focus(target.focused);
                                 panes.insert(
                                     pane_id.clone(),
@@ -122,19 +164,20 @@ impl OcHerdrView {
                                         frame: None,
                                         mode,
                                         focused: target.focused,
-                                        size: (cols, rows),
-                                        pixel_size: (0, 0),
-                                        viewport_ready: false,
-                                        frame_context: 0,
+                                        size: (resolved.columns, resolved.rows),
+                                        pixel_size: viewport.pixels,
+                                        viewport_ready: true,
+                                        frame_context,
                                         color_scheme_dark,
                                         palette_signature: palette.signature(),
                                         listen: None,
                                         exit_seen: false,
                                         scroll_px: 0.,
-                                        body_bounds: (0., 0., 0., 0.),
+                                        body_bounds: viewport.body_bounds,
                                         pending_resize: None,
                                     },
                                 );
+                                mounted += 1;
                                 spawned.insert(pane_id.clone());
                                 pending_listens.push((pane_id.clone(), frames));
                             }
@@ -150,7 +193,8 @@ impl OcHerdrView {
                     pane_tab,
                     visible_tab_id.as_deref(),
                     spawned.contains(pane_id),
-                ) {
+                ) && !optimistic_visible.contains(pane_id)
+                {
                     continue;
                 }
                 if let Some(runtime) = panes.get_mut(pane_id) {
@@ -158,9 +202,15 @@ impl OcHerdrView {
                 }
             }
         }
+        for pane_id in too_small {
+            if let Some(viewport) = self.pane_viewports.get_mut(&pane_id) {
+                viewport.mountable = false;
+            }
+        }
         if let Some(error) = palette_error {
             self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }
+        let spawn_failed = spawn_error.is_some();
         if let Some(error) = spawn_error {
             self.notify_failure(FailureKind::SpawnTerminal, error, cx);
         }
@@ -170,11 +220,33 @@ impl OcHerdrView {
                 runtime.listen = Some(task);
             }
         }
+        if mount_more && !spawn_failed {
+            self.schedule_pane_mount(cx);
+        }
     }
 
     pub(super) fn stop_session_terminals(&mut self) {
         self.pane_resize_serial = self.pane_resize_serial.wrapping_add(1);
         self.session_panes = None;
+        self.pane_viewports.clear();
+        self.pane_mount_scheduled = false;
+    }
+
+    fn schedule_pane_mount(&mut self, cx: &mut Context<Self>) {
+        if self.pane_mount_scheduled {
+            return;
+        }
+        self.pane_mount_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PANE_MOUNT_DELAY).await;
+            this.update(cx, |this, cx| {
+                this.pane_mount_scheduled = false;
+                this.ensure_session_terminals(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// A direct terminal interaction is an explicit request to take over this
@@ -223,7 +295,7 @@ impl OcHerdrView {
 
     pub(super) fn listen_pane(
         pane_id: String,
-        mut frames: UnboundedReceiver<std::result::Result<TerminalEvent, HerdrError>>,
+        mut frames: TerminalEventReceiver,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -269,8 +341,7 @@ impl OcHerdrView {
     ) -> bool {
         let composing = self.ime_marked.clone();
         let selected_pane = self.selection.pane_id.clone();
-        let visible_pane_ids =
-            visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
+        let visible_pane_ids = self.optimistic_visible_pane_ids();
         let mut error = None;
         let mut hierarchy_changed = false;
         let mut control_loss = None;
@@ -384,8 +455,7 @@ impl OcHerdrView {
         frame: Option<std::result::Result<RenderedFrame, ocherdr_terminal::TerminalError>>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let visible_pane_ids =
-            visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
+        let visible_pane_ids = self.optimistic_visible_pane_ids();
         let mut error = None;
         let mut changed = false;
         let mut hierarchy_changed = false;
@@ -426,23 +496,60 @@ impl OcHerdrView {
         keep
     }
 
-    /// Terminal grids stay put while the tab's geometry is only a preview
-    /// (design §5.4, §7.2): a pending relocation plan. They resize once,
-    /// when the authoritative layout is on screen.
+    /// Pane ids painted in the selected tab, including panes Herdr has
+    /// temporarily parked elsewhere during an optimistic template rebuild.
+    pub(crate) fn optimistic_visible_pane_ids(&self) -> HashSet<String> {
+        let mut visible =
+            visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
+        if let Some(tab_id) = self.selection.tab_id.as_deref()
+            && !self.pane_template_commits.contains_key(tab_id)
+            && let Some(layout) = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.layout_for(tab_id))
+            && layout.zoomed
+        {
+            visible.retain(|pane_id| pane_id == &layout.focused_pane_id);
+        }
+        if let Some(tab_id) = self.selection.tab_id.as_deref()
+            && let Some(pending) = self.pane_template_commits.get(tab_id)
+        {
+            visible.extend(pending.predicted_pane_ids().map(str::to_owned));
+        }
+        if let Some(tab_id) = self.selection.tab_id.as_deref()
+            && let Some(pending) = self
+                .pane_relocations
+                .get(tab_id)
+                .filter(|pending| pending.phase.locks_tab())
+        {
+            visible.extend(pending.plan.predicted_pane_ids().map(str::to_owned));
+        }
+        visible
+    }
+
+    /// Terminal grids stay put while free-form geometry is only a preview
+    /// (design §5.4, §7.2). Template destinations are already exact, so they
+    /// resize optimistically while Herdr rebuilds the same layout in back.
     pub(crate) fn pane_resize_frozen(&self, pane_id: &str) -> bool {
+        if self
+            .pane_template_commits
+            .values()
+            .any(|pending| pending.predicted_pane_ids().any(|id| id == pane_id))
+        {
+            return false;
+        }
         self.pane_tab_id(pane_id)
             .is_some_and(|tab_id| self.tab_resize_frozen(&tab_id))
             || self.pane_relocations.values().any(|pending| {
                 pending.phase.locks_tab()
                     && pending.plan.predicted_pane_ids().any(|id| id == pane_id)
             })
-            || self
-                .pane_template_commits
-                .values()
-                .any(|pending| pending.predicted_pane_ids().any(|id| id == pane_id))
     }
 
     pub(super) fn tab_resize_frozen(&self, tab_id: &str) -> bool {
+        if self.pane_template_commits.contains_key(tab_id) {
+            return false;
+        }
         self.tab_relocation_locked(tab_id)
             || self.tab_split_dragging(tab_id)
             || matches!(
@@ -513,6 +620,19 @@ impl OcHerdrView {
         let width_px = (body.2 * scale).round() as u32;
         let height_px = (body.3 * scale).round() as u32;
         let scale_factor = f64::from(scale);
+        let previous = self.pane_viewports.get(pane_id).copied();
+        let mountable = previous
+            .filter(|viewport| viewport.pixels == (width_px, height_px))
+            .is_none_or(|viewport| viewport.mountable);
+        self.pane_viewports.insert(
+            pane_id.to_owned(),
+            MeasuredPaneViewport {
+                body_bounds: body,
+                pixels: (width_px, height_px),
+                scale_factor,
+                mountable,
+            },
+        );
         let palette = current_terminal_palette(&self.appearance);
         let mut palette_error = None;
         let frozen = self.pane_resize_frozen(pane_id);
@@ -520,6 +640,7 @@ impl OcHerdrView {
         let mut scheduled = None;
         {
             let Some(runtime) = self.pane_mut(pane_id) else {
+                self.schedule_pane_mount(cx);
                 return;
             };
             runtime.body_bounds = body;
@@ -580,12 +701,13 @@ impl OcHerdrView {
         serial: u64,
         cx: &mut Context<Self>,
     ) {
-        let visible = self.pane_tab_id(pane_id).as_deref() == self.selection.tab_id.as_deref();
+        let visible = self.optimistic_visible_pane_ids().contains(pane_id);
         let frozen = self.pane_resize_frozen(pane_id);
         let observer_reconnect = self
             .current_session()
             .map(|session| (self.current_profile(), session.name.clone()));
         let mut replacement_frames = None;
+        let mut collapse = false;
         {
             let Some(runtime) = self.pane_mut(pane_id) else {
                 return;
@@ -607,6 +729,9 @@ impl OcHerdrView {
                 pending.scale_factor,
                 runtime.frame_context,
             );
+            if !pane_grid_mountable(resolved.columns, resolved.rows) {
+                collapse = true;
+            }
             let size = (resolved.columns, resolved.rows);
             let restart_observer = observer_session_needs_measured_restart(
                 runtime.viewport_ready,
@@ -621,7 +746,12 @@ impl OcHerdrView {
             runtime.size = size;
             runtime.pixel_size = pending.pixels;
             runtime.viewport_ready = pending.pixels.0 > 0 && pending.pixels.1 > 0;
-            if restart_observer && let Some((profile, session_name)) = observer_reconnect.as_ref() {
+            if collapse {
+                // Keep only the shell/dividers. A later, larger measurement
+                // makes the pane mountable again and creates a fresh stream.
+            } else if restart_observer
+                && let Some((profile, session_name)) = observer_reconnect.as_ref()
+            {
                 let (session, frames) = TerminalSession::spawn(
                     profile.clone(),
                     session_name.clone(),
@@ -644,7 +774,20 @@ impl OcHerdrView {
             // Resizing swaps the framebuffer context. Produce and collect the
             // first matching frame now instead of waiting for a pointer or key
             // event to take the same refresh path.
-            flush_pane_surface(runtime);
+            if !collapse {
+                flush_pane_surface(runtime);
+            }
+        }
+        if collapse {
+            if let Some(viewport) = self.pane_viewports.get_mut(pane_id) {
+                viewport.mountable = false;
+            }
+            if let Some(session) = self.session_panes.as_mut() {
+                session.controls.remove(pane_id);
+                session.panes.remove(pane_id);
+            }
+            cx.notify();
+            return;
         }
         if let Some(frames) = replacement_frames {
             let task = Self::listen_pane(pane_id.to_owned(), frames, cx);

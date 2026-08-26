@@ -118,3 +118,19 @@ fn pane_fractions_are_relative_to_a_non_zero_area_origin() {
     assert_eq!(pane_fractions(&layout, "left"), Some((0.0, 0.0, 0.5, 1.0)));
     assert_eq!(pane_fractions(&layout, "right"), Some((0.5, 0.0, 0.5, 1.0)));
 }
+
+#[test]
+fn zoomed_layout_only_exposes_the_focused_pane_at_full_size() {
+    let mut layout = pane_layout(
+        layout_rect(0, 0, 100, 50),
+        &[
+            ("left", layout_rect(0, 0, 50, 50)),
+            ("right", layout_rect(50, 0, 50, 50)),
+        ],
+    );
+    layout.zoomed = true;
+    layout.focused_pane_id = "right".into();
+
+    assert_eq!(pane_fractions(&layout, "left"), None);
+    assert_eq!(pane_fractions(&layout, "right"), Some((0.0, 0.0, 1.0, 1.0)));
+}

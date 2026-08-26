@@ -288,6 +288,15 @@ impl OcHerdrView {
                 .filter_map(|pane_id| snapshot.pane(pane_id).cloned())
                 .collect();
         }
+        if let Some(layout) = snapshot.layout_for(tab_id)
+            && layout.zoomed
+        {
+            return snapshot
+                .pane(&layout.focused_pane_id)
+                .cloned()
+                .into_iter()
+                .collect();
+        }
         snapshot.panes_for(tab_id).cloned().collect()
     }
 
@@ -558,12 +567,30 @@ impl OcHerdrView {
     }
 
     pub(crate) fn update_pane_drag(&mut self, mouse: (f32, f32), cx: &mut Context<Self>) -> bool {
+        self.update_pane_drag_with_template_hover(mouse, None, cx)
+    }
+
+    pub(crate) fn update_pane_drag_over_template(
+        &mut self,
+        mouse: (f32, f32),
+        template_hover: PaneTemplateHover,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.update_pane_drag_with_template_hover(mouse, Some(template_hover), cx)
+    }
+
+    fn update_pane_drag_with_template_hover(
+        &mut self,
+        mouse: (f32, f32),
+        painted_template_hover: Option<PaneTemplateHover>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(mut drag) = self.take_pane_drag() else {
             return false;
         };
         drag.pointer = mouse;
         let template_hover = if pane_drag_past_slop(&drag) && drag.layout_templates {
-            self.pane_template_hover_for(&drag)
+            painted_template_hover.or_else(|| self.pane_template_hover_for(&drag))
         } else {
             None
         };
@@ -633,6 +660,15 @@ impl OcHerdrView {
         let Some(mut drag) = self.take_pane_drag() else {
             return false;
         };
+        // A template cell resolves its hit against the geometry that was
+        // actually painted. Keep that semantic hit for the matching mouse-up
+        // instead of recalculating it from a terminal surface that may already
+        // have published bounds for the next frame.
+        let pointer_unchanged =
+            (drag.pointer.0 - mouse.0).abs() <= 0.5 && (drag.pointer.1 - mouse.1).abs() <= 0.5;
+        let painted_template_hover = pointer_unchanged
+            .then(|| drag.template_hover.clone())
+            .flatten();
         drag.pointer = mouse;
         cx.notify();
         if !pane_drag_past_slop(&drag) {
@@ -640,7 +676,7 @@ impl OcHerdrView {
             return true;
         }
         drag.template_hover = if drag.layout_templates {
-            self.pane_template_hover_for(&drag)
+            painted_template_hover.or_else(|| self.pane_template_hover_for(&drag))
         } else {
             None
         };
@@ -1195,6 +1231,9 @@ impl OcHerdrView {
         reduce_motion: bool,
     ) -> Option<(f32, f32, f32, f32)> {
         let layout = layout?;
+        if layout.zoomed {
+            return (layout.focused_pane_id == pane_id).then_some((0., 0., 1., 1.));
+        }
         if let Some(pending) = self.pane_template_commits.get(&layout.tab_id)
             && let Some(rect) = pending
                 .predicted_fractions(layout.area)
@@ -1250,8 +1289,12 @@ impl OcHerdrView {
         {
             return Some(rect);
         }
-        let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
-        layout_rect_fractions(layout.area, pane.rect)
+        squeezed_layout(layout, &[])
+            .and_then(|resolved| resolved.pane(pane_id))
+            .or_else(|| {
+                let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+                layout_rect_fractions(layout.area, pane.rect)
+            })
     }
 
     // ---- Keyboard move mode (design §11) ----

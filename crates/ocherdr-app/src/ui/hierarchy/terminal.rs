@@ -321,9 +321,10 @@ impl OcHerdrView {
                 .into_any_element(),
             );
         }
-        let squeezed = layout
-            .as_ref()
-            .and_then(|layout| self.squeezed_tab_layout(layout));
+        let squeezed = layout.as_ref().and_then(|layout| {
+            self.squeezed_tab_layout(layout)
+                .or_else(|| squeezed_layout(layout, &[]))
+        });
         let dragged_split = match &self.surface_drag {
             SurfaceDrag::Split(drag) if drag.tab_id == tab_id => Some(drag.path.clone()),
             _ => None,
@@ -333,7 +334,7 @@ impl OcHerdrView {
         // until the drag ends; the tab is already gesture-locked.
         let split_handles = layout
             .as_ref()
-            .filter(|_| pane_drag.is_none())
+            .filter(|layout| pane_drag.is_none() && !layout.zoomed)
             .map(|layout| {
                 layout
                     .splits
@@ -343,20 +344,7 @@ impl OcHerdrView {
                         // While a divider is dragged every handle in the tab
                         // follows the squeeze preview, including nested ones
                         // whose rects the dragged split moves.
-                        let geometry = squeezed
-                            .as_ref()
-                            .and_then(|squeezed| squeezed.split(&path))
-                            .or_else(|| {
-                                Some((
-                                    rect_fractions(layout.area, split.rect)?,
-                                    split_line_fraction(
-                                        layout.area,
-                                        split.rect,
-                                        split.direction,
-                                        split.ratio,
-                                    )?,
-                                ))
-                            })?;
+                        let geometry = squeezed.as_ref()?.split(&path)?;
                         let dragging = dragged_split.as_deref() == Some(path.as_slice());
                         render_split_handle(
                             split,
@@ -571,6 +559,9 @@ impl OcHerdrView {
             .as_ref()
             .filter(|_| droppable)
             .map(|hover| render_drop_highlight(hover, true, origin, reduce_motion));
+        let template_highlight = self
+            .terminal_surface_bounds
+            .and_then(|surface| render_pane_template_target_highlight(drag, surface, origin, i18n));
         // The zone label goes above the preview: the floating card follows
         // the pointer, which sits inside the target, so a label drawn in the
         // highlight itself would be hidden under the card.
@@ -585,8 +576,9 @@ impl OcHerdrView {
                 .layout_for(&drag.tab_id)
                 .map(|layout| layout.panes.len())
                 .unwrap_or_default();
-            self.terminal_surface_bounds
-                .and_then(|surface| render_pane_template_palette(drag, pane_count, surface, i18n))
+            self.terminal_surface_bounds.and_then(|surface| {
+                render_pane_template_palette(drag, pane_count, surface, i18n, cx)
+            })
         });
         let frame = self
             .pane(&drag.pane_id)
@@ -654,6 +646,7 @@ impl OcHerdrView {
                 cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
             )
             .children(highlight)
+            .children(template_highlight)
             .children(preview)
             .children(zone_label)
             .children(palette.into_iter().flatten())

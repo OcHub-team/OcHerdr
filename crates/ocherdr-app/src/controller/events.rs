@@ -15,29 +15,22 @@ impl OcHerdrView {
         })
     }
 
-    /// Reset the startup replay quiet-period deadline. Herdr has no replay
-    /// completion marker, so a matching timer is the local presentation
-    /// barrier: it fetches the final snapshot without ever applying retained
-    /// layout history to the rendered hierarchy.
-    pub(super) fn schedule_startup_event_replay_settle(&mut self, cx: &mut Context<Self>) {
-        self.startup_event_replay_serial = self.startup_event_replay_serial.wrapping_add(1);
-        let serial = self.startup_event_replay_serial;
+    pub(super) fn schedule_startup_replay_quiet(&mut self, cx: &mut Context<Self>) {
+        self.startup_replay_serial = self.startup_replay_serial.wrapping_add(1);
+        let serial = self.startup_replay_serial;
         let epoch = self.event_epoch;
-        self.startup_event_replay = Some(StartupEventReplay::Draining { serial });
+        self.startup_replay_sync = Some(StartupReplaySync::Draining { serial });
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(STARTUP_EVENT_REPLAY_SETTLE_DELAY)
+                .timer(STARTUP_REPLAY_QUIET_DELAY)
                 .await;
             this.update(cx, |this, cx| {
                 if this.event_epoch != epoch
-                    || this.startup_event_replay != Some(StartupEventReplay::Draining { serial })
+                    || this.startup_replay_sync != Some(StartupReplaySync::Draining { serial })
                 {
                     return;
                 }
-                this.startup_event_replay = Some(StartupEventReplay::Refreshing);
-                // This refresh supersedes requests deferred while the replay
-                // was draining. New arrivals during the request set it again.
-                this.snapshot_refresh_pending = false;
+                this.startup_replay_sync = Some(StartupReplaySync::Refreshing);
                 this.resync_snapshot(epoch, cx);
             })
             .ok();
@@ -45,7 +38,11 @@ impl OcHerdrView {
         .detach();
     }
 
-    pub(super) fn quarantine_startup_event_batch(
+    /// During retained-history replay, payload order is not authoritative for
+    /// the current UI. Treat every batch as an invalidation and immediately
+    /// fetch Herdr's current snapshot. Snapshot refresh is single-flight, so a
+    /// long replay becomes at most one active request plus one pending refresh.
+    pub(super) fn refresh_during_startup_replay(
         &mut self,
         items: Vec<std::result::Result<HerdrEvent, HerdrError>>,
         cx: &mut Context<Self>,
@@ -56,7 +53,7 @@ impl OcHerdrView {
                 Ok(_) => {}
                 Err(error) if error.is_event_payload_error() => payload_error = Some(error),
                 Err(error) => {
-                    self.startup_event_replay = None;
+                    self.startup_replay_sync = None;
                     self.event_stream = EventStreamState::Lost(error.to_string().into());
                     self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
                     cx.notify();
@@ -67,17 +64,15 @@ impl OcHerdrView {
         if let Some(error) = payload_error {
             self.notify_failure(FailureKind::ApplyLiveUpdate, error, cx);
         }
-        match startup_event_batch_plan(self.startup_event_replay.as_ref()) {
-            StartupEventBatchPlan::Apply => unreachable!("startup replay gate disappeared"),
-            StartupEventBatchPlan::QuarantineAndResettle => {
-                self.schedule_startup_event_replay_settle(cx);
+        match self.startup_replay_sync {
+            Some(StartupReplaySync::Draining { .. }) => {
+                self.resync_snapshot(self.event_epoch, cx);
+                self.schedule_startup_replay_quiet(cx);
             }
-            StartupEventBatchPlan::QuarantineAndRefreshAgain => {
-                // The in-flight snapshot may have been captured before this
-                // event. A follow-up snapshot closes that race without ever
-                // rendering the event's historical intermediate state.
+            Some(StartupReplaySync::Refreshing) => {
                 self.snapshot_refresh_pending = true;
             }
+            None => unreachable!("startup replay state disappeared"),
         }
         true
     }
@@ -87,19 +82,12 @@ impl OcHerdrView {
         batch: Option<Vec<std::result::Result<HerdrEvent, HerdrError>>>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let batch = if startup_event_batch_plan(self.startup_event_replay.as_ref())
-            != StartupEventBatchPlan::Apply
-        {
+        if self.startup_replay_sync.is_some() {
             match batch {
-                Some(items) => return self.quarantine_startup_event_batch(items, cx),
-                None => {
-                    self.startup_event_replay = None;
-                    None
-                }
+                Some(items) => return self.refresh_during_startup_replay(items, cx),
+                None => self.startup_replay_sync = None,
             }
-        } else {
-            batch
-        };
+        }
         let old_tab = self.selection.tab_id.clone();
         let old_selected = self.selection.pane_id.clone();
         let old_panes = self
@@ -398,16 +386,6 @@ impl OcHerdrView {
     }
 
     pub(crate) fn resync_snapshot(&mut self, epoch: u64, cx: &mut Context<Self>) {
-        if matches!(
-            self.startup_event_replay,
-            Some(StartupEventReplay::Draining { .. })
-        ) {
-            // Agent-status setup and recoverable payload errors can ask for a
-            // resync during EventHub replay. The post-replay snapshot serves
-            // all of them and avoids exposing a partial historical layout.
-            self.snapshot_refresh_pending = true;
-            return;
-        }
         if snapshot_refresh_should_queue(self.snapshot_refreshing) {
             self.snapshot_refresh_pending = true;
             return;
@@ -482,8 +460,8 @@ impl OcHerdrView {
                 }
                 if this.snapshot_refresh_pending {
                     this.resync_snapshot(epoch, cx);
-                } else if this.startup_event_replay == Some(StartupEventReplay::Refreshing) {
-                    this.startup_event_replay = None;
+                } else if this.startup_replay_sync == Some(StartupReplaySync::Refreshing) {
+                    this.startup_replay_sync = None;
                 }
                 if snapshot_handoff_should_release(this.snapshot_refreshing) {
                     this.release_agent_status_handoff(cx);

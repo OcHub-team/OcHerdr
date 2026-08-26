@@ -114,10 +114,15 @@ const PANE_SETTLE_ANIMATION: Duration = Duration::from_millis(160);
 /// frames. Coalesce them before resizing Ghostty or replacing an observer so
 /// stale geometry never makes a pane repeatedly blank and reflow.
 const PANE_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
-/// Session-wide subscriptions replay retained history from sequence zero.
-/// Treat a short quiet period as the end of that startup burst, then install
-/// one fresh snapshot instead of rendering every historical layout.
-const STARTUP_EVENT_REPLAY_SETTLE_DELAY: Duration = Duration::from_millis(150);
+/// Ghostty surface construction is intentionally spread across UI turns.
+/// Creating every visible pane in one snapshot callback can starve GPUI long
+/// enough for the app to look hung.
+const PANE_MOUNT_BATCH_SIZE: usize = 1;
+const PANE_MOUNT_DELAY: Duration = Duration::from_millis(1);
+/// Herdr does not mark the end of retained EventHub replay. This quiet period
+/// only decides when OcHerdr may resume applying incremental payloads; current
+/// snapshots are refreshed throughout replay and remain visible immediately.
+const STARTUP_REPLAY_QUIET_DELAY: Duration = Duration::from_millis(150);
 /// Share of the target pane it keeps on an edge drop (design §5.3: 0.5 in
 /// the first version; presets come later).
 const PANE_EDGE_DROP_RATIO: f32 = 0.5;
@@ -300,28 +305,9 @@ pub(crate) enum EventStreamState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartupEventReplay {
-    /// Historical events are still arriving. Their payloads are quarantined
-    /// and each batch moves the quiet-period deadline forward.
+enum StartupReplaySync {
     Draining { serial: u64 },
-    /// Replay went quiet and an authoritative snapshot is in flight. Events
-    /// arriving now request one more snapshot instead of mutating the UI.
     Refreshing,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartupEventBatchPlan {
-    Apply,
-    QuarantineAndResettle,
-    QuarantineAndRefreshAgain,
-}
-
-fn startup_event_batch_plan(replay: Option<&StartupEventReplay>) -> StartupEventBatchPlan {
-    match replay {
-        None => StartupEventBatchPlan::Apply,
-        Some(StartupEventReplay::Draining { .. }) => StartupEventBatchPlan::QuarantineAndResettle,
-        Some(StartupEventReplay::Refreshing) => StartupEventBatchPlan::QuarantineAndRefreshAgain,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,6 +326,16 @@ struct SessionPanes {
     controls: HashMap<String, TerminalMode>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MeasuredPaneViewport {
+    body_bounds: (f32, f32, f32, f32),
+    pixels: (u32, u32),
+    scale_factor: f64,
+    /// False after Ghostty resolves the viewport below Herdr's 4x2 minimum.
+    /// A changed measurement makes it eligible again.
+    mountable: bool,
+}
+
 impl SessionPanes {
     fn new(owner: SessionKey) -> Self {
         Self {
@@ -351,9 +347,9 @@ impl SessionPanes {
 }
 
 struct PaneRuntime {
-    /// Panes observe by default. Explicitly controlled panes are writable;
-    /// snapshot panes stay alive across tabs so hidden terminals keep their
-    /// Ghostty surface, last Metal frame, and observe stream.
+    /// Painted panes observe by default. Explicitly controlled panes are
+    /// writable. Hidden panes have no runtime; switching tabs recreates them
+    /// after the new shell has supplied its measured viewport.
     session: TerminalSession,
     terminal: Terminal,
     frame: Option<RenderedFrame>,
@@ -730,10 +726,10 @@ struct OcHerdrView {
     event_stream: EventStreamState,
     /// Dropping this cancels the session-wide event await loop.
     event_listen: Option<Task<()>>,
-    /// Startup-only barrier that keeps EventHub history out of the rendered
-    /// hierarchy until one post-replay snapshot has landed.
-    startup_event_replay: Option<StartupEventReplay>,
-    startup_event_replay_serial: u64,
+    /// Retained events are invalidations until replay goes quiet. Unlike the
+    /// old barrier, every replay batch refreshes the visible current snapshot.
+    startup_replay_sync: Option<StartupReplaySync>,
+    startup_replay_serial: u64,
     /// Dropping this cancels the per-pane agent-status await loop.
     agent_status_listen: Option<Task<()>>,
     /// In-flight agent-status subscribe that will replace `agent_status_listen`.
@@ -759,6 +755,10 @@ struct OcHerdrView {
     snapshot_refreshing: bool,
     snapshot_refresh_pending: bool,
     session_panes: Option<SessionPanes>,
+    /// Geometry belongs to the lightweight pane shell, not the Ghostty
+    /// runtime. It lets a pane be measured before its native surface exists.
+    pane_viewports: HashMap<String, MeasuredPaneViewport>,
+    pane_mount_scheduled: bool,
     overlay: Overlay,
     open_select: Option<SharedString>,
     appearance_scroll: ScrollHandle,

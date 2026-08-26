@@ -17,7 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use futures::channel::mpsc::{self as futures_mpsc, UnboundedReceiver};
+use futures::channel::mpsc::{self as futures_mpsc, Receiver, UnboundedReceiver};
+use futures::{FutureExt as _, SinkExt as _, Stream};
 use ocherdr_core::{
     AgentStatus, ConnectionProfile, HerdrEvent, HierarchySnapshot, MINIMUM_HERDR_VERSION,
     SessionSummary,
@@ -852,14 +853,17 @@ const STREAM_BATCH_LIMIT: usize = 128;
 
 /// Await the next item, then drain already-ready items.
 /// `None` means the stream has closed.
-pub async fn next_batch<T>(rx: &mut UnboundedReceiver<T>) -> Option<Vec<T>> {
+pub async fn next_batch<T, S>(rx: &mut S) -> Option<Vec<T>>
+where
+    S: Stream<Item = T> + Unpin,
+{
     use futures::StreamExt as _;
     let first = rx.next().await?;
     let mut batch = vec![first];
     while batch.len() < STREAM_BATCH_LIMIT {
-        match rx.try_recv() {
-            Ok(item) => batch.push(item),
-            Err(_) => break,
+        match rx.next().now_or_never().flatten() {
+            Some(item) => batch.push(item),
+            None => break,
         }
     }
     Some(batch)
@@ -1163,6 +1167,12 @@ pub struct TerminalSession {
     alive: Arc<AtomicBool>,
 }
 
+/// A small queue deliberately applies backpressure to Herdr's terminal
+/// reader. Full frames can be large; an unbounded queue made a temporarily
+/// stalled GPUI retain every frame for every pane.
+pub type TerminalEventReceiver = Receiver<Result<TerminalEvent>>;
+const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4;
+
 impl TerminalSession {
     pub fn spawn(
         profile: ConnectionProfile,
@@ -1171,9 +1181,10 @@ impl TerminalSession {
         mode: TerminalMode,
         cols: u16,
         rows: u16,
-    ) -> (Self, UnboundedReceiver<Result<TerminalEvent>>) {
+    ) -> (Self, TerminalEventReceiver) {
         let (command_tx, command_rx) = mpsc::channel::<TerminalCommand>();
-        let (event_tx, event_rx) = futures_mpsc::unbounded::<Result<TerminalEvent>>();
+        let (mut event_tx, event_rx) =
+            futures_mpsc::channel::<Result<TerminalEvent>>(TERMINAL_EVENT_QUEUE_CAPACITY);
         let process_id = Arc::new(AtomicU32::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let worker_process_id = process_id.clone();
@@ -1184,7 +1195,7 @@ impl TerminalSession {
                 Ok(stream) => stream,
                 Err(error) => {
                     worker_alive.store(false, Ordering::Release);
-                    let _ = event_tx.unbounded_send(Err(error));
+                    let _ = futures::executor::block_on(event_tx.send(Err(error)));
                     return;
                 }
             };
@@ -1204,13 +1215,13 @@ impl TerminalSession {
             loop {
                 match stream.read_event() {
                     Ok(Some(event)) => {
-                        if event_tx.unbounded_send(Ok(event)).is_err() {
+                        if futures::executor::block_on(event_tx.send(Ok(event))).is_err() {
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = event_tx.unbounded_send(Err(error));
+                        let _ = futures::executor::block_on(event_tx.send(Err(error)));
                         break;
                     }
                 }

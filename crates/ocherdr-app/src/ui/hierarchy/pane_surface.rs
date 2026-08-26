@@ -4,42 +4,15 @@ pub(super) fn pane_fractions(
     layout: &ocherdr_core::PaneLayout,
     pane_id: &str,
 ) -> Option<(f32, f32, f32, f32)> {
-    let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
-    rect_fractions(layout.area, pane.rect)
-}
-
-pub(super) fn rect_fractions(
-    area: ocherdr_core::LayoutRect,
-    rect: ocherdr_core::LayoutRect,
-) -> Option<(f32, f32, f32, f32)> {
-    let area_w = f32::from(area.width);
-    let area_h = f32::from(area.height);
-    if area_w == 0. || area_h == 0. {
-        return None;
+    if layout.zoomed {
+        return (layout.focused_pane_id == pane_id).then_some((0., 0., 1., 1.));
     }
-    Some((
-        (f32::from(rect.x) - f32::from(area.x)) / area_w,
-        (f32::from(rect.y) - f32::from(area.y)) / area_h,
-        f32::from(rect.width) / area_w,
-        f32::from(rect.height) / area_h,
-    ))
-}
-
-/// Where the divider of a settled split sits: on the far edge of the first
-/// child as Herdr rounds it to cells, the same boundary the pane frames
-/// use, so the line and the frames never disagree by a fraction of a cell.
-pub(super) fn split_line_fraction(
-    area: ocherdr_core::LayoutRect,
-    rect: ocherdr_core::LayoutRect,
-    direction: SplitDirection,
-    ratio: f32,
-) -> Option<f32> {
-    let (first, _) = ocherdr_core::split_rect(rect, direction, ratio);
-    let (x, y, w, h) = rect_fractions(area, first)?;
-    Some(match direction {
-        SplitDirection::Right => x + w,
-        SplitDirection::Down => y + h,
-    })
+    squeezed_layout(layout, &[])
+        .and_then(|resolved| resolved.pane(pane_id))
+        .or_else(|| {
+            let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+            layout_rect_fractions(layout.area, pane.rect)
+        })
 }
 
 /// Divider of one split (design §5.4): a 10 px hit strip. Its line stays

@@ -59,6 +59,43 @@ fn a_two_pane_template_parks_then_rebuilds_the_tab(cx: &mut TestAppContext) {
             this.surface_drag,
             this.pane_drag_return.is_some(),
         );
+        assert!(
+            !this.tab_resize_frozen("t-a"),
+            "an exact template prediction must render at its final size immediately"
+        );
+        assert!(!this.pane_resize_frozen("p-left"));
+        assert!(!this.pane_resize_frozen("p-right"));
+
+        // Herdr parks panes in hidden tabs while rebuilding. Their
+        // authoritative tab id may change, but locally they remain visible
+        // in the optimistic final layout and must keep producing frames.
+        {
+            let pane = this
+                .snapshot
+                .as_mut()
+                .and_then(|snapshot| {
+                    snapshot
+                        .panes
+                        .iter_mut()
+                        .find(|pane| pane.pane_id == "p-left")
+                })
+                .expect("source pane");
+            pane.tab_id = "temporary-template-tab".into();
+        }
+        let visible = this.optimistic_visible_pane_ids();
+        assert!(visible.contains("p-left"));
+        assert!(visible.contains("p-right"));
+        assert!(!this.pane_resize_frozen("p-left"));
+        this.snapshot
+            .as_mut()
+            .and_then(|snapshot| {
+                snapshot
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == "p-left")
+            })
+            .expect("source pane")
+            .tab_id = "t-a".into();
     });
     cx.run_until_parked();
 
@@ -87,6 +124,80 @@ fn a_two_pane_template_parks_then_rebuilds_the_tab(cx: &mut TestAppContext) {
         assert!(this.pane_template_commits.is_empty());
         assert!(!this.tab_relocation_locked("t-a"));
     });
+}
+
+#[gpui::test]
+fn the_painted_template_card_owns_its_hit_geometry(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    cx.run_until_parked();
+    let surface = view.read_with(cx, |this, _| {
+        this.terminal_surface_bounds
+            .expect("terminal surface bounds")
+    });
+    view.update(cx, |this, cx| {
+        this.terminal_surface_bounds = Some(surface);
+        let grab = (surface.0 + 20., surface.1 + 80.);
+        assert!(this.begin_pane_drag("p-left".into(), grab));
+        assert!(this.update_pane_drag((grab.0 + 40., grab.1 + 30.), cx));
+    });
+    cx.run_until_parked();
+
+    let surface = view.read_with(cx, |this, _| {
+        this.terminal_surface_bounds.expect("drag surface bounds")
+    });
+    let painted_card = cx
+        .debug_bounds("pane-layout-template-0")
+        .expect("painted template card");
+    let card = (
+        f32::from(painted_card.origin.x),
+        f32::from(painted_card.origin.y),
+        f32::from(painted_card.size.width),
+        f32::from(painted_card.size.height),
+    );
+    view.update(cx, |this, _| {
+        this.terminal_surface_bounds =
+            Some((surface.0 + 2_000., surface.1 + 2_000., surface.2, surface.3));
+    });
+    let pointer = (card.0 + card.2 / 2., card.1 + card.3 / 2.);
+    let newer_surface = view.read_with(cx, |this, _| this.terminal_surface_bounds.unwrap());
+    assert!(
+        crate::pane_template_hover(newer_surface, 2, pointer).is_none(),
+        "the global geometry deliberately no longer matches the painted card"
+    );
+    cx.simulate_mouse_move(
+        gpui::point(gpui::px(pointer.0), gpui::px(pointer.1)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    view.read_with(cx, |this, _| {
+        let crate::SurfaceDrag::Pane(drag) = &this.surface_drag else {
+            panic!("pane drag");
+        };
+        assert!(
+            drag.template_hover.is_some(),
+            "the painted card must resolve its own semantic slot: pointer={:?}, card={card:?}, surface={surface:?}",
+            drag.pointer,
+        );
+    });
+
+    // The release must consume the same semantic hit even if a newer surface
+    // measurement arrives before the mouse-up is dispatched.
+    view.update(cx, |this, _| {
+        this.terminal_surface_bounds =
+            Some((surface.0 + 2_000., surface.1 + 2_000., surface.2, surface.3));
+    });
+    cx.simulate_mouse_up(
+        gpui::point(gpui::px(pointer.0), gpui::px(pointer.1)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        !fake.requests_for("pane.move").is_empty(),
+        "releasing over the painted slot must commit its template"
+    );
 }
 
 #[gpui::test]

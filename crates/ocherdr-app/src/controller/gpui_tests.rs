@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{Entity, TestAppContext, VisualTestContext, prelude::*};
 use ocherdr_core::{
-    AgentInfo, AgentStatus, ConnectionProfile, HerdrEvent, HierarchySnapshot, PaneInfo,
-    ReorderHover, Selection, SessionSummary, TabInfo, WorkspaceInfo,
+    AgentInfo, AgentStatus, ConnectionProfile, HierarchySnapshot, PaneInfo, ReorderHover,
+    Selection, SessionSummary, TabInfo, WorkspaceInfo,
 };
 use ocherdr_herdr::{HostHealthStatus, SessionConnection, TerminalMode};
 use serde_json::{Value, json};

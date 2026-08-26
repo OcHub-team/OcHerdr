@@ -630,6 +630,30 @@ fn key(name: &str, control: bool) -> gpui::KeyDownEvent {
     }
 }
 
+fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestContext) {
+    view.update_in(cx, |this, window, cx| {
+        for (pane_id, x) in [("p-left", 0.), ("p-right", 400.)] {
+            this.sync_measured_pane_body(
+                pane_id,
+                gpui::Bounds {
+                    origin: gpui::point(gpui::px(x), gpui::px(0.)),
+                    size: gpui::size(gpui::px(400.), gpui::px(300.)),
+                },
+                window,
+                cx,
+            );
+        }
+        // The production scheduler spreads one mount over each wall-clock
+        // turn. GPUI's parked test executor does not advance that timer, so
+        // drive the same two batches explicitly after supplying geometry.
+        for _ in 0..2 {
+            this.pane_mount_scheduled = false;
+            this.ensure_session_terminals(cx);
+        }
+    });
+    cx.run_until_parked();
+}
+
 /// Real Ghostty surfaces (not `headless_terminals`): a key press takes control,
 /// then libghostty encodes it and sends its bytes to that pane's stream.
 #[gpui::test]
@@ -638,6 +662,7 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
+    measure_two_terminal_bodies(&view, cx);
     view.update_in(cx, |this, window, cx| {
         assert_eq!(this.selection.pane_id.as_deref(), Some("p-left"));
         assert!(
@@ -673,6 +698,7 @@ fn wheel_interaction_controls_each_hovered_pane_without_changing_focus(cx: &mut 
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
+    measure_two_terminal_bodies(&view, cx);
 
     view.update(cx, |this, cx| {
         assert_eq!(this.selection.pane_id.as_deref(), Some("p-left"));

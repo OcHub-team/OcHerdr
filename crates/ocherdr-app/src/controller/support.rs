@@ -120,6 +120,10 @@ pub(super) enum PaneResizeSchedule {
     Replace,
 }
 
+pub(super) fn pane_grid_mountable(cols: u16, rows: u16) -> bool {
+    cols >= 4 && rows >= 2
+}
+
 /// What a measured pane body means for the terminal: the grid follows the
 /// body once it is authoritative, and every stream receives the size. Herdr
 /// applies it to the shared PTY only for control streams; observe streams get
@@ -1143,7 +1147,7 @@ pub(super) fn sync_pane_session(
     profile: ConnectionProfile,
     session_name: String,
     pane_id: String,
-) -> Option<UnboundedReceiver<std::result::Result<TerminalEvent, HerdrError>>> {
+) -> Option<TerminalEventReceiver> {
     if runtime.focused != focused {
         runtime.terminal.set_focus(focused);
         runtime.focused = focused;

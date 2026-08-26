@@ -11,12 +11,12 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::mpsc::{self, Receiver as StdReceiver};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 
 use futures::Stream;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{Receiver, Sender};
 
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFRelease, TCFType as _};
@@ -417,7 +417,7 @@ struct PendingFrame {
 
 struct CallbackState {
     surface: Weak<SurfaceCore>,
-    frames: UnboundedSender<PendingFrame>,
+    frames: Mutex<Sender<PendingFrame>>,
     input: mpsc::Sender<Vec<u8>>,
 }
 
@@ -459,6 +459,10 @@ impl Drop for SurfaceCore {
 
 struct GhosttyRuntime {
     app: NonNull<c_void>,
+    /// `ghostty_app_update_config` broadcasts to every surface. Reapplying
+    /// the same palette once per pane turns pane creation into quadratic
+    /// work and can re-enter surfaces that are still being constructed.
+    palette_signature: Mutex<Option<u64>>,
 }
 
 // The runtime is process-global and Ghostty owns its internal synchronization.
@@ -523,7 +527,10 @@ impl GhosttyRuntime {
             let app =
                 NonNull::new(app).ok_or_else(|| "ghostty_app_new returned null".to_owned())?;
             ffi::ghostty_app_set_focus(app.as_ptr(), true);
-            Ok(Self { app })
+            Ok(Self {
+                app,
+                palette_signature: Mutex::new(None),
+            })
         }
     }
 
@@ -543,9 +550,19 @@ impl GhosttyRuntime {
     }
 
     fn apply_palette(&self, palette: &TerminalPalette) -> Result<(), TerminalError> {
+        let signature = palette.signature();
+        let mut applied = self
+            .palette_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *applied == Some(signature) {
+            return Ok(());
+        }
         with_palette_config(palette, |config| unsafe {
             ffi::ghostty_app_update_config(self.app.as_ptr(), config);
-        })
+        })?;
+        *applied = Some(signature);
+        Ok(())
     }
 }
 
@@ -734,7 +751,12 @@ unsafe extern "C" fn present_frame(
             token: AtomicU64::new(frame.frame_token),
         }),
     };
-    match callback.frames.unbounded_send(pending) {
+    let sent = callback
+        .frames
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .try_send(pending);
+    match sent {
         Ok(()) => {
             ffi::ghostty_metal_external_frame_disposition_e_GHOSTTY_METAL_EXTERNAL_FRAME_ACQUIRE
         }
@@ -761,8 +783,8 @@ unsafe extern "C" fn write_input(userdata: *mut c_void, bytes: *const c_char, le
 
 pub struct Terminal {
     surface: Arc<SurfaceCore>,
-    frames: UnboundedReceiver<PendingFrame>,
-    input: Receiver<Vec<u8>>,
+    frames: Receiver<PendingFrame>,
+    input: StdReceiver<Vec<u8>>,
 }
 
 impl Terminal {
@@ -775,7 +797,10 @@ impl Terminal {
         let runtime = GhosttyRuntime::shared()?;
         runtime.apply_palette(palette)?;
         runtime.set_color_scheme(palette.dark);
-        let (frame_sender, frames) = futures::channel::mpsc::unbounded();
+        // Metal presentation callbacks cannot block. Keep one pending lease;
+        // when GPUI is behind, Ghostty drops newer callbacks and releases
+        // their tokens immediately instead of growing an unbounded queue.
+        let (frame_sender, frames) = futures::channel::mpsc::channel(1);
         let (input_sender, input) = mpsc::channel();
         let surface = Arc::new(SurfaceCore {
             raw: AtomicPtr::new(std::ptr::null_mut()),
@@ -783,7 +808,7 @@ impl Terminal {
         });
         let callback = Arc::new(CallbackState {
             surface: Arc::downgrade(&surface),
-            frames: frame_sender,
+            frames: Mutex::new(frame_sender),
             input: input_sender,
         });
         let callback_pointer = Arc::into_raw(callback).cast_mut();
@@ -825,7 +850,7 @@ impl Terminal {
             input,
         };
         terminal.set_grid_size(cols, rows)?;
-        terminal.apply_palette(palette)?;
+        terminal.apply_surface_palette(palette)?;
         terminal.set_focus(false);
         terminal.refresh();
         Ok(terminal)
@@ -1139,6 +1164,10 @@ impl Terminal {
         let runtime = GhosttyRuntime::shared()?;
         runtime.apply_palette(palette)?;
         runtime.set_color_scheme(palette.dark);
+        self.apply_surface_palette(palette)
+    }
+
+    fn apply_surface_palette(&self, palette: &TerminalPalette) -> Result<(), TerminalError> {
         with_palette_config(palette, |config| unsafe {
             ffi::ghostty_surface_update_config(self.raw(), config);
         })?;

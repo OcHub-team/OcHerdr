@@ -341,6 +341,13 @@ fn target(pane_id: &str, mode: TerminalMode, focused: bool) -> PaneRuntimeTarget
 }
 
 #[test]
+fn tiny_pane_grids_stay_as_shells_until_herdrs_minimum_fits() {
+    assert!(!pane_grid_mountable(3, 24));
+    assert!(!pane_grid_mountable(80, 1));
+    assert!(pane_grid_mountable(4, 2));
+}
+
+#[test]
 fn session_targets_every_snapshot_pane_as_observers_by_default() {
     let snapshot = two_tab_snapshot();
     let targets = snapshot_runtime_targets(&snapshot, &HashMap::new(), Some("t-a"), Some("p-a"));
@@ -984,25 +991,6 @@ fn a_successful_subscription_is_live() {
     let (_tx, rx) = futures::channel::mpsc::unbounded();
     let loaded = LoadedEvents::from_subscribe(Ok(EventSubscription::new(rx)));
     assert!(matches!(loaded, LoadedEvents::Live(_)));
-}
-
-#[test]
-fn startup_history_is_quarantined_until_the_final_snapshot_lands() {
-    assert_eq!(
-        startup_event_batch_plan(None),
-        StartupEventBatchPlan::Apply,
-        "steady-state events update the live snapshot"
-    );
-    assert_eq!(
-        startup_event_batch_plan(Some(&StartupEventReplay::Draining { serial: 7 })),
-        StartupEventBatchPlan::QuarantineAndResettle,
-        "retained history must only extend the replay quiet period"
-    );
-    assert_eq!(
-        startup_event_batch_plan(Some(&StartupEventReplay::Refreshing)),
-        StartupEventBatchPlan::QuarantineAndRefreshAgain,
-        "an event racing the final snapshot requests another snapshot"
-    );
 }
 
 #[test]

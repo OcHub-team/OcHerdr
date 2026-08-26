@@ -3,7 +3,6 @@ use std::task::Poll;
 
 use ocherdr_core::{WorkspaceInfo, WorktreeInfo, WorktreeList, WorktreeSourceInfo};
 
-use futures::channel::mpsc::UnboundedReceiver;
 use futures::future::{self, Either, poll_fn};
 use futures::pin_mut;
 use ocherdr_core::{
@@ -12,7 +11,7 @@ use ocherdr_core::{
     agent_status_stream_should_rebuild, event_panes_after_failed_subscribe, parse_agent_name,
     reorder_hover_along_axis, reorder_insert_index,
 };
-use ocherdr_herdr::{TerminalEvent, next_batch, subscribe_agent_status};
+use ocherdr_herdr::{TerminalEvent, TerminalEventReceiver, next_batch, subscribe_agent_status};
 
 use ochub_ui::notifications::NotificationHost;
 
@@ -120,8 +119,8 @@ impl OcHerdrView {
             herdr_capabilities: HerdrCapabilities::default(),
             event_stream: EventStreamState::Idle,
             event_listen: None,
-            startup_event_replay: None,
-            startup_event_replay_serial: 0,
+            startup_replay_sync: None,
+            startup_replay_serial: 0,
             agent_status_listen: None,
             agent_status_rebuild: None,
             agent_status_panes: HashSet::new(),
@@ -141,6 +140,8 @@ impl OcHerdrView {
             snapshot_refreshing: false,
             snapshot_refresh_pending: false,
             session_panes: None,
+            pane_viewports: HashMap::new(),
+            pane_mount_scheduled: false,
             overlay: Overlay::None,
             open_select: None,
             appearance_scroll: ScrollHandle::new(),
@@ -274,8 +275,8 @@ impl OcHerdrView {
         self.event_epoch = self.event_epoch.wrapping_add(1);
         self.event_listen = None;
         self.event_stream = EventStreamState::Idle;
-        self.startup_event_replay = None;
-        self.startup_event_replay_serial = self.startup_event_replay_serial.wrapping_add(1);
+        self.startup_replay_sync = None;
+        self.startup_replay_serial = self.startup_replay_serial.wrapping_add(1);
         self.agent_status_listen = None;
         self.agent_status_rebuild = None;
         self.agent_status_panes.clear();
@@ -361,7 +362,7 @@ impl OcHerdrView {
                             }
                             LoadedEvents::Live(subscription) => {
                                 this.event_stream = EventStreamState::Live;
-                                this.schedule_startup_event_replay_settle(cx);
+                                this.schedule_startup_replay_quiet(cx);
                                 this.event_listen = Some(Self::listen_events(subscription, cx));
                             }
                         }
@@ -374,7 +375,7 @@ impl OcHerdrView {
                         this.herdr_capabilities = HerdrCapabilities::default();
                         this.event_stream = EventStreamState::Idle;
                         this.event_listen = None;
-                        this.startup_event_replay = None;
+                        this.startup_replay_sync = None;
                         this.agent_status_listen = None;
                         this.agent_status_rebuild = None;
                         this.agent_status_panes.clear();
