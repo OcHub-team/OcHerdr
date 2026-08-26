@@ -185,7 +185,7 @@ fn confirm_dialog_receives_keys_even_when_nothing_was_focused(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn tab_rename_enter_submits_once_without_reentering_the_input(cx: &mut TestAppContext) {
+fn tab_rename_enter_submits_once_and_applies_the_success_response(cx: &mut TestAppContext) {
     let (fake, view, cx) = connect_two_pane_view(cx);
     view.update_in(cx, |this, window, cx| {
         this.open_rename(
@@ -216,6 +216,14 @@ fn tab_rename_enter_submits_once_without_reentering_the_input(cx: &mut TestAppCo
     );
     view.read_with(cx, |this, _| {
         assert!(matches!(this.overlay, crate::Overlay::None));
+        assert_eq!(
+            this.snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.tabs.iter().find(|tab| tab.tab_id == "t-a"))
+                .map(|tab| tab.label.as_str()),
+            Some("renamed"),
+            "a successful rename response must update the tab even if its event is delayed",
+        );
     });
 }
 

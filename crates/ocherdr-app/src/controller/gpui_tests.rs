@@ -612,6 +612,32 @@ fn serve_snapshot_with_live_events(
                     Some("agent.focus") => {
                         write_fake_response(stream, json!({ "id": id, "result": { "type": "ok" } }))
                     }
+                    Some("tab.rename") => {
+                        let tab_id = request["params"]["tab_id"].as_str().unwrap_or_default();
+                        let label = request["params"]["label"].as_str().unwrap_or_default();
+                        let Some(tab) = snapshot.tabs.iter_mut().find(|tab| tab.tab_id == tab_id)
+                        else {
+                            write_fake_response(
+                                stream,
+                                json!({
+                                    "id": id,
+                                    "error": {
+                                        "code": "tab_not_found",
+                                        "message": format!("tab {tab_id} not found"),
+                                    },
+                                }),
+                            );
+                            continue;
+                        };
+                        tab.label = label.to_owned();
+                        write_fake_response(
+                            stream,
+                            json!({
+                                "id": id,
+                                "result": { "type": "tab_info", "tab": tab },
+                            }),
+                        );
+                    }
                     Some("tab.move") | Some("layout.set_split_ratio") => write_fake_response(
                         stream,
                         json!({

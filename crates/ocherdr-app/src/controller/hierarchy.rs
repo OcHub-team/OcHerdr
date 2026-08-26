@@ -256,7 +256,12 @@ impl OcHerdrView {
                 );
             }
             HierarchyTarget::Tab { id, .. } => {
-                self.invoke("tab.rename", json!({ "tab_id": id, "label": label }), cx);
+                self.invoke_with_response(
+                    "tab.rename",
+                    json!({ "tab_id": id, "label": label }),
+                    Self::apply_tab_rename_response,
+                    cx,
+                );
             }
             HierarchyTarget::Pane { id, .. } => {
                 self.invoke(
@@ -267,6 +272,35 @@ impl OcHerdrView {
             }
         }
         self.focus.focus(window, cx);
+    }
+
+    fn apply_tab_rename_response(
+        &mut self,
+        result: std::result::Result<Value, HerdrError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(result) = result else {
+            return;
+        };
+        let Some(tab) = result.get("tab") else {
+            self.resync_snapshot(self.event_epoch, cx);
+            return;
+        };
+        let (Some(tab_id), Some(label)) = (
+            tab.get("tab_id").and_then(Value::as_str),
+            tab.get("label").and_then(Value::as_str),
+        ) else {
+            self.resync_snapshot(self.event_epoch, cx);
+            return;
+        };
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        let Some(current) = snapshot.tabs.iter_mut().find(|tab| tab.tab_id == tab_id) else {
+            self.resync_snapshot(self.event_epoch, cx);
+            return;
+        };
+        current.label = label.to_owned();
     }
 
     pub(crate) fn open_native_tui(&mut self, cx: &mut Context<Self>) {
