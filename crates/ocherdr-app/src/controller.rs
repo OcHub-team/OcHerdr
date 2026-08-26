@@ -23,7 +23,9 @@ mod appearance;
 mod events;
 mod hierarchy;
 mod input;
+mod pane_keyboard;
 mod pane_layout;
+mod pane_tab_drop;
 mod pane_templates;
 mod reorder;
 mod runtime;
@@ -162,6 +164,7 @@ impl OcHerdrView {
             split_commit: None,
             pane_drag_snapshot: None,
             pane_relocations: HashMap::new(),
+            pane_detaches: HashMap::new(),
             pane_template_commits: HashMap::new(),
             pane_drag_return: None,
             pane_resize_frozen_tabs: HashSet::new(),

@@ -303,7 +303,7 @@ fn a_centre_hover_squeezes_the_local_layout_before_release(cx: &mut TestAppConte
                         target_pane_id,
                         zone,
                     } => Some((&**target_pane_id, *zone)),
-                    crate::PaneDragIntent::Template(_) => None,
+                    crate::PaneDragIntent::Template(_) | crate::PaneDragIntent::Tab(_) => None,
                 }),
             Some(("p-right", ocherdr_core::DropZone::Center))
         );

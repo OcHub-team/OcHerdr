@@ -10,8 +10,9 @@ use ocherdr_core::{
     DropZone, HerdrEvent, HierarchySnapshot, LayoutNode, LayoutRect, LayoutSplit, PaneInfo,
     PaneLayout, PredictedLayout, PredictedPane, ReorderHover, Selection, SessionSummary,
     SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, ZoneRect, drop_zone,
-    layout_fingerprint, predict_relocation_steps, predict_swap, rebuild_tree, reorder_insert_index,
-    split_ratio_from_drag, split_rect, valid_split_ratio,
+    layout_fingerprint, predict_insert_pane, predict_relocation_steps, predict_remove_pane,
+    predict_swap, rebuild_tree, reorder_insert_index, split_ratio_from_drag, split_rect,
+    valid_split_ratio,
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
@@ -53,6 +54,7 @@ mod i18n;
 mod ime;
 mod notify;
 mod pane_model;
+mod pane_tab_drop;
 mod pane_templates;
 mod reorder_model;
 mod theme_ansi;
@@ -60,6 +62,7 @@ mod ui;
 
 pub(crate) use host_model::*;
 pub(crate) use pane_model::*;
+pub(crate) use pane_tab_drop::*;
 pub(crate) use pane_templates::*;
 pub(crate) use reorder_model::*;
 
@@ -799,6 +802,8 @@ struct OcHerdrView {
     /// Optimistic pane relocations keyed by tab. While one is set the tab is
     /// locked: no split drag, no pane drag, no pane close, frozen resizes.
     pane_relocations: HashMap<String, PendingPaneRelocation>,
+    /// One-shot tab-bar detach (`pane.move` to a new or existing tab).
+    pane_detaches: HashMap<String, PendingPaneDetach>,
     /// Whole-tab 2/3/4-pane template rebuilds. Like a relocation, these keep
     /// the final geometry optimistic while Herdr parks and reinserts panes.
     pane_template_commits: HashMap<String, PendingPaneTemplateCommit>,

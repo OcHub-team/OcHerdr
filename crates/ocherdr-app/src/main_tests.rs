@@ -73,9 +73,11 @@ fn pane_drag_at(pointer: (f32, f32)) -> PaneDrag {
         source_rect,
         hover: None,
         template_hover: None,
+        tab_target: None,
         layout_preview: None,
         edge_drops: false,
         layout_templates: true,
+        tab_bar_drops: true,
         pressed_at: Instant::now(),
     }
 }
@@ -276,7 +278,7 @@ fn a_droppable_hover_builds_and_animates_the_local_draft_layout() {
     let preview = update_pane_drag_layout_preview(
         &layout,
         "a",
-        pane_drag_preview_intent(Some(&hover), None, false),
+        pane_drag_preview_intent(Some(&hover), None, None, false),
         None,
         started,
         false,
@@ -307,7 +309,7 @@ fn a_droppable_hover_builds_and_animates_the_local_draft_layout() {
     let repeated = update_pane_drag_layout_preview(
         &layout,
         "a",
-        pane_drag_preview_intent(Some(&hover), None, false),
+        pane_drag_preview_intent(Some(&hover), None, None, false),
         Some(&preview),
         started + Duration::from_millis(20),
         false,
@@ -327,7 +329,7 @@ fn leaving_a_drop_zone_eases_every_shell_back_to_authority() {
     let active = update_pane_drag_layout_preview(
         &layout,
         "a",
-        pane_drag_preview_intent(Some(&hover), None, false),
+        pane_drag_preview_intent(Some(&hover), None, None, false),
         None,
         started,
         false,
@@ -358,7 +360,7 @@ fn a_disabled_edge_zone_never_creates_an_uncommittable_preview() {
         update_pane_drag_layout_preview(
             &layout,
             "a",
-            pane_drag_preview_intent(Some(&hover), None, false),
+            pane_drag_preview_intent(Some(&hover), None, None, false),
             None,
             Instant::now(),
             false,
@@ -369,13 +371,65 @@ fn a_disabled_edge_zone_never_creates_an_uncommittable_preview() {
         update_pane_drag_layout_preview(
             &layout,
             "a",
-            pane_drag_preview_intent(Some(&hover), None, true),
+            pane_drag_preview_intent(Some(&hover), None, None, true),
             None,
             Instant::now(),
             false,
         )
         .is_some()
     );
+}
+
+#[test]
+fn a_new_tab_hover_previews_the_collapsed_source_layout() {
+    let layout = two_pane_layout();
+    let started = Instant::now();
+    let preview = update_pane_drag_layout_preview(
+        &layout,
+        "a",
+        pane_drag_preview_intent(None, None, Some(&PaneTabDropTarget::NewTab), true),
+        None,
+        started,
+        true,
+    )
+    .expect("new-tab removal preview");
+    assert_eq!(
+        preview.intent,
+        Some(PaneDragIntent::Tab(PaneTabDropTarget::NewTab))
+    );
+    assert!(preview.target_fractions("a").is_none());
+    assert!(close(
+        preview.target_fractions("b").unwrap(),
+        (0., 0., 1., 1.)
+    ));
+}
+
+#[test]
+fn an_existing_tab_hover_previews_the_collapsed_source_layout() {
+    let layout = two_pane_layout();
+    let started = Instant::now();
+    let preview = update_pane_drag_layout_preview(
+        &layout,
+        "a",
+        pane_drag_preview_intent(
+            None,
+            None,
+            Some(&PaneTabDropTarget::Existing {
+                tab_id: "t-b".into(),
+                target_pane_id: "p-b".into(),
+            }),
+            true,
+        ),
+        None,
+        started,
+        true,
+    )
+    .expect("existing-tab removal preview");
+    assert!(preview.target_fractions("a").is_none());
+    assert!(close(
+        preview.target_fractions("b").unwrap(),
+        (0., 0., 1., 1.)
+    ));
 }
 
 fn swap_plan(layout: &PaneLayout) -> RelocationPlan {

@@ -83,6 +83,8 @@ struct PaneMoveScript {
     /// Same race for `tab.create` / `workspace.create`: Herdr broadcasts
     /// `tab.created` / `pane.created` before it answers the request.
     events_before_create_response: Mutex<Vec<Value>>,
+    /// Events broadcast before answering `pane.move { destination: tab }`.
+    events_before_insert_response: Mutex<Vec<Value>>,
     /// The live subscription's queue, filled in by the constructor.
     event_queue: Mutex<Option<Sender<QueuedEvent>>>,
 }
@@ -753,6 +755,16 @@ fn serve_snapshot_with_live_events(
                                 }),
                             );
                             continue;
+                        }
+                        let early = std::mem::take(
+                            &mut *script
+                                .events_before_insert_response
+                                .lock()
+                                .expect("early insert events"),
+                        );
+                        if !early.is_empty() {
+                            script.broadcast(early);
+                            thread::sleep(Duration::from_millis(60));
                         }
                         let pane_id = request["params"]["pane_id"].clone();
                         write_fake_response(
@@ -1438,4 +1450,5 @@ fn swapped_layout_event() -> Value {
 
 mod creation;
 mod pane;
+mod pane_tab_drop;
 mod relocation;

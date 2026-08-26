@@ -63,6 +63,10 @@ impl OcHerdrView {
             SurfaceDrag::Reorder(drag) => Some(drag),
             _ => None,
         };
+        let pane_tab_drop = match &self.surface_drag {
+            SurfaceDrag::Pane(drag) if drag.tab_bar_drops => Some(drag.clone()),
+            _ => None,
+        };
         let pending = self
             .pending_reorder
             .as_ref()
@@ -135,6 +139,21 @@ impl OcHerdrView {
                 };
                 let close_target = tab_target.clone();
                 let selected = row.a11y.selected == Some(true);
+                let existing_drop =
+                    pane_tab_drop
+                        .as_ref()
+                        .and_then(|drag| match &drag.tab_target {
+                            Some(PaneTabDropTarget::Existing { tab_id: hit, .. })
+                                if hit == &tab_id =>
+                            {
+                                Some(row.a11y.name.clone())
+                            }
+                            _ => None,
+                        });
+                let existing_hovered = existing_drop.is_some();
+                let drop_pill_id = tab_id.clone();
+                let drop_move_id = tab_id.clone();
+                let drop_debug_id = tab_id.clone();
                 let title_needs_fade = Self::tab_title_needs_fade(&row.a11y.name, window);
                 let fade_background = if selected {
                     theme::current().bg.rgba()
@@ -175,12 +194,16 @@ impl OcHerdrView {
                     .overflow_hidden()
                     .rounded_full()
                     .border_1()
-                    .border_color(if selected {
+                    .border_color(if existing_hovered {
+                        theme::accent()
+                    } else if selected {
                         theme::border()
                     } else {
                         theme::surface().alpha(0.)
                     })
-                    .bg(if selected {
+                    .bg(if existing_hovered {
+                        theme::accent().alpha(0.16)
+                    } else if selected {
                         theme::current().bg.rgba()
                     } else {
                         theme::surface().alpha(0.)
@@ -192,7 +215,9 @@ impl OcHerdrView {
                         theme::muted()
                     })
                     .hover(move |style| {
-                        style.bg(if selected {
+                        style.bg(if existing_hovered {
+                            theme::accent().alpha(0.16)
+                        } else if selected {
                             theme::current().bg.rgba()
                         } else {
                             theme::surface_hover()
@@ -203,8 +228,25 @@ impl OcHerdrView {
                     .group(tab_hover_group.clone())
                     .opacity(if hidden { 0. } else { 1. })
                     .debug_selector(move || format!("tab-{debug_tab_id}"))
-                    .on_hover(cx.listener(move |this, hovered, _window, cx| {
+                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
                         this.set_tab_hovered(hover_id.clone(), *hovered, cx);
+                        if !*hovered {
+                            let pointer = match &this.surface_drag {
+                                SurfaceDrag::Pane(drag) => drag.pointer,
+                                _ => return,
+                            };
+                            if matches!(
+                                &this.surface_drag,
+                                SurfaceDrag::Pane(drag)
+                                    if matches!(
+                                        &drag.tab_target,
+                                        Some(PaneTabDropTarget::Existing { tab_id, .. })
+                                            if tab_id == &drop_pill_id
+                                    )
+                            ) {
+                                this.clear_pane_tab_drop_target(pointer, cx);
+                            }
+                        }
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -224,8 +266,18 @@ impl OcHerdrView {
                             this.pane_mouse_up(event, window, cx);
                         }),
                     )
-                    .on_mouse_move(cx.listener(move |this, event, window, cx| {
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
                         this.set_tab_hovered(move_hover_id.clone(), true, cx);
+                        let pointer =
+                            (f32::from(event.position.x), f32::from(event.position.y));
+                        if this.update_pane_drag_over_tab_pill(
+                            pointer,
+                            drop_move_id.clone(),
+                            cx,
+                        ) {
+                            cx.stop_propagation();
+                            return;
+                        }
                         this.pane_mouse_move(event, window, cx);
                     }))
                     .on_mouse_down(
@@ -327,7 +379,28 @@ impl OcHerdrView {
                                     },
                                 )),
                             ),
-                    );
+                    )
+                    .when_some(existing_drop, |tab, name| {
+                        let hint = i18n.drop_move_into_tab(&name);
+                        tab.aria_label(i18n.drop_move_to_tab(&name)).child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
+                                .px_2()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::accent_text())
+                                .debug_selector(move || {
+                                    format!("pane-tab-drop-existing-{drop_debug_id}")
+                                })
+                                .child(icon(IconName::Blocks, theme::accent_text(), 11.))
+                                .child(hint),
+                        )
+                    });
                 let tab = if tab_reorder.is_some() {
                     let animation_name = match motion {
                         Some(ReorderMotion::Dragging) => "reorder-shift",
@@ -391,6 +464,9 @@ impl OcHerdrView {
         let pane_id_zoom = self.selection.pane_id.clone();
         let pane_id_close = self.selection.pane_id.clone();
         let node_manager_open = self.overlay.host_center();
+        let new_tab_hover = pane_tab_drop
+            .as_ref()
+            .is_some_and(|drag| drag.tab_target == Some(PaneTabDropTarget::NewTab));
         div()
             .flex()
             .items_center()
@@ -418,23 +494,34 @@ impl OcHerdrView {
                     .track_scroll(&self.tab_scroll)
                     .children(tabs),
             )
-            .child(
-                apply_control(
-                    icon_only_button_tone(
-                        "new-tab",
-                        chrome.toolbar.new_tab.name.clone(),
-                        IconName::Add,
-                        ButtonTone::Ghost,
-                        ButtonSize::Sm,
+            .when(pane_tab_drop.is_none(), |bar| {
+                bar.child(
+                    apply_control(
+                        icon_only_button_tone(
+                            "new-tab",
+                            chrome.toolbar.new_tab.name.clone(),
+                            IconName::Add,
+                            ButtonTone::Ghost,
+                            ButtonSize::Sm,
+                        )
+                        .rounded_full()
+                        .debug_selector(|| "new-tab".to_owned()),
+                        &chrome.toolbar.new_tab,
                     )
-                    .rounded_full(),
-                    &chrome.toolbar.new_tab,
+                    .on_click(cx.listener(|this, _, _window, cx| this.create_tab(cx))),
                 )
-                .on_click(cx.listener(|this, _, _window, cx| this.create_tab(cx))),
-            )
-            // Everything between `+` and the toolbar is empty strip, so a
-            // drag there means "move the window".
-            .child(self.window_move_area("tab-strip-space", cx).flex_1())
+                // Everything between `+` and the toolbar is empty strip, so a
+                // drag there means "move the window".
+                .child(self.window_move_area("tab-strip-space", cx).flex_1())
+            })
+            .when(pane_tab_drop.is_some(), |bar| {
+                bar.child(Self::render_new_tab_drop_zone(
+                    new_tab_hover,
+                    chrome.toolbar.new_tab.name.clone(),
+                    i18n,
+                    cx,
+                ))
+            })
             .child(div().id("pane-actions").role(ochub_ui::gpui::Role::Toolbar).aria_label(i18n.text(k::TERMINAL_PANE_ACTIONS)).flex().items_center().gap_1().px_2()
             .child(
                 apply_control(
@@ -565,5 +652,113 @@ impl OcHerdrView {
                 ),
                 &chrome.toolbar.remote,
             ).mr_3().on_click(cx.listener(|this, _, _window, cx| this.open_node_manager(cx))))
+    }
+
+    fn render_new_tab_drop_zone(
+        hovered: bool,
+        new_tab_name: impl Into<SharedString>,
+        i18n: I18n,
+        cx: &mut Context<Self>,
+    ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
+        let label = i18n.text(k::TERMINAL_DROP_NEW_TAB);
+        let aria = i18n.text(k::TERMINAL_DROP_MOVE_TO_NEW_TAB);
+        let new_tab_name = new_tab_name.into();
+        div()
+            .id("pane-tab-drop-new-tab")
+            .debug_selector(|| "pane-tab-drop-new-tab".to_owned())
+            .flex()
+            .items_center()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .gap_1()
+            .px_1()
+            .rounded(px(CORNER_CONTROL))
+            .border_1()
+            .border_color(if hovered {
+                theme::accent()
+            } else {
+                theme::surface().alpha(0.)
+            })
+            .bg(if hovered {
+                theme::accent().alpha(0.16)
+            } else {
+                theme::surface().alpha(0.)
+            })
+            .role(ochub_ui::gpui::Role::Button)
+            .aria_label(aria)
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                let pointer = (f32::from(event.position.x), f32::from(event.position.y));
+                if this.update_pane_drag_over_tab_target(pointer, PaneTabDropTarget::NewTab, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| {
+                    this.pane_mouse_up(event, window, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| {
+                    this.pane_mouse_up(event, window, cx);
+                }),
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    let pointer = match &this.surface_drag {
+                        SurfaceDrag::Pane(drag) => drag.pointer,
+                        _ => return,
+                    };
+                    this.clear_pane_tab_drop_target(pointer, cx);
+                }
+            }))
+            .child(
+                icon_only_button_tone(
+                    "new-tab",
+                    new_tab_name,
+                    IconName::Add,
+                    if hovered {
+                        ButtonTone::Primary
+                    } else {
+                        ButtonTone::Ghost
+                    },
+                    ButtonSize::Sm,
+                )
+                .rounded_full()
+                .debug_selector(|| "new-tab".to_owned())
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    if matches!(this.surface_drag, SurfaceDrag::Pane(_)) {
+                        return;
+                    }
+                    this.create_tab(cx);
+                })),
+            )
+            .child(
+                div()
+                    .id("tab-strip-space")
+                    .debug_selector(|| "tab-strip-space".to_owned())
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .gap_1()
+                    .px_2()
+                    .when(hovered, |space| {
+                        space
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::accent_text())
+                            .child(icon(IconName::Add, theme::accent_text(), 11.))
+                            .child(
+                                div()
+                                    .id("pane-tab-drop-new-tab-hint")
+                                    .debug_selector(|| "pane-tab-drop-new-tab-hint".to_owned())
+                                    .child(label),
+                            )
+                    }),
+            )
     }
 }

@@ -524,6 +524,10 @@ impl OcHerdrView {
         {
             visible.extend(pending.plan.predicted_pane_ids().map(str::to_owned));
         }
+        for pending in self.pane_detaches.values() {
+            visible.insert(pending.source_pane_id.clone());
+            visible.extend(pending.predicted_pane_ids().map(str::to_owned));
+        }
         visible
     }
 
@@ -533,6 +537,13 @@ impl OcHerdrView {
     pub(crate) fn pane_resize_frozen(&self, pane_id: &str) -> bool {
         if self
             .pane_template_commits
+            .values()
+            .any(|pending| pending.predicted_pane_ids().any(|id| id == pane_id))
+        {
+            return false;
+        }
+        if self
+            .pane_detaches
             .values()
             .any(|pending| pending.predicted_pane_ids().any(|id| id == pane_id))
         {
@@ -548,6 +559,13 @@ impl OcHerdrView {
 
     pub(super) fn tab_resize_frozen(&self, tab_id: &str) -> bool {
         if self.pane_template_commits.contains_key(tab_id) {
+            return false;
+        }
+        if self
+            .pane_detaches
+            .values()
+            .any(|pending| pending.locks_tab(tab_id))
+        {
             return false;
         }
         self.tab_relocation_locked(tab_id)

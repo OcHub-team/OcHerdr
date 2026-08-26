@@ -37,6 +37,10 @@ impl OcHerdrView {
         if !matches!(self.overlay, Overlay::None) {
             return;
         }
+        if matches!(self.surface_drag, SurfaceDrag::Pane(_)) {
+            cx.stop_propagation();
+            return;
+        }
         let Some(snapshot) = &self.snapshot else {
             return;
         };

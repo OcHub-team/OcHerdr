@@ -226,6 +226,10 @@ impl OcHerdrView {
             .get(tab_id)
             .is_some_and(|pending| pending.phase.locks_tab())
             || self
+                .pane_detaches
+                .values()
+                .any(|pending| pending.locks_tab(tab_id))
+            || self
                 .split_commit
                 .as_ref()
                 .is_some_and(|commit| commit.tab_id == tab_id)
@@ -277,6 +281,21 @@ impl OcHerdrView {
             return pending
                 .predicted_pane_ids()
                 .filter_map(|pane_id| snapshot.pane(pane_id).cloned())
+                .collect();
+        }
+        if let Some(pending) = self.pane_detach_for_tab(tab_id) {
+            let ids = pending
+                .tab_state(tab_id)
+                .map(|state| {
+                    state
+                        .predicted_pane_ids()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return ids
+                .into_iter()
+                .filter_map(|pane_id| snapshot.pane(&pane_id).cloned())
                 .collect();
         }
         if let Some(pending) = self.pane_relocations.get(tab_id)
@@ -359,6 +378,7 @@ impl OcHerdrView {
                 _ => None,
             });
         self.pane_relocations.clear();
+        self.pane_detaches.clear();
         self.pane_template_commits.clear();
         if parked.is_some() {
             self.parked_recovery = parked;
@@ -439,8 +459,10 @@ impl OcHerdrView {
     }
 
     /// Returns `true` when a drag was armed. Refuses while any other gesture
-    /// is active, while the tab has a pending plan, when the tab has a single
-    /// pane, or when the pane rect cannot be measured yet.
+    /// is active, while the tab has a pending plan, when the layout is zoomed,
+    /// or when the pane rect cannot be measured yet. A single-pane tab can
+    /// start a drag if tab-bar drops are available; pane-local targets still
+    /// require two or more panes.
     pub(crate) fn begin_pane_drag(&mut self, pane_id: String, pointer: (f32, f32)) -> bool {
         if !matches!(self.overlay, Overlay::None) {
             return false;
@@ -467,13 +489,18 @@ impl OcHerdrView {
         let Some(layout) = snapshot.layout_for(&tab_id) else {
             return false;
         };
-        if layout.zoomed || layout.panes.len() < 2 {
+        if layout.zoomed {
+            return false;
+        }
+        let tab_bar_drops = self.pane_move_supported();
+        if layout.panes.len() < 2 && !tab_bar_drops {
             return false;
         }
         let Some(source_rect) = pane_window_rect(layout, &pane_id, surface) else {
             return false;
         };
         let fingerprint = layout_fingerprint(layout);
+        let pane_count = layout.panes.len();
         // Capture before anything dims or re-lays out the slot: the source
         // body and the floating preview draw this when the runtime has no
         // frame of its own on a given render.
@@ -493,9 +520,11 @@ impl OcHerdrView {
             source_rect,
             hover: None,
             template_hover: None,
+            tab_target: None,
             layout_preview: None,
             edge_drops: self.edge_drops_enabled(),
-            layout_templates: self.pane_move_supported(),
+            layout_templates: self.pane_move_supported() && pane_count >= 2,
+            tab_bar_drops,
             pressed_at: Instant::now(),
         });
         true
@@ -567,7 +596,7 @@ impl OcHerdrView {
     }
 
     pub(crate) fn update_pane_drag(&mut self, mouse: (f32, f32), cx: &mut Context<Self>) -> bool {
-        self.update_pane_drag_with_template_hover(mouse, None, cx)
+        self.update_pane_drag_with_hits(mouse, None, None, cx)
     }
 
     pub(crate) fn update_pane_drag_over_template(
@@ -576,29 +605,37 @@ impl OcHerdrView {
         template_hover: PaneTemplateHover,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.update_pane_drag_with_template_hover(mouse, Some(template_hover), cx)
+        self.update_pane_drag_with_hits(mouse, Some(template_hover), None, cx)
     }
 
-    fn update_pane_drag_with_template_hover(
+    pub(super) fn update_pane_drag_with_hits(
         &mut self,
         mouse: (f32, f32),
         painted_template_hover: Option<PaneTemplateHover>,
+        painted_tab_target: Option<PaneTabDropTarget>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(mut drag) = self.take_pane_drag() else {
             return false;
         };
         drag.pointer = mouse;
-        let template_hover = if pane_drag_past_slop(&drag) && drag.layout_templates {
-            painted_template_hover.or_else(|| self.pane_template_hover_for(&drag))
+        let tab_target = if pane_drag_past_slop(&drag) && drag.tab_bar_drops {
+            painted_tab_target
         } else {
             None
         };
-        let mut hover = if pane_drag_past_slop(&drag) && template_hover.is_none() {
-            self.pane_hover_for(&drag)
-        } else {
-            None
-        };
+        let template_hover =
+            if pane_drag_past_slop(&drag) && drag.layout_templates && tab_target.is_none() {
+                painted_template_hover.or_else(|| self.pane_template_hover_for(&drag))
+            } else {
+                None
+            };
+        let mut hover =
+            if pane_drag_past_slop(&drag) && tab_target.is_none() && template_hover.is_none() {
+                self.pane_hover_for(&drag)
+            } else {
+                None
+            };
         if pane_drag_past_slop(&drag)
             && let Some(layout) = self
                 .snapshot
@@ -606,8 +643,12 @@ impl OcHerdrView {
                 .and_then(|snapshot| snapshot.layout_for(&drag.tab_id))
         {
             let now = Instant::now();
-            let intent =
-                pane_drag_preview_intent(hover.as_ref(), template_hover.as_ref(), drag.edge_drops);
+            let intent = pane_drag_preview_intent(
+                hover.as_ref(),
+                template_hover.as_ref(),
+                tab_target.as_ref(),
+                drag.edge_drops,
+            );
             drag.layout_preview = update_pane_drag_layout_preview(
                 layout,
                 &drag.pane_id,
@@ -632,6 +673,7 @@ impl OcHerdrView {
         }
         drag.hover = hover;
         drag.template_hover = template_hover;
+        drag.tab_target = tab_target;
         self.surface_drag = SurfaceDrag::Pane(drag);
         cx.notify();
         true
@@ -669,10 +711,31 @@ impl OcHerdrView {
         let painted_template_hover = pointer_unchanged
             .then(|| drag.template_hover.clone())
             .flatten();
+        let painted_tab_target = pointer_unchanged.then(|| drag.tab_target.clone()).flatten();
         drag.pointer = mouse;
         cx.notify();
         if !pane_drag_past_slop(&drag) {
             self.select_pane(drag.pane_id, window, cx);
+            return true;
+        }
+        drag.tab_target = if drag.tab_bar_drops {
+            painted_tab_target
+        } else {
+            None
+        };
+        if let Some(destination) = drag.tab_target.clone() {
+            let committed = self.commit_pane_tab_drop(
+                &drag.workspace_id,
+                &drag.tab_id,
+                &drag.pane_id,
+                drag.fingerprint,
+                destination,
+                cx,
+            );
+            if !committed {
+                self.surface_drag = SurfaceDrag::Pane(drag);
+                self.cancel_pane_drag();
+            }
             return true;
         }
         drag.template_hover = if drag.layout_templates {
@@ -1083,6 +1146,7 @@ impl OcHerdrView {
     /// (keep waiting), or something else (revert).
     pub(super) fn reconcile_pane_relocations(&mut self, cx: &mut Context<Self>) {
         self.reconcile_pane_template_commits(cx);
+        self.reconcile_pane_detaches(cx);
         let tab_ids: Vec<String> = self.pane_relocations.keys().cloned().collect();
         for tab_id in tab_ids {
             let Some(pending) = self.pane_relocations.get_mut(&tab_id) else {
@@ -1214,6 +1278,7 @@ impl OcHerdrView {
             && !matches!(self.surface_drag, SurfaceDrag::Pane(_))
             && self.pane_drag_return.is_none()
             && self.pane_relocations.is_empty()
+            && self.pane_detaches.is_empty()
             && self.pane_template_commits.is_empty()
         {
             self.pane_drag_snapshot = None;
@@ -1237,6 +1302,17 @@ impl OcHerdrView {
         if let Some(pending) = self.pane_template_commits.get(&layout.tab_id)
             && let Some(rect) = pending
                 .predicted_fractions(layout.area)
+                .into_iter()
+                .find(|(id, _)| id == pane_id)
+                .map(|(_, rect)| rect)
+        {
+            return Some(rect);
+        }
+        if let Some(pending) = self.pane_detach_for_tab(&layout.tab_id)
+            && let Some(rect) = pending
+                .tab_state(&layout.tab_id)
+                .map(|state| state.predicted_fractions())
+                .unwrap_or_default()
                 .into_iter()
                 .find(|(id, _)| id == pane_id)
                 .map(|(_, rect)| rect)
@@ -1295,162 +1371,5 @@ impl OcHerdrView {
                 let pane = layout.panes.iter().find(|pane| pane.pane_id == pane_id)?;
                 layout_rect_fractions(layout.area, pane.rect)
             })
-    }
-
-    // ---- Keyboard move mode (design §11) ----
-
-    /// Prefix `m`: lift the selected pane. Arrows pick a neighbour, Tab
-    /// cycles the zone, Enter commits, Esc cancels.
-    pub(crate) fn enter_keyboard_pane_move(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.overlay, Overlay::None)
-            || !matches!(
-                self.surface_drag,
-                SurfaceDrag::Idle | SurfaceDrag::Text { .. }
-            )
-        {
-            return;
-        }
-        let Some(pane_id) = self.selection.pane_id.clone() else {
-            return;
-        };
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return;
-        };
-        let Some(pane) = snapshot.pane(&pane_id) else {
-            return;
-        };
-        let (workspace_id, tab_id) = (pane.workspace_id.clone(), pane.tab_id.clone());
-        if self.tab_relocation_locked(&tab_id) {
-            return;
-        }
-        let Some(layout) = snapshot.layout_for(&tab_id) else {
-            return;
-        };
-        if layout.zoomed || layout.panes.len() < 2 {
-            return;
-        }
-        let fingerprint = layout_fingerprint(layout);
-        self.end_text_drag();
-        self.pane_keyboard_move = Some(KeyboardPaneMove {
-            workspace_id,
-            tab_id,
-            pane_id,
-            fingerprint,
-            target: None,
-            edge_drops: self.edge_drops_enabled(),
-        });
-        cx.notify();
-    }
-
-    pub(crate) fn cancel_keyboard_pane_move(&mut self) {
-        self.pane_keyboard_move = None;
-    }
-
-    /// Snapshot changed: the mode survives only while the tab's structure is
-    /// what it was on entry.
-    pub(super) fn reconcile_keyboard_pane_move(&mut self, cx: &mut Context<Self>) {
-        let Some(mode) = self.pane_keyboard_move.as_ref() else {
-            return;
-        };
-        let survives = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.layout_for(&mode.tab_id))
-            .is_some_and(|layout| layout_fingerprint(layout) == mode.fingerprint);
-        if !survives {
-            self.pane_keyboard_move = None;
-            cx.notify();
-        }
-    }
-
-    /// Returns `true` when the key belonged to the move mode.
-    pub(crate) fn handle_keyboard_pane_move_key(
-        &mut self,
-        event: &KeyDownEvent,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(mut mode) = self.pane_keyboard_move.take() else {
-            return false;
-        };
-        let key = event.keystroke.key.as_str();
-        let direction = match key {
-            "left" => Some(DropEdge::Left),
-            "right" => Some(DropEdge::Right),
-            "up" => Some(DropEdge::Up),
-            "down" => Some(DropEdge::Down),
-            _ => None,
-        };
-        let handled = match (key, direction) {
-            ("escape", _) => {
-                cx.notify();
-                return true;
-            }
-            ("enter", _) => {
-                if let Some(hover) = mode.target.clone().filter(|_| mode.droppable()) {
-                    let request = PaneDropRequest {
-                        workspace_id: mode.workspace_id.clone(),
-                        tab_id: mode.tab_id.clone(),
-                        pane_id: mode.pane_id.clone(),
-                        fingerprint: mode.fingerprint,
-                        hover,
-                        edge_drops: mode.edge_drops,
-                    };
-                    self.commit_pane_drop(&request, cx);
-                }
-                cx.notify();
-                return true;
-            }
-            ("tab", _) => {
-                if let Some(target) = mode.target.as_mut() {
-                    target.zone = next_keyboard_zone(target.zone, mode.edge_drops);
-                }
-                true
-            }
-            (_, Some(direction)) => {
-                let target = self.snapshot.as_ref().and_then(|snapshot| {
-                    let layout = snapshot.layout_for(&mode.tab_id)?;
-                    let target_pane_id = keyboard_neighbour(layout, &mode.pane_id, direction)?;
-                    let target_rect = self
-                        .terminal_surface_bounds
-                        .and_then(|surface| pane_window_rect(layout, &target_pane_id, surface))
-                        .unwrap_or((0., 0., 0., 0.));
-                    Some(PaneDropHover {
-                        target_pane_id,
-                        zone: DropZone::Center,
-                        target_rect,
-                    })
-                });
-                if let Some(target) = target {
-                    mode.target = Some(target);
-                }
-                true
-            }
-            _ => false,
-        };
-        self.pane_keyboard_move = Some(mode);
-        if handled {
-            cx.notify();
-        }
-        handled
-    }
-
-    /// Context-menu swap with the neighbouring pane (design §11).
-    pub(crate) fn swap_pane_direction(
-        &mut self,
-        pane_id: String,
-        direction: &'static str,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .pane_tab_id(&pane_id)
-            .is_some_and(|tab_id| self.tab_relocation_locked(&tab_id))
-        {
-            return;
-        }
-        self.invoke(
-            "pane.swap",
-            json!({ "pane_id": pane_id, "direction": direction }),
-            cx,
-        );
     }
 }
