@@ -86,6 +86,13 @@ pub(crate) struct PaneTemplatePaletteGeometry {
     pub(crate) cards: Vec<PaneTemplateCardGeometry>,
 }
 
+pub(crate) fn pane_template_local_rect(
+    child: (f32, f32, f32, f32),
+    parent: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    (child.0 - parent.0, child.1 - parent.1, child.2, child.3)
+}
+
 pub(crate) fn pane_template_palette_geometry(
     surface: (f32, f32, f32, f32),
     pane_count: usize,
@@ -143,19 +150,55 @@ pub(crate) fn pane_template_hover(
     pointer: (f32, f32),
 ) -> Option<PaneTemplateHover> {
     let palette = pane_template_palette_geometry(surface, pane_count)?;
-    palette.cards.into_iter().find_map(|card| {
-        card.slots
-            .into_iter()
-            .enumerate()
-            .find(|(_, rect)| point_in_rect(pointer, *rect))
-            .map(|(slot, slot_rect)| PaneTemplateHover {
-                placement: PaneTemplatePlacement {
-                    template: card.template,
-                    slot,
-                },
-                slot_rect,
-            })
-    })
+    palette
+        .cards
+        .iter()
+        .find_map(|card| pane_template_card_hover(card, pointer))
+}
+
+/// Resolve against the geometry that was actually painted. The terminal
+/// canvas can publish a newer surface measurement between paint and pointer
+/// dispatch; using the card captured by the element keeps visuals and hit
+/// testing in the same frame of reference.
+pub(crate) fn pane_template_card_hover(
+    card: &PaneTemplateCardGeometry,
+    pointer: (f32, f32),
+) -> Option<PaneTemplateHover> {
+    if !point_in_rect(pointer, card.rect) {
+        return None;
+    }
+    card.slots
+        .iter()
+        .copied()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            distance_squared_to_rect(pointer, *a).total_cmp(&distance_squared_to_rect(pointer, *b))
+        })
+        .map(|(slot, slot_rect)| PaneTemplateHover {
+            placement: PaneTemplatePlacement {
+                template: card.template,
+                slot,
+            },
+            slot_rect,
+        })
+}
+
+fn distance_squared_to_rect(point: (f32, f32), rect: (f32, f32, f32, f32)) -> f32 {
+    let dx = if point.0 < rect.0 {
+        rect.0 - point.0
+    } else if point.0 > rect.0 + rect.2 {
+        point.0 - rect.0 - rect.2
+    } else {
+        0.
+    };
+    let dy = if point.1 < rect.1 {
+        rect.1 - point.1
+    } else if point.1 > rect.1 + rect.3 {
+        point.1 - rect.1 - rect.3
+    } else {
+        0.
+    };
+    dx * dx + dy * dy
 }
 
 fn point_in_rect(point: (f32, f32), rect: (f32, f32, f32, f32)) -> bool {
@@ -538,7 +581,26 @@ mod tests {
         let palette = pane_template_palette_geometry(surface, 3).unwrap();
         assert!((palette.rect.0 + palette.rect.2 / 2. - 400.).abs() < 1e-6);
         for card in palette.cards {
+            let local = pane_template_local_rect(card.rect, palette.rect);
+            assert!(local.0 >= 0. && local.1 >= 0.);
+            assert!(local.0 + local.2 <= palette.rect.2);
+            assert!(local.1 + local.3 <= palette.rect.3);
             assert_eq!(card.slots.len(), 3);
+            for pointer in [
+                (card.rect.0 + 1., card.rect.1 + 1.),
+                (card.rect.0 + card.rect.2 - 1., card.rect.1 + 1.),
+                (card.rect.0 + 1., card.rect.1 + card.rect.3 - 1.),
+                (
+                    card.rect.0 + card.rect.2 - 1.,
+                    card.rect.1 + card.rect.3 - 1.,
+                ),
+            ] {
+                let hover = pane_template_hover(surface, 3, pointer).unwrap();
+                assert_eq!(
+                    hover.placement.template, card.template,
+                    "card padding must snap to its nearest slot"
+                );
+            }
             for (slot, rect) in card.slots.into_iter().enumerate() {
                 let hover =
                     pane_template_hover(surface, 3, (rect.0 + rect.2 / 2., rect.1 + rect.3 / 2.))

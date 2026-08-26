@@ -1,6 +1,7 @@
 use super::*;
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // PaneDrag carries hover + tab-bar drop state.
 pub(crate) enum SurfaceDrag {
     Idle,
     Text { pane_id: String, captured: bool },
@@ -28,6 +29,10 @@ pub(crate) struct PaneDrag {
     /// Cell of the layout palette currently under the pointer. Template
     /// cells take precedence over the pane-local five-zone target.
     pub(crate) template_hover: Option<PaneTemplateHover>,
+    /// Tab-bar drop published by the painted `+` / trailing strip (or, in
+    /// phase 2, an existing tab pill). Tab targets outrank pane-local and
+    /// template hits and are never reverse-engineered from the terminal.
+    pub(crate) tab_target: Option<PaneTabDropTarget>,
     /// Local-only layout shown while hovering a droppable zone. Herdr is not
     /// contacted until release. `intent == None` is the animated return to
     /// the authoritative layout after leaving a valid zone.
@@ -38,7 +43,20 @@ pub(crate) struct PaneDrag {
     /// The layout palette needs `pane.move`, independently of the optional
     /// four-edge drop setting.
     pub(crate) layout_templates: bool,
+    /// Tab-bar drops need `pane.move` and a non-zoomed tab; a single-pane
+    /// tab may still use them.
+    pub(crate) tab_bar_drops: bool,
     pub(crate) pressed_at: Instant,
+}
+
+/// Semantic tab-bar drop published by a painted element.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PaneTabDropTarget {
+    NewTab,
+    Existing {
+        tab_id: String,
+        target_pane_id: String,
+    },
 }
 
 pub(crate) type PaneFractions = (f32, f32, f32, f32);
@@ -53,6 +71,7 @@ pub(crate) enum PaneDragIntent {
         zone: DropZone,
     },
     Template(PaneTemplatePlacement),
+    Tab(PaneTabDropTarget),
 }
 
 /// Transition between two local draft layouts during a pane drag.
@@ -809,6 +828,13 @@ pub(crate) fn pane_drag_target_fractions(
         PaneDragIntent::Template(placement) => {
             pane_template_predicted_layout(layout, source_pane_id, *placement)?.panes
         }
+        PaneDragIntent::Tab(_) => match predict_remove_pane(layout, source_pane_id) {
+            Some(predicted) => predicted.panes,
+            None if layout.panes.len() == 1 && layout.panes[0].pane_id == source_pane_id => {
+                Vec::new()
+            }
+            None => return None,
+        },
     };
     Some(predicted_pane_fractions(layout.area, panes))
 }
@@ -856,10 +882,13 @@ pub(crate) fn update_pane_drag_layout_preview(
 pub(crate) fn pane_drag_preview_intent(
     hover: Option<&PaneDropHover>,
     template_hover: Option<&PaneTemplateHover>,
+    tab_target: Option<&PaneTabDropTarget>,
     edge_drops: bool,
 ) -> Option<PaneDragIntent> {
-    template_hover
-        .map(|hover| PaneDragIntent::Template(hover.placement))
+    tab_target
+        .cloned()
+        .map(PaneDragIntent::Tab)
+        .or_else(|| template_hover.map(|hover| PaneDragIntent::Template(hover.placement)))
         .or_else(|| {
             hover
                 .filter(|hover| hover.droppable(edge_drops))

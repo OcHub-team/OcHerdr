@@ -174,6 +174,14 @@ impl I18n {
         tf!(self, k::TERMINAL_DRAG_PANE, name = name)
     }
 
+    pub(crate) fn drop_move_into_tab(self, name: &str) -> String {
+        tf!(self, k::TERMINAL_DROP_MOVE_INTO_TAB, name = name)
+    }
+
+    pub(crate) fn drop_move_to_tab(self, name: &str) -> String {
+        tf!(self, k::TERMINAL_DROP_MOVE_TO_TAB, name = name)
+    }
+
     pub(crate) fn move_pane_mode(self, name: &str) -> String {
         tf!(self, k::TERMINAL_MOVE_PANE_MODE, name = name)
     }

@@ -38,8 +38,8 @@ impl OcHerdrView {
         let mut spawn_error = None;
         let mut spawned = HashSet::new();
         let mut pending_listens = Vec::new();
+        let optimistic_visible = self.optimistic_visible_pane_ids();
         {
-            let visible_pane_ids = visible_pane_ids(Some(snapshot), visible_tab_id.as_deref());
             let controls = {
                 let session = self
                     .session_panes
@@ -47,7 +47,7 @@ impl OcHerdrView {
                     .expect("live session adopted panes");
                 session
                     .controls
-                    .retain(|pane_id, _| visible_pane_ids.contains(pane_id));
+                    .retain(|pane_id, _| optimistic_visible.contains(pane_id));
                 session.controls.clone()
             };
             #[cfg_attr(not(test), allow(unused_mut))]
@@ -57,6 +57,16 @@ impl OcHerdrView {
                 visible_tab_id.as_deref(),
                 selected_pane_id.as_deref(),
             );
+            // A template rebuild temporarily moves panes through hidden tabs.
+            // Keep the streams users are still looking at in their current
+            // control modes instead of reconnecting them midway.
+            for target in &mut wanted {
+                if optimistic_visible.contains(&target.pane_id)
+                    && let Some(mode) = controls.get(&target.pane_id)
+                {
+                    target.mode = *mode;
+                }
+            }
             #[cfg(test)]
             if self.headless_terminals {
                 wanted.clear();
@@ -150,7 +160,8 @@ impl OcHerdrView {
                     pane_tab,
                     visible_tab_id.as_deref(),
                     spawned.contains(pane_id),
-                ) {
+                ) && !optimistic_visible.contains(pane_id)
+                {
                     continue;
                 }
                 if let Some(runtime) = panes.get_mut(pane_id) {
@@ -269,8 +280,7 @@ impl OcHerdrView {
     ) -> bool {
         let composing = self.ime_marked.clone();
         let selected_pane = self.selection.pane_id.clone();
-        let visible_pane_ids =
-            visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
+        let visible_pane_ids = self.optimistic_visible_pane_ids();
         let mut error = None;
         let mut hierarchy_changed = false;
         let mut control_loss = None;
@@ -384,8 +394,7 @@ impl OcHerdrView {
         frame: Option<std::result::Result<RenderedFrame, ocherdr_terminal::TerminalError>>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let visible_pane_ids =
-            visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
+        let visible_pane_ids = self.optimistic_visible_pane_ids();
         let mut error = None;
         let mut changed = false;
         let mut hierarchy_changed = false;
@@ -426,23 +435,60 @@ impl OcHerdrView {
         keep
     }
 
-    /// Terminal grids stay put while the tab's geometry is only a preview
-    /// (design §5.4, §7.2): a pending relocation plan. They resize once,
-    /// when the authoritative layout is on screen.
+    /// Pane ids painted in the selected tab, including panes Herdr has
+    /// temporarily parked elsewhere during an optimistic template rebuild.
+    pub(crate) fn optimistic_visible_pane_ids(&self) -> HashSet<String> {
+        let mut visible =
+            visible_pane_ids(self.snapshot.as_ref(), self.selection.tab_id.as_deref());
+        if let Some(tab_id) = self.selection.tab_id.as_deref()
+            && let Some(pending) = self.pane_template_commits.get(tab_id)
+        {
+            visible.extend(pending.predicted_pane_ids().map(str::to_owned));
+        }
+        for pending in self.pane_detaches.values() {
+            visible.insert(pending.source_pane_id.clone());
+            visible.extend(pending.predicted_pane_ids().map(str::to_owned));
+        }
+        visible
+    }
+
+    /// Terminal grids stay put while free-form geometry is only a preview
+    /// (design §5.4, §7.2). Template destinations are already exact, so they
+    /// resize optimistically while Herdr rebuilds the same layout in back.
     pub(crate) fn pane_resize_frozen(&self, pane_id: &str) -> bool {
+        if self
+            .pane_template_commits
+            .values()
+            .any(|pending| pending.predicted_pane_ids().any(|id| id == pane_id))
+        {
+            return false;
+        }
+        if self
+            .pane_detaches
+            .values()
+            .any(|pending| pending.predicted_pane_ids().any(|id| id == pane_id))
+        {
+            return false;
+        }
         self.pane_tab_id(pane_id)
             .is_some_and(|tab_id| self.tab_resize_frozen(&tab_id))
             || self.pane_relocations.values().any(|pending| {
                 pending.phase.locks_tab()
                     && pending.plan.predicted_pane_ids().any(|id| id == pane_id)
             })
-            || self
-                .pane_template_commits
-                .values()
-                .any(|pending| pending.predicted_pane_ids().any(|id| id == pane_id))
     }
 
     pub(super) fn tab_resize_frozen(&self, tab_id: &str) -> bool {
+        if self.pane_template_commits.contains_key(tab_id) {
+            return false;
+        }
+        if self
+            .pane_detaches
+            .values()
+            .any(|pending| pending.locks_tab(tab_id))
+        {
+            return false;
+        }
         self.tab_relocation_locked(tab_id)
             || self.tab_split_dragging(tab_id)
             || matches!(
@@ -580,7 +626,7 @@ impl OcHerdrView {
         serial: u64,
         cx: &mut Context<Self>,
     ) {
-        let visible = self.pane_tab_id(pane_id).as_deref() == self.selection.tab_id.as_deref();
+        let visible = self.optimistic_visible_pane_ids().contains(pane_id);
         let frozen = self.pane_resize_frozen(pane_id);
         let observer_reconnect = self
             .current_session()

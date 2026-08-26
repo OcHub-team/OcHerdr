@@ -185,6 +185,41 @@ fn confirm_dialog_receives_keys_even_when_nothing_was_focused(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn tab_rename_enter_submits_once_without_reentering_the_input(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    view.update_in(cx, |this, window, cx| {
+        this.open_rename(
+            crate::HierarchyTarget::Tab {
+                id: "t-a".into(),
+                label: "alpha".into(),
+            },
+            window,
+            cx,
+        );
+        this.rename_input
+            .update(cx, |input, cx| input.set_content("renamed", cx));
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let renames = fake.requests_for("tab.rename");
+    assert_eq!(
+        renames.len(),
+        1,
+        "Enter must submit exactly once: {renames:?}"
+    );
+    assert_eq!(
+        renames[0].get("params"),
+        Some(&json!({ "tab_id": "t-a", "label": "renamed" }))
+    );
+    view.read_with(cx, |this, _| {
+        assert!(matches!(this.overlay, crate::Overlay::None));
+    });
+}
+
+#[gpui::test]
 fn tab_shortcut_hints_show_only_while_command_is_held(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);
     cx.update(|_, cx| cx.set_reduce_motion(true));

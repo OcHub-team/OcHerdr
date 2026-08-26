@@ -205,12 +205,17 @@ impl OcHerdrView {
             .as_ref()
             .map(|drag| drag.pane_id.clone())
             .or_else(|| keyboard_move.as_ref().map(|mode| mode.pane_id.clone()));
-        let draggable = layout
-            .as_ref()
-            .is_some_and(|layout| !layout.zoomed && layout.panes.len() > 1)
-            && !self.tab_relocation_locked(tab_id);
+        let draggable = layout.as_ref().is_some_and(|layout| {
+            !layout.zoomed && (layout.panes.len() > 1 || self.pane_move_supported())
+        }) && !self.tab_relocation_locked(tab_id);
         let mut elements = Vec::new();
         for pane in panes {
+            if pane_drag
+                .as_ref()
+                .is_some_and(|drag| drag.tab_target.is_some() && drag.pane_id == pane.pane_id)
+            {
+                continue;
+            }
             let fractions = self
                 .displayed_pane_fractions(layout.as_ref(), &pane.pane_id, now, reduce_motion)
                 .unwrap_or((0., 0., 1., 1.));
@@ -555,22 +560,35 @@ impl OcHerdrView {
         // Gesture math lives in window pixels; this overlay is a child of the
         // `relative()` surface, so everything painted here is surface-local.
         let origin = self.surface_origin();
-        let droppable = drag.template_hover.is_some()
+        let droppable = drag.tab_target.is_some()
+            || drag.template_hover.is_some()
             || drag
                 .hover
                 .as_ref()
                 .is_some_and(|hover| hover.droppable(drag.edge_drops));
         let zone = drag.hover.as_ref().map(|hover| hover.zone);
-        let state_text = drag
-            .template_hover
-            .as_ref()
-            .map(|hover| hover.placement.template.label(i18n))
-            .unwrap_or_else(|| pane_drag_state_text(zone, droppable, i18n));
+        let state_text = match drag.tab_target.as_ref() {
+            Some(PaneTabDropTarget::NewTab) => i18n.text(k::TERMINAL_DROP_NEW_TAB).to_owned(),
+            Some(PaneTabDropTarget::Existing { tab_id, .. }) => snapshot
+                .tabs
+                .iter()
+                .find(|tab| tab.tab_id == *tab_id)
+                .map(|tab| i18n.drop_move_into_tab(&tab.label))
+                .unwrap_or_else(|| i18n.text(k::TERMINAL_DROP_INVALID).to_owned()),
+            None => drag
+                .template_hover
+                .as_ref()
+                .map(|hover| hover.placement.template.label(i18n).to_owned())
+                .unwrap_or_else(|| pane_drag_state_text(zone, droppable, i18n).to_owned()),
+        };
         let highlight = drag
             .hover
             .as_ref()
             .filter(|_| droppable)
             .map(|hover| render_drop_highlight(hover, true, origin, reduce_motion));
+        let template_highlight = self
+            .terminal_surface_bounds
+            .and_then(|surface| render_pane_template_target_highlight(drag, surface, origin, i18n));
         // The zone label goes above the preview: the floating card follows
         // the pointer, which sits inside the target, so a label drawn in the
         // highlight itself would be hidden under the card.
@@ -585,8 +603,9 @@ impl OcHerdrView {
                 .layout_for(&drag.tab_id)
                 .map(|layout| layout.panes.len())
                 .unwrap_or_default();
-            self.terminal_surface_bounds
-                .and_then(|surface| render_pane_template_palette(drag, pane_count, surface, i18n))
+            self.terminal_surface_bounds.and_then(|surface| {
+                render_pane_template_palette(drag, pane_count, surface, i18n, cx)
+            })
         });
         let frame = self
             .pane(&drag.pane_id)
@@ -654,6 +673,7 @@ impl OcHerdrView {
                 cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
             )
             .children(highlight)
+            .children(template_highlight)
             .children(preview)
             .children(zone_label)
             .children(palette.into_iter().flatten())
