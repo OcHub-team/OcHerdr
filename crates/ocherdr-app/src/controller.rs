@@ -1133,7 +1133,7 @@ impl OcHerdrView {
                 return true;
             }
         }
-        if modifiers.platform && !modifiers.alt && !modifiers.control {
+        if is_primary_app_modifier(modifiers) {
             let handled = match (key, modifiers.shift) {
                 ("t", false) => {
                     self.create_tab(cx);
@@ -1213,7 +1213,7 @@ impl OcHerdrView {
             return;
         };
         let key = &event.keystroke;
-        if key.modifiers.platform && key.key == "v" {
+        if is_primary_app_modifier(key.modifiers) && key.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                 let _ = runtime
                     .session
@@ -1296,5 +1296,13 @@ impl OcHerdrView {
             .ok();
         })
         .detach();
+    }
+}
+
+fn is_primary_app_modifier(modifiers: ochub_ui::gpui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.platform && !modifiers.alt && !modifiers.control
+    } else {
+        modifiers.control && !modifiers.platform && !modifiers.alt
     }
 }

@@ -91,6 +91,10 @@ impl I18n {
         }
     }
 
+    pub(crate) fn empty_session_hint(self) -> &'static str {
+        self.text(empty_session_hint_english())
+    }
+
     pub(crate) fn close_action(self, kind: &str) -> String {
         match self.locale {
             Locale::English => format!("Close {}", self.kind(kind)),
@@ -179,6 +183,34 @@ impl I18n {
     }
 }
 
+pub(crate) fn uses_macos_shortcuts() -> bool {
+    cfg!(target_os = "macos")
+}
+
+pub(crate) fn new_tab_shortcut() -> &'static str {
+    if uses_macos_shortcuts() {
+        "⌘T"
+    } else {
+        "Ctrl-T"
+    }
+}
+
+pub(crate) fn close_tab_shortcut() -> &'static str {
+    if uses_macos_shortcuts() {
+        "⌘W"
+    } else {
+        "Ctrl-W"
+    }
+}
+
+fn empty_session_hint_english() -> &'static str {
+    if uses_macos_shortcuts() {
+        "Press ⌘T to open your first terminal."
+    } else {
+        "Press Ctrl-T to open your first terminal."
+    }
+}
+
 fn zh_hans(english: &'static str) -> &'static str {
     match english {
         "Spaces" => "空间",
@@ -215,6 +247,9 @@ fn zh_hans(english: &'static str) -> &'static str {
         }
         "This session has no tabs" => "此会话没有标签页",
         "Create a workspace to open the first terminal." => "新建工作区以打开第一个终端。",
+        "Press ⌘T to open your first terminal." => "按 ⌘T 打开第一个终端。",
+        "Press Cmd-T to open your first terminal." => "按 Cmd-T 打开第一个终端。",
+        "Press Ctrl-T to open your first terminal." => "按 Ctrl-T 打开第一个终端。",
         "Connecting…" => "正在连接…",
         "System" => "跟随系统",
         "English" => "English",
@@ -393,6 +428,35 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Language>(&json).unwrap(),
             Language::SimplifiedChinese
+        );
+    }
+
+    #[test]
+    fn empty_session_hint_uses_platform_new_tab_shortcut() {
+        let english = I18n::new(Language::English);
+        let chinese = I18n::new(Language::SimplifiedChinese);
+
+        assert_eq!(english.empty_session_hint(), empty_session_hint_english());
+        assert_eq!(
+            chinese.empty_session_hint(),
+            zh_hans(empty_session_hint_english())
+        );
+        assert_eq!(
+            english.empty_session_hint().contains('⌘')
+                || english.empty_session_hint().contains("Cmd-T"),
+            cfg!(target_os = "macos")
+        );
+        assert_eq!(
+            english.empty_session_hint().contains("Ctrl-T"),
+            !cfg!(target_os = "macos")
+        );
+        assert_eq!(
+            new_tab_shortcut(),
+            if cfg!(target_os = "macos") {
+                "⌘T"
+            } else {
+                "Ctrl-T"
+            }
         );
     }
 }

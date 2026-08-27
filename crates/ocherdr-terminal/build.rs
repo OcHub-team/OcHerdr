@@ -6,8 +6,18 @@ fn zig_target(target: &str) -> &str {
     match target {
         "x86_64-apple-darwin" => "x86_64-macos",
         "aarch64-apple-darwin" => "aarch64-macos",
-        other => panic!("OcHerdr currently supports libghostty-vt on macOS only: {other}"),
+        // Ghostty's CMake integration and `zig targets` use `$arch-linux-$abi`
+        // (see vendor/libghostty-vt/dist/cmake/README.md and PACKAGING.md).
+        "x86_64-unknown-linux-gnu" => "x86_64-linux-gnu",
+        "aarch64-unknown-linux-gnu" => "aarch64-linux-gnu",
+        "x86_64-unknown-linux-musl" => "x86_64-linux-musl",
+        "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
+        other => panic!("unsupported rustc target for libghostty-vt: {other}"),
     }
+}
+
+fn is_apple_darwin(target: &str) -> bool {
+    target.ends_with("-apple-darwin")
 }
 
 fn main() {
@@ -55,13 +65,15 @@ fn main() {
         .expect("execute Zig for libghostty-vt");
     assert!(status.success(), "libghostty-vt Zig build failed: {status}");
 
-    cc::Build::new()
-        .file(crate_dir.join("native/terminal_shim.c"))
+    let mut cc = cc::Build::new();
+    cc.file(crate_dir.join("native/terminal_shim.c"))
         .include(vendor.join("include"))
         .define("GHOSTTY_STATIC", None)
-        .flag_if_supported("-mmacosx-version-min=11.0")
-        .warnings(true)
-        .compile("ocherdr-terminal-shim");
+        .warnings(true);
+    if is_apple_darwin(&target) {
+        cc.flag_if_supported("-mmacosx-version-min=11.0");
+    }
+    cc.compile("ocherdr-terminal-shim");
 
     // Zig emits a static archive and a dylib with the same linker name. Copy
     // the archive to an unambiguous name so rustc cannot resolve `-l` to the
