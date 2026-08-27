@@ -36,7 +36,7 @@ mod controller;
 mod i18n;
 mod ui;
 
-use i18n::{I18n, Language};
+use i18n::{I18n, Language, close_tab_shortcut, new_tab_shortcut};
 
 const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;

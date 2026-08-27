@@ -578,7 +578,7 @@ impl OcHerdrView {
                 .child(empty_state(
                     IconName::Layers,
                     i18n.text("This session has no tabs"),
-                    i18n.text("Create a workspace to open the first terminal."),
+                    i18n.empty_session_hint(),
                     None,
                 ))
                 .into_any_element();

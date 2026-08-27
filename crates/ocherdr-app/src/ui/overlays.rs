@@ -198,7 +198,7 @@ impl OcHerdrView {
                     context_menu_item(
                         "tab-menu-new",
                         i18n.text("New tab"),
-                        Some("⌘T"),
+                        Some(new_tab_shortcut()),
                         Some(IconName::Add),
                         false,
                     )
@@ -227,7 +227,7 @@ impl OcHerdrView {
                     context_menu_item(
                         "tab-menu-close",
                         i18n.text("Close"),
-                        Some("⌘W"),
+                        Some(close_tab_shortcut()),
                         Some(IconName::Close),
                         true,
                     )
