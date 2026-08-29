@@ -118,6 +118,131 @@ fn interactive_ssh_command_preserves_profile_overrides() {
 }
 
 #[test]
+fn remote_clipboard_image_upload_streams_bytes_with_profile_ssh_options() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    let arguments = dir.path().join("arguments");
+    let payload = dir.path().join("payload");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\ncat > {}\nprintf '%s' '/tmp/ocherdr-clipboard-images-501/clipboard-123-456-1/image.png'\n",
+        posix_quote(&arguments.to_string_lossy()),
+        posix_quote(&payload.to_string_lossy()),
+    );
+    fs::write(&ssh, script).unwrap();
+    let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&ssh, permissions).unwrap();
+
+    let identity = dir.path().join("key with space");
+    let profile = ConnectionProfile::Ssh {
+        id: "server".into(),
+        label: "Server".into(),
+        destination: "deploy@example.com".into(),
+        port: Some(2202),
+        identity_file: Some(identity.clone()),
+        herdr_path: "herdr".into(),
+    };
+    let bytes = b"\x89PNG\r\n\x1a\nremote".to_vec();
+    let path = upload_remote_clipboard_image_with_ssh(&profile, "PNG", bytes.clone(), &ssh)
+        .expect("fake SSH upload");
+
+    assert_eq!(
+        path,
+        "/tmp/ocherdr-clipboard-images-501/clipboard-123-456-1/image.png"
+    );
+    assert_eq!(fs::read(payload).unwrap(), bytes);
+    let arguments = fs::read_to_string(arguments).unwrap();
+    assert!(arguments.lines().any(|line| line == "-p"));
+    assert!(arguments.lines().any(|line| line == "2202"));
+    assert!(
+        arguments
+            .lines()
+            .any(|line| line == identity.to_string_lossy())
+    );
+    assert!(arguments.lines().any(|line| line == "deploy@example.com"));
+    assert!(arguments.contains("/tmp/ocherdr-clipboard-images-$uid"));
+    assert!(arguments.contains("cat > \"$path\""));
+}
+
+#[test]
+fn remote_clipboard_image_script_writes_a_private_remote_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nfor argument\ndo\n  remote=$argument\ndone\nexec /bin/sh -c \"$remote\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&ssh, permissions).unwrap();
+
+    let profile = ConnectionProfile::Ssh {
+        id: "server".into(),
+        label: "Server".into(),
+        destination: "deploy@example.com".into(),
+        port: None,
+        identity_file: None,
+        herdr_path: "herdr".into(),
+    };
+    let bytes = b"\x89PNG\r\n\x1a\nremote".to_vec();
+    let path = upload_remote_clipboard_image_with_ssh(&profile, "png", bytes.clone(), &ssh)
+        .expect("execute remote staging script");
+    let path = PathBuf::from(path);
+
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let upload_dir = path.parent().unwrap().to_owned();
+    let staging_dir = upload_dir.parent().unwrap().to_owned();
+    assert_eq!(
+        fs::metadata(&staging_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    fs::remove_file(path).unwrap();
+    fs::remove_dir(upload_dir).unwrap();
+    let _ = fs::remove_dir(staging_dir);
+}
+
+#[test]
+fn remote_clipboard_image_validation_rejects_unsafe_content() {
+    assert!(validate_remote_clipboard_image("svg", b"<svg/>").is_err());
+    assert!(validate_remote_clipboard_image("png", b"not png").is_err());
+    assert!(validate_remote_clipboard_image("png", b"").is_err());
+    assert_eq!(
+        validate_remote_clipboard_image("PNG", b"\x89PNG\r\n\x1a\nrest").unwrap(),
+        "png"
+    );
+}
+
+#[test]
+fn remote_clipboard_image_path_allows_only_the_generated_shape() {
+    assert!(remote_clipboard_image_path_is_safe(
+        "/tmp/ocherdr-clipboard-images-501/clipboard-123-456-1/image.png",
+        "png"
+    ));
+    assert!(!remote_clipboard_image_path_is_safe(
+        "/tmp/ocherdr-clipboard-images-501/clipboard-../../bin/run/image.png",
+        "png"
+    ));
+    assert!(!remote_clipboard_image_path_is_safe(
+        "/tmp/ocherdr-clipboard-images-user/clipboard-123/image.png",
+        "png"
+    ));
+    assert!(!remote_clipboard_image_path_is_safe(
+        "/tmp/ocherdr-clipboard-images-501/clipboard-123/image.png;touch-pwned",
+        "png"
+    ));
+}
+
+#[test]
 fn terminal_input_serializes_lossless_bytes() {
     let encoded = base64::engine::general_purpose::STANDARD.encode([0, 0x1b, 0x80, 0xff]);
     let value = serde_json::to_value(TerminalControlCommand::Input { bytes: &encoded }).unwrap();

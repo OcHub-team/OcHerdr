@@ -15,9 +15,9 @@ use ocherdr_core::{
     valid_split_ratio,
 };
 use ocherdr_herdr::{
-    EventSubscription, HerdrError, HostHealthStatus, SessionConnection, TerminalCommand,
-    TerminalMode, TerminalSession, attach_command, discover_sessions, open_system_terminal,
-    request_socket,
+    EventSubscription, HerdrError, HostHealthStatus, MAX_REMOTE_CLIPBOARD_IMAGE_BYTES,
+    SessionConnection, TerminalCommand, TerminalMode, TerminalSession, attach_command,
+    discover_sessions, open_system_terminal, request_socket, upload_remote_clipboard_image,
 };
 use ocherdr_terminal::{KeyAction, KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
 use ochub_ui::anim::Transition;
@@ -27,14 +27,14 @@ use ochub_ui::components::{
     modal_card, modal_footer, modal_header, modal_overlay, spinner, status_dot,
 };
 use ochub_ui::gpui::{
-    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClickEvent, ClipboardItem,
-    Context, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    FontWeight, IntoElement, KeyBinding, KeyDownEvent, Menu, MenuItem, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, Task, TextOverflow, TextRun, TitlebarOptions,
-    UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds, WindowOptions, canvas, div,
-    ease_out_quint, linear_color_stop, linear_gradient, point, prelude::*, px, relative, size,
-    surface,
+    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClickEvent, ClipboardEntry,
+    ClipboardItem, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent, Menu, MenuItem,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Task, TextOverflow, TextRun,
+    TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds,
+    WindowOptions, canvas, div, ease_out_quint, linear_color_stop, linear_gradient, point,
+    prelude::*, px, relative, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
@@ -283,6 +283,9 @@ struct LoadedSession {
     events: LoadedEvents,
     snapshot: Option<HierarchySnapshot>,
 }
+
+type RemoteClipboardImageUpload =
+    fn(ConnectionProfile, String, Vec<u8>) -> Result<String, HerdrError>;
 
 enum LoadedEvents {
     Idle,
@@ -726,6 +729,9 @@ struct OcHerdrView {
     connection: Option<SessionConnection>,
     /// What the connected Herdr can do, derived from the last full snapshot.
     herdr_capabilities: HerdrCapabilities,
+    /// Blocking transport used by the asynchronous remote-image paste path.
+    /// A function pointer keeps that controller boundary independently testable.
+    remote_clipboard_image_upload: RemoteClipboardImageUpload,
     event_stream: EventStreamState,
     /// Dropping this cancels the session-wide event await loop.
     event_listen: Option<Task<()>>,

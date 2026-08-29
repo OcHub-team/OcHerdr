@@ -274,14 +274,20 @@ impl FakeHerdr {
     /// Base64 payloads of every `terminal.input` the view wrote to the
     /// pane's control stream, in order.
     fn terminal_inputs(&self, pane_id: &str) -> Vec<String> {
+        self.terminal_commands(pane_id)
+            .into_iter()
+            .filter(|command| command["type"] == json!("terminal.input"))
+            .filter_map(|command| command["bytes"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn terminal_commands(&self, pane_id: &str) -> Vec<Value> {
         let path = self._dir.path().join(format!("terminal-{pane_id}.jsonl"));
         let Ok(log) = std::fs::read_to_string(path) else {
             return Vec::new();
         };
         log.lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|command| command["type"] == json!("terminal.input"))
-            .filter_map(|command| command["bytes"].as_str().map(str::to_owned))
             .collect()
     }
 

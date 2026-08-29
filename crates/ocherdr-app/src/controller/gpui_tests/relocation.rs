@@ -1,4 +1,16 @@
 use super::*;
+
+fn fake_remote_clipboard_image_upload(
+    profile: ConnectionProfile,
+    extension: String,
+    bytes: Vec<u8>,
+) -> std::result::Result<String, ocherdr_herdr::HerdrError> {
+    assert!(matches!(profile, ConnectionProfile::Ssh { .. }));
+    assert_eq!(extension, "png");
+    assert_eq!(bytes, b"\x89PNG\r\n\x1a\nremote");
+    Ok("/tmp/ocherdr-clipboard-images-501/clipboard-123-456-1/image.png".into())
+}
+
 pub(super) fn temp_tab() -> TabInfo {
     TabInfo {
         tab_id: "t-tmp".into(),
@@ -690,6 +702,84 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
         vec!["G1syNzsyOzEzfg==".to_owned()]
     );
     assert!(fake.terminal_inputs("p-right").is_empty());
+
+    // Ghostty makes Cmd+V a performable text paste. If the clipboard holds
+    // only an image, the chord must instead reach the agent through its Kitty
+    // keyboard protocol so the agent can perform its native image paste.
+    view.update_in(cx, |this, window, cx| {
+        let runtime = this.pane_mut("p-left").expect("selected terminal");
+        runtime.terminal.apply_frame(b"\x1b[>1u", false);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image {
+            format: gpui::ImageFormat::Png,
+            bytes: b"\x89PNG\r\n\x1a\nlocal".to_vec(),
+            id: 1,
+        }));
+        let mut cmd_v = key("v", false);
+        cmd_v.keystroke.modifiers.platform = true;
+        this.send_key(&cmd_v, window, cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.terminal_inputs("p-left").len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "Ghostty never forwarded image-only Cmd+V"
+        );
+        view.update(cx, |this, _| this.pump_terminal_input());
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fake.terminal_inputs("p-left"),
+        vec!["G1syNzsyOzEzfg==".to_owned(), "G1sxMTg7OXU=".to_owned()]
+    );
+
+    // The same image-only Cmd+V on an SSH profile uploads outside Herdr, then
+    // pastes the returned remote path through ordinary terminal.input.
+    view.update_in(cx, |this, window, cx| {
+        this.profiles[0] = ConnectionProfile::Ssh {
+            // Keep the fixture's existing per-pane child stream while making
+            // routing remote. Production profile ids are unique; this test id
+            // intentionally matches Local's synthetic `local` owner.
+            id: "local".into(),
+            label: "Remote".into(),
+            destination: "unused.example".into(),
+            port: None,
+            identity_file: None,
+            herdr_path: "herdr".into(),
+        };
+        this.remote_clipboard_image_upload = fake_remote_clipboard_image_upload;
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image {
+            format: gpui::ImageFormat::Png,
+            bytes: b"\x89PNG\r\n\x1a\nremote".to_vec(),
+            id: 2,
+        }));
+        assert!(matches!(
+            this.current_profile(),
+            ConnectionProfile::Ssh { .. }
+        ));
+        let mut cmd_v = key("v", false);
+        cmd_v.keystroke.modifiers.platform = true;
+        this.send_key(&cmd_v, window, cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.terminal_inputs("p-left").len() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "uploaded remote image path never reached the pane stream"
+        );
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fake.terminal_inputs("p-left"),
+        vec![
+            "G1syNzsyOzEzfg==".to_owned(),
+            "G1sxMTg7OXU=".to_owned(),
+            "L3RtcC9vY2hlcmRyLWNsaXBib2FyZC1pbWFnZXMtNTAxL2NsaXBib2FyZC0xMjMtNDU2LTEvaW1hZ2UucG5n"
+                .to_owned(),
+        ],
+        "remote image paste must not leak another Cmd+V into the PTY"
+    );
 }
 
 #[gpui::test]

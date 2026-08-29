@@ -38,6 +38,7 @@ pub(crate) enum FailureKind {
     NoSessionSelected,
     MissingTheme,
     AgentBlocked,
+    ClipboardImagePaste,
     /// Step 3 of an edge relocation failed: the pane landed on the mirrored
     /// side. The layout is legal, so this is a warning, not an error.
     PaneMisordered,
@@ -76,7 +77,8 @@ impl FailureKind {
             | Self::MoveTab
             | Self::RenderTerminal
             | Self::TerminalStream
-            | Self::TerminalRuntime => NotificationLevel::Error,
+            | Self::TerminalRuntime
+            | Self::ClipboardImagePaste => NotificationLevel::Error,
         }
     }
 
@@ -112,6 +114,7 @@ impl FailureKind {
             Self::NoSessionSelected => k::NOTIFY_CANNOT_OPEN_TERMINAL,
             Self::MissingTheme => k::NOTIFY_MISSING_THEME,
             Self::AgentBlocked => k::NOTIFY_AGENT_BLOCKED,
+            Self::ClipboardImagePaste => k::NOTIFY_CLIPBOARD_IMAGE_PASTE,
             Self::PaneMisordered => k::NOTIFY_PANE_MISORDERED,
         }
     }
@@ -189,11 +192,14 @@ mod tests {
             i18n,
         );
         let failed = notification_for(FailureKind::DiscoverSessions, "connection refused", i18n);
+        let image = notification_for(FailureKind::ClipboardImagePaste, "too large", i18n);
         assert_eq!(invalid.level, NotificationLevel::Warning);
         assert_eq!(invalid.title, "Invalid SSH destination");
         assert_eq!(invalid.message, "SSH destination is required.");
         assert_eq!(failed.level, NotificationLevel::Error);
         assert_eq!(failed.title, "Could not discover Herdr sessions");
         assert_eq!(failed.message, "connection refused");
+        assert_eq!(image.level, NotificationLevel::Error);
+        assert_eq!(image.title, "Could not paste clipboard image");
     }
 }

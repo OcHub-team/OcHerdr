@@ -25,6 +25,7 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - workspace/tab creation, rename, close, and pane operations through the public API;
 - native context menus for workspace, tab, and pane actions;
 - macOS shortcuts plus Herdr's `Ctrl+B` prefix workflow;
+- local and SSH-host clipboard image paste with `Cmd+V`;
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
 - runtime internationalization with system-language detection, English, and Simplified Chinese;
 - an Open TUI handoff for Herdr settings through the system Terminal;
@@ -85,6 +86,10 @@ closes the tab), `Cmd+Shift+W` (close workspace), `Cmd+Shift+N` (new workspace),
 `Cmd+1…9` (switch tab), `Ctrl+Tab` (cycle tabs), `F2` (rename), and `Cmd+,`
 (open Herdr settings in Terminal). Click the status-bar host to switch machines; `Hosts` in the
 toolbar opens the connection manager. `Cmd+W` is for panes, not hosts.
+
+With an image-only clipboard, `Cmd+V` stays native for local panes. For an SSH
+pane, OcHerdr uploads the image with the host's existing OpenSSH profile and pastes
+the resulting remote path; no Herdr private protocol or server modification is used.
 
 The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 `Shift+N` for a workspace, `N/P` to cycle tabs, `Shift+T/W/P` to rename,

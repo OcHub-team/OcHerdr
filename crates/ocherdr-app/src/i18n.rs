@@ -249,6 +249,23 @@ impl I18n {
         tf!(self, k::NOTIFY_DETAIL_MISSING_THEME, name = name)
     }
 
+    pub(crate) fn clipboard_image_format_detail(self, format: &str) -> String {
+        tf!(
+            self,
+            k::NOTIFY_DETAIL_CLIPBOARD_IMAGE_FORMAT,
+            format = format
+        )
+    }
+
+    pub(crate) fn clipboard_image_too_large_detail(self, bytes: usize, max: usize) -> String {
+        tf!(
+            self,
+            k::NOTIFY_DETAIL_CLIPBOARD_IMAGE_TOO_LARGE,
+            bytes = bytes,
+            max = max
+        )
+    }
+
     pub(crate) fn running_operation(self, method: &str) -> String {
         tf!(self, k::NOTIFY_RUNNING, method = method)
     }

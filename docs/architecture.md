@@ -44,6 +44,14 @@ Remote command arguments are POSIX-quoted before OpenSSH constructs its remote c
 string. User labels and paths used for topology mutations travel as JSON through the
 forwarded public socket instead of through a shell.
 
+An image-only `Cmd+V` follows the local-client boundary used by remote attach: OcHerdr
+validates the encoded image, streams at most 16 MiB through a separate non-TTY SSH
+command, and writes it with user-only permissions below
+`/tmp/ocherdr-clipboard-images-<uid>`. The command lazily removes staged images older
+than 24 hours. Its returned path is restricted to OcHerdr's generated shape before
+Ghostty pastes it through the existing public `terminal.input` stream. The binary
+payload never enters Herdr's NDJSON adapter or private client protocol.
+
 ## Terminal policy
 
 Only one controller may own one terminal, but a single OcHerdr may independently

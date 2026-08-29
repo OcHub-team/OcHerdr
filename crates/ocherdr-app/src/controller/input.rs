@@ -1,5 +1,87 @@
 use super::*;
 
+#[derive(Debug, PartialEq, Eq)]
+enum CommandPaste {
+    PassThrough,
+    Text(String),
+    RemoteImage { extension: String, bytes: Vec<u8> },
+    RemoteImageError(RemoteImagePasteError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteImagePasteError {
+    UnsupportedFormat(String),
+    TooLarge { bytes: usize, max: usize },
+    InvalidImage,
+}
+
+impl RemoteImagePasteError {
+    fn detail(&self, i18n: I18n) -> String {
+        match self {
+            Self::UnsupportedFormat(format) => i18n.clipboard_image_format_detail(format),
+            Self::TooLarge { bytes, max } => i18n.clipboard_image_too_large_detail(*bytes, *max),
+            Self::InvalidImage => i18n
+                .text(k::NOTIFY_DETAIL_CLIPBOARD_IMAGE_INVALID)
+                .to_owned(),
+        }
+    }
+}
+
+fn command_paste(item: Option<ClipboardItem>, remote: bool) -> CommandPaste {
+    let Some(item) = item else {
+        return CommandPaste::PassThrough;
+    };
+    if let Some(text) = item.text() {
+        return CommandPaste::Text(text);
+    }
+    if !remote {
+        return CommandPaste::PassThrough;
+    }
+    let Some(image) = item.into_entries().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(image),
+        _ => None,
+    }) else {
+        return CommandPaste::PassThrough;
+    };
+    let extension = image.format.extension();
+    if !matches!(extension, "png" | "jpg" | "gif" | "webp" | "bmp") {
+        return CommandPaste::RemoteImageError(RemoteImagePasteError::UnsupportedFormat(
+            extension.to_owned(),
+        ));
+    }
+    if image.bytes.is_empty() || !image_bytes_match_signature(extension, &image.bytes) {
+        return CommandPaste::RemoteImageError(RemoteImagePasteError::InvalidImage);
+    }
+    let max = MAX_REMOTE_CLIPBOARD_IMAGE_BYTES;
+    if image.bytes.len() > max {
+        return CommandPaste::RemoteImageError(RemoteImagePasteError::TooLarge {
+            bytes: image.bytes.len(),
+            max,
+        });
+    }
+    CommandPaste::RemoteImage {
+        extension: extension.to_owned(),
+        bytes: image.bytes,
+    }
+}
+
+fn image_bytes_match_signature(extension: &str, bytes: &[u8]) -> bool {
+    match extension {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP",
+        "bmp" => {
+            if bytes.len() < 26 || !bytes.starts_with(b"BM") {
+                return false;
+            }
+            let offset = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
+            (26..=bytes.len()).contains(&offset)
+        }
+        _ => false,
+    }
+}
+
 impl OcHerdrView {
     pub(crate) fn create_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(workspace_id) = self.selection.workspace_id.clone() {
@@ -274,6 +356,15 @@ impl OcHerdrView {
         };
         self.take_terminal_control(pane_id.clone(), cx);
         let key = &event.keystroke;
+        let paste = (key.modifiers.platform && key.key == "v").then(|| {
+            command_paste(
+                cx.read_from_clipboard(),
+                matches!(self.current_profile(), ConnectionProfile::Ssh { .. }),
+            )
+        });
+        let mut paste_error = None;
+        let mut remote_image = None;
+        let mut suppress_key_release = false;
         let stream_closed = {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
@@ -281,38 +372,129 @@ impl OcHerdrView {
             if !runtime.mode.is_controlled() {
                 return;
             }
-            if key.modifiers.platform && key.key == "v" {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            match paste.unwrap_or(CommandPaste::PassThrough) {
+                CommandPaste::Text(text) => {
                     runtime.terminal.paste(&text);
+                    suppress_key_release = true;
                     cx.stop_propagation();
                     drain_terminal_input(runtime)
-                } else {
+                }
+                CommandPaste::RemoteImage { extension, bytes } => {
+                    suppress_key_release = true;
+                    cx.stop_propagation();
+                    remote_image = Some((extension, bytes));
                     false
                 }
-            } else {
-                // Ghostty encodes the key for the modes the application
-                // enabled (kitty keyboard protocol, modifyOtherKeys,
-                // application cursor keys) and queues the pty bytes.
-                let action = if event.is_held {
-                    KeyAction::Repeat
-                } else {
-                    KeyAction::Press
-                };
-                if !runtime.terminal.send_key(
-                    action,
-                    &key.key,
-                    key.key_char.as_deref(),
-                    gpui_key_modifiers(key.modifiers),
-                ) {
-                    return;
+                CommandPaste::RemoteImageError(error) => {
+                    suppress_key_release = true;
+                    paste_error = Some(error);
+                    cx.stop_propagation();
+                    false
                 }
-                cx.stop_propagation();
-                drain_terminal_input(runtime)
+                CommandPaste::PassThrough => {
+                    // Match Ghostty's performable paste binding: an image-only
+                    // clipboard on a local profile leaves the original Cmd+V
+                    // intact, so a local agent can read the OS clipboard.
+                    let action = if event.is_held {
+                        KeyAction::Repeat
+                    } else {
+                        KeyAction::Press
+                    };
+                    if !runtime.terminal.send_key(
+                        action,
+                        &key.key,
+                        key.key_char.as_deref(),
+                        gpui_key_modifiers(key.modifiers),
+                    ) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    drain_terminal_input(runtime)
+                }
             }
         };
+        if suppress_key_release {
+            self.suppress_key_release = true;
+        }
+        if let Some(error) = paste_error {
+            let detail = error.detail(self.i18n);
+            self.notify_failure(FailureKind::ClipboardImagePaste, detail, cx);
+        }
+        if let Some((extension, bytes)) = remote_image {
+            self.upload_and_paste_remote_clipboard_image(pane_id, extension, bytes, cx);
+        }
         if stream_closed {
             self.resync_snapshot(self.event_epoch, cx);
         }
+    }
+
+    fn upload_and_paste_remote_clipboard_image(
+        &mut self,
+        pane_id: String,
+        extension: String,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        let profile = self.current_profile();
+        let profile_id = profile.id().to_owned();
+        let session_name = self.current_session().map(|session| session.name.clone());
+        let event_epoch = self.event_epoch;
+        let upload = self.remote_clipboard_image_upload;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { upload(profile, extension, bytes) })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok(path) => {
+                    let target_is_current = this.event_epoch == event_epoch
+                        && this.current_profile().id() == profile_id
+                        && this.current_session().map(|session| &session.name)
+                            == session_name.as_ref();
+                    if !target_is_current {
+                        this.notify_failure(
+                            FailureKind::ClipboardImagePaste,
+                            this.i18n
+                                .text(k::NOTIFY_DETAIL_CLIPBOARD_IMAGE_TARGET_CHANGED),
+                            cx,
+                        );
+                        return;
+                    }
+                    let Some(stream_closed) =
+                        this.paste_uploaded_remote_clipboard_image(&pane_id, &path)
+                    else {
+                        this.notify_failure(
+                            FailureKind::ClipboardImagePaste,
+                            this.i18n
+                                .text(k::NOTIFY_DETAIL_CLIPBOARD_IMAGE_TARGET_CHANGED),
+                            cx,
+                        );
+                        return;
+                    };
+                    if stream_closed {
+                        this.notify_failure(
+                            FailureKind::TerminalStream,
+                            HerdrError::TerminalClosed("terminal worker stopped".into()),
+                            cx,
+                        );
+                        this.resync_snapshot(this.event_epoch, cx);
+                    }
+                }
+                Err(error) => {
+                    this.notify_failure(FailureKind::ClipboardImagePaste, error, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn paste_uploaded_remote_clipboard_image(&mut self, pane_id: &str, path: &str) -> Option<bool> {
+        let runtime = self.pane_mut(pane_id)?;
+        if !runtime.mode.is_controlled() {
+            return None;
+        }
+        runtime.terminal.paste(path);
+        Some(drain_terminal_input(runtime))
     }
 
     /// Key releases matter only to applications that asked the kitty
@@ -495,5 +677,75 @@ impl OcHerdrView {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ochub_ui::gpui::{Image, ImageFormat};
+
+    fn png(bytes: Vec<u8>) -> ClipboardItem {
+        ClipboardItem::new_image(&Image {
+            format: ImageFormat::Png,
+            bytes,
+            id: 1,
+        })
+    }
+
+    #[test]
+    fn local_image_paste_keeps_the_original_command_v() {
+        assert_eq!(
+            command_paste(Some(png(b"\x89PNG\r\n\x1a\nrest".to_vec())), false),
+            CommandPaste::PassThrough
+        );
+    }
+
+    #[test]
+    fn remote_image_paste_validates_content() {
+        assert_eq!(
+            command_paste(Some(png(b"not png".to_vec())), true),
+            CommandPaste::RemoteImageError(RemoteImagePasteError::InvalidImage)
+        );
+        assert_eq!(
+            command_paste(
+                Some(ClipboardItem::new_image(&Image {
+                    format: ImageFormat::Svg,
+                    bytes: b"<svg/>".to_vec(),
+                    id: 2,
+                })),
+                true,
+            ),
+            CommandPaste::RemoteImageError(RemoteImagePasteError::UnsupportedFormat("svg".into()))
+        );
+        let mut too_large = vec![0; MAX_REMOTE_CLIPBOARD_IMAGE_BYTES + 1];
+        too_large[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        assert_eq!(
+            command_paste(Some(png(too_large)), true),
+            CommandPaste::RemoteImageError(RemoteImagePasteError::TooLarge {
+                bytes: MAX_REMOTE_CLIPBOARD_IMAGE_BYTES + 1,
+                max: MAX_REMOTE_CLIPBOARD_IMAGE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_png_becomes_an_upload_request() {
+        let bytes = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        assert_eq!(
+            command_paste(Some(png(bytes.clone())), true),
+            CommandPaste::RemoteImage {
+                extension: "png".into(),
+                bytes,
+            }
+        );
+    }
+
+    #[test]
+    fn clipboard_text_keeps_precedence_for_remote_profiles() {
+        assert_eq!(
+            command_paste(Some(ClipboardItem::new_string("hello".into())), true),
+            CommandPaste::Text("hello".into())
+        );
     }
 }

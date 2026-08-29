@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use futures::channel::mpsc::{self as futures_mpsc, Receiver, UnboundedReceiver};
@@ -29,6 +29,8 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static REMOTE_CLIPBOARD_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
+pub const MAX_REMOTE_CLIPBOARD_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum HerdrError {
@@ -44,6 +46,8 @@ pub enum HerdrError {
     Protocol(String),
     #[error("terminal stream closed: {0}")]
     TerminalClosed(String),
+    #[error("remote clipboard image upload failed: {0}")]
+    RemoteClipboardImage(String),
     #[error("Herdr event stream closed: {0}")]
     EventStreamClosed(String),
     #[error("Herdr did not respond within {0:?}")]
@@ -401,6 +405,195 @@ fn add_ssh_common(
         command.arg("-i").arg(identity_file);
     }
     command.arg(destination);
+}
+
+/// Upload a clipboard image through the SSH profile without involving Herdr's
+/// wire protocol. The returned path is on the remote host and is safe to paste
+/// into the already-controlled terminal stream.
+pub fn upload_remote_clipboard_image(
+    profile: ConnectionProfile,
+    extension: String,
+    bytes: Vec<u8>,
+) -> Result<String> {
+    upload_remote_clipboard_image_with_ssh(&profile, &extension, bytes, Path::new("/usr/bin/ssh"))
+}
+
+fn upload_remote_clipboard_image_with_ssh(
+    profile: &ConnectionProfile,
+    extension: &str,
+    bytes: Vec<u8>,
+    ssh_program: &Path,
+) -> Result<String> {
+    let ConnectionProfile::Ssh {
+        destination,
+        port,
+        identity_file,
+        ..
+    } = profile
+    else {
+        return Err(HerdrError::RemoteClipboardImage(
+            "an SSH profile is required".into(),
+        ));
+    };
+    let extension = validate_remote_clipboard_image(extension, &bytes)?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let serial = REMOTE_CLIPBOARD_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+    let token = format!("{}-{unique}-{serial}", std::process::id());
+    let remote = remote_clipboard_image_command(extension, &token);
+
+    let mut command = Command::new(ssh_program);
+    add_ssh_common(&mut command, destination, *port, identity_file.as_deref());
+    let mut child = command
+        .arg("--")
+        .arg(remote)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(HerdrError::RemoteClipboardImage(
+            "SSH stdin was not piped".into(),
+        ));
+    };
+    let writer = thread::spawn(move || -> io::Result<()> {
+        stdin.write_all(&bytes)?;
+        stdin.flush()
+    });
+    let output = child.wait_with_output()?;
+    let write_result = writer.join().map_err(|_| {
+        HerdrError::RemoteClipboardImage("SSH upload writer stopped unexpectedly".into())
+    })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = if detail.is_empty() {
+            format!("SSH exited with {}", output.status)
+        } else {
+            detail
+        };
+        return Err(HerdrError::Ssh(detail));
+    }
+    write_result?;
+
+    let path = String::from_utf8(output.stdout)
+        .map_err(|_| HerdrError::RemoteClipboardImage("remote path was not valid UTF-8".into()))?;
+    if !remote_clipboard_image_path_is_safe(&path, extension) {
+        return Err(HerdrError::RemoteClipboardImage(
+            "remote host returned an invalid staging path".into(),
+        ));
+    }
+    Ok(path)
+}
+
+fn remote_clipboard_image_path_is_safe(path: &str, extension: &str) -> bool {
+    if path.len() > 4096 {
+        return false;
+    }
+    let Some(path) = path.strip_prefix("/tmp/ocherdr-clipboard-images-") else {
+        return false;
+    };
+    let Some((user_id, staged)) = path.split_once('/') else {
+        return false;
+    };
+    if user_id.is_empty() || !user_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Some(staged) = staged.strip_prefix("clipboard-") else {
+        return false;
+    };
+    let suffix = format!("/image.{extension}");
+    let Some(token) = staged.strip_suffix(&suffix) else {
+        return false;
+    };
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+}
+
+fn validate_remote_clipboard_image(extension: &str, bytes: &[u8]) -> Result<&'static str> {
+    let extension = if extension.eq_ignore_ascii_case("png") {
+        "png"
+    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        "jpg"
+    } else if extension.eq_ignore_ascii_case("gif") {
+        "gif"
+    } else if extension.eq_ignore_ascii_case("webp") {
+        "webp"
+    } else if extension.eq_ignore_ascii_case("bmp") {
+        "bmp"
+    } else {
+        return Err(HerdrError::RemoteClipboardImage(format!(
+            "unsupported image format: {extension}"
+        )));
+    };
+    if bytes.is_empty() {
+        return Err(HerdrError::RemoteClipboardImage(
+            "the clipboard image is empty".into(),
+        ));
+    }
+    if bytes.len() > MAX_REMOTE_CLIPBOARD_IMAGE_BYTES {
+        return Err(HerdrError::RemoteClipboardImage(format!(
+            "the clipboard image is {} bytes; maximum is {MAX_REMOTE_CLIPBOARD_IMAGE_BYTES} bytes",
+            bytes.len()
+        )));
+    }
+    if !remote_clipboard_image_signature_matches(extension, bytes) {
+        return Err(HerdrError::RemoteClipboardImage(format!(
+            "image bytes do not match the {extension} format"
+        )));
+    }
+    Ok(extension)
+}
+
+fn remote_clipboard_image_signature_matches(extension: &str, bytes: &[u8]) -> bool {
+    match extension {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP",
+        "bmp" => {
+            if bytes.len() < 26 || !bytes.starts_with(b"BM") {
+                return false;
+            }
+            let offset = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
+            (26..=bytes.len()).contains(&offset)
+        }
+        _ => false,
+    }
+}
+
+fn remote_clipboard_image_command(extension: &str, token: &str) -> String {
+    format!(
+        r#"set -eu
+umask 077
+uid=$(id -u)
+dir="/tmp/ocherdr-clipboard-images-$uid"
+if mkdir -m 700 "$dir" 2>/dev/null; then
+    :
+elif [ ! -d "$dir" ] || [ -L "$dir" ]; then
+    printf '%s\n' 'OcHerdr: unsafe remote clipboard image directory' >&2
+    exit 1
+fi
+chmod 700 "$dir"
+find "$dir" -type f -name 'image.*' -mtime +0 -exec rm -f {{}} \; 2>/dev/null || :
+find "$dir" -type d -name 'clipboard-*' -empty -exec rmdir {{}} \; 2>/dev/null || :
+upload_dir="$dir/clipboard-{token}"
+mkdir -m 700 "$upload_dir"
+path="$upload_dir/image.{extension}"
+cleanup() {{
+    rm -f "$path"
+    rmdir "$upload_dir" 2>/dev/null || :
+}}
+trap cleanup 0 1 2 15
+cat > "$path"
+trap - 0 1 2 15
+printf '%s' "$path""#
+    )
 }
 
 pub fn posix_quote(value: &str) -> String {
