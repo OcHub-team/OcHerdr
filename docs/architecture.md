@@ -44,11 +44,11 @@ Remote command arguments are POSIX-quoted before OpenSSH constructs its remote c
 string. User labels and paths used for topology mutations travel as JSON through the
 forwarded public socket instead of through a shell.
 
-An image-only or single file-backed image `Cmd+V` follows the local-client boundary
-used by remote attach. File-backed clipboard providers such as PixPin are recognized
-before GPUI's path-to-text fallback; OcHerdr reads that local file on a background
-executor, validates the encoded image, streams at most 16 MiB through a separate
-non-TTY SSH command, and writes it with user-only permissions below
+An image-only or single file-backed image pasted with `Cmd+V` or `Ctrl+V` follows the
+local-client boundary used by remote attach. File-backed clipboard providers such as
+PixPin are recognized before GPUI's path-to-text fallback; OcHerdr reads that local
+file on a background executor, validates the encoded image, streams at most 16 MiB
+through a separate non-TTY SSH command, and writes it with user-only permissions below
 `/tmp/ocherdr-clipboard-images-<uid>`. The command lazily removes staged images older
 than 24 hours. Its returned path is restricted to OcHerdr's generated shape before
 Ghostty pastes it through the existing public `terminal.input` stream. The binary

@@ -829,6 +829,21 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
         cx.run_until_parked();
         thread::sleep(Duration::from_millis(20));
     }
+
+    // Herdr users also paste with Ctrl+V. It must take the identical remote
+    // upload path instead of being encoded as a literal control character.
+    view.update_in(cx, |this, window, cx| {
+        this.send_key(&key("v", true), window, cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.terminal_inputs("p-left").len() < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "Ctrl+V remote image path never reached the pane stream"
+        );
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(
         fake.terminal_inputs("p-left"),
         vec![
@@ -836,8 +851,10 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
             "G1sxMTg7OXU=".to_owned(),
             "L3RtcC9vY2hlcmRyLWNsaXBib2FyZC1pbWFnZXMtNTAxL2NsaXBib2FyZC0xMjMtNDU2LTEvaW1hZ2UucG5n"
                 .to_owned(),
+            "L3RtcC9vY2hlcmRyLWNsaXBib2FyZC1pbWFnZXMtNTAxL2NsaXBib2FyZC0xMjMtNDU2LTEvaW1hZ2UucG5n"
+                .to_owned(),
         ],
-        "remote image paste must not leak another Cmd+V into the PTY"
+        "remote image paste must not leak Cmd+V or Ctrl+V into the PTY"
     );
 }
 

@@ -86,6 +86,10 @@ fn command_paste(item: Option<ClipboardItem>, remote: bool) -> CommandPaste {
         .unwrap_or(CommandPaste::PassThrough)
 }
 
+fn is_clipboard_paste_shortcut(keystroke: &Keystroke) -> bool {
+    keystroke.key == "v" && (keystroke.modifiers.platform || keystroke.modifiers.control)
+}
+
 fn explicit_clipboard_text(item: &ClipboardItem) -> Option<String> {
     let mut text = String::new();
     for entry in item.entries() {
@@ -498,7 +502,7 @@ impl OcHerdrView {
         };
         self.take_terminal_control(pane_id.clone(), cx);
         let key = &event.keystroke;
-        let paste = (key.modifiers.platform && key.key == "v").then(|| {
+        let paste = is_clipboard_paste_shortcut(key).then(|| {
             command_paste(
                 cx.read_from_clipboard(),
                 matches!(self.current_profile(), ConnectionProfile::Ssh { .. }),
@@ -857,6 +861,28 @@ mod tests {
             command_paste(Some(png(b"\x89PNG\r\n\x1a\nrest".to_vec())), false),
             CommandPaste::PassThrough
         );
+    }
+
+    #[test]
+    fn command_v_and_control_v_are_both_clipboard_paste_shortcuts() {
+        let mut command_v = Keystroke {
+            key: "v".into(),
+            ..Default::default()
+        };
+        command_v.modifiers.platform = true;
+        assert!(is_clipboard_paste_shortcut(&command_v));
+
+        let mut control_v = Keystroke {
+            key: "v".into(),
+            ..Default::default()
+        };
+        control_v.modifiers.control = true;
+        assert!(is_clipboard_paste_shortcut(&control_v));
+
+        assert!(!is_clipboard_paste_shortcut(&Keystroke {
+            key: "v".into(),
+            ..Default::default()
+        }));
     }
 
     #[test]
