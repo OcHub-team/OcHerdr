@@ -2,6 +2,7 @@ use super::*;
 
 impl OcHerdrView {
     pub(crate) fn ensure_session_terminals(&mut self, cx: &mut Context<Self>) {
+        let profile_id = self.current_profile().id().to_owned();
         let Some(session_name) = self.current_session().map(|session| session.name.clone()) else {
             self.stop_session_terminals();
             return;
@@ -10,10 +11,18 @@ impl OcHerdrView {
             self.stop_session_terminals();
             return;
         }
-        let profile = self.current_profile();
+        let Some(terminal_endpoint) = self
+            .connection
+            .as_ref()
+            .map(SessionConnection::terminal_endpoint)
+        else {
+            self.stop_session_terminals();
+            return;
+        };
         let visible_tab_id = self.selection.tab_id.clone();
         let selected_pane_id = self.selection.pane_id.clone();
         let snapshot = self.snapshot.as_ref().expect("snapshot checked above");
+        let terminal_protocol = snapshot.protocol;
         let live_pane_ids = snapshot_pane_ids(snapshot);
         let pane_tabs = snapshot
             .panes
@@ -21,7 +30,7 @@ impl OcHerdrView {
             .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
             .collect::<HashMap<_, _>>();
         let incoming = SessionKey {
-            profile_id: profile.id().to_owned(),
+            profile_id,
             session_name: session_name.clone(),
         };
         if session_panes_plan(
@@ -40,21 +49,22 @@ impl OcHerdrView {
         let mut pending_listens = Vec::new();
         let optimistic_visible = self.optimistic_visible_pane_ids();
         self.pane_viewports
-            .retain(|pane_id, _| optimistic_visible.contains(pane_id));
+            .retain(|pane_id, _| live_pane_ids.contains(pane_id));
         let measured_viewports = self.pane_viewports.clone();
         let mut too_small = Vec::new();
         let mut mounted = 0usize;
         let mut mount_more = false;
         {
-            let controls = {
+            let (controls, access_serial) = {
                 let session = self
                     .session_panes
                     .as_mut()
                     .expect("live session adopted panes");
+                session.access_serial = session.access_serial.wrapping_add(1);
                 session
                     .controls
                     .retain(|pane_id, _| optimistic_visible.contains(pane_id));
-                session.controls.clone()
+                (session.controls.clone(), session.access_serial)
             };
             #[cfg_attr(not(test), allow(unused_mut))]
             let mut wanted = snapshot_runtime_targets(
@@ -84,9 +94,32 @@ impl OcHerdrView {
                 .as_mut()
                 .expect("live session adopted panes")
                 .panes;
-            panes.retain(|pane_id, _| {
-                live_pane_ids.contains(pane_id) && optimistic_visible.contains(pane_id)
-            });
+            panes.retain(|pane_id, _| live_pane_ids.contains(pane_id));
+
+            // A hidden pane must not keep writable ownership, but its Ghostty
+            // surface and last frame stay alive. Native private streams can be
+            // demoted independently without rebuilding that render state.
+            let hidden_controlled = panes
+                .iter()
+                .filter(|(pane_id, runtime)| {
+                    !optimistic_visible.contains(*pane_id) && runtime.mode.is_controlled()
+                })
+                .map(|(pane_id, _)| pane_id.clone())
+                .collect::<Vec<_>>();
+            for pane_id in hidden_controlled {
+                if let Some(runtime) = panes.get_mut(&pane_id)
+                    && let Some(frames) = sync_pane_session(
+                        runtime,
+                        TerminalMode::Observe,
+                        false,
+                        terminal_endpoint.clone(),
+                        terminal_protocol,
+                        pane_id.clone(),
+                    )
+                {
+                    pending_listens.push((pane_id, frames));
+                }
+            }
             for target in &wanted {
                 let pane_id = &target.pane_id;
                 let mode = target.mode;
@@ -101,6 +134,7 @@ impl OcHerdrView {
                     | VisiblePanePlan::PromoteToControl
                     | VisiblePanePlan::DemoteToObserve => {
                         if let Some(runtime) = panes.get_mut(pane_id) {
+                            runtime.last_visible_serial = access_serial;
                             if runtime.palette_signature != palette.signature() {
                                 if let Err(error) = runtime.terminal.apply_palette(&palette) {
                                     palette_error = Some(error);
@@ -112,8 +146,8 @@ impl OcHerdrView {
                                 runtime,
                                 mode,
                                 target.focused,
-                                profile.clone(),
-                                session_name.clone(),
+                                terminal_endpoint.clone(),
+                                terminal_protocol,
                                 pane_id.clone(),
                             ) {
                                 pending_listens.push((pane_id.clone(), frames));
@@ -148,8 +182,8 @@ impl OcHerdrView {
                                     continue;
                                 }
                                 let (session, frames) = TerminalSession::spawn(
-                                    profile.clone(),
-                                    session_name.clone(),
+                                    terminal_endpoint.clone(),
+                                    terminal_protocol,
                                     pane_id.clone(),
                                     mode,
                                     resolved.columns,
@@ -175,6 +209,7 @@ impl OcHerdrView {
                                         scroll_px: 0.,
                                         body_bounds: viewport.body_bounds,
                                         pending_resize: None,
+                                        last_visible_serial: access_serial,
                                     },
                                 );
                                 mounted += 1;
@@ -199,6 +234,20 @@ impl OcHerdrView {
                 }
                 if let Some(runtime) = panes.get_mut(pane_id) {
                     flush_pane_surface(runtime);
+                }
+            }
+
+            let retained_limit = PANE_RUNTIME_CACHE_LIMIT.max(optimistic_visible.len());
+            if panes.len() > retained_limit {
+                let mut hidden = panes
+                    .iter()
+                    .filter(|(pane_id, _)| !optimistic_visible.contains(*pane_id))
+                    .map(|(pane_id, runtime)| (runtime.last_visible_serial, pane_id.clone()))
+                    .collect::<Vec<_>>();
+                hidden.sort_by_key(|(serial, _)| *serial);
+                let remove = panes.len().saturating_sub(retained_limit);
+                for (_, pane_id) in hidden.into_iter().take(remove) {
+                    panes.remove(&pane_id);
                 }
             }
         }
@@ -386,6 +435,9 @@ impl OcHerdrView {
                                 enabled,
                                 sgr_pixels,
                             }) => runtime.terminal.set_mouse_capture(enabled, sgr_pixels),
+                            Ok(TerminalEvent::KittyKeyboardReportAll { enabled }) => {
+                                runtime.terminal.set_kitty_keyboard_report_all(enabled)
+                            }
                             Err(stream_error) => {
                                 runtime.exit_seen = true;
                                 control_loss = runtime
@@ -721,10 +773,6 @@ impl OcHerdrView {
     ) {
         let visible = self.optimistic_visible_pane_ids().contains(pane_id);
         let frozen = self.pane_resize_frozen(pane_id);
-        let observer_reconnect = self
-            .current_session()
-            .map(|session| (self.current_profile(), session.name.clone()));
-        let mut replacement_frames = None;
         let mut collapse = false;
         {
             let Some(runtime) = self.pane_mut(pane_id) else {
@@ -751,36 +799,17 @@ impl OcHerdrView {
                 collapse = true;
             }
             let size = (resolved.columns, resolved.rows);
-            let restart_observer = observer_session_needs_measured_restart(
-                runtime.viewport_ready,
-                runtime.mode,
-                runtime.size,
-                size,
-            );
             // Herdr distinguishes the stream mode: a controller resize
             // changes the shared PTY, while an observer resize updates only
-            // that observer's render viewport. Bootstrap observers on older
-            // servers are still replaced, but only after geometry settles.
+            // that observer's render viewport. The native protocol handles
+            // both modes in place, so resizing never tears down the surface or
+            // its private stream.
             runtime.size = size;
             runtime.pixel_size = pending.pixels;
             runtime.viewport_ready = pending.pixels.0 > 0 && pending.pixels.1 > 0;
             if collapse {
                 // Keep only the shell/dividers. A later, larger measurement
                 // makes the pane mountable again and creates a fresh stream.
-            } else if restart_observer
-                && let Some((profile, session_name)) = observer_reconnect.as_ref()
-            {
-                let (session, frames) = TerminalSession::spawn(
-                    profile.clone(),
-                    session_name.clone(),
-                    pane_id.to_owned(),
-                    TerminalMode::Observe,
-                    resolved.columns,
-                    resolved.rows,
-                );
-                runtime.listen = None;
-                runtime.session = session;
-                replacement_frames = Some(frames);
             } else {
                 let _ = runtime.session.send(TerminalCommand::Resize {
                     cols: resolved.columns,
@@ -806,12 +835,6 @@ impl OcHerdrView {
             }
             cx.notify();
             return;
-        }
-        if let Some(frames) = replacement_frames {
-            let task = Self::listen_pane(pane_id.to_owned(), frames, cx);
-            if let Some(runtime) = self.pane_mut(pane_id) {
-                runtime.listen = Some(task);
-            }
         }
         cx.notify();
     }

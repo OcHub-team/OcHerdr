@@ -197,18 +197,6 @@ pub(super) fn incoming_frame_should_apply(
     viewport_ready && local_grid == frame_grid
 }
 
-/// The first observer starts before GPUI has measured its pane and therefore
-/// uses 80×24. Reopen it with the measured grid instead of waiting for an
-/// observe-resize repaint that older Herdr servers do not produce.
-pub(super) fn observer_session_needs_measured_restart(
-    viewport_ready: bool,
-    mode: TerminalMode,
-    stream_grid: (u16, u16),
-    measured_grid: (u16, u16),
-) -> bool {
-    !viewport_ready && mode == TerminalMode::Observe && stream_grid != measured_grid
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionPanesPlan {
     Keep,
@@ -1144,8 +1132,8 @@ pub(super) fn sync_pane_session(
     runtime: &mut PaneRuntime,
     wanted: TerminalMode,
     focused: bool,
-    profile: ConnectionProfile,
-    session_name: String,
+    endpoint: ocherdr_herdr::TerminalEndpoint,
+    protocol: u32,
     pane_id: String,
 ) -> Option<TerminalEventReceiver> {
     if runtime.focused != focused {
@@ -1158,8 +1146,8 @@ pub(super) fn sync_pane_session(
     runtime.listen = None;
     let (cols, rows) = runtime.size;
     let (session, frames) = TerminalSession::spawn(
-        profile,
-        session_name,
+        endpoint,
+        protocol,
         pane_id,
         wanted,
         cols.max(1),

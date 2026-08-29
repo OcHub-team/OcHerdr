@@ -304,34 +304,6 @@ fn stale_observe_frames_do_not_replace_or_paint_the_local_display_grid() {
     assert!(incoming_frame_should_apply(true, (120, 40), (120, 40)));
 }
 
-#[test]
-fn bootstrap_observer_reopens_with_the_first_measured_grid() {
-    assert!(observer_session_needs_measured_restart(
-        false,
-        TerminalMode::Observe,
-        (80, 24),
-        (120, 40),
-    ));
-    assert!(!observer_session_needs_measured_restart(
-        true,
-        TerminalMode::Observe,
-        (80, 24),
-        (120, 40),
-    ));
-    assert!(!observer_session_needs_measured_restart(
-        false,
-        TerminalMode::Control,
-        (80, 24),
-        (120, 40),
-    ));
-    assert!(!observer_session_needs_measured_restart(
-        false,
-        TerminalMode::Observe,
-        (80, 24),
-        (80, 24),
-    ));
-}
-
 fn target(pane_id: &str, mode: TerminalMode, focused: bool) -> PaneRuntimeTarget {
     PaneRuntimeTarget {
         pane_id: pane_id.into(),

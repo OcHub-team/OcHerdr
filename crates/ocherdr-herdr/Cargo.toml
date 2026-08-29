@@ -7,10 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-base64.workspace = true
+bincode.workspace = true
 dirs.workspace = true
 futures.workspace = true
-libc.workspace = true
 ocherdr-core = { path = "../ocherdr-core" }
 serde.workspace = true
 serde_json.workspace = true

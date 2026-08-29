@@ -119,7 +119,6 @@ impl OcHerdrView {
             session_index: None,
             connection: None,
             herdr_capabilities: HerdrCapabilities::default(),
-            remote_clipboard_image_upload: upload_remote_clipboard_image,
             event_stream: EventStreamState::Idle,
             event_listen: None,
             startup_replay_sync: None,

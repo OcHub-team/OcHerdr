@@ -1,22 +1,6 @@
 use super::*;
 
 #[test]
-fn parses_terminal_mouse_capture_envelope() {
-    let envelope: TerminalEnvelope = serde_json::from_str(
-        r#"{"type":"terminal.mouse_capture","enabled":true,"sgr_pixels":false}"#,
-    )
-    .unwrap();
-
-    assert_eq!(
-        envelope,
-        TerminalEnvelope::MouseCapture {
-            enabled: true,
-            sgr_pixels: false,
-        }
-    );
-}
-
-#[test]
 fn quotes_remote_arguments_without_shell_injection() {
     assert_eq!(posix_quote("plain/path-1"), "plain/path-1");
     assert_eq!(posix_quote("a b'c"), "'a b'\"'\"'c'");
@@ -118,191 +102,61 @@ fn interactive_ssh_command_preserves_profile_overrides() {
 }
 
 #[test]
-fn remote_clipboard_image_upload_streams_bytes_with_profile_ssh_options() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let ssh = dir.path().join("ssh");
-    let arguments = dir.path().join("arguments");
-    let payload = dir.path().join("payload");
-    let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\ncat > {}\nprintf '%s' '/tmp/ocherdr-clipboard-images-501/clipboard-123-456-1/image.png'\n",
-        posix_quote(&arguments.to_string_lossy()),
-        posix_quote(&payload.to_string_lossy()),
+fn private_socket_path_is_derived_exactly_like_herdr() {
+    assert_eq!(
+        client_socket_path_from_api(Path::new("/tmp/herdr.sock")),
+        PathBuf::from("/tmp/herdr-client.sock")
     );
-    fs::write(&ssh, script).unwrap();
-    let mut permissions = fs::metadata(&ssh).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&ssh, permissions).unwrap();
+    assert_eq!(
+        client_socket_path_from_api(Path::new("/tmp/custom-api")),
+        PathBuf::from("/tmp/custom-api-client.sock")
+    );
+    assert_eq!(SUPPORTED_TERMINAL_PROTOCOL_VERSIONS, &[20]);
+    assert_eq!(MAX_CLIPBOARD_IMAGE_BYTES, 16 * 1024 * 1024);
+}
 
-    let identity = dir.path().join("key with space");
+#[test]
+fn ssh_tunnel_forwards_public_and_private_sockets_in_one_process() {
     let profile = ConnectionProfile::Ssh {
         id: "server".into(),
         label: "Server".into(),
         destination: "deploy@example.com".into(),
         port: Some(2202),
-        identity_file: Some(identity.clone()),
+        identity_file: Some("/Keys/work key".into()),
         herdr_path: "herdr".into(),
     };
-    let bytes = b"\x89PNG\r\n\x1a\nremote".to_vec();
-    let path = upload_remote_clipboard_image_with_ssh(&profile, "PNG", bytes.clone(), &ssh)
-        .expect("fake SSH upload");
-
-    assert_eq!(
-        path,
-        "/tmp/ocherdr-clipboard-images-501/clipboard-123-456-1/image.png"
-    );
-    assert_eq!(fs::read(payload).unwrap(), bytes);
-    let arguments = fs::read_to_string(arguments).unwrap();
-    assert!(arguments.lines().any(|line| line == "-p"));
-    assert!(arguments.lines().any(|line| line == "2202"));
-    assert!(
-        arguments
-            .lines()
-            .any(|line| line == identity.to_string_lossy())
-    );
-    assert!(arguments.lines().any(|line| line == "deploy@example.com"));
-    assert!(arguments.contains("/tmp/ocherdr-clipboard-images-$uid"));
-    assert!(arguments.contains("cat > \"$image_path\""));
-    assert!(
-        !arguments.lines().any(|line| line.starts_with("path=")),
-        "`path` is a special zsh parameter tied to PATH"
-    );
-}
-
-#[test]
-fn remote_clipboard_image_script_writes_a_private_remote_file() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let ssh = dir.path().join("ssh");
-    fs::write(
-        &ssh,
-        "#!/bin/sh\nfor argument\ndo\n  remote=$argument\ndone\nshell=/bin/sh\nif [ -x /bin/zsh ]\nthen\n  shell=/bin/zsh\nfi\nexec \"$shell\" -c \"$remote\"\n",
+    let command = ssh_tunnel_command(
+        &profile,
+        "/tmp/local-api.sock:/remote/herdr.sock",
+        "/tmp/local-client.sock:/remote/herdr-client.sock",
     )
     .unwrap();
-    let mut permissions = fs::metadata(&ssh).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&ssh, permissions).unwrap();
-
-    let profile = ConnectionProfile::Ssh {
-        id: "server".into(),
-        label: "Server".into(),
-        destination: "deploy@example.com".into(),
-        port: None,
-        identity_file: None,
-        herdr_path: "herdr".into(),
-    };
-    let bytes = b"\x89PNG\r\n\x1a\nremote".to_vec();
-    let path = upload_remote_clipboard_image_with_ssh(&profile, "png", bytes.clone(), &ssh)
-        .expect("execute remote staging script");
-    let path = PathBuf::from(path);
-
-    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let forwards = arguments
+        .windows(2)
+        .filter(|arguments| arguments[0] == "-L")
+        .map(|arguments| arguments[1].as_str())
+        .collect::<Vec<_>>();
     assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let upload_dir = path.parent().unwrap().to_owned();
-    let staging_dir = upload_dir.parent().unwrap().to_owned();
-    assert_eq!(
-        fs::metadata(&staging_dir).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-
-    fs::remove_file(path).unwrap();
-    fs::remove_dir(upload_dir).unwrap();
-    let _ = fs::remove_dir(staging_dir);
-}
-
-#[test]
-fn remote_clipboard_image_validation_rejects_unsafe_content() {
-    assert!(validate_remote_clipboard_image("svg", b"<svg/>").is_err());
-    assert!(validate_remote_clipboard_image("png", b"not png").is_err());
-    assert!(validate_remote_clipboard_image("png", b"").is_err());
-    assert_eq!(
-        validate_remote_clipboard_image("PNG", b"\x89PNG\r\n\x1a\nrest").unwrap(),
-        "png"
-    );
-}
-
-#[test]
-fn remote_clipboard_image_path_allows_only_the_generated_shape() {
-    assert!(remote_clipboard_image_path_is_safe(
-        "/tmp/ocherdr-clipboard-images-501/clipboard-123-456-1/image.png",
-        "png"
-    ));
-    assert!(!remote_clipboard_image_path_is_safe(
-        "/tmp/ocherdr-clipboard-images-501/clipboard-../../bin/run/image.png",
-        "png"
-    ));
-    assert!(!remote_clipboard_image_path_is_safe(
-        "/tmp/ocherdr-clipboard-images-user/clipboard-123/image.png",
-        "png"
-    ));
-    assert!(!remote_clipboard_image_path_is_safe(
-        "/tmp/ocherdr-clipboard-images-501/clipboard-123/image.png;touch-pwned",
-        "png"
-    ));
-}
-
-#[test]
-fn terminal_input_serializes_lossless_bytes() {
-    let encoded = base64::engine::general_purpose::STANDARD.encode([0, 0x1b, 0x80, 0xff]);
-    let value = serde_json::to_value(TerminalControlCommand::Input { bytes: &encoded }).unwrap();
-
-    assert_eq!(value["type"], "terminal.input");
-    assert_eq!(value["bytes"], "ABuA/w==");
-    assert!(value.get("text").is_none());
-}
-
-#[test]
-fn terminal_scroll_serializes_as_a_semantic_wheel_command() {
-    let value = serde_json::to_value(TerminalControlCommand::Scroll {
-        direction: "up",
-        lines: 3,
-        source: "wheel",
-        column: None,
-        row: None,
-        modifiers: 0,
-    })
-    .unwrap();
-
-    assert_eq!(
-        value,
-        serde_json::json!({
-            "type": "terminal.scroll",
-            "direction": "up",
-            "lines": 3,
-            "source": "wheel",
-            "column": null,
-            "row": null,
-            "modifiers": 0,
-        })
-    );
-}
-
-#[test]
-fn terminal_control_requires_an_explicit_takeover_mode() {
-    let control = terminal_session_args("work", "pane-1", TerminalMode::Control, 120, 40);
-    assert_eq!(
-        control,
+        forwards,
         [
-            "--session",
-            "work",
-            "terminal",
-            "session",
-            "control",
-            "pane-1",
-            "--cols",
-            "120",
-            "--rows",
-            "40",
+            "/tmp/local-api.sock:/remote/herdr.sock",
+            "/tmp/local-client.sock:/remote/herdr-client.sock",
         ]
     );
-
-    let takeover = terminal_session_args("work", "pane-1", TerminalMode::ControlTakeover, 120, 40);
-    assert!(takeover.contains(&"--takeover".to_owned()));
+    assert!(arguments.windows(2).any(|args| args == ["-p", "2202"]));
+    assert!(
+        arguments
+            .windows(2)
+            .any(|args| args == ["-i", "/Keys/work key"])
+    );
+    assert_eq!(
+        arguments.last().map(String::as_str),
+        Some("deploy@example.com")
+    );
 }
 
 #[test]

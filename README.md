@@ -9,7 +9,7 @@ OcHerdr is intentionally a client, not another multiplexer:
 - state and mutations use Herdr's public JSON socket API;
 - local and remote sessions share the same typed model;
 - remote transport uses the system OpenSSH client and SSH config;
-- terminal frames use Herdr's public NDJSON terminal bridge;
+- terminal frames and input use a versioned facade over Herdr's private client protocol;
 - ANSI state, font shaping, colors, images, and terminal rendering use native Ghostty Metal;
 - application controls come from [`ochub-ui`](https://github.com/OcHub-team/ochub-ui).
 
@@ -21,7 +21,7 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - an in-app host center for filtering, organizing, diagnosing, and switching SSH hosts;
 - live workspace, tab, pane, layout, and agent status rendering;
 - independent `--takeover` control for each visible pane after a click, wheel, or input action;
-- read-only observation of untouched panes and panes on hidden tabs;
+- read-only observation of untouched panes, with a bounded cache of hidden tab surfaces;
 - workspace/tab creation, rename, close, and pane operations through the public API;
 - native context menus for workspace, tab, and pane actions;
 - macOS shortcuts plus Herdr's `Ctrl+B` prefix workflow;
@@ -31,8 +31,9 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - an Open TUI handoff for Herdr settings through the system Terminal;
 - stopped-session guidance through the system Terminal.
 
-OcHerdr never reads Herdr's private `herdr-client.sock` protocol and never stores SSH
-passwords or private keys.
+OcHerdr does not link or modify Herdr. It implements protocol 20 of Herdr's private
+`herdr-client.sock` wire format behind an isolated codec, and never stores SSH passwords
+or private keys. Unknown protocol versions fail closed with an upgrade error.
 
 ## Requirements
 
@@ -89,9 +90,10 @@ toolbar opens the connection manager. `Cmd+W` is for panes, not hosts.
 
 With an image-only or file-backed image clipboard (including PixPin and Finder),
 `Cmd+V` stays native for local panes. For an SSH pane, either `Cmd+V` or `Ctrl+V`
-reads the local image in the background, uploads it with the host's existing OpenSSH
-profile, and pastes the resulting remote path; no Herdr private protocol or server
-modification is used.
+reads and validates the local image in the background, then sends one `ClipboardImage`
+message over the pane's existing Herdr connection. Herdr stages the bytes on the target
+host and pastes its path. No extra SSH command, remote shell utility, X11 clipboard, or
+Herdr server modification is involved.
 
 The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 `Shift+N` for a workspace, `N/P` to cycle tabs, `Shift+T/W/P` to rename,
@@ -104,7 +106,7 @@ to open Herdr settings in Terminal.
 | --- | --- |
 | `ocherdr-app` | GPUI shell, `ochub-ui` composition, selection and terminal surfaces |
 | `ocherdr-core` | Connection/session hierarchy, layout snapshots, compatibility model |
-| `ocherdr-herdr` | Public JSON socket, OpenSSH tunneling, CLI and terminal NDJSON streams |
+| `ocherdr-herdr` | Public JSON socket, dual-socket OpenSSH tunnel, and versioned terminal protocol codecs |
 | `ocherdr-terminal` | GhosttyKit runtime, leased IOSurface frames, and native input encoding |
 
 GhosttyKit is pinned and checksum-verified by `scripts/bootstrap-ghosttykit.sh`. GPUI

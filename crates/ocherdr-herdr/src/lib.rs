@@ -1,22 +1,23 @@
-//! Public Herdr transports used by OcHerdr.
+//! Herdr transports used by OcHerdr.
 //!
-//! This crate intentionally does not know the private bincode client protocol.
-//! State travels over Herdr's public NDJSON socket; terminal bytes travel through
-//! `herdr terminal session observe/control`.
+//! Session state uses Herdr's public NDJSON API. Terminal rendering and input use
+//! a versioned private-protocol facade over the companion client socket.
+
+mod private_protocol;
+mod private_v20;
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use futures::channel::mpsc::{self as futures_mpsc, Receiver, UnboundedReceiver};
 use futures::{FutureExt as _, SinkExt as _, Stream};
 use ocherdr_core::{
@@ -29,8 +30,8 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-static REMOTE_CLIPBOARD_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
-pub const MAX_REMOTE_CLIPBOARD_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = private_protocol::MAX_CLIPBOARD_IMAGE_BYTES;
+pub const SUPPORTED_TERMINAL_PROTOCOL_VERSIONS: &[u32] = private_protocol::SUPPORTED_VERSIONS;
 
 #[derive(Debug, Error)]
 pub enum HerdrError {
@@ -46,8 +47,6 @@ pub enum HerdrError {
     Protocol(String),
     #[error("terminal stream closed: {0}")]
     TerminalClosed(String),
-    #[error("remote clipboard image upload failed: {0}")]
-    RemoteClipboardImage(String),
     #[error("Herdr event stream closed: {0}")]
     EventStreamClosed(String),
     #[error("Herdr did not respond within {0:?}")]
@@ -407,195 +406,6 @@ fn add_ssh_common(
     command.arg(destination);
 }
 
-/// Upload a clipboard image through the SSH profile without involving Herdr's
-/// wire protocol. The returned path is on the remote host and is safe to paste
-/// into the already-controlled terminal stream.
-pub fn upload_remote_clipboard_image(
-    profile: ConnectionProfile,
-    extension: String,
-    bytes: Vec<u8>,
-) -> Result<String> {
-    upload_remote_clipboard_image_with_ssh(&profile, &extension, bytes, Path::new("/usr/bin/ssh"))
-}
-
-fn upload_remote_clipboard_image_with_ssh(
-    profile: &ConnectionProfile,
-    extension: &str,
-    bytes: Vec<u8>,
-    ssh_program: &Path,
-) -> Result<String> {
-    let ConnectionProfile::Ssh {
-        destination,
-        port,
-        identity_file,
-        ..
-    } = profile
-    else {
-        return Err(HerdrError::RemoteClipboardImage(
-            "an SSH profile is required".into(),
-        ));
-    };
-    let extension = validate_remote_clipboard_image(extension, &bytes)?;
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let serial = REMOTE_CLIPBOARD_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
-    let token = format!("{}-{unique}-{serial}", std::process::id());
-    let remote = remote_clipboard_image_command(extension, &token);
-
-    let mut command = Command::new(ssh_program);
-    add_ssh_common(&mut command, destination, *port, identity_file.as_deref());
-    let mut child = command
-        .arg("--")
-        .arg(remote)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(HerdrError::RemoteClipboardImage(
-            "SSH stdin was not piped".into(),
-        ));
-    };
-    let writer = thread::spawn(move || -> io::Result<()> {
-        stdin.write_all(&bytes)?;
-        stdin.flush()
-    });
-    let output = child.wait_with_output()?;
-    let write_result = writer.join().map_err(|_| {
-        HerdrError::RemoteClipboardImage("SSH upload writer stopped unexpectedly".into())
-    })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let detail = if detail.is_empty() {
-            format!("SSH exited with {}", output.status)
-        } else {
-            detail
-        };
-        return Err(HerdrError::Ssh(detail));
-    }
-    write_result?;
-
-    let path = String::from_utf8(output.stdout)
-        .map_err(|_| HerdrError::RemoteClipboardImage("remote path was not valid UTF-8".into()))?;
-    if !remote_clipboard_image_path_is_safe(&path, extension) {
-        return Err(HerdrError::RemoteClipboardImage(
-            "remote host returned an invalid staging path".into(),
-        ));
-    }
-    Ok(path)
-}
-
-fn remote_clipboard_image_path_is_safe(path: &str, extension: &str) -> bool {
-    if path.len() > 4096 {
-        return false;
-    }
-    let Some(path) = path.strip_prefix("/tmp/ocherdr-clipboard-images-") else {
-        return false;
-    };
-    let Some((user_id, staged)) = path.split_once('/') else {
-        return false;
-    };
-    if user_id.is_empty() || !user_id.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
-    }
-    let Some(staged) = staged.strip_prefix("clipboard-") else {
-        return false;
-    };
-    let suffix = format!("/image.{extension}");
-    let Some(token) = staged.strip_suffix(&suffix) else {
-        return false;
-    };
-    !token.is_empty()
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'-')
-}
-
-fn validate_remote_clipboard_image(extension: &str, bytes: &[u8]) -> Result<&'static str> {
-    let extension = if extension.eq_ignore_ascii_case("png") {
-        "png"
-    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
-        "jpg"
-    } else if extension.eq_ignore_ascii_case("gif") {
-        "gif"
-    } else if extension.eq_ignore_ascii_case("webp") {
-        "webp"
-    } else if extension.eq_ignore_ascii_case("bmp") {
-        "bmp"
-    } else {
-        return Err(HerdrError::RemoteClipboardImage(format!(
-            "unsupported image format: {extension}"
-        )));
-    };
-    if bytes.is_empty() {
-        return Err(HerdrError::RemoteClipboardImage(
-            "the clipboard image is empty".into(),
-        ));
-    }
-    if bytes.len() > MAX_REMOTE_CLIPBOARD_IMAGE_BYTES {
-        return Err(HerdrError::RemoteClipboardImage(format!(
-            "the clipboard image is {} bytes; maximum is {MAX_REMOTE_CLIPBOARD_IMAGE_BYTES} bytes",
-            bytes.len()
-        )));
-    }
-    if !remote_clipboard_image_signature_matches(extension, bytes) {
-        return Err(HerdrError::RemoteClipboardImage(format!(
-            "image bytes do not match the {extension} format"
-        )));
-    }
-    Ok(extension)
-}
-
-fn remote_clipboard_image_signature_matches(extension: &str, bytes: &[u8]) -> bool {
-    match extension {
-        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "jpg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
-        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP",
-        "bmp" => {
-            if bytes.len() < 26 || !bytes.starts_with(b"BM") {
-                return false;
-            }
-            let offset = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
-            (26..=bytes.len()).contains(&offset)
-        }
-        _ => false,
-    }
-}
-
-fn remote_clipboard_image_command(extension: &str, token: &str) -> String {
-    format!(
-        r#"set -eu
-umask 077
-uid=$(id -u)
-dir="/tmp/ocherdr-clipboard-images-$uid"
-if mkdir -m 700 "$dir" 2>/dev/null; then
-    :
-elif [ ! -d "$dir" ] || [ -L "$dir" ]; then
-    printf '%s\n' 'OcHerdr: unsafe remote clipboard image directory' >&2
-    exit 1
-fi
-chmod 700 "$dir"
-find "$dir" -type f -name 'image.*' -mtime +0 -exec rm -f {{}} \; 2>/dev/null || :
-find "$dir" -type d -name 'clipboard-*' -empty -exec rmdir {{}} \; 2>/dev/null || :
-upload_dir="$dir/clipboard-{token}"
-mkdir -m 700 "$upload_dir"
-image_path="$upload_dir/image.{extension}"
-cleanup() {{
-    rm -f "$image_path"
-    rmdir "$upload_dir" 2>/dev/null || :
-}}
-trap cleanup 0 1 2 15
-cat > "$image_path"
-trap - 0 1 2 15
-printf '%s' "$image_path""#
-    )
-}
-
 pub fn posix_quote(value: &str) -> String {
     if !value.is_empty()
         && value
@@ -608,22 +418,45 @@ pub fn posix_quote(value: &str) -> String {
     }
 }
 
-pub struct SessionConnection {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalEndpoint {
     socket_path: PathBuf,
+}
+
+impl TerminalEndpoint {
+    fn new(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+
+    fn connect(&self) -> io::Result<UnixStream> {
+        UnixStream::connect(&self.socket_path)
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+pub struct SessionConnection {
+    api_socket_path: PathBuf,
+    terminal_endpoint: TerminalEndpoint,
     _tunnel: Option<SshTunnel>,
 }
 
 impl SessionConnection {
     pub fn connect(profile: &ConnectionProfile, session: &SessionSummary) -> Result<Self> {
+        let remote_client_socket = client_socket_path_from_api(&session.socket_path);
         match profile {
             ConnectionProfile::Local { .. } => Ok(Self {
-                socket_path: session.socket_path.clone(),
+                api_socket_path: session.socket_path.clone(),
+                terminal_endpoint: TerminalEndpoint::new(remote_client_socket),
                 _tunnel: None,
             }),
             ConnectionProfile::Ssh { .. } => {
-                let tunnel = SshTunnel::open(profile, &session.socket_path)?;
+                let tunnel = SshTunnel::open(profile, &session.socket_path, &remote_client_socket)?;
                 Ok(Self {
-                    socket_path: tunnel.local_socket.clone(),
+                    api_socket_path: tunnel.local_api_socket.clone(),
+                    terminal_endpoint: TerminalEndpoint::new(tunnel.local_client_socket.clone()),
                     _tunnel: Some(tunnel),
                 })
             }
@@ -640,20 +473,35 @@ impl SessionConnection {
     }
 
     pub fn invoke(&self, method: &str, params: Value) -> Result<Value> {
-        request_socket(&self.socket_path, method, params)
+        request_socket(&self.api_socket_path, method, params)
     }
 
     pub fn subscribe(&self) -> Result<EventStream> {
-        EventStream::connect(&self.socket_path)
+        EventStream::connect(&self.api_socket_path)
     }
 
     pub fn subscribe_background(&self) -> Result<EventSubscription> {
-        subscribe_events(&self.socket_path)
+        subscribe_events(&self.api_socket_path)
     }
 
     pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+        &self.api_socket_path
     }
+
+    pub fn terminal_endpoint(&self) -> TerminalEndpoint {
+        self.terminal_endpoint.clone()
+    }
+}
+
+fn client_socket_path_from_api(api_socket_path: &Path) -> PathBuf {
+    let stem = api_socket_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("herdr");
+    api_socket_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(format!("{stem}-client.sock"))
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -732,58 +580,45 @@ fn timeout_or_io(error: io::Error, timeout: Duration) -> HerdrError {
 
 struct SshTunnel {
     child: Child,
-    local_socket: PathBuf,
+    local_api_socket: PathBuf,
+    local_client_socket: PathBuf,
     _directory: TempDir,
 }
 
 impl SshTunnel {
-    fn open(profile: &ConnectionProfile, remote_socket: &Path) -> Result<Self> {
-        let ConnectionProfile::Ssh {
-            destination,
-            port,
-            identity_file,
-            ..
-        } = profile
-        else {
-            return Err(HerdrError::Protocol(
-                "SSH tunnel requires an SSH profile".into(),
-            ));
-        };
+    fn open(
+        profile: &ConnectionProfile,
+        remote_api_socket: &Path,
+        remote_client_socket: &Path,
+    ) -> Result<Self> {
         let directory = tempfile::Builder::new()
             .prefix("ocherdr-")
             .tempdir_in("/tmp")?;
-        let local_socket = directory.path().join("api.sock");
-        let forwarding = format!("{}:{}", local_socket.display(), remote_socket.display());
-        let mut command = Command::new("/usr/bin/ssh");
+        let local_api_socket = directory.path().join("api.sock");
+        let local_client_socket = directory.path().join("client.sock");
+        let api_forwarding = format!(
+            "{}:{}",
+            local_api_socket.display(),
+            remote_api_socket.display()
+        );
+        let client_forwarding = format!(
+            "{}:{}",
+            local_client_socket.display(),
+            remote_client_socket.display()
+        );
+        let mut command = ssh_tunnel_command(profile, &api_forwarding, &client_forwarding)?;
         command
-            .args(["-N", "-T", "-o", "BatchMode=yes"])
-            .args(["-o", "ConnectTimeout=8", "-o", "ExitOnForwardFailure=yes"])
-            .args([
-                "-o",
-                "StreamLocalBindUnlink=yes",
-                "-o",
-                "ServerAliveInterval=15",
-            ])
-            .args(["-o", "ServerAliveCountMax=3", "-L"])
-            .arg(&forwarding);
-        if let Some(port) = port {
-            command.arg("-p").arg(port.to_string());
-        }
-        if let Some(identity_file) = identity_file {
-            command.arg("-i").arg(identity_file);
-        }
-        command
-            .arg(destination)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
-            if local_socket.exists() {
+            if local_api_socket.exists() && local_client_socket.exists() {
                 return Ok(Self {
                     child,
-                    local_socket,
+                    local_api_socket,
+                    local_client_socket,
                     _directory: directory,
                 });
             }
@@ -805,8 +640,51 @@ impl SshTunnel {
             thread::sleep(Duration::from_millis(40));
         }
         let _ = child.kill();
-        Err(HerdrError::Ssh("timed out opening Herdr API tunnel".into()))
+        let _ = child.wait();
+        Err(HerdrError::Ssh(
+            "timed out opening the Herdr socket tunnel".into(),
+        ))
     }
+}
+
+fn ssh_tunnel_command(
+    profile: &ConnectionProfile,
+    api_forwarding: &str,
+    client_forwarding: &str,
+) -> Result<Command> {
+    let ConnectionProfile::Ssh {
+        destination,
+        port,
+        identity_file,
+        ..
+    } = profile
+    else {
+        return Err(HerdrError::Protocol(
+            "SSH tunnel requires an SSH profile".into(),
+        ));
+    };
+    let mut command = Command::new("/usr/bin/ssh");
+    command
+        .args(["-N", "-T", "-o", "BatchMode=yes"])
+        .args(["-o", "ConnectTimeout=8", "-o", "ExitOnForwardFailure=yes"])
+        .args([
+            "-o",
+            "StreamLocalBindUnlink=yes",
+            "-o",
+            "ServerAliveInterval=15",
+        ])
+        .args(["-o", "ServerAliveCountMax=3", "-L"])
+        .arg(api_forwarding)
+        .arg("-L")
+        .arg(client_forwarding);
+    if let Some(port) = port {
+        command.arg("-p").arg(port.to_string());
+    }
+    if let Some(identity_file) = identity_file {
+        command.arg("-i").arg(identity_file);
+    }
+    command.arg(destination);
+    Ok(command)
 }
 
 impl Drop for SshTunnel {
@@ -1081,24 +959,6 @@ impl TerminalMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type")]
-enum TerminalEnvelope {
-    #[serde(rename = "terminal.frame")]
-    Frame {
-        seq: u64,
-        encoding: String,
-        width: u16,
-        height: u16,
-        full: bool,
-        bytes: String,
-    },
-    #[serde(rename = "terminal.mouse_capture")]
-    MouseCapture { enabled: bool, sgr_pixels: bool },
-    #[serde(rename = "terminal.closed")]
-    Closed { reason: Option<String> },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalFrame {
     pub seq: u64,
@@ -1112,36 +972,16 @@ pub struct TerminalFrame {
 pub enum TerminalEvent {
     Frame(TerminalFrame),
     MouseCapture { enabled: bool, sgr_pixels: bool },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-pub enum TerminalControlCommand<'a> {
-    #[serde(rename = "terminal.input")]
-    Input { bytes: &'a str },
-    #[serde(rename = "terminal.resize")]
-    Resize {
-        cols: u16,
-        rows: u16,
-        cell_width_px: u32,
-        cell_height_px: u32,
-    },
-    #[serde(rename = "terminal.scroll")]
-    Scroll {
-        direction: &'a str,
-        lines: u16,
-        source: &'a str,
-        column: Option<u16>,
-        row: Option<u16>,
-        modifiers: u8,
-    },
-    #[serde(rename = "terminal.release")]
-    Release {},
+    KittyKeyboardReportAll { enabled: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalCommand {
     Input(Vec<u8>),
+    ClipboardImage {
+        extension: String,
+        bytes: Vec<u8>,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -1149,214 +989,20 @@ pub enum TerminalCommand {
         cell_height_px: u32,
     },
     Scroll {
-        direction: &'static str,
+        direction: TerminalScrollDirection,
         lines: u16,
     },
     Release,
 }
 
-impl TerminalCommand {
-    fn write_to(&self, stdin: &mut ChildStdin) -> Result<()> {
-        match self {
-            Self::Input(bytes) => {
-                let bytes = base64::engine::general_purpose::STANDARD.encode(bytes);
-                serde_json::to_writer(
-                    &mut *stdin,
-                    &TerminalControlCommand::Input { bytes: &bytes },
-                )?
-            }
-            Self::Resize {
-                cols,
-                rows,
-                cell_width_px,
-                cell_height_px,
-            } => serde_json::to_writer(
-                &mut *stdin,
-                &TerminalControlCommand::Resize {
-                    cols: *cols,
-                    rows: *rows,
-                    cell_width_px: *cell_width_px,
-                    cell_height_px: *cell_height_px,
-                },
-            )?,
-            Self::Scroll { direction, lines } => serde_json::to_writer(
-                &mut *stdin,
-                &TerminalControlCommand::Scroll {
-                    direction,
-                    lines: *lines,
-                    source: "wheel",
-                    column: None,
-                    row: None,
-                    modifiers: 0,
-                },
-            )?,
-            Self::Release => {
-                serde_json::to_writer(&mut *stdin, &TerminalControlCommand::Release {})?
-            }
-        }
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        Ok(())
-    }
-}
-
-pub struct TerminalStream {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
-    last_seq: Option<u64>,
-    released: bool,
-}
-
-impl TerminalStream {
-    pub fn spawn(
-        profile: &ConnectionProfile,
-        session_name: &str,
-        target: &str,
-        mode: TerminalMode,
-        cols: u16,
-        rows: u16,
-    ) -> Result<Self> {
-        let args = terminal_session_args(session_name, target, mode, cols, rows);
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut command = command_for(profile, &refs)?;
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdin = child.stdin.take();
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HerdrError::Protocol("terminal stdout was not piped".into()))?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            last_seq: None,
-            released: false,
-        })
-    }
-
-    pub fn read_event(&mut self) -> Result<Option<TerminalEvent>> {
-        let mut line = String::new();
-        if self.stdout.read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
-        match serde_json::from_str::<TerminalEnvelope>(&line)? {
-            TerminalEnvelope::Closed { reason } => Err(HerdrError::TerminalClosed(
-                reason.unwrap_or_else(|| "server closed the stream".into()),
-            )),
-            TerminalEnvelope::Frame {
-                seq,
-                encoding,
-                width,
-                height,
-                full,
-                bytes,
-            } => {
-                if encoding != "ansi" {
-                    return Err(HerdrError::Protocol(format!(
-                        "unsupported terminal encoding {encoding}"
-                    )));
-                }
-                if let Some(previous) = self.last_seq
-                    && seq != previous.saturating_add(1)
-                    && !full
-                {
-                    return Err(HerdrError::Protocol(format!(
-                        "terminal frame gap: expected {}, got {seq}",
-                        previous.saturating_add(1)
-                    )));
-                }
-                self.last_seq = Some(seq);
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(bytes)
-                    .map_err(|error| HerdrError::Protocol(error.to_string()))?;
-                Ok(Some(TerminalEvent::Frame(TerminalFrame {
-                    seq,
-                    width,
-                    height,
-                    full,
-                    bytes,
-                })))
-            }
-            TerminalEnvelope::MouseCapture {
-                enabled,
-                sgr_pixels,
-            } => Ok(Some(TerminalEvent::MouseCapture {
-                enabled,
-                sgr_pixels,
-            })),
-        }
-    }
-
-    pub fn send(&mut self, command: &TerminalControlCommand<'_>) -> Result<()> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| HerdrError::Protocol("terminal stream has no writable input".into()))?;
-        serde_json::to_writer(&mut *stdin, command)?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        Ok(())
-    }
-
-    pub fn release(&mut self) -> Result<()> {
-        if !self.released {
-            self.send(&TerminalControlCommand::Release {})?;
-            self.released = true;
-        }
-        Ok(())
-    }
-}
-
-fn terminal_session_args(
-    session_name: &str,
-    target: &str,
-    mode: TerminalMode,
-    cols: u16,
-    rows: u16,
-) -> Vec<String> {
-    let mut args = Vec::<String>::new();
-    if session_name != "default" {
-        args.extend(["--session".into(), session_name.into()]);
-    }
-    args.extend([
-        "terminal".into(),
-        "session".into(),
-        match mode {
-            TerminalMode::Observe => "observe",
-            TerminalMode::Control | TerminalMode::ControlTakeover => "control",
-        }
-        .into(),
-        target.into(),
-    ]);
-    if mode.takes_over() {
-        args.push("--takeover".into());
-    }
-    args.extend([
-        "--cols".into(),
-        cols.max(1).to_string(),
-        "--rows".into(),
-        rows.max(1).to_string(),
-    ]);
-    args
-}
-
-impl Drop for TerminalStream {
-    fn drop(&mut self) {
-        let _ = self.release();
-        self.stdin.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalScrollDirection {
+    Up,
+    Down,
 }
 
 pub struct TerminalSession {
     commands: Sender<TerminalCommand>,
-    process_id: Arc<AtomicU32>,
     alive: Arc<AtomicBool>,
 }
 
@@ -1368,8 +1014,8 @@ const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4;
 
 impl TerminalSession {
     pub fn spawn(
-        profile: ConnectionProfile,
-        session_name: String,
+        endpoint: TerminalEndpoint,
+        protocol: u32,
         target: String,
         mode: TerminalMode,
         cols: u16,
@@ -1378,35 +1024,37 @@ impl TerminalSession {
         let (command_tx, command_rx) = mpsc::channel::<TerminalCommand>();
         let (mut event_tx, event_rx) =
             futures_mpsc::channel::<Result<TerminalEvent>>(TERMINAL_EVENT_QUEUE_CAPACITY);
-        let process_id = Arc::new(AtomicU32::new(0));
         let alive = Arc::new(AtomicBool::new(true));
-        let worker_process_id = process_id.clone();
         let worker_alive = alive.clone();
         thread::spawn(move || {
-            let stream = TerminalStream::spawn(&profile, &session_name, &target, mode, cols, rows);
-            let mut stream = match stream {
-                Ok(stream) => stream,
+            let connection = private_protocol::connect(private_protocol::TerminalConnect {
+                endpoint: &endpoint,
+                protocol,
+                target: &target,
+                mode,
+                cols,
+                rows,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            });
+            let (mut reader, mut writer) = match connection {
+                Ok(connection) => connection,
                 Err(error) => {
                     worker_alive.store(false, Ordering::Release);
                     let _ = futures::executor::block_on(event_tx.send(Err(error)));
                     return;
                 }
             };
-            worker_process_id.store(stream.child.id(), Ordering::Release);
-            let mut stdin = stream.stdin.take();
-            let writer = thread::spawn(move || {
-                let Some(mut stdin) = stdin.take() else {
-                    return;
-                };
+            let _writer = thread::spawn(move || {
                 while let Ok(command) = command_rx.recv() {
                     let release = command == TerminalCommand::Release;
-                    if command.write_to(&mut stdin).is_err() || release {
+                    if writer.send(command).is_err() || release {
                         break;
                     }
                 }
             });
             loop {
-                match stream.read_event() {
+                match reader.read_event() {
                     Ok(Some(event)) => {
                         if futures::executor::block_on(event_tx.send(Ok(event))).is_err() {
                             break;
@@ -1419,15 +1067,11 @@ impl TerminalSession {
                     }
                 }
             }
-            drop(stream);
-            worker_process_id.store(0, Ordering::Release);
             worker_alive.store(false, Ordering::Release);
-            let _ = writer.join();
         });
         (
             Self {
                 commands: command_tx,
-                process_id,
                 alive,
             },
             event_rx,
@@ -1448,14 +1092,6 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = self.commands.send(TerminalCommand::Release);
-        let process_id = self.process_id.load(Ordering::Acquire);
-        if process_id != 0 {
-            // SAFETY: the PID was obtained from our still-live child process. SIGTERM is
-            // idempotent for teardown, and ESRCH simply means the process already exited.
-            unsafe {
-                libc::kill(process_id as libc::pid_t, libc::SIGTERM);
-            }
-        }
     }
 }
 

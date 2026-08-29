@@ -1094,6 +1094,14 @@ impl Terminal {
         self.apply_frame(&mouse_capture_sequence(enabled, sgr_pixels), false);
     }
 
+    /// Mirror Herdr's host-side Kitty keyboard stack entry into the embedded
+    /// Ghostty key encoder. Protocol 20 sends only the report-all bit; Herdr's
+    /// compatible base flags are 7 and report-all plus associated text is 31.
+    pub fn set_kitty_keyboard_report_all(&self, enabled: bool) {
+        let flags = if enabled { 31 } else { 7 };
+        self.apply_frame(format!("\x1b[<1u\x1b[>{flags}u").as_bytes(), false);
+    }
+
     pub fn has_selection(&self) -> bool {
         // SAFETY: the surface is live and queried on GPUI's application thread.
         unsafe { ffi::ghostty_surface_has_selection(self.raw()) }

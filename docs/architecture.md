@@ -6,23 +6,27 @@ Herdr is the source of truth for sessions, PTYs, processes, workspaces, tabs, pa
 layouts, persistence, and agent detection. OcHerdr projects that state into a native
 window and sends explicit public API mutations back to Herdr.
 
-OcHerdr does not link Herdr, open the private client socket, or decode the private
-bincode protocol.
+OcHerdr does not link or modify Herdr. It mirrors the serialization-relevant v20
+private client schema in a frozen codec and exposes only version-neutral terminal
+commands and events to the rest of the application.
 
 ## Data flow
 
 1. Run `herdr session list --json` locally or through `ssh -T`.
 2. For a local session, connect directly to its public `herdr.sock`.
-3. For a remote session, use OpenSSH StreamLocal forwarding to map the remote public
-   socket into a private `/tmp/ocherdr-*` directory.
+3. For a remote session, one persistent OpenSSH process uses two StreamLocal forwards
+   to map both the public API socket and private client socket into an owner-private
+   `/tmp/ocherdr-*` directory.
 4. Bootstrap state with `session.snapshot`; unknown fields are ignored for forward
    compatibility.
 5. Use public API methods for Workspace, Tab, Pane, and layout mutations.
-6. Open every pane as `observe`. A click, wheel gesture, or terminal input replaces
-   that visible pane's bridge with `terminal session control --takeover` without
-   releasing other controlled panes. Only the selected pane receives keyboard/IME
-   input and terminal focus; wheel input targets the pane under the pointer. Hidden
-   panes return to observe. Release every bridge when the connection changes.
+6. Open a measured pane through the native private socket as `ObserveTerminal`. A
+   click, wheel gesture, or terminal input replaces that pane's connection with
+   `ControlTerminal { takeover: true }` without releasing other controlled panes.
+   Only the selected pane receives keyboard/IME input and terminal focus; wheel input
+   targets the pane under the pointer. Hidden panes return to observe, while recently
+   visited Ghostty surfaces and frames remain in a bounded LRU cache. Release every
+   private connection when its pane is evicted or the session changes.
 7. Feed decoded ANSI bytes into Ghostty's `manualMirror` surface. Ghostty owns VT
    state, shaping, glyph/image rendering, and produces a leased BGRA IOSurface.
 8. Wrap that IOSurface as a CoreVideo pixel buffer without copying it and without
@@ -45,14 +49,12 @@ string. User labels and paths used for topology mutations travel as JSON through
 forwarded public socket instead of through a shell.
 
 An image-only or single file-backed image pasted with `Cmd+V` or `Ctrl+V` follows the
-local-client boundary used by remote attach. File-backed clipboard providers such as
-PixPin are recognized before GPUI's path-to-text fallback; OcHerdr reads that local
-file on a background executor, validates the encoded image, streams at most 16 MiB
-through a separate non-TTY SSH command, and writes it with user-only permissions below
-`/tmp/ocherdr-clipboard-images-<uid>`. The command lazily removes staged images older
-than 24 hours. Its returned path is restricted to OcHerdr's generated shape before
-Ghostty pastes it through the existing public `terminal.input` stream. The binary
-payload never enters Herdr's NDJSON adapter or private client protocol.
+same local-client boundary as Herdr remote attach. File-backed clipboard providers
+such as PixPin are recognized before GPUI's path-to-text fallback; OcHerdr reads the
+local file on a background executor, validates its signature and 16 MiB limit, then
+sends `ClipboardImage` over the selected pane's existing private connection. Herdr
+stages and pastes the path on the host that owns the PTY. No second SSH process, remote
+shell, X11 clipboard, `cat`, or `rm` is required.
 
 ## Terminal policy
 
@@ -62,15 +64,16 @@ the target pane while preserving the other controlled panes. Stream mode is sepa
 from focus: keyboard, IME, and focus-in/out reporting go to the selected pane, while
 wheel input goes to the pane under the pointer. A takeover by another client demotes
 only the affected pane locally; it is promoted again only by another direct
-interaction. Panes on hidden tabs are observers. A sequence gap in a delta frame
+interaction. Panes on hidden tabs are observers and retain their most recent surface
+until LRU eviction. A sequence gap in a delta frame
 invalidates the local terminal state and requires a fresh bridge. A full frame is an
 ANSI redraw and is applied to the existing Ghostty surface; it does not destroy or
 recreate renderer state.
 
 Terminal input follows the reverse path: GPUI key or committed-text events enter
-Ghostty's native input encoder, and its exact output bytes are base64-encoded into
-Herdr's public `terminal.input` command. This preserves application-cursor mode,
-bracketed paste, modifier protocols, and other terminal modes.
+Ghostty's native input encoder, and its exact output bytes are sent losslessly in the
+private protocol's `Input` message. This preserves application-cursor mode, bracketed
+paste, modifier protocols, and other terminal modes.
 
 Key presses, repeats, and releases go through `ghostty_surface_key`. The surface runs
 in `GHOSTTY_SURFACE_IO_MANUAL_MIRROR` mode with an `io_write_cb`, so everything
@@ -101,6 +104,25 @@ that are pty writes (`super+left/right/backspace` → `^A`/`^E`/`^U`,
 exactly as Ghostty would encode it with those bindings. The same base config sets
 `macos-option-as-alt = true`: Option is Alt, prefixing `ESC` rather than typing the
 macOS symbol, which is what OcHerdr sent before it used Ghostty's encoder.
+
+## Private protocol evolution
+
+The snapshot's `protocol` value selects a codec before a terminal socket is opened.
+Unknown versions are rejected; OcHerdr never guesses a layout or falls back to the
+process/NDJSON adapter.
+
+`ocherdr-herdr/src/private_v20.rs` is a frozen wire schema. Enum and field order are
+part of bincode's ABI and are guarded by golden byte fixtures. Application code cannot
+import it. `private_protocol.rs` owns the explicit version registry, handshake, limits,
+and mapping between wire values and the stable `TerminalCommand` / `TerminalEvent`
+facade.
+
+For a future v21, add a new `private_v21.rs`, copy the released Herdr schema exactly,
+add independent golden fixtures, register one new codec variant, and implement only
+the facade mappings that changed. The SSH tunnel, pane lifecycle, clipboard reader,
+Ghostty integration, and controllers must not depend on a versioned wire type and
+therefore should require no edits. The end-to-end fake-socket test must run once per
+registered codec before support is advertised.
 
 ## Agent status events
 

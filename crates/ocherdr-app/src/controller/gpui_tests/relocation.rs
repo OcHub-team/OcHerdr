@@ -1,16 +1,5 @@
 use super::*;
 
-fn fake_remote_clipboard_image_upload(
-    profile: ConnectionProfile,
-    extension: String,
-    bytes: Vec<u8>,
-) -> std::result::Result<String, ocherdr_herdr::HerdrError> {
-    assert!(matches!(profile, ConnectionProfile::Ssh { .. }));
-    assert_eq!(extension, "png");
-    assert_eq!(bytes, b"\x89PNG\r\n\x1a\nremote");
-    Ok("/tmp/ocherdr-clipboard-images-501/clipboard-123-456-1/image.png".into())
-}
-
 pub(super) fn temp_tab() -> TabInfo {
     TabInfo {
         tab_id: "t-tmp".into(),
@@ -667,6 +656,96 @@ fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestCo
 }
 
 #[gpui::test]
+fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppContext) {
+    let mut snapshot = pane_move_capable_snapshot();
+    snapshot.version = "0.8.2".into();
+    snapshot.protocol = 20;
+    snapshot.tabs.truncate(2);
+    snapshot.tabs[0].pane_count = 1;
+    snapshot.tabs[1].pane_count = 1;
+    snapshot.workspaces[0].tab_count = 2;
+    snapshot.workspaces[0].pane_count = 2;
+    let pane_a = split_pane("p-a", true);
+    let mut pane_b = split_pane("p-b", false);
+    pane_b.tab_id = "t-b".into();
+    snapshot.focused_pane_id = Some("p-a".into());
+    snapshot.panes = vec![pane_a, pane_b];
+    snapshot.layouts = vec![
+        single_pane_layout("t-a", "p-a"),
+        single_pane_layout("t-b", "p-b"),
+    ];
+
+    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update_in(cx, |this, window, cx| {
+        this.sync_measured_pane_body(
+            "p-a",
+            gpui::Bounds {
+                origin: gpui::point(gpui::px(0.), gpui::px(0.)),
+                size: gpui::size(gpui::px(500.), gpui::px(320.)),
+            },
+            window,
+            cx,
+        );
+        this.pane_mount_scheduled = false;
+        this.ensure_session_terminals(cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.terminal_attach_count("p-a") == 0
+        || !view.read_with(cx, |this, _| {
+            this.pane("p-a")
+                .is_some_and(|runtime| runtime.frame.is_some())
+        })
+    {
+        assert!(Instant::now() < deadline, "first tab never painted");
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+    let original_context = view.read_with(cx, |this, _| this.pane("p-a").unwrap().frame_context);
+    assert_eq!(fake.terminal_attach_modes("p-a"), vec![false]);
+
+    view.update(cx, |this, cx| {
+        this.selection.tab_id = Some("t-b".into());
+        this.selection.pane_id = Some("p-b".into());
+        this.ensure_session_terminals(cx);
+        let hidden = this.pane("p-a").expect("hidden surface stays cached");
+        assert!(hidden.frame.is_some());
+        assert_eq!(hidden.frame_context, original_context);
+    });
+    view.update_in(cx, |this, window, cx| {
+        this.sync_measured_pane_body(
+            "p-b",
+            gpui::Bounds {
+                origin: gpui::point(gpui::px(0.), gpui::px(0.)),
+                size: gpui::size(gpui::px(500.), gpui::px(320.)),
+            },
+            window,
+            cx,
+        );
+        this.pane_mount_scheduled = false;
+        this.ensure_session_terminals(cx);
+    });
+
+    view.update(cx, |this, cx| {
+        this.selection.tab_id = Some("t-a".into());
+        this.selection.pane_id = Some("p-a".into());
+        this.ensure_session_terminals(cx);
+        let restored = this
+            .pane("p-a")
+            .expect("cached surface restores immediately");
+        assert!(restored.frame.is_some());
+        assert_eq!(restored.frame_context, original_context);
+    });
+    assert_eq!(
+        fake.terminal_attach_count("p-a"),
+        1,
+        "returning to a cached observer must not reconnect it"
+    );
+}
+
+#[gpui::test]
 fn notification_copy_button_wins_over_the_terminal_behind_it(cx: &mut TestAppContext) {
     let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
     let (view, cx) = open_view(cx);
@@ -750,15 +829,15 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
         cx.run_until_parked();
         thread::sleep(Duration::from_millis(20));
     }
-    // Ghostty's legacy encoding of Shift+Enter, base64 as Herdr receives it.
+    // Ghostty's legacy encoding of Shift+Enter reaches Herdr losslessly.
     assert_eq!(
         fake.terminal_inputs("p-left"),
-        vec!["G1syNzsyOzEzfg==".to_owned()]
+        vec![b"\x1b[27;2;13~".to_vec()]
     );
     assert!(fake.terminal_inputs("p-right").is_empty());
 
     // PixPin and Finder expose an image as a local file path. Keep the file
-    // alive while both local pass-through and remote upload exercise it.
+    // alive while both local pass-through and remote protocol bridging exercise it.
     let clipboard_dir = tempfile::TempDir::new().expect("clipboard directory");
     let clipboard_image = clipboard_dir.path().join("PixPin capture.png");
     std::fs::write(&clipboard_image, b"\x89PNG\r\n\x1a\nremote").expect("clipboard image");
@@ -789,11 +868,11 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
     }
     assert_eq!(
         fake.terminal_inputs("p-left"),
-        vec!["G1syNzsyOzEzfg==".to_owned(), "G1sxMTg7OXU=".to_owned()]
+        vec![b"\x1b[27;2;13~".to_vec(), b"\x1b[118;9u".to_vec()]
     );
 
     // The same file-backed Cmd+V on an SSH profile reads the local file in the
-    // background, uploads outside Herdr, then pastes the returned remote path.
+    // background, then sends its bytes over Herdr's private protocol.
     view.update_in(cx, |this, window, cx| {
         this.profiles[0] = ConnectionProfile::Ssh {
             // Keep the fixture's existing per-pane child stream while making
@@ -806,7 +885,6 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
             identity_file: None,
             herdr_path: "herdr".into(),
         };
-        this.remote_clipboard_image_upload = fake_remote_clipboard_image_upload;
         cx.write_to_clipboard(gpui::ClipboardItem {
             entries: vec![gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
                 vec![clipboard_image.clone()].into(),
@@ -821,40 +899,40 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
         this.send_key(&cmd_v, window, cx);
     });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_inputs("p-left").len() < 3 {
+    while fake.terminal_images("p-left").is_empty() {
         assert!(
             Instant::now() < deadline,
-            "uploaded remote image path never reached the pane stream"
+            "remote ClipboardImage never reached the pane stream"
         );
         cx.run_until_parked();
         thread::sleep(Duration::from_millis(20));
     }
 
-    // Herdr users also paste with Ctrl+V. It must take the identical remote
-    // upload path instead of being encoded as a literal control character.
+    // Herdr users also paste with Ctrl+V. It must take the identical native
+    // bridge path instead of being encoded as a literal control character.
     view.update_in(cx, |this, window, cx| {
         this.send_key(&key("v", true), window, cx);
     });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_inputs("p-left").len() < 4 {
+    while fake.terminal_images("p-left").len() < 2 {
         assert!(
             Instant::now() < deadline,
-            "Ctrl+V remote image path never reached the pane stream"
+            "Ctrl+V ClipboardImage never reached the pane stream"
         );
         cx.run_until_parked();
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(
         fake.terminal_inputs("p-left"),
-        vec![
-            "G1syNzsyOzEzfg==".to_owned(),
-            "G1sxMTg7OXU=".to_owned(),
-            "L3RtcC9vY2hlcmRyLWNsaXBib2FyZC1pbWFnZXMtNTAxL2NsaXBib2FyZC0xMjMtNDU2LTEvaW1hZ2UucG5n"
-                .to_owned(),
-            "L3RtcC9vY2hlcmRyLWNsaXBib2FyZC1pbWFnZXMtNTAxL2NsaXBib2FyZC0xMjMtNDU2LTEvaW1hZ2UucG5n"
-                .to_owned(),
-        ],
+        vec![b"\x1b[27;2;13~".to_vec(), b"\x1b[118;9u".to_vec()],
         "remote image paste must not leak Cmd+V or Ctrl+V into the PTY"
+    );
+    assert_eq!(
+        fake.terminal_images("p-left"),
+        vec![
+            ("png".into(), b"\x89PNG\r\n\x1a\nremote".to_vec()),
+            ("png".into(), b"\x89PNG\r\n\x1a\nremote".to_vec()),
+        ]
     );
 }
 

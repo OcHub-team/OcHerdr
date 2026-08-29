@@ -21,6 +21,7 @@ use ocherdr_core::{
     Selection, SessionSummary, TabInfo, WorkspaceInfo,
 };
 use ocherdr_herdr::{HostHealthStatus, SessionConnection, TerminalMode};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::split_drag_from_press;
@@ -67,7 +68,139 @@ struct FakeHerdr {
     script: Arc<PaneMoveScript>,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
+    terminal_commands: Arc<Mutex<HashMap<String, Vec<FakeTerminalCommand>>>>,
+    terminal_server: Option<JoinHandle<()>>,
     _dir: tempfile::TempDir,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FakeTerminalCommand {
+    Attach { controlled: bool },
+    Input(Vec<u8>),
+    ClipboardImage { extension: String, bytes: Vec<u8> },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+enum TestClientMessage {
+    Hello {
+        version: u32,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        requested_encoding: TestRenderEncoding,
+        keybindings: TestClientKeybindings,
+        launch_mode: TestClientLaunchMode,
+    },
+    Input {
+        data: Vec<u8>,
+    },
+    ClipboardImage {
+        extension: String,
+        data: Vec<u8>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    },
+    Detach,
+    AttachTerminal {
+        terminal_id: String,
+        takeover: bool,
+    },
+    AttachScroll {
+        source: TestAttachScrollSource,
+        direction: TestAttachScrollDirection,
+        lines: u16,
+        column: Option<u16>,
+        row: Option<u16>,
+        modifiers: u8,
+    },
+    InputEvents {
+        events: Vec<()>,
+    },
+    ObserveTerminal {
+        target: String,
+    },
+    ControlTerminal {
+        target: String,
+        takeover: bool,
+    },
+    GraphicsTransmissionResult {
+        transfer_id: u64,
+        image_id: u32,
+        success: bool,
+    },
+    InputPixels {
+        data: Vec<u8>,
+        cols: u16,
+        rows: u16,
+        width_px: u32,
+        height_px: u32,
+    },
+    GraphicsTransmissionStarted {
+        transfer_id: u64,
+        image_id: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum TestRenderEncoding {
+    SemanticFrame,
+    TerminalAnsi,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+enum TestClientKeybindings {
+    Server,
+    Local { keys_toml: String },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+enum TestClientLaunchMode {
+    App,
+    AppDirectGraphics,
+    TerminalAttach,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+enum TestAttachScrollDirection {
+    Up,
+    Down,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+enum TestAttachScrollSource {
+    Wheel,
+    PageKey { input: Vec<u8> },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+enum TestServerMessage {
+    Welcome {
+        version: u32,
+        encoding: TestRenderEncoding,
+        error: Option<String>,
+    },
+    Frame(()),
+    Terminal(TestTerminalFrame),
+}
+
+#[derive(Debug, Serialize)]
+struct TestTerminalFrame {
+    seq: u64,
+    width: u16,
+    height: u16,
+    full: bool,
+    bytes: Vec<u8>,
 }
 
 /// Scripted `pane.move` behaviour: how many of the next `new_tab` (step 1)
@@ -232,6 +365,12 @@ impl FakeHerdr {
         listener
             .set_nonblocking(true)
             .expect("nonblocking fake herdr socket");
+        let terminal_socket_path = dir.path().join("herdr-client.sock");
+        let terminal_listener =
+            UnixListener::bind(&terminal_socket_path).expect("bind fake private protocol socket");
+        terminal_listener
+            .set_nonblocking(true)
+            .expect("nonblocking fake private protocol socket");
 
         let sessions = json!({
             "sessions": [
@@ -240,14 +379,10 @@ impl FakeHerdr {
             ]
         });
         let herdr_path = dir.path().join("herdr");
-        // `terminal session control|observe <pane> …` streams control
-        // commands on stdin: log them per pane so tests can read what the
-        // view sent, and hold the stream open the way Herdr would.
-        let log_dir = dir.path().display();
         std::fs::write(
             &herdr_path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"session\" ] && [ \"$2\" = \"list\" ]; then\ncat <<'EOF'\n{sessions}\nEOF\nexit 0\nfi\nwhile [ $# -gt 0 ] && [ \"$1\" != \"terminal\" ]; do shift; done\nif [ \"$1\" = \"terminal\" ]; then\ncat >> \"{log_dir}/terminal-$4.jsonl\"\nexit 0\nfi\necho \"unexpected: $*\" >&2\nexit 1\n"
+                "#!/bin/sh\nif [ \"$1\" = \"session\" ] && [ \"$2\" = \"list\" ]; then\ncat <<'EOF'\n{sessions}\nEOF\nexit 0\nfi\necho \"unexpected: $*\" >&2\nexit 1\n"
             ),
         )
         .expect("write fake herdr");
@@ -260,6 +395,16 @@ impl FakeHerdr {
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
         let server = thread::spawn(move || serve(listener, server_stop));
+        let terminal_commands = Arc::new(Mutex::new(HashMap::new()));
+        let terminal_server_commands = terminal_commands.clone();
+        let terminal_server_stop = stop.clone();
+        let terminal_server = thread::spawn(move || {
+            serve_private_terminal_protocol(
+                terminal_listener,
+                terminal_server_commands,
+                terminal_server_stop,
+            )
+        });
         Self {
             herdr_path,
             events,
@@ -267,27 +412,60 @@ impl FakeHerdr {
             script: Arc::new(PaneMoveScript::default()),
             stop,
             server: Some(server),
+            terminal_commands,
+            terminal_server: Some(terminal_server),
             _dir: dir,
         }
     }
 
-    /// Base64 payloads of every `terminal.input` the view wrote to the
-    /// pane's control stream, in order.
-    fn terminal_inputs(&self, pane_id: &str) -> Vec<String> {
-        self.terminal_commands(pane_id)
+    /// Lossless payloads of every private-protocol `Input` for one pane.
+    fn terminal_inputs(&self, pane_id: &str) -> Vec<Vec<u8>> {
+        self.terminal_commands
+            .lock()
+            .expect("fake terminal command log")
+            .get(pane_id)
             .into_iter()
-            .filter(|command| command["type"] == json!("terminal.input"))
-            .filter_map(|command| command["bytes"].as_str().map(str::to_owned))
+            .flatten()
+            .filter_map(|command| match command {
+                FakeTerminalCommand::Input(bytes) => Some(bytes.clone()),
+                FakeTerminalCommand::Attach { .. } | FakeTerminalCommand::ClipboardImage { .. } => {
+                    None
+                }
+            })
             .collect()
     }
 
-    fn terminal_commands(&self, pane_id: &str) -> Vec<Value> {
-        let path = self._dir.path().join(format!("terminal-{pane_id}.jsonl"));
-        let Ok(log) = std::fs::read_to_string(path) else {
-            return Vec::new();
-        };
-        log.lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    fn terminal_images(&self, pane_id: &str) -> Vec<(String, Vec<u8>)> {
+        self.terminal_commands
+            .lock()
+            .expect("fake terminal command log")
+            .get(pane_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|command| match command {
+                FakeTerminalCommand::ClipboardImage { extension, bytes } => {
+                    Some((extension.clone(), bytes.clone()))
+                }
+                FakeTerminalCommand::Attach { .. } | FakeTerminalCommand::Input(_) => None,
+            })
+            .collect()
+    }
+
+    fn terminal_attach_count(&self, pane_id: &str) -> usize {
+        self.terminal_attach_modes(pane_id).len()
+    }
+
+    fn terminal_attach_modes(&self, pane_id: &str) -> Vec<bool> {
+        self.terminal_commands
+            .lock()
+            .expect("fake terminal command log")
+            .get(pane_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|command| match command {
+                FakeTerminalCommand::Attach { controlled } => Some(*controlled),
+                FakeTerminalCommand::Input(_) | FakeTerminalCommand::ClipboardImage { .. } => None,
+            })
             .collect()
     }
 
@@ -310,11 +488,178 @@ impl FakeHerdr {
     }
 }
 
+fn serve_private_terminal_protocol(
+    listener: UnixListener,
+    commands: Arc<Mutex<HashMap<String, Vec<FakeTerminalCommand>>>>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let commands = commands.clone();
+                let stop = stop.clone();
+                thread::spawn(move || handle_private_terminal(stream, commands, stop));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_private_terminal(
+    mut stream: UnixStream,
+    commands: Arc<Mutex<HashMap<String, Vec<FakeTerminalCommand>>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let Ok(TestClientMessage::Hello {
+        version,
+        cols,
+        rows,
+        requested_encoding: TestRenderEncoding::TerminalAnsi,
+        launch_mode: TestClientLaunchMode::TerminalAttach,
+        ..
+    }) = read_test_wire_message(&mut stream)
+    else {
+        return;
+    };
+    if version != 20 {
+        return;
+    }
+    if write_test_wire_message(
+        &mut stream,
+        &TestServerMessage::Welcome {
+            version: 20,
+            encoding: TestRenderEncoding::TerminalAnsi,
+            error: None,
+        },
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    let (target, controlled) = loop {
+        match read_test_wire_message::<TestClientMessage>(&mut stream) {
+            Ok(TestClientMessage::ObserveTerminal { target }) => break (target, false),
+            Ok(TestClientMessage::ControlTerminal { target, .. }) => break (target, true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && !stop.load(Ordering::Relaxed) => {}
+            _ => return,
+        }
+    };
+    commands
+        .lock()
+        .expect("fake terminal command log")
+        .entry(target.clone())
+        .or_default()
+        .push(FakeTerminalCommand::Attach { controlled });
+    let mut sequence = 0u64;
+    if write_test_terminal_frame(&mut stream, sequence, cols, rows).is_err() {
+        return;
+    }
+
+    while !stop.load(Ordering::Relaxed) {
+        let message = match read_test_wire_message::<TestClientMessage>(&mut stream) {
+            Ok(message) => message,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        };
+        match message {
+            TestClientMessage::Input { data } => commands
+                .lock()
+                .expect("fake terminal command log")
+                .entry(target.clone())
+                .or_default()
+                .push(FakeTerminalCommand::Input(data)),
+            TestClientMessage::ClipboardImage { extension, data } => commands
+                .lock()
+                .expect("fake terminal command log")
+                .entry(target.clone())
+                .or_default()
+                .push(FakeTerminalCommand::ClipboardImage {
+                    extension,
+                    bytes: data,
+                }),
+            TestClientMessage::Resize { cols, rows, .. } => {
+                sequence = sequence.saturating_add(1);
+                if write_test_terminal_frame(&mut stream, sequence, cols, rows).is_err() {
+                    break;
+                }
+            }
+            TestClientMessage::Detach => break,
+            _ => {}
+        }
+    }
+}
+
+fn write_test_terminal_frame(
+    stream: &mut UnixStream,
+    seq: u64,
+    width: u16,
+    height: u16,
+) -> std::io::Result<()> {
+    write_test_wire_message(
+        stream,
+        &TestServerMessage::Terminal(TestTerminalFrame {
+            seq,
+            width,
+            height,
+            full: true,
+            bytes: b"\x1b[2J\x1b[H".to_vec(),
+        }),
+    )
+}
+
+fn write_test_wire_message<T: Serialize>(
+    stream: &mut UnixStream,
+    message: &T,
+) -> std::io::Result<()> {
+    let payload = bincode::serde::encode_to_vec(message, bincode::config::standard())
+        .map_err(std::io::Error::other)?;
+    let length = u32::try_from(payload.len()).map_err(std::io::Error::other)?;
+    stream.write_all(&length.to_le_bytes())?;
+    stream.write_all(&payload)?;
+    stream.flush()
+}
+
+fn read_test_wire_message<T: for<'de> Deserialize<'de>>(
+    stream: &mut UnixStream,
+) -> std::io::Result<T> {
+    let mut length = [0; 4];
+    stream.read_exact(&mut length)?;
+    let mut payload = vec![0; u32::from_le_bytes(length) as usize];
+    stream.read_exact(&mut payload)?;
+    let (message, consumed) =
+        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+            .map_err(std::io::Error::other)?;
+    if consumed != payload.len() {
+        return Err(std::io::Error::other("trailing private protocol bytes"));
+    }
+    Ok(message)
+}
+
 impl Drop for FakeHerdr {
     fn drop(&mut self) {
         self.events = None;
         self.stop.store(true, Ordering::Relaxed);
         if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+        if let Some(server) = self.terminal_server.take() {
             let _ = server.join();
         }
     }
@@ -1404,6 +1749,8 @@ fn two_pane_layout(left: &str, right: &str) -> ocherdr_core::PaneLayout {
 
 fn two_pane_snapshot() -> HierarchySnapshot {
     let mut snapshot = pane_move_capable_snapshot();
+    snapshot.protocol = 20;
+    snapshot.version = "0.8.2".into();
     snapshot.focused_pane_id = Some("p-left".into());
     snapshot.panes = vec![split_pane("p-left", true), split_pane("p-right", false)];
     snapshot.layouts = vec![two_pane_layout("p-left", "p-right")];

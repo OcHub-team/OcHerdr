@@ -60,7 +60,11 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
-        let direction = if lines > 0 { "up" } else { "down" };
+        let direction = if lines > 0 {
+            TerminalScrollDirection::Up
+        } else {
+            TerminalScrollDirection::Down
+        };
         let _ = runtime.session.send(TerminalCommand::Scroll {
             direction,
             lines: lines.unsigned_abs() as u16,

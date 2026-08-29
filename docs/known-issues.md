@@ -3,7 +3,7 @@
 ## Control ownership follows interaction
 
 Panes start as observers. A click, wheel gesture, or terminal input promotes
-only that visible pane to `terminal session control --takeover`; other panes
+only that visible pane to a private-protocol control connection with takeover; other panes
 already controlled by the same OcHerdr stay controlled. Panes on hidden tabs
 return to observe mode.
 

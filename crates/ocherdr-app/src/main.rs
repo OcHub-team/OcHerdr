@@ -15,9 +15,9 @@ use ocherdr_core::{
     valid_split_ratio,
 };
 use ocherdr_herdr::{
-    EventSubscription, HerdrError, HostHealthStatus, MAX_REMOTE_CLIPBOARD_IMAGE_BYTES,
-    SessionConnection, TerminalCommand, TerminalMode, TerminalSession, attach_command,
-    discover_sessions, open_system_terminal, request_socket, upload_remote_clipboard_image,
+    EventSubscription, HerdrError, HostHealthStatus, MAX_CLIPBOARD_IMAGE_BYTES, SessionConnection,
+    TerminalCommand, TerminalMode, TerminalScrollDirection, TerminalSession, attach_command,
+    discover_sessions, open_system_terminal, request_socket,
 };
 use ocherdr_terminal::{KeyAction, KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
 use ochub_ui::anim::Transition;
@@ -122,6 +122,10 @@ const PANE_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 /// enough for the app to look hung.
 const PANE_MOUNT_BATCH_SIZE: usize = 1;
 const PANE_MOUNT_DELAY: Duration = Duration::from_millis(1);
+/// Keep recently visited pane surfaces alive across tab switches. This avoids
+/// recreating Metal/Ghostty state on every switch while bounding private socket,
+/// framebuffer, and scrollback usage for sessions with many tabs.
+const PANE_RUNTIME_CACHE_LIMIT: usize = 24;
 /// Herdr does not mark the end of retained EventHub replay. This quiet period
 /// only decides when OcHerdr may resume applying incremental payloads; current
 /// snapshots are refreshed throughout replay and remain visible immediately.
@@ -284,9 +288,6 @@ struct LoadedSession {
     snapshot: Option<HierarchySnapshot>,
 }
 
-type RemoteClipboardImageUpload =
-    fn(ConnectionProfile, String, Vec<u8>) -> Result<String, HerdrError>;
-
 enum LoadedEvents {
     Idle,
     Live(EventSubscription),
@@ -330,6 +331,8 @@ struct SessionPanes {
     /// Ownership is per terminal, so distinct panes can stay controlled at
     /// the same time. Hidden or remotely taken-over panes are removed.
     controls: HashMap<String, TerminalMode>,
+    /// Monotonic recency clock used only for hidden-pane cache eviction.
+    access_serial: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -348,14 +351,15 @@ impl SessionPanes {
             owner,
             panes: HashMap::new(),
             controls: HashMap::new(),
+            access_serial: 0,
         }
     }
 }
 
 struct PaneRuntime {
     /// Painted panes observe by default. Explicitly controlled panes are
-    /// writable. Hidden panes have no runtime; switching tabs recreates them
-    /// after the new shell has supplied its measured viewport.
+    /// writable. Recently visited hidden panes retain their surface and an
+    /// observe stream so tab switches can paint the cached frame immediately.
     session: TerminalSession,
     terminal: Terminal,
     frame: Option<RenderedFrame>,
@@ -383,6 +387,8 @@ struct PaneRuntime {
     /// Latest authoritative pixel size waiting for layout to settle. Older
     /// timer callbacks compare the serial and become no-ops.
     pending_resize: Option<PendingPaneResize>,
+    /// Last `SessionPanes::access_serial` at which this pane was visible.
+    last_visible_serial: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -729,9 +735,6 @@ struct OcHerdrView {
     connection: Option<SessionConnection>,
     /// What the connected Herdr can do, derived from the last full snapshot.
     herdr_capabilities: HerdrCapabilities,
-    /// Blocking transport used by the asynchronous remote-image paste path.
-    /// A function pointer keeps that controller boundary independently testable.
-    remote_clipboard_image_upload: RemoteClipboardImageUpload,
     event_stream: EventStreamState,
     /// Dropping this cancels the session-wide event await loop.
     event_listen: Option<Task<()>>,

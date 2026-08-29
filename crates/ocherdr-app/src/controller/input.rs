@@ -148,7 +148,7 @@ fn validate_remote_image_bytes(
     if bytes.is_empty() || !image_bytes_match_signature(extension, bytes) {
         return Err(RemoteImagePasteError::InvalidImage);
     }
-    let max = MAX_REMOTE_CLIPBOARD_IMAGE_BYTES;
+    let max = MAX_CLIPBOARD_IMAGE_BYTES;
     if bytes.len() > max {
         return Err(RemoteImagePasteError::TooLarge {
             bytes: bytes.len(),
@@ -170,7 +170,7 @@ fn read_remote_clipboard_image_file(
             "the clipboard path is not a regular file",
         ));
     }
-    let max = MAX_REMOTE_CLIPBOARD_IMAGE_BYTES;
+    let max = MAX_CLIPBOARD_IMAGE_BYTES;
     if metadata.len() > max as u64 {
         return Err(RemoteImagePasteError::TooLarge {
             bytes: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
@@ -194,12 +194,6 @@ fn remote_image_file_read_error(
         path: path.display().to_string(),
         error: error.to_string(),
     }
-}
-
-#[derive(Debug)]
-enum RemoteImageUploadError {
-    Clipboard(RemoteImagePasteError),
-    Upload(HerdrError),
 }
 
 impl RemoteClipboardImage {
@@ -567,14 +561,14 @@ impl OcHerdrView {
             self.notify_failure(FailureKind::ClipboardImagePaste, detail, cx);
         }
         if let Some(image) = remote_image {
-            self.upload_and_paste_remote_clipboard_image(pane_id, image, cx);
+            self.bridge_remote_clipboard_image(pane_id, image, cx);
         }
         if stream_closed {
             self.resync_snapshot(self.event_epoch, cx);
         }
     }
 
-    fn upload_and_paste_remote_clipboard_image(
+    fn bridge_remote_clipboard_image(
         &mut self,
         pane_id: String,
         image: RemoteClipboardImage,
@@ -584,18 +578,10 @@ impl OcHerdrView {
         let profile_id = profile.id().to_owned();
         let session_name = self.current_session().map(|session| session.name.clone());
         let event_epoch = self.event_epoch;
-        let upload = self.remote_clipboard_image_upload;
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let (extension, bytes) = image
-                        .into_bytes()
-                        .map_err(RemoteImageUploadError::Clipboard)?;
-                    upload(profile, extension, bytes).map_err(RemoteImageUploadError::Upload)
-                })
-                .await;
+            let result = cx.background_spawn(async move { image.into_bytes() }).await;
             this.update(cx, |this, cx| match result {
-                Ok(path) => {
+                Ok((extension, bytes)) => {
                     let target_is_current = this.event_epoch == event_epoch
                         && this.current_profile().id() == profile_id
                         && this.current_session().map(|session| &session.name)
@@ -609,9 +595,7 @@ impl OcHerdrView {
                         );
                         return;
                     }
-                    let Some(stream_closed) =
-                        this.paste_uploaded_remote_clipboard_image(&pane_id, &path)
-                    else {
+                    let Some(runtime) = this.pane_mut(&pane_id) else {
                         this.notify_failure(
                             FailureKind::ClipboardImagePaste,
                             this.i18n
@@ -620,35 +604,31 @@ impl OcHerdrView {
                         );
                         return;
                     };
-                    if stream_closed {
+                    if !runtime.mode.is_controlled() {
                         this.notify_failure(
-                            FailureKind::TerminalStream,
-                            HerdrError::TerminalClosed("terminal worker stopped".into()),
+                            FailureKind::ClipboardImagePaste,
+                            this.i18n
+                                .text(k::NOTIFY_DETAIL_CLIPBOARD_IMAGE_TARGET_CHANGED),
                             cx,
                         );
+                        return;
+                    }
+                    let result = runtime
+                        .session
+                        .send(TerminalCommand::ClipboardImage { extension, bytes });
+                    if let Err(error) = result {
+                        this.notify_failure(FailureKind::ClipboardImagePaste, error, cx);
                         this.resync_snapshot(this.event_epoch, cx);
                     }
                 }
-                Err(RemoteImageUploadError::Clipboard(error)) => {
+                Err(error) => {
                     let detail = error.detail(this.i18n);
                     this.notify_failure(FailureKind::ClipboardImagePaste, detail, cx);
-                }
-                Err(RemoteImageUploadError::Upload(error)) => {
-                    this.notify_failure(FailureKind::ClipboardImagePaste, error, cx);
                 }
             })
             .ok();
         })
         .detach();
-    }
-
-    fn paste_uploaded_remote_clipboard_image(&mut self, pane_id: &str, path: &str) -> Option<bool> {
-        let runtime = self.pane_mut(pane_id)?;
-        if !runtime.mode.is_controlled() {
-            return None;
-        }
-        runtime.terminal.paste(path);
-        Some(drain_terminal_input(runtime))
     }
 
     /// Key releases matter only to applications that asked the kitty
@@ -902,19 +882,19 @@ mod tests {
             ),
             CommandPaste::RemoteImageError(RemoteImagePasteError::UnsupportedFormat("svg".into()))
         );
-        let mut too_large = vec![0; MAX_REMOTE_CLIPBOARD_IMAGE_BYTES + 1];
+        let mut too_large = vec![0; MAX_CLIPBOARD_IMAGE_BYTES + 1];
         too_large[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
         assert_eq!(
             command_paste(Some(png(too_large)), true),
             CommandPaste::RemoteImageError(RemoteImagePasteError::TooLarge {
-                bytes: MAX_REMOTE_CLIPBOARD_IMAGE_BYTES + 1,
-                max: MAX_REMOTE_CLIPBOARD_IMAGE_BYTES,
+                bytes: MAX_CLIPBOARD_IMAGE_BYTES + 1,
+                max: MAX_CLIPBOARD_IMAGE_BYTES,
             })
         );
     }
 
     #[test]
-    fn remote_png_becomes_an_upload_request() {
+    fn remote_png_becomes_a_protocol_bridge_request() {
         let bytes = b"\x89PNG\r\n\x1a\nrest".to_vec();
         assert_eq!(
             command_paste(Some(png(bytes.clone())), true),
@@ -926,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn pixpin_file_backed_png_becomes_an_upload_request() {
+    fn pixpin_file_backed_png_becomes_a_protocol_bridge_request() {
         let path = PathBuf::from("/tmp/PixPin Screenshot.PNG");
         assert_eq!(
             command_paste(Some(external_path(path.clone())), true),
@@ -946,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_image_is_read_and_revalidated_before_upload() {
+    fn file_backed_image_is_read_and_revalidated_before_bridging() {
         let dir = tempfile::TempDir::new().unwrap();
         let image = dir.path().join("capture.jpeg");
         let bytes = b"\xff\xd8\xffremote".to_vec();
@@ -966,13 +946,13 @@ mod tests {
         let oversized = dir.path().join("oversized.png");
         fs::File::create(&oversized)
             .unwrap()
-            .set_len(MAX_REMOTE_CLIPBOARD_IMAGE_BYTES as u64 + 1)
+            .set_len(MAX_CLIPBOARD_IMAGE_BYTES as u64 + 1)
             .unwrap();
         assert_eq!(
             read_remote_clipboard_image_file(oversized, "png".into()).unwrap_err(),
             RemoteImagePasteError::TooLarge {
-                bytes: MAX_REMOTE_CLIPBOARD_IMAGE_BYTES + 1,
-                max: MAX_REMOTE_CLIPBOARD_IMAGE_BYTES,
+                bytes: MAX_CLIPBOARD_IMAGE_BYTES + 1,
+                max: MAX_CLIPBOARD_IMAGE_BYTES,
             }
         );
     }
