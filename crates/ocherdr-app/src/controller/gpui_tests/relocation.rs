@@ -666,6 +666,60 @@ fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestCo
     cx.run_until_parked();
 }
 
+#[gpui::test]
+fn notification_copy_button_wins_over_the_terminal_behind_it(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    measure_two_terminal_bodies(&view, cx);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(500.)));
+    view.update(cx, |this, cx| {
+        this.notifications.update(cx, |host, cx| {
+            host.notify(
+                ochub_ui::notifications::NotificationRequest::new(
+                    ochub_ui::notifications::NotificationLevel::Error,
+                    "Copy title",
+                )
+                .message("Copy detail")
+                .timeout(Duration::from_secs(60)),
+                cx,
+            );
+            cx.notify();
+        });
+    });
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+    cx.run_until_parked();
+
+    let copy = cx
+        .debug_bounds("notification-copy-1")
+        .expect("notification copy button");
+    let copy_center = copy.center();
+    let pointer = (f32::from(copy_center.x), f32::from(copy_center.y));
+    view.read_with(cx, |this, _| {
+        assert!(
+            ["p-left", "p-right"].into_iter().any(|pane_id| {
+                this.pane(pane_id).is_some_and(|runtime| {
+                    let (x, y, width, height) = runtime.body_bounds;
+                    pointer.0 >= x
+                        && pointer.0 <= x + width
+                        && pointer.1 >= y
+                        && pointer.1 <= y + height
+                })
+            }),
+            "the fixture must put a live terminal below the notification button"
+        );
+    });
+    cx.simulate_click(copy_center, gpui::Modifiers::default());
+
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("Copy title\nCopy detail".into()),
+        "the toast must intercept the click instead of starting a terminal selection"
+    );
+}
+
 /// Real Ghostty surfaces (not `headless_terminals`): a key press takes control,
 /// then libghostty encodes it and sends its bytes to that pane's stream.
 #[gpui::test]
@@ -703,17 +757,22 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
     );
     assert!(fake.terminal_inputs("p-right").is_empty());
 
-    // Ghostty makes Cmd+V a performable text paste. If the clipboard holds
-    // only an image, the chord must instead reach the agent through its Kitty
-    // keyboard protocol so the agent can perform its native image paste.
+    // PixPin and Finder expose an image as a local file path. Keep the file
+    // alive while both local pass-through and remote upload exercise it.
+    let clipboard_dir = tempfile::TempDir::new().expect("clipboard directory");
+    let clipboard_image = clipboard_dir.path().join("PixPin capture.png");
+    std::fs::write(&clipboard_image, b"\x89PNG\r\n\x1a\nremote").expect("clipboard image");
+
+    // On a local profile the file-backed image must still reach the agent as
+    // the original Cmd+V through its Kitty keyboard protocol.
     view.update_in(cx, |this, window, cx| {
         let runtime = this.pane_mut("p-left").expect("selected terminal");
         runtime.terminal.apply_frame(b"\x1b[>1u", false);
-        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image {
-            format: gpui::ImageFormat::Png,
-            bytes: b"\x89PNG\r\n\x1a\nlocal".to_vec(),
-            id: 1,
-        }));
+        cx.write_to_clipboard(gpui::ClipboardItem {
+            entries: vec![gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                vec![clipboard_image.clone()].into(),
+            ))],
+        });
         let mut cmd_v = key("v", false);
         cmd_v.keystroke.modifiers.platform = true;
         this.send_key(&cmd_v, window, cx);
@@ -733,8 +792,8 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
         vec!["G1syNzsyOzEzfg==".to_owned(), "G1sxMTg7OXU=".to_owned()]
     );
 
-    // The same image-only Cmd+V on an SSH profile uploads outside Herdr, then
-    // pastes the returned remote path through ordinary terminal.input.
+    // The same file-backed Cmd+V on an SSH profile reads the local file in the
+    // background, uploads outside Herdr, then pastes the returned remote path.
     view.update_in(cx, |this, window, cx| {
         this.profiles[0] = ConnectionProfile::Ssh {
             // Keep the fixture's existing per-pane child stream while making
@@ -748,11 +807,11 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
             herdr_path: "herdr".into(),
         };
         this.remote_clipboard_image_upload = fake_remote_clipboard_image_upload;
-        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image {
-            format: gpui::ImageFormat::Png,
-            bytes: b"\x89PNG\r\n\x1a\nremote".to_vec(),
-            id: 2,
-        }));
+        cx.write_to_clipboard(gpui::ClipboardItem {
+            entries: vec![gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                vec![clipboard_image.clone()].into(),
+            ))],
+        });
         assert!(matches!(
             this.current_profile(),
             ConnectionProfile::Ssh { .. }

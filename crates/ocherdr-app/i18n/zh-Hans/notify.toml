@@ -19,6 +19,7 @@
 "notify.clipboard_image_paste" = "无法粘贴剪贴板图片"
 "notify.detail.clipboard_image_format" = "OcHerdr 不支持 {format} 格式的剪贴板图片。"
 "notify.detail.clipboard_image_invalid" = "剪贴板图片为空，或图片内容与格式不匹配。"
+"notify.detail.clipboard_image_read" = "OcHerdr 无法读取剪贴板图片 {path}：{error}。"
 "notify.detail.clipboard_image_target_changed" = "图片上传完成前，所选远程窗格已经改变。"
 "notify.detail.clipboard_image_too_large" = "剪贴板图片大小为 {bytes} 字节；OcHerdr 最多可上传 {max} 字节。"
 "notify.detail.cannot_edit_this_mac" = "无法编辑这台 Mac。"

@@ -19,6 +19,7 @@
 "notify.clipboard_image_paste" = "Could not paste clipboard image"
 "notify.detail.clipboard_image_format" = "OcHerdr does not support clipboard image format {format}."
 "notify.detail.clipboard_image_invalid" = "The clipboard image is empty or its bytes do not match its format."
+"notify.detail.clipboard_image_read" = "OcHerdr could not read the clipboard image at {path}: {error}."
 "notify.detail.clipboard_image_target_changed" = "The selected remote pane changed before the image upload finished."
 "notify.detail.clipboard_image_too_large" = "The clipboard image is {bytes} bytes; OcHerdr can upload at most {max} bytes."
 "notify.detail.cannot_edit_this_mac" = "This Mac cannot be edited."

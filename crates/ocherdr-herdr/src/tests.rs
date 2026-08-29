@@ -163,7 +163,11 @@ fn remote_clipboard_image_upload_streams_bytes_with_profile_ssh_options() {
     );
     assert!(arguments.lines().any(|line| line == "deploy@example.com"));
     assert!(arguments.contains("/tmp/ocherdr-clipboard-images-$uid"));
-    assert!(arguments.contains("cat > \"$path\""));
+    assert!(arguments.contains("cat > \"$image_path\""));
+    assert!(
+        !arguments.lines().any(|line| line.starts_with("path=")),
+        "`path` is a special zsh parameter tied to PATH"
+    );
 }
 
 #[test]
@@ -174,7 +178,7 @@ fn remote_clipboard_image_script_writes_a_private_remote_file() {
     let ssh = dir.path().join("ssh");
     fs::write(
         &ssh,
-        "#!/bin/sh\nfor argument\ndo\n  remote=$argument\ndone\nexec /bin/sh -c \"$remote\"\n",
+        "#!/bin/sh\nfor argument\ndo\n  remote=$argument\ndone\nshell=/bin/sh\nif [ -x /bin/zsh ]\nthen\n  shell=/bin/zsh\nfi\nexec \"$shell\" -c \"$remote\"\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&ssh).unwrap().permissions();

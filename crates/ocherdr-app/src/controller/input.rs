@@ -1,11 +1,20 @@
 use super::*;
+use std::fs;
+use std::io::Read as _;
+use std::path::Path;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CommandPaste {
     PassThrough,
     Text(String),
-    RemoteImage { extension: String, bytes: Vec<u8> },
+    RemoteImage(RemoteClipboardImage),
     RemoteImageError(RemoteImagePasteError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteClipboardImage {
+    Bytes { extension: String, bytes: Vec<u8> },
+    File { extension: String, path: PathBuf },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,6 +22,7 @@ enum RemoteImagePasteError {
     UnsupportedFormat(String),
     TooLarge { bytes: usize, max: usize },
     InvalidImage,
+    FileRead { path: String, error: String },
 }
 
 impl RemoteImagePasteError {
@@ -23,6 +33,7 @@ impl RemoteImagePasteError {
             Self::InvalidImage => i18n
                 .text(k::NOTIFY_DETAIL_CLIPBOARD_IMAGE_INVALID)
                 .to_owned(),
+            Self::FileRead { path, error } => i18n.clipboard_image_read_detail(path, error),
         }
     }
 }
@@ -31,37 +42,168 @@ fn command_paste(item: Option<ClipboardItem>, remote: bool) -> CommandPaste {
     let Some(item) = item else {
         return CommandPaste::PassThrough;
     };
-    if let Some(text) = item.text() {
+    let explicit_text = explicit_clipboard_text(&item);
+    let fallback_text = item.text();
+    let entries = item.into_entries().collect::<Vec<_>>();
+    let file_image = clipboard_image_file(&entries);
+    if let Some(text) = explicit_text
+        && !file_image
+            .as_ref()
+            .is_some_and(|(path, _)| text == path.display().to_string())
+    {
         return CommandPaste::Text(text);
     }
     if !remote {
-        return CommandPaste::PassThrough;
+        if file_image.is_some()
+            || entries
+                .iter()
+                .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+        {
+            return CommandPaste::PassThrough;
+        }
+        return fallback_text
+            .map(CommandPaste::Text)
+            .unwrap_or(CommandPaste::PassThrough);
     }
-    let Some(image) = item.into_entries().find_map(|entry| match entry {
+    if let Some(image) = entries.into_iter().find_map(|entry| match entry {
         ClipboardEntry::Image(image) => Some(image),
         _ => None,
-    }) else {
-        return CommandPaste::PassThrough;
-    };
-    let extension = image.format.extension();
-    if !matches!(extension, "png" | "jpg" | "gif" | "webp" | "bmp") {
-        return CommandPaste::RemoteImageError(RemoteImagePasteError::UnsupportedFormat(
+    }) {
+        let extension = image.format.extension();
+        return match validate_remote_image_bytes(extension, &image.bytes) {
+            Ok(extension) => CommandPaste::RemoteImage(RemoteClipboardImage::Bytes {
+                extension: extension.to_owned(),
+                bytes: image.bytes,
+            }),
+            Err(error) => CommandPaste::RemoteImageError(error),
+        };
+    }
+    if let Some((path, extension)) = file_image {
+        return CommandPaste::RemoteImage(RemoteClipboardImage::File { extension, path });
+    }
+    fallback_text
+        .map(CommandPaste::Text)
+        .unwrap_or(CommandPaste::PassThrough)
+}
+
+fn explicit_clipboard_text(item: &ClipboardItem) -> Option<String> {
+    let mut text = String::new();
+    for entry in item.entries() {
+        if let ClipboardEntry::String(value) = entry {
+            text.push_str(value.text());
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn clipboard_image_file(entries: &[ClipboardEntry]) -> Option<(PathBuf, String)> {
+    let mut path = None;
+    for entry in entries {
+        let ClipboardEntry::ExternalPaths(paths) = entry else {
+            continue;
+        };
+        for candidate in paths.paths() {
+            if path.replace(candidate).is_some() {
+                return None;
+            }
+        }
+    }
+    let path = path?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(normalize_image_extension)?;
+    Some((path.clone(), extension.to_owned()))
+}
+
+fn normalize_image_extension(extension: &str) -> Option<&'static str> {
+    if extension.eq_ignore_ascii_case("png") {
+        Some("png")
+    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        Some("jpg")
+    } else if extension.eq_ignore_ascii_case("gif") {
+        Some("gif")
+    } else if extension.eq_ignore_ascii_case("webp") {
+        Some("webp")
+    } else if extension.eq_ignore_ascii_case("bmp") {
+        Some("bmp")
+    } else {
+        None
+    }
+}
+
+fn validate_remote_image_bytes(
+    extension: &str,
+    bytes: &[u8],
+) -> Result<&'static str, RemoteImagePasteError> {
+    let Some(extension) = normalize_image_extension(extension) else {
+        return Err(RemoteImagePasteError::UnsupportedFormat(
             extension.to_owned(),
         ));
-    }
-    if image.bytes.is_empty() || !image_bytes_match_signature(extension, &image.bytes) {
-        return CommandPaste::RemoteImageError(RemoteImagePasteError::InvalidImage);
+    };
+    if bytes.is_empty() || !image_bytes_match_signature(extension, bytes) {
+        return Err(RemoteImagePasteError::InvalidImage);
     }
     let max = MAX_REMOTE_CLIPBOARD_IMAGE_BYTES;
-    if image.bytes.len() > max {
-        return CommandPaste::RemoteImageError(RemoteImagePasteError::TooLarge {
-            bytes: image.bytes.len(),
+    if bytes.len() > max {
+        return Err(RemoteImagePasteError::TooLarge {
+            bytes: bytes.len(),
             max,
         });
     }
-    CommandPaste::RemoteImage {
-        extension: extension.to_owned(),
-        bytes: image.bytes,
+    Ok(extension)
+}
+
+fn read_remote_clipboard_image_file(
+    path: PathBuf,
+    extension: String,
+) -> Result<(String, Vec<u8>), RemoteImagePasteError> {
+    let metadata =
+        fs::metadata(&path).map_err(|error| remote_image_file_read_error(&path, error))?;
+    if !metadata.is_file() {
+        return Err(remote_image_file_read_error(
+            &path,
+            "the clipboard path is not a regular file",
+        ));
+    }
+    let max = MAX_REMOTE_CLIPBOARD_IMAGE_BYTES;
+    if metadata.len() > max as u64 {
+        return Err(RemoteImagePasteError::TooLarge {
+            bytes: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+            max,
+        });
+    }
+    let file = fs::File::open(&path).map_err(|error| remote_image_file_read_error(&path, error))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| remote_image_file_read_error(&path, error))?;
+    let extension = validate_remote_image_bytes(&extension, &bytes)?.to_owned();
+    Ok((extension, bytes))
+}
+
+fn remote_image_file_read_error(
+    path: &Path,
+    error: impl std::fmt::Display,
+) -> RemoteImagePasteError {
+    RemoteImagePasteError::FileRead {
+        path: path.display().to_string(),
+        error: error.to_string(),
+    }
+}
+
+#[derive(Debug)]
+enum RemoteImageUploadError {
+    Clipboard(RemoteImagePasteError),
+    Upload(HerdrError),
+}
+
+impl RemoteClipboardImage {
+    fn into_bytes(self) -> Result<(String, Vec<u8>), RemoteImagePasteError> {
+        match self {
+            Self::Bytes { extension, bytes } => Ok((extension, bytes)),
+            Self::File { extension, path } => read_remote_clipboard_image_file(path, extension),
+        }
     }
 }
 
@@ -379,10 +521,10 @@ impl OcHerdrView {
                     cx.stop_propagation();
                     drain_terminal_input(runtime)
                 }
-                CommandPaste::RemoteImage { extension, bytes } => {
+                CommandPaste::RemoteImage(image) => {
                     suppress_key_release = true;
                     cx.stop_propagation();
-                    remote_image = Some((extension, bytes));
+                    remote_image = Some(image);
                     false
                 }
                 CommandPaste::RemoteImageError(error) => {
@@ -420,8 +562,8 @@ impl OcHerdrView {
             let detail = error.detail(self.i18n);
             self.notify_failure(FailureKind::ClipboardImagePaste, detail, cx);
         }
-        if let Some((extension, bytes)) = remote_image {
-            self.upload_and_paste_remote_clipboard_image(pane_id, extension, bytes, cx);
+        if let Some(image) = remote_image {
+            self.upload_and_paste_remote_clipboard_image(pane_id, image, cx);
         }
         if stream_closed {
             self.resync_snapshot(self.event_epoch, cx);
@@ -431,8 +573,7 @@ impl OcHerdrView {
     fn upload_and_paste_remote_clipboard_image(
         &mut self,
         pane_id: String,
-        extension: String,
-        bytes: Vec<u8>,
+        image: RemoteClipboardImage,
         cx: &mut Context<Self>,
     ) {
         let profile = self.current_profile();
@@ -442,7 +583,12 @@ impl OcHerdrView {
         let upload = self.remote_clipboard_image_upload;
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { upload(profile, extension, bytes) })
+                .background_spawn(async move {
+                    let (extension, bytes) = image
+                        .into_bytes()
+                        .map_err(RemoteImageUploadError::Clipboard)?;
+                    upload(profile, extension, bytes).map_err(RemoteImageUploadError::Upload)
+                })
                 .await;
             this.update(cx, |this, cx| match result {
                 Ok(path) => {
@@ -479,7 +625,11 @@ impl OcHerdrView {
                         this.resync_snapshot(this.event_epoch, cx);
                     }
                 }
-                Err(error) => {
+                Err(RemoteImageUploadError::Clipboard(error)) => {
+                    let detail = error.detail(this.i18n);
+                    this.notify_failure(FailureKind::ClipboardImagePaste, detail, cx);
+                }
+                Err(RemoteImageUploadError::Upload(error)) => {
                     this.notify_failure(FailureKind::ClipboardImagePaste, error, cx);
                 }
             })
@@ -683,7 +833,7 @@ impl OcHerdrView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ochub_ui::gpui::{Image, ImageFormat};
+    use ochub_ui::gpui::{ClipboardString, ExternalPaths, Image, ImageFormat};
 
     fn png(bytes: Vec<u8>) -> ClipboardItem {
         ClipboardItem::new_image(&Image {
@@ -691,6 +841,14 @@ mod tests {
             bytes,
             id: 1,
         })
+    }
+
+    fn external_path(path: PathBuf) -> ClipboardItem {
+        ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                vec![path].into(),
+            ))],
+        }
     }
 
     #[test]
@@ -734,9 +892,61 @@ mod tests {
         let bytes = b"\x89PNG\r\n\x1a\nrest".to_vec();
         assert_eq!(
             command_paste(Some(png(bytes.clone())), true),
-            CommandPaste::RemoteImage {
+            CommandPaste::RemoteImage(RemoteClipboardImage::Bytes {
                 extension: "png".into(),
                 bytes,
+            })
+        );
+    }
+
+    #[test]
+    fn pixpin_file_backed_png_becomes_an_upload_request() {
+        let path = PathBuf::from("/tmp/PixPin Screenshot.PNG");
+        assert_eq!(
+            command_paste(Some(external_path(path.clone())), true),
+            CommandPaste::RemoteImage(RemoteClipboardImage::File {
+                extension: "png".into(),
+                path,
+            })
+        );
+        assert_eq!(
+            command_paste(
+                Some(external_path(PathBuf::from("/tmp/PixPin Screenshot.PNG"))),
+                false,
+            ),
+            CommandPaste::PassThrough,
+            "a local agent must receive the original Cmd+V"
+        );
+    }
+
+    #[test]
+    fn file_backed_image_is_read_and_revalidated_before_upload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let image = dir.path().join("capture.jpeg");
+        let bytes = b"\xff\xd8\xffremote".to_vec();
+        fs::write(&image, &bytes).unwrap();
+        assert_eq!(
+            read_remote_clipboard_image_file(image, "jpg".into()).unwrap(),
+            ("jpg".into(), bytes)
+        );
+
+        let invalid = dir.path().join("invalid.png");
+        fs::write(&invalid, b"not png").unwrap();
+        assert_eq!(
+            read_remote_clipboard_image_file(invalid, "png".into()).unwrap_err(),
+            RemoteImagePasteError::InvalidImage
+        );
+
+        let oversized = dir.path().join("oversized.png");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_REMOTE_CLIPBOARD_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(
+            read_remote_clipboard_image_file(oversized, "png".into()).unwrap_err(),
+            RemoteImagePasteError::TooLarge {
+                bytes: MAX_REMOTE_CLIPBOARD_IMAGE_BYTES + 1,
+                max: MAX_REMOTE_CLIPBOARD_IMAGE_BYTES,
             }
         );
     }
@@ -746,6 +956,37 @@ mod tests {
         assert_eq!(
             command_paste(Some(ClipboardItem::new_string("hello".into())), true),
             CommandPaste::Text("hello".into())
+        );
+
+        let item = ClipboardItem {
+            // macOS presents copied files in this order. A real string must
+            // still win; ExternalPaths alone is what PixPin supplies.
+            entries: vec![
+                ClipboardEntry::ExternalPaths(ExternalPaths(
+                    vec![PathBuf::from("/tmp/capture.png")].into(),
+                )),
+                ClipboardEntry::String(ClipboardString::new("caption".into())),
+            ],
+        };
+        assert_eq!(
+            command_paste(Some(item), true),
+            CommandPaste::Text("caption".into())
+        );
+
+        let path = PathBuf::from("/tmp/capture.png");
+        let item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.clone()].into())),
+                ClipboardEntry::String(ClipboardString::new(path.display().to_string())),
+            ],
+        };
+        assert_eq!(
+            command_paste(Some(item), true),
+            CommandPaste::RemoteImage(RemoteClipboardImage::File {
+                extension: "png".into(),
+                path,
+            }),
+            "a file provider's redundant path string is not user-authored text"
         );
     }
 }

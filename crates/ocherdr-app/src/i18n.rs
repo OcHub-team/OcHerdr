@@ -266,6 +266,15 @@ impl I18n {
         )
     }
 
+    pub(crate) fn clipboard_image_read_detail(self, path: &str, error: &str) -> String {
+        tf!(
+            self,
+            k::NOTIFY_DETAIL_CLIPBOARD_IMAGE_READ,
+            path = path,
+            error = error
+        )
+    }
+
     pub(crate) fn running_operation(self, method: &str) -> String {
         tf!(self, k::NOTIFY_RUNNING, method = method)
     }

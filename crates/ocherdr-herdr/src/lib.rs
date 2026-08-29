@@ -584,15 +584,15 @@ find "$dir" -type f -name 'image.*' -mtime +0 -exec rm -f {{}} \; 2>/dev/null ||
 find "$dir" -type d -name 'clipboard-*' -empty -exec rmdir {{}} \; 2>/dev/null || :
 upload_dir="$dir/clipboard-{token}"
 mkdir -m 700 "$upload_dir"
-path="$upload_dir/image.{extension}"
+image_path="$upload_dir/image.{extension}"
 cleanup() {{
-    rm -f "$path"
+    rm -f "$image_path"
     rmdir "$upload_dir" 2>/dev/null || :
 }}
 trap cleanup 0 1 2 15
-cat > "$path"
+cat > "$image_path"
 trap - 0 1 2 15
-printf '%s' "$path""#
+printf '%s' "$image_path""#
     )
 }
 
