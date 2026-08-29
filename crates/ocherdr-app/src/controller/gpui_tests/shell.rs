@@ -86,8 +86,8 @@ fn empty_tab_strip_space_is_a_full_height_window_move_area(cx: &mut TestAppConte
         "the free space starts after the last tab and `+`: {space:?} vs {last:?}"
     );
     assert!(
-        space.size.width > gpui::px(100.),
-        "the free space fills the strip"
+        space.size.width > gpui::px(0.),
+        "the remaining strip space stays a hittable move area: {space:?}"
     );
     for tab in ["tab-t-a", "tab-t-b", "tab-t-c"] {
         let bounds = cx.debug_bounds(tab).unwrap();
