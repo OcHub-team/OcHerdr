@@ -127,7 +127,9 @@ impl OcHerdrView {
         );
         let sheet = self.render_appearance_sheet(cx);
         apply_dialog(
-            layout::page(),
+            // Settings are a reading surface, not part of the frosted terminal
+            // canvas. Keep the page opaque even when the workspace uses glass.
+            layout::page().bg(theme::current().bg.rgba()),
             "appearance-dialog",
             i18n.text(k::APPEARANCE_TITLE),
         )
@@ -938,13 +940,24 @@ impl OcHerdrView {
             )
             .into_any_element()
         };
-        let mut body = modal_body();
+        let mut body = modal_body()
+            .id("ghostty-import-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
         if let Some(path) = preview.source.as_deref() {
-            body = body.child(div().text_xs().text_color(theme::muted()).child(crate::tf!(
-                i18n,
-                k::APPEARANCE_CONFIG_IMPORT_SOURCE,
-                path = path
-            )));
+            body = body.child(
+                div()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .whitespace_normal()
+                    .child(crate::tf!(
+                        i18n,
+                        k::APPEARANCE_CONFIG_IMPORT_SOURCE,
+                        path = path
+                    )),
+            );
         } else {
             body = body.child(
                 div()
@@ -956,8 +969,10 @@ impl OcHerdrView {
         if let Some(error) = preview.error.as_deref() {
             body = body.child(
                 div()
+                    .min_w_0()
                     .text_xs()
                     .text_color(theme::yellow())
+                    .whitespace_normal()
                     .child(error.to_owned()),
             );
         }
@@ -981,7 +996,28 @@ impl OcHerdrView {
                         .iter()
                         .map(|(key, value)| {
                             row()
-                                .child(row_label(key.clone(), Some(value.clone().into())))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_color(theme::text())
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .whitespace_normal()
+                                                .child(key.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme::muted())
+                                                .whitespace_normal()
+                                                .child(value.clone()),
+                                        ),
+                                )
                                 .into_any_element()
                         })
                         .collect(),
@@ -993,25 +1029,26 @@ impl OcHerdrView {
                     i18n.text(k::APPEARANCE_CONFIG_IMPORT_UNKNOWN),
                     None,
                 ))
-                .child(
-                    div().flex().flex_col().gap_1().children(
-                        preview
-                            .unknown
-                            .iter()
-                            .cloned()
-                            .map(|key| div().text_xs().text_color(theme::muted()).child(key)),
-                    ),
-                );
+                .child(div().flex().flex_col().gap_1().children(
+                    preview.unknown.iter().cloned().map(|key| {
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .whitespace_normal()
+                            .child(key)
+                    }),
+                ));
         }
         modal_overlay(
             apply_dialog(
-                modal_card().w(px(520.)),
+                modal_card().w(px(520.)).max_h(relative(0.84)),
                 "ghostty-import-dialog",
                 i18n.text(k::APPEARANCE_CONFIG_IMPORT_TITLE),
             )
-            .child(modal_header(i18n.text(k::APPEARANCE_CONFIG_IMPORT_TITLE)))
+            .child(modal_header(i18n.text(k::APPEARANCE_CONFIG_IMPORT_TITLE)).flex_none())
             .child(body)
-            .child(modal_footer(vec![cancel, confirm])),
+            .child(modal_footer(vec![cancel, confirm]).flex_none()),
         )
         .on_key_down(cx.listener(|this, event, window, cx| {
             this.handle_appearance_sheet_key(event, window, cx);

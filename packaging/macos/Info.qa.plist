@@ -10,6 +10,8 @@
   <string>ocherdr</string>
   <key>CFBundleIdentifier</key>
   <string>io.github.ochub-team.ocherdr.qa</string>
+  <key>CFBundleIconFile</key>
+  <string>OcHerdr.icns</string>
   <key>CFBundleName</key>
   <string>OcHerdr</string>
   <key>CFBundlePackageType</key>

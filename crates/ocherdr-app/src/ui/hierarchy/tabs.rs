@@ -496,19 +496,23 @@ impl OcHerdrView {
             )
             .when(pane_tab_drop.is_none(), |bar| {
                 bar.child(
-                    apply_control(
-                        icon_only_button_tone(
-                            "new-tab",
-                            chrome.toolbar.new_tab.name.clone(),
-                            IconName::Add,
-                            ButtonTone::Ghost,
-                            ButtonSize::Sm,
+                    icon_action_tooltip(
+                        "new-tab-tooltip",
+                        chrome.toolbar.new_tab.name.clone(),
+                        apply_control(
+                            icon_only_button_tone(
+                                "new-tab",
+                                chrome.toolbar.new_tab.name.clone(),
+                                IconName::Add,
+                                ButtonTone::Ghost,
+                                ButtonSize::Sm,
+                            )
+                            .rounded_full()
+                            .debug_selector(|| "new-tab".to_owned()),
+                            &chrome.toolbar.new_tab,
                         )
-                        .rounded_full()
-                        .debug_selector(|| "new-tab".to_owned()),
-                        &chrome.toolbar.new_tab,
+                        .on_click(cx.listener(|this, _, _window, cx| this.create_tab(cx))),
                     )
-                    .on_click(cx.listener(|this, _, _window, cx| this.create_tab(cx))),
                 )
                 // Everything between `+` and the toolbar is empty strip, so a
                 // drag there means "move the window".
@@ -524,123 +528,147 @@ impl OcHerdrView {
             })
             .child(div().id("pane-actions").role(ochub_ui::gpui::Role::Toolbar).aria_label(i18n.text(k::TERMINAL_PANE_ACTIONS)).flex().items_center().gap_1().px_2()
             .child(
-                apply_control(
-                    icon_only_button_tone(
-                    "split-right",
+                icon_action_tooltip(
+                    "split-right-tooltip",
                     chrome.toolbar.split_right.name.clone(),
-                    IconName::Blocks,
-                    ButtonTone::Primary,
-                    ButtonSize::Sm,
+                    apply_control(
+                        icon_only_button_tone(
+                            "split-right",
+                            chrome.toolbar.split_right.name.clone(),
+                            IconName::Blocks,
+                            ButtonTone::Primary,
+                            ButtonSize::Sm,
+                        ),
+                        &chrome.toolbar.split_right,
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        if let Some(pane_id) = pane_id_right.clone() {
+                            this.invoke(
+                                "pane.split",
+                                json!({ "target_pane_id": pane_id, "direction": SplitDirection::Right, "focus": true, "right_click": "herdr", "env": {} }),
+                                cx,
+                            )
+                        }
+                    })),
                 ),
-                    &chrome.toolbar.split_right,
-                )
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    if let Some(pane_id) = pane_id_right.clone() {
-                        this.invoke(
-                            "pane.split",
-                            json!({ "target_pane_id": pane_id, "direction": SplitDirection::Right, "focus": true, "right_click": "herdr", "env": {} }),
-                            cx,
-                        )
-                    }
-                })),
             )
             .child(
-                apply_control(
-                    icon_only_button_tone(
-                        "split-down",
-                        chrome.toolbar.split_down.name.clone(),
-                        IconName::ChevronDown,
-                        ButtonTone::Ghost,
-                        ButtonSize::Sm,
-                    ),
-                    &chrome.toolbar.split_down,
-                )
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    if let Some(pane_id) = pane_id_down.clone() {
-                        this.invoke(
-                            "pane.split",
-                            json!({ "target_pane_id": pane_id, "direction": SplitDirection::Down, "focus": true, "right_click": "herdr", "env": {} }),
-                            cx,
-                        )
-                    }
-                })),
+                icon_action_tooltip(
+                    "split-down-tooltip",
+                    chrome.toolbar.split_down.name.clone(),
+                    apply_control(
+                        icon_only_button_tone(
+                            "split-down",
+                            chrome.toolbar.split_down.name.clone(),
+                            IconName::ChevronDown,
+                            ButtonTone::Ghost,
+                            ButtonSize::Sm,
+                        ),
+                        &chrome.toolbar.split_down,
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        if let Some(pane_id) = pane_id_down.clone() {
+                            this.invoke(
+                                "pane.split",
+                                json!({ "target_pane_id": pane_id, "direction": SplitDirection::Down, "focus": true, "right_click": "herdr", "env": {} }),
+                                cx,
+                            )
+                        }
+                    })),
+                ),
             )
             .child(
-                apply_control(
-                    icon_only_button_tone(
-                        "zoom-pane",
-                        chrome.toolbar.zoom.name.clone(),
-                        IconName::Eye,
-                        ButtonTone::Ghost,
-                        ButtonSize::Sm,
-                    ),
-                    &chrome.toolbar.zoom,
-                )
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    if let Some(pane_id) = pane_id_zoom.clone() {
-                        this.invoke(
-                            "pane.zoom",
-                            json!({ "pane_id": pane_id, "mode": "toggle" }),
-                            cx,
-                        )
-                    }
-                })),
+                icon_action_tooltip(
+                    "zoom-pane-tooltip",
+                    chrome.toolbar.zoom.name.clone(),
+                    apply_control(
+                        icon_only_button_tone(
+                            "zoom-pane",
+                            chrome.toolbar.zoom.name.clone(),
+                            IconName::Eye,
+                            ButtonTone::Ghost,
+                            ButtonSize::Sm,
+                        ),
+                        &chrome.toolbar.zoom,
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        if let Some(pane_id) = pane_id_zoom.clone() {
+                            this.invoke(
+                                "pane.zoom",
+                                json!({ "pane_id": pane_id, "mode": "toggle" }),
+                                cx,
+                            )
+                        }
+                    })),
+                ),
             )
             .child(
-                apply_control(
-                    icon_only_button_tone(
-                        "close-pane",
-                        chrome.toolbar.close_pane.name.clone(),
-                        IconName::Close,
-                        ButtonTone::Ghost,
-                        ButtonSize::Sm,
-                    ),
-                    &chrome.toolbar.close_pane,
-                )
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    if let Some(pane_id) = pane_id_close.clone() {
-                        let label = this
-                            .snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.pane(&pane_id))
-                            .map(PaneInfo::display_name)
-                            .unwrap_or("pane")
-                            .to_owned();
-                        this.request_close(HierarchyTarget::Pane { id: pane_id, label }, cx)
-                    }
-                })),
+                icon_action_tooltip(
+                    "close-pane-tooltip",
+                    chrome.toolbar.close_pane.name.clone(),
+                    apply_control(
+                        icon_only_button_tone(
+                            "close-pane",
+                            chrome.toolbar.close_pane.name.clone(),
+                            IconName::Close,
+                            ButtonTone::Ghost,
+                            ButtonSize::Sm,
+                        ),
+                        &chrome.toolbar.close_pane,
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        if let Some(pane_id) = pane_id_close.clone() {
+                            let label = this
+                                .snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.pane(&pane_id))
+                                .map(PaneInfo::display_name)
+                                .unwrap_or("pane")
+                                .to_owned();
+                            this.request_close(HierarchyTarget::Pane { id: pane_id, label }, cx)
+                        }
+                    })),
+                ),
             )
             )
             .child(div().h(px(22.)).w(px(1.)).bg(theme::border()))
             .child(
-                apply_control(
-                    icon_only_button_tone(
-                        "open-appearance",
-                        chrome.toolbar.appearance.name.clone(),
-                        IconName::Palette,
-                        if matches!(self.overlay, Overlay::Appearance) {
-                            ButtonTone::Primary
-                        } else {
-                            ButtonTone::Ghost
-                        },
-                        ButtonSize::Sm,
-                    ),
-                    &chrome.toolbar.appearance,
-                )
-                .on_click(cx.listener(|this, _, _window, cx| this.open_appearance(cx))),
+                icon_action_tooltip(
+                    "open-appearance-tooltip",
+                    chrome.toolbar.appearance.name.clone(),
+                    apply_control(
+                        icon_only_button_tone(
+                            "open-appearance",
+                            chrome.toolbar.appearance.name.clone(),
+                            IconName::Palette,
+                            if matches!(self.overlay, Overlay::Appearance) {
+                                ButtonTone::Primary
+                            } else {
+                                ButtonTone::Ghost
+                            },
+                            ButtonSize::Sm,
+                        ),
+                        &chrome.toolbar.appearance,
+                    )
+                    .on_click(cx.listener(|this, _, _window, cx| this.open_appearance(cx))),
+                ),
             )
             .child(
-                apply_control(
-                    icon_only_button_tone(
-                        "open-herdr-settings",
-                        chrome.toolbar.herdr_settings.name.clone(),
-                        IconName::Settings,
-                        ButtonTone::Ghost,
-                        ButtonSize::Sm,
-                    ),
-                    &chrome.toolbar.herdr_settings,
-                )
-                .on_click(cx.listener(|this, _, _window, cx| this.open_native_tui(cx))),
+                icon_action_tooltip(
+                    "open-herdr-settings-tooltip",
+                    chrome.toolbar.herdr_settings.name.clone(),
+                    apply_control(
+                        icon_only_button_tone(
+                            "open-herdr-settings",
+                            chrome.toolbar.herdr_settings.name.clone(),
+                            IconName::Settings,
+                            ButtonTone::Ghost,
+                            ButtonSize::Sm,
+                        ),
+                        &chrome.toolbar.herdr_settings,
+                    )
+                    .on_click(cx.listener(|this, _, _window, cx| this.open_native_tui(cx))),
+                ),
             )
             .child(apply_control(
                 icon_button_tone(

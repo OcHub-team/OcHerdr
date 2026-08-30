@@ -57,6 +57,7 @@ config_json="$(
         --arg target "${target}" \
         --arg binaries_dir "${repo_root}/target/${target}/release" \
         --arg out_dir "${out_dir}" \
+        --arg icon "${repo_root}/packaging/macos/OcHerdr.icns" \
         --arg info_plist "${repo_root}/packaging/macos/Info.plist" \
         --arg entitlements "${repo_root}/packaging/macos/entitlements.plist" \
         --arg identity "${signing_identity}" \
@@ -72,6 +73,7 @@ config_json="$(
             binariesDir: $binaries_dir,
             outDir: $out_dir,
             targetTriple: $target,
+            icons: [$icon],
             macos: ({
                 minimumSystemVersion: "14.0",
                 entitlements: $entitlements,

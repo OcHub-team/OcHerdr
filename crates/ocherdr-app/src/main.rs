@@ -27,14 +27,14 @@ use ochub_ui::components::{
     modal_card, modal_footer, modal_header, modal_overlay, spinner, status_dot,
 };
 use ochub_ui::gpui::{
-    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClickEvent, ClipboardEntry,
-    ClipboardItem, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent, Keystroke, Menu,
-    MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Task,
-    TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
-    WindowBounds, WindowOptions, canvas, div, ease_out_quint, linear_color_stop, linear_gradient,
-    point, prelude::*, px, relative, size, surface,
+    Anchor, Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClickEvent,
+    ClipboardEntry, ClipboardItem, Context, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent,
+    Keystroke, Menu, MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Task, TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window,
+    WindowAppearance, WindowBounds, WindowOptions, anchored, canvas, deferred, div, ease_out_quint,
+    linear_color_stop, linear_gradient, point, prelude::*, px, relative, size, surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
@@ -1087,6 +1087,50 @@ fn bind_enter_submit<T: 'static>(
             host.update(cx, |this, cx| on_enter(this, window, cx)).ok();
         });
     });
+}
+
+/// Adds a discoverable hover label to a compact icon action. Deferred paint
+/// keeps the tooltip above terminal textures and other later siblings.
+fn icon_action_tooltip(
+    group: &'static str,
+    label: impl Into<SharedString>,
+    action: impl IntoElement,
+) -> impl IntoElement {
+    let label = label.into();
+    div()
+        .relative()
+        .flex_none()
+        .group(group)
+        .child(action)
+        .child(
+            deferred(
+                anchored()
+                    .anchor(Anchor::TopCenter)
+                    .offset(point(px(0.), px(7.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("{group}-popup").into()))
+                            .role(ochub_ui::gpui::Role::Tooltip)
+                            .invisible()
+                            .group_hover(group, |style| style.visible())
+                            .max_w(px(260.))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(CORNER_COMPACT))
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::overlay())
+                            .shadow(theme::shadow_popover())
+                            .text_xs()
+                            .text_color(theme::text())
+                            .whitespace_normal()
+                            .occlude()
+                            .child(label),
+                    ),
+            )
+            .priority(40),
+        )
 }
 
 fn quit_app(_: &Quit, cx: &mut App) {

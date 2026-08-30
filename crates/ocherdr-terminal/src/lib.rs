@@ -135,6 +135,8 @@ const CT_FONT_MANAGER_SCOPE_PROCESS: u32 = 1;
 pub struct TerminalPalette {
     pub dark: bool,
     pub background: u32,
+    /// Percentage, matching OcHerdr's window content opacity.
+    pub background_opacity: u8,
     pub foreground: u32,
     pub cursor: u32,
     pub selection: u32,
@@ -161,6 +163,9 @@ impl TerminalPalette {
     fn config_text(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "background = {}", hex_color(self.background));
+        let opacity = f64::from(self.background_opacity.min(100)) / 100.;
+        let _ = writeln!(out, "background-opacity = {opacity:.2}");
+        let _ = writeln!(out, "background-opacity-cells = true");
         let _ = writeln!(out, "foreground = {}", hex_color(self.foreground));
         let _ = writeln!(out, "cursor-color = {}", hex_color(self.cursor));
         let _ = writeln!(out, "cursor-text = {}", hex_color(self.background));

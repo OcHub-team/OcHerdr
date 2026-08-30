@@ -435,7 +435,7 @@ impl OcHerdrView {
                     true
                 }
                 (",", false) => {
-                    self.open_native_tui(cx);
+                    self.open_appearance(cx);
                     true
                 }
                 ("c", false) => {

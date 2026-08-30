@@ -10,6 +10,7 @@ fn terminal_palette_follows_the_gui_light_and_dark_theme() {
     assert!(!light.dark);
     assert!(dark.dark);
     assert_eq!(light.background, family.light.bg.0);
+    assert_eq!(light.background_opacity, 100);
     assert_eq!(light.foreground, family.light.text.0);
     assert_eq!(dark.background, family.dark.bg.0);
     assert_ne!(light.background, dark.background);
@@ -18,6 +19,18 @@ fn terminal_palette_follows_the_gui_light_and_dark_theme() {
     assert_eq!(light.font_size, 13);
     assert!(light.font_features.is_empty());
     assert!(light.font_family.is_empty());
+}
+
+#[test]
+fn terminal_palette_uses_workspace_background_opacity() {
+    let family = ochub_ui::theme::ochub_family();
+    let appearance = AppearanceSettings {
+        background_opacity: 0.85,
+        ..AppearanceSettings::default()
+    };
+    let overlay = crate::theme_ansi::overlay_for(Some(&family));
+    let palette = terminal_palette_from_theme(family.dark, true, overlay, &appearance);
+    assert_eq!(palette.background_opacity, 85);
 }
 
 #[test]

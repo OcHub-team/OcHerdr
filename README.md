@@ -28,7 +28,7 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - local clipboard image paste with `Cmd+V`, plus SSH-host paste with `Cmd+V` or `Ctrl+V`;
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
 - runtime internationalization with system-language detection, English, and Simplified Chinese;
-- an Open TUI handoff for Herdr settings through the system Terminal;
+- an Open TUI handoff for Herdr settings through the toolbar;
 - stopped-session guidance through the system Terminal.
 
 OcHerdr does not link or modify Herdr. It implements protocol 20 of Herdr's private
@@ -101,7 +101,7 @@ Authentication and host-key enrollment remain with OpenSSH and the system Termin
 OcHerdr supports `Cmd+T` (new tab), `Cmd+W` (close pane; last pane in a tab
 closes the tab), `Cmd+Shift+W` (close workspace), `Cmd+Shift+N` (new workspace),
 `Cmd+1…9` (switch tab), `Ctrl+Tab` (cycle tabs), `F2` (rename), and `Cmd+,`
-(open Herdr settings in Terminal). Click the status-bar host to switch machines; `Hosts` in the
+(open OcHerdr appearance settings). Click the status-bar host to switch machines; `Hosts` in the
 toolbar opens the connection manager. `Cmd+W` is for panes, not hosts.
 
 With an image-only or file-backed image clipboard (including PixPin and Finder),

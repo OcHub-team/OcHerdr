@@ -44,6 +44,7 @@ fn palette_config_uses_light_background_and_ansi_slots() {
     let palette = TerminalPalette {
         dark: false,
         background: 0xEFF1F5,
+        background_opacity: 85,
         foreground: 0x4C4F69,
         cursor: 0x8839EF,
         selection: 0xCCD0DA,
@@ -63,6 +64,8 @@ fn palette_config_uses_light_background_and_ansi_slots() {
     };
     let config = palette.config_text();
     assert!(config.contains("background = #EFF1F5"));
+    assert!(config.contains("background-opacity = 0.85"));
+    assert!(config.contains("background-opacity-cells = true"));
     assert!(config.contains("foreground = #4C4F69"));
     assert!(config.contains("palette = 0=#5C5F77"));
     assert!(config.contains("palette = 15=#4C4F69"));
@@ -194,6 +197,7 @@ fn test_palette() -> TerminalPalette {
     TerminalPalette {
         dark: true,
         background: 0x000000,
+        background_opacity: 100,
         foreground: 0xffffff,
         cursor: 0xffffff,
         selection: 0x444444,

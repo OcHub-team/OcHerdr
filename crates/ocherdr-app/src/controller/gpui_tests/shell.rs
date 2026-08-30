@@ -1,4 +1,31 @@
 use super::*;
+
+#[gpui::test]
+fn command_comma_opens_ocherdr_settings_in_place(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    view.update_in(cx, |this, window, cx| {
+        this.focus.focus(window, cx);
+        let event = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: gpui::Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
+                key: ",".into(),
+                key_char: Some(",".into()),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert!(this.handle_app_shortcut(&event, window, cx));
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |this, _| {
+        assert!(matches!(this.overlay, crate::Overlay::Appearance));
+    });
+}
+
 #[gpui::test]
 fn overflowing_tab_bar_scrolls_horizontally_with_the_wheel(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);

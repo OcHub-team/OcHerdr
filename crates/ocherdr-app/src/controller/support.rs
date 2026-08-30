@@ -1083,6 +1083,9 @@ pub(super) fn terminal_palette_from_theme(
     TerminalPalette {
         dark,
         background: theme.bg.0,
+        background_opacity: crate::config::values::opacity_percent_u8(
+            appearance.background_opacity,
+        ),
         foreground: theme.text.0,
         cursor: theme.accent.0,
         selection: theme.selection.0,

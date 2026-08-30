@@ -61,8 +61,10 @@ build-release: doctor
 # Create an ad-hoc signed macOS app bundle at target/qa/OcHerdr.app.
 qa-app: build-release
     install -d "{{ app_bundle }}/Contents/MacOS"
+    install -d "{{ app_bundle }}/Contents/Resources"
     install -m 755 target/release/ocherdr "{{ app_binary }}"
     install -m 644 packaging/macos/Info.qa.plist "{{ app_bundle }}/Contents/Info.plist"
+    install -m 644 packaging/macos/OcHerdr.icns "{{ app_bundle }}/Contents/Resources/OcHerdr.icns"
     codesign --force --deep --sign - "{{ app_bundle }}"
     @echo "Built {{ app_bundle }}"
 
