@@ -5,11 +5,12 @@ workflow; a tag whose version does not exactly match `Cargo.toml` is rejected be
 any macOS build starts.
 
 The pipeline builds Apple Silicon and Intel apps on their native GitHub runners,
-Developer ID-signs each app and DMG, optionally notarizes the DMG, signs each updater
-archive with a separate minisign key, generates checksums and a versioned
-`latest.json`, attests every asset, and publishes one GitHub Release. A published
-release is immutable from this workflow: a manual rerun may resume a draft but will
-not overwrite a release that is already public.
+signs each updater archive with a separate minisign key, generates checksums and a
+versioned `latest.json`, attests every asset, and publishes one GitHub Release. When
+all Developer ID credentials are configured, it Developer ID-signs each app and DMG
+and optionally notarizes the DMG. Otherwise it produces an explicitly ad-hoc-signed
+release. A published release is immutable from this workflow: a manual rerun may
+resume a draft but will not overwrite a release that is already public.
 
 ## Repository configuration
 
@@ -17,10 +18,10 @@ Configure these GitHub Actions secrets in `OcHub-team/OcHerdr` before pushing a 
 
 | Name | Required | Purpose |
 | --- | --- | --- |
-| `APPLE_SIGNING_IDENTITY` | yes | Exact `Developer ID Application: …` identity imported from the certificate |
-| `APPLE_CERTIFICATE` | yes | Base64-encoded Developer ID Application `.p12` |
-| `APPLE_CERTIFICATE_PASSWORD` | yes | Password used when the `.p12` was exported |
-| `APPLE_TEAM_ID` | yes | Apple Developer Team ID; release validation requires every artifact to match it |
+| `APPLE_SIGNING_IDENTITY` | optional set | Exact `Developer ID Application: …` identity imported from the certificate |
+| `APPLE_CERTIFICATE` | optional set | Base64-encoded Developer ID Application `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | optional set | Password used when the `.p12` was exported |
+| `APPLE_TEAM_ID` | optional set | Apple Developer Team ID; release validation requires every artifact to match it |
 | `OCHERDR_SIGNING_PRIVATE_KEY` | yes | Contents of the dedicated cargo-packager/minisign private key |
 | `OCHERDR_SIGNING_PRIVATE_KEY_PASSWORD` | if set | Password chosen for the updater key |
 | `APPLE_ID` | recommended | Apple account used by `notarytool` |
@@ -50,6 +51,13 @@ updater private key.
 `HOMEBREW_TAP_DISPATCH_TOKEN` only reduces latency. The tap's
 `update-ocherdr-cask.yml` also checks the latest public release every day, so a missing
 cross-repository token does not fail or block an OcHerdr release.
+
+The four Developer ID values form one optional set. If any member is absent, the
+release workflow falls back to ad-hoc signing and skips notarization. Homebrew can
+still install and upgrade that build, but Gatekeeper may require explicit approval on
+first launch and the in-app updater will open the release page instead of replacing
+the application automatically. Set `MACOS_SIGNING_MODE=required` when running the
+packaging script to fail closed instead of falling back.
 
 ## Publish a version
 

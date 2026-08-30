@@ -26,17 +26,35 @@ x86_64-apple-darwin) arch="x86_64" ;;
     ;;
 esac
 
-signing_identity="${APPLE_SIGNING_IDENTITY:-}"
+signing_mode="${MACOS_SIGNING_MODE:-auto}"
+case "${signing_mode}" in
+auto | required | adhoc) ;;
+*)
+    printf 'unsupported MACOS_SIGNING_MODE: %s (expected auto, required, or adhoc)\n' \
+        "${signing_mode}" >&2
+    exit 1
+    ;;
+esac
+
+apple_credentials=(
+    APPLE_SIGNING_IDENTITY
+    APPLE_CERTIFICATE
+    APPLE_CERTIFICATE_PASSWORD
+    APPLE_TEAM_ID
+)
+missing_apple_credentials=()
+for variable in "${apple_credentials[@]}"; do
+    if [[ -z "${!variable:-}" ]]; then
+        missing_apple_credentials+=("${variable}")
+    fi
+done
+
+signing_identity=""
 developer_id_signing=false
 notarize=false
-if [[ -n "${signing_identity}" ]]; then
+if [[ "${signing_mode}" != adhoc && ${#missing_apple_credentials[@]} -eq 0 ]]; then
+    signing_identity="${APPLE_SIGNING_IDENTITY}"
     developer_id_signing=true
-    for variable in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_TEAM_ID; do
-        if [[ -z "${!variable:-}" ]]; then
-            printf '%s is required when APPLE_SIGNING_IDENTITY is set.\n' "${variable}" >&2
-            exit 1
-        fi
-    done
     if [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" ]]; then
         notarize=true
     elif [[ -n "${APPLE_ID:-}" || -n "${APPLE_PASSWORD:-}" ]]; then
@@ -46,9 +64,21 @@ if [[ -n "${signing_identity}" ]]; then
         unset APPLE_ID APPLE_PASSWORD APPLE_KEYCHAIN_PROFILE
         unset APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
     fi
-elif [[ "${MACOS_REQUIRE_DEVELOPER_ID_SIGNATURE:-false}" == true ]]; then
-    printf 'Developer ID signing is required for a GitHub release.\n' >&2
+elif [[ "${signing_mode}" == required ]]; then
+    printf 'Developer ID signing is required, but these credentials are missing: %s\n' \
+        "${missing_apple_credentials[*]}" >&2
     exit 1
+else
+    if [[ "${signing_mode}" == auto && ${#missing_apple_credentials[@]} -gt 0 ]]; then
+        printf 'Apple signing credentials are incomplete (%s); using ad-hoc signing.\n' \
+            "${missing_apple_credentials[*]}"
+    else
+        printf 'Using ad-hoc macOS signing.\n'
+    fi
+    signing_identity=""
+    unset APPLE_SIGNING_IDENTITY APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+    unset APPLE_TEAM_ID APPLE_ID APPLE_PASSWORD APPLE_KEYCHAIN_PROFILE
+    unset APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
 fi
 
 config_json="$(

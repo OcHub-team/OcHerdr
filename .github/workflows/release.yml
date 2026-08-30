@@ -119,21 +119,11 @@ jobs:
       - name: Require release credentials
         shell: bash
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           OCHERDR_SIGNING_PRIVATE_KEY: ${{ secrets.OCHERDR_SIGNING_PRIVATE_KEY }}
           OCHERDR_UPDATER_PUBKEY: ${{ vars.OCHERDR_UPDATER_PUBKEY }}
         run: |
           set -euo pipefail
           for variable in \
-            APPLE_SIGNING_IDENTITY \
-            APPLE_CERTIFICATE \
-            APPLE_CERTIFICATE_PASSWORD \
-            APPLE_TEAM_ID \
             OCHERDR_SIGNING_PRIVATE_KEY \
             OCHERDR_UPDATER_PUBKEY; do
             if [ -z "${!variable:-}" ]; then
@@ -141,17 +131,12 @@ jobs:
               exit 1
             fi
           done
-          if [[ -n "${APPLE_ID:-}" && -z "${APPLE_PASSWORD:-}" ]] || \
-             [[ -z "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" ]]; then
-            printf 'APPLE_ID and APPLE_PASSWORD must be configured together\n' >&2
-            exit 1
-          fi
 
       - name: Package macOS
         shell: bash
         env:
           OCHERDR_BUILD_TARGET: ${{ matrix.target }}
-          MACOS_REQUIRE_DEVELOPER_ID_SIGNATURE: "true"
+          MACOS_SIGNING_MODE: "auto"
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}

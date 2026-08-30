@@ -51,12 +51,12 @@ brew tap OcHub-team/tap
 brew install --cask ocherdr
 ```
 
-The same signed DMGs are available from
+The same release DMGs are available from
 [GitHub Releases](https://github.com/OcHub-team/OcHerdr/releases). OcHerdr checks for a
 new signed release once per day and also exposes **OcHerdr → Check for Updates…**.
 Application replacement is offered only when both the updater minisign signature and
-the macOS code-signing identity are valid; source builds and binaries launched outside
-an app bundle fall back to the release page.
+the macOS Developer ID signature are valid; ad-hoc-signed releases, source builds, and
+binaries launched outside an app bundle fall back to the release page.
 
 Install the pinned GhosttyKit artifact once before the first build:
 
