@@ -3958,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "ocherdr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "ocherdr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3994,7 +3994,7 @@ dependencies = [
 
 [[package]]
 name = "ocherdr-herdr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "dirs",
@@ -4008,7 +4008,7 @@ dependencies = [
 
 [[package]]
 name = "ocherdr-terminal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bindgen 0.72.1",
  "core-foundation 0.10.1",

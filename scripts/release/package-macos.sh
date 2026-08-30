@@ -136,8 +136,11 @@ if [[ "${developer_id_signing}" == true ]]; then
         grep -Fxq "TeamIdentifier=${APPLE_TEAM_ID}" <<<"${details}"
     done
 else
+    codesign --remove-signature "${app_path}/Contents/MacOS/ocherdr"
     codesign --force --deep --sign - "${app_path}"
     codesign --force --sign - "${dmg_path}"
+    codesign --verify --deep --strict --verbose=2 "${app_path}"
+    codesign --verify --strict --verbose=2 "${dmg_path}"
 fi
 
 if [[ "${notarize}" == true ]]; then

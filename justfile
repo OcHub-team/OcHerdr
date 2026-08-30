@@ -65,7 +65,9 @@ qa-app: build-release
     install -m 755 target/release/ocherdr "{{ app_binary }}"
     install -m 644 packaging/macos/Info.qa.plist "{{ app_bundle }}/Contents/Info.plist"
     install -m 644 packaging/macos/OcHerdr.icns "{{ app_bundle }}/Contents/Resources/OcHerdr.icns"
+    codesign --remove-signature "{{ app_binary }}"
     codesign --force --deep --sign - "{{ app_bundle }}"
+    codesign --verify --deep --strict --verbose=2 "{{ app_bundle }}"
     @echo "Built {{ app_bundle }}"
 
 # Full local acceptance: CI gate, package the app, then launch a fresh instance.
