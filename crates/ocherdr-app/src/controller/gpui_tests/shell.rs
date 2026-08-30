@@ -349,7 +349,10 @@ fn fixed_width_tab_hover_reveals_close_then_delayed_preview(cx: &mut TestAppCont
         };
         cx.notify();
     });
-    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(500.)));
+    // Keep all three fixed-width tabs inside the scroll viewport. Toolbar text
+    // uses platform font metrics, so 900px can clip the second tab on CI even
+    // though its pre-clip debug bounds still report the full pill.
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(500.)));
     cx.run_until_parked();
 
     let alpha_before = cx.debug_bounds("tab-t-a").expect("alpha tab bounds");
