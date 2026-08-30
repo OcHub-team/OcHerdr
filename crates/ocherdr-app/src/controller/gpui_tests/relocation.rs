@@ -732,6 +732,19 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
         this.ensure_session_terminals(cx);
     });
 
+    // Stream replacement runs on the terminal worker. Wait until the hidden
+    // controller has actually reattached as an observer before checking that
+    // returning to the tab reuses it; fast local machines often complete this
+    // before the next assertion, while CI does not.
+    while fake.terminal_attach_modes("p-a") != [true, false] {
+        assert!(
+            Instant::now() < deadline,
+            "hidden pane never reattached as an observer"
+        );
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+
     view.update(cx, |this, cx| {
         this.selection.tab_id = Some("t-a".into());
         this.selection.pane_id = Some("p-a".into());
