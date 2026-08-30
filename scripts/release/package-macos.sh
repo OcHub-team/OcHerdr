@@ -91,6 +91,7 @@ config_json="$(
         --arg info_plist "${repo_root}/packaging/macos/Info.plist" \
         --arg entitlements "${repo_root}/packaging/macos/entitlements.plist" \
         --arg identity "${signing_identity}" \
+        --arg before_each_dir "${repo_root}" \
         '{
             productName: "OcHerdr",
             version: $version,
@@ -114,9 +115,15 @@ config_json="$(
                 appPosition: { x: 180, y: 210 },
                 appFolderPosition: { x: 480, y: 210 }
             }
-        }'
+        } + if $identity == "" then {
+            beforeEachPackageCommand: {
+                script: "bash scripts/release/prepare-adhoc-app.sh",
+                dir: $before_each_dir
+            }
+        } else {} end'
 )"
 
+export OCHERDR_PACKAGE_APP_PATH="${out_dir}/OcHerdr.app"
 cargo packager --config "${config_json}" --formats app,dmg
 
 app_path="$(find "${out_dir}" -maxdepth 1 -type d -name 'OcHerdr.app' -print -quit)"
@@ -136,12 +143,28 @@ if [[ "${developer_id_signing}" == true ]]; then
         grep -Fxq "TeamIdentifier=${APPLE_TEAM_ID}" <<<"${details}"
     done
 else
-    codesign --remove-signature "${app_path}/Contents/MacOS/ocherdr"
-    codesign --force --deep --sign - "${app_path}"
     codesign --force --sign - "${dmg_path}"
     codesign --verify --deep --strict --verbose=2 "${app_path}"
     codesign --verify --strict --verbose=2 "${dmg_path}"
 fi
+
+dmg_mount="$(mktemp -d "${TMPDIR:-/tmp}/ocherdr-dmg.XXXXXX")"
+dmg_attached=false
+cleanup_dmg_mount() {
+    if [[ "${dmg_attached}" == true ]]; then
+        hdiutil detach "${dmg_mount}" >/dev/null
+    fi
+    rmdir "${dmg_mount}" 2>/dev/null || true
+}
+trap cleanup_dmg_mount EXIT
+hdiutil attach "${dmg_path}" -nobrowse -readonly -mountpoint "${dmg_mount}" >/dev/null
+dmg_attached=true
+test -f "${dmg_mount}/OcHerdr.app/Contents/_CodeSignature/CodeResources"
+codesign --verify --deep --strict --verbose=2 "${dmg_mount}/OcHerdr.app"
+hdiutil detach "${dmg_mount}" >/dev/null
+dmg_attached=false
+rmdir "${dmg_mount}"
+trap - EXIT
 
 if [[ "${notarize}" == true ]]; then
     xcrun notarytool submit "${dmg_path}" \
