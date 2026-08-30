@@ -328,10 +328,16 @@ struct SessionPanes {
     /// Dropping a mismatched owner drops every pane runtime and its listen task.
     owner: SessionKey,
     panes: HashMap<String, PaneRuntime>,
-    /// Panes this OcHerdr instance explicitly interacted with while visible.
+    /// Panes this OcHerdr instance currently controls. A first visible pane
+    /// starts with non-takeover control so its PTY adopts the measured local
+    /// viewport; direct interaction upgrades an observer with takeover.
     /// Ownership is per terminal, so distinct panes can stay controlled at
     /// the same time. Hidden or remotely taken-over panes are removed.
     controls: HashMap<String, TerminalMode>,
+    /// Pane ids for which this session already made its one automatic,
+    /// non-takeover control attempt. Busy panes fall back to observation and
+    /// must not reconnect-loop; an explicit interaction can still take over.
+    automatic_control_attempts: HashSet<String>,
     /// Monotonic recency clock used only for hidden-pane cache eviction.
     access_serial: u64,
 }
@@ -352,15 +358,16 @@ impl SessionPanes {
             owner,
             panes: HashMap::new(),
             controls: HashMap::new(),
+            automatic_control_attempts: HashSet::new(),
             access_serial: 0,
         }
     }
 }
 
 struct PaneRuntime {
-    /// Painted panes observe by default. Explicitly controlled panes are
-    /// writable. Recently visited hidden panes retain their surface and an
-    /// observe stream so tab switches can paint the cached frame immediately.
+    /// First-visible panes attempt non-takeover control so the remote PTY is
+    /// sized before it paints. Busy and recently visited hidden panes observe;
+    /// explicit interaction can promote an observer with takeover.
     session: TerminalSession,
     terminal: Terminal,
     frame: Option<RenderedFrame>,

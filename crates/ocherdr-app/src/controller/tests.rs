@@ -320,7 +320,7 @@ fn tiny_pane_grids_stay_as_shells_until_herdrs_minimum_fits() {
 }
 
 #[test]
-fn session_targets_every_snapshot_pane_as_observers_by_default() {
+fn session_targets_every_snapshot_pane_as_observers_without_control_intent() {
     let snapshot = two_tab_snapshot();
     let targets = snapshot_runtime_targets(&snapshot, &HashMap::new(), Some("t-a"), Some("p-a"));
     assert_eq!(
@@ -330,6 +330,34 @@ fn session_targets_every_snapshot_pane_as_observers_by_default() {
             target("p-b", TerminalMode::Observe, false),
         ]
     );
+}
+
+#[test]
+fn newly_visible_panes_attempt_non_takeover_control_only_once() {
+    let mut session = SessionPanes::new(SessionKey {
+        profile_id: "ssh:host".into(),
+        session_name: "work".into(),
+    });
+    let live = HashSet::from(["p-a".to_owned(), "p-b".to_owned()]);
+    let first_visible = HashSet::from(["p-a".to_owned()]);
+
+    prime_automatic_terminal_control(&mut session, &first_visible, &live);
+    assert_eq!(session.controls.get("p-a"), Some(&TerminalMode::Control));
+    assert!(demote_terminal_control(&mut session, "p-a"));
+
+    prime_automatic_terminal_control(&mut session, &first_visible, &live);
+    assert!(
+        !session.controls.contains_key("p-a"),
+        "a busy automatic attempt must fall back without reconnecting"
+    );
+
+    let second_visible = HashSet::from(["p-b".to_owned()]);
+    prime_automatic_terminal_control(&mut session, &second_visible, &live);
+    assert_eq!(session.controls.get("p-b"), Some(&TerminalMode::Control));
+
+    let remaining = HashSet::from(["p-b".to_owned()]);
+    prime_automatic_terminal_control(&mut session, &second_visible, &remaining);
+    assert!(!session.automatic_control_attempts.contains("p-a"));
 }
 
 #[test]

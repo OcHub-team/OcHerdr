@@ -704,7 +704,11 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
         thread::sleep(Duration::from_millis(10));
     }
     let original_context = view.read_with(cx, |this, _| this.pane("p-a").unwrap().frame_context);
-    assert_eq!(fake.terminal_attach_modes("p-a"), vec![false]);
+    assert_eq!(
+        fake.terminal_attach_modes("p-a"),
+        vec![true],
+        "the first visible pane acquires non-takeover control so Herdr resizes its PTY"
+    );
 
     view.update(cx, |this, cx| {
         this.selection.tab_id = Some("t-b".into());
@@ -739,9 +743,9 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
         assert_eq!(restored.frame_context, original_context);
     });
     assert_eq!(
-        fake.terminal_attach_count("p-a"),
-        1,
-        "returning to a cached observer must not reconnect it"
+        fake.terminal_attach_modes("p-a"),
+        vec![true, false],
+        "hiding demotes the initial controller once; returning reuses the cached observer"
     );
 }
 
@@ -937,7 +941,7 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
 }
 
 #[gpui::test]
-fn wheel_interaction_controls_each_hovered_pane_without_changing_focus(cx: &mut TestAppContext) {
+fn wheel_interaction_reuses_automatic_controls_without_changing_focus(cx: &mut TestAppContext) {
     let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
@@ -946,8 +950,8 @@ fn wheel_interaction_controls_each_hovered_pane_without_changing_focus(cx: &mut 
 
     view.update(cx, |this, cx| {
         assert_eq!(this.selection.pane_id.as_deref(), Some("p-left"));
-        assert_eq!(this.pane("p-left").unwrap().mode, TerminalMode::Observe);
-        assert_eq!(this.pane("p-right").unwrap().mode, TerminalMode::Observe);
+        assert_eq!(this.pane("p-left").unwrap().mode, TerminalMode::Control);
+        assert_eq!(this.pane("p-right").unwrap().mode, TerminalMode::Control);
         let wheel = gpui::ScrollWheelEvent {
             position: gpui::point(gpui::px(0.), gpui::px(0.)),
             delta: gpui::ScrollDelta::Lines(gpui::point(0., 3.)),
@@ -956,21 +960,12 @@ fn wheel_interaction_controls_each_hovered_pane_without_changing_focus(cx: &mut 
         };
 
         this.scroll_pane("p-left", &wheel, cx);
-        assert_eq!(
-            this.pane("p-left").unwrap().mode,
-            TerminalMode::ControlTakeover
-        );
-        assert_eq!(this.pane("p-right").unwrap().mode, TerminalMode::Observe);
+        assert_eq!(this.pane("p-left").unwrap().mode, TerminalMode::Control);
+        assert_eq!(this.pane("p-right").unwrap().mode, TerminalMode::Control);
 
         this.scroll_pane("p-right", &wheel, cx);
-        assert_eq!(
-            this.pane("p-left").unwrap().mode,
-            TerminalMode::ControlTakeover
-        );
-        assert_eq!(
-            this.pane("p-right").unwrap().mode,
-            TerminalMode::ControlTakeover
-        );
+        assert_eq!(this.pane("p-left").unwrap().mode, TerminalMode::Control);
+        assert_eq!(this.pane("p-right").unwrap().mode, TerminalMode::Control);
         assert_eq!(
             this.selection.pane_id.as_deref(),
             Some("p-left"),
@@ -978,11 +973,8 @@ fn wheel_interaction_controls_each_hovered_pane_without_changing_focus(cx: &mut 
         );
         let controls = &this.session_panes.as_ref().unwrap().controls;
         assert_eq!(controls.len(), 2);
-        assert_eq!(controls.get("p-left"), Some(&TerminalMode::ControlTakeover));
-        assert_eq!(
-            controls.get("p-right"),
-            Some(&TerminalMode::ControlTakeover)
-        );
+        assert_eq!(controls.get("p-left"), Some(&TerminalMode::Control));
+        assert_eq!(controls.get("p-right"), Some(&TerminalMode::Control));
     });
 }
 

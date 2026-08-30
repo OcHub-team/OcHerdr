@@ -64,6 +64,7 @@ impl OcHerdrView {
                 session
                     .controls
                     .retain(|pane_id, _| optimistic_visible.contains(pane_id));
+                prime_automatic_terminal_control(session, &optimistic_visible, &live_pane_ids);
                 (session.controls.clone(), session.access_serial)
             };
             #[cfg_attr(not(test), allow(unused_mut))]
@@ -303,6 +304,12 @@ impl OcHerdrView {
     /// deliberately user-driven, never a reconnect retry, so clients cannot
     /// get into a takeover loop.
     pub(crate) fn take_terminal_control(&mut self, pane_id: String, cx: &mut Context<Self>) {
+        if self
+            .pane(&pane_id)
+            .is_some_and(|runtime| runtime.mode.is_controlled())
+        {
+            return;
+        }
         let Some(session) = self.session_panes.as_mut() else {
             return;
         };
@@ -320,6 +327,7 @@ impl OcHerdrView {
         &mut self,
         pane_id: &str,
         loss: TerminalControlLoss,
+        mode: TerminalMode,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(session) = self.session_panes.as_mut() else {
@@ -327,6 +335,12 @@ impl OcHerdrView {
         };
         if !demote_terminal_control(session, pane_id) {
             return false;
+        }
+        // The first visible-pane control request is deliberately
+        // non-takeover. An existing owner is normal: reconnect once as an
+        // observer without presenting an error or retrying control.
+        if mode == TerminalMode::Control && loss == TerminalControlLoss::Busy {
+            return true;
         }
         let (kind, detail) = match loss {
             TerminalControlLoss::Busy => (
@@ -443,7 +457,10 @@ impl OcHerdrView {
                                 control_loss = runtime
                                     .mode
                                     .is_controlled()
-                                    .then(|| terminal_control_loss(&stream_error))
+                                    .then(|| {
+                                        terminal_control_loss(&stream_error)
+                                            .map(|loss| (loss, runtime.mode))
+                                    })
                                     .flatten();
                                 hierarchy_changed = control_loss.is_none();
                                 closed = true;
@@ -486,8 +503,8 @@ impl OcHerdrView {
         if let Some((kind, detail)) = error {
             self.notify_failure(kind, detail, cx);
         }
-        if let Some(loss) = control_loss
-            && self.demote_lost_terminal_control(pane_id, loss, cx)
+        if let Some((loss, mode)) = control_loss
+            && self.demote_lost_terminal_control(pane_id, loss, mode, cx)
         {
             self.ensure_session_terminals(cx);
             cx.notify();

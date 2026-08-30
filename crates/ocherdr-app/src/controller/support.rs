@@ -70,9 +70,9 @@ pub(super) struct PaneRuntimeTarget {
     pub(super) focused: bool,
 }
 
-/// Panes observe by default. A visible pane that the user interacted with can
-/// own its independent control stream; focus remains separate so only the
-/// selected local surface gets native Ghostty key handling.
+/// Visible panes use the control modes selected by the session lifecycle;
+/// everything else observes. Focus remains separate so only the selected
+/// local surface gets native Ghostty key handling.
 pub(super) fn snapshot_runtime_targets(
     snapshot: &HierarchySnapshot,
     controls: &HashMap<String, TerminalMode>,
@@ -99,6 +99,28 @@ pub(super) fn snapshot_runtime_targets(
 
 pub(super) fn demote_terminal_control(session: &mut SessionPanes, pane_id: &str) -> bool {
     session.controls.remove(pane_id).is_some()
+}
+
+/// Give every newly visible pane one non-takeover control attempt. Successful
+/// control resizes the real PTY to the measured OcHerdr viewport. If another
+/// client already owns the pane, loss handling removes the control entry while
+/// this attempted set prevents an observe/control reconnect loop.
+pub(super) fn prime_automatic_terminal_control(
+    session: &mut SessionPanes,
+    visible_pane_ids: &HashSet<String>,
+    live_pane_ids: &HashSet<String>,
+) {
+    session
+        .automatic_control_attempts
+        .retain(|pane_id| live_pane_ids.contains(pane_id));
+    for pane_id in visible_pane_ids {
+        if session.automatic_control_attempts.insert(pane_id.clone()) {
+            session
+                .controls
+                .entry(pane_id.clone())
+                .or_insert(TerminalMode::Control);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
