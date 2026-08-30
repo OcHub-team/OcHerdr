@@ -358,6 +358,7 @@ fn fixed_width_tab_hover_reveals_close_then_delayed_preview(cx: &mut TestAppCont
     assert_eq!(long_before.size.width, gpui::px(TAB_PILL_WIDTH));
     assert_eq!(cx.debug_bounds("tab-title-fade-t-a"), None);
     assert!(cx.debug_bounds("tab-title-fade-t-b").is_some());
+    assert_eq!(cx.debug_bounds("close-tab-t-b"), None);
     assert_eq!(cx.debug_bounds("tab-preview-t-b"), None);
     view.read_with(cx, |this, _| {
         assert_eq!(this.hovered_tab_id, None);

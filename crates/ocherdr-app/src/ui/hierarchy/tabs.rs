@@ -126,6 +126,7 @@ impl OcHerdrView {
                 let measure_id = tab_id.clone();
                 let hover_id = tab_id.clone();
                 let move_hover_id = tab_id.clone();
+                let close_target_visible = self.hovered_tab_id.as_deref() == Some(tab_id.as_str());
                 let debug_tab_id = tab_id.clone();
                 let debug_title_id = tab_id.clone();
                 let debug_close_id = tab_id.clone();
@@ -358,7 +359,14 @@ impl OcHerdrView {
                             .flex()
                             .items_center()
                             .opacity(close_reveal)
-                            .when(close_reveal <= f32::EPSILON, |close| close.invisible())
+                            // Keep the hit target mounted on the first hover frame even
+                            // while the opacity transition is still exactly zero. This
+                            // makes the control immediately available and avoids a
+                            // render-timing-dependent gap on slower machines.
+                            .when(
+                                close_reveal <= f32::EPSILON && !close_target_visible,
+                                |close| close.invisible(),
+                            )
                             .child(
                                 icon_only_button_tone(
                                     ("close-tab", row.number),
