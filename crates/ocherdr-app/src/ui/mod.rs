@@ -2,6 +2,7 @@ use super::*;
 
 mod agent;
 mod appearance;
+mod files;
 mod hierarchy;
 mod overlays;
 mod remote;
@@ -12,6 +13,7 @@ pub(crate) use appearance::AppearanceUi;
 impl Render for OcHerdrView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_pending_focus(window, cx);
+        self.sync_file_panel_source(cx);
         let chrome = self.chrome_a11y();
         let main = crate::a11y::apply_region(div().id(chrome.main.id), &chrome.main)
             .flex()
@@ -22,7 +24,14 @@ impl Render for OcHerdrView {
             .bg(theme::surface().alpha(0.))
             .child(self.render_tab_bar(&chrome, window, cx))
             .child(self.render_terminal(window, cx));
+        let file_panel_overlay =
+            f32::from(window.viewport_size().width) < FILE_PANEL_OVERLAY_BREAKPOINT;
+        let file_panel = self
+            .file_panel
+            .open
+            .then(|| self.render_file_panel(file_panel_overlay, cx));
         let workspace_body = div()
+            .relative()
             .flex()
             .flex_row()
             .flex_1()
@@ -30,6 +39,7 @@ impl Render for OcHerdrView {
             .min_w_0()
             .child(self.render_sidebar(&chrome, cx))
             .child(main)
+            .when_some(file_panel, |body, panel| body.child(panel))
             .into_any_element();
         let body = if self.overlay.host_center() {
             self.host_center.clone().into_any_element()
@@ -52,6 +62,10 @@ impl Render for OcHerdrView {
                 if this.handle_overlay_key(event, window, cx) {
                     return;
                 }
+                if this.handle_file_panel_key(event, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if !key_goes_to_terminal(&this.overlay) {
                     return;
                 }
@@ -68,15 +82,25 @@ impl Render for OcHerdrView {
                 }
             }))
             .on_mouse_move(cx.listener(|this, event, window, cx| {
-                this.pane_mouse_move(event, window, cx);
+                if !this.file_panel_mouse_move(event, cx) {
+                    this.pane_mouse_move(event, window, cx);
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+                cx.listener(|this, event, window, cx| {
+                    if !this.file_panel_mouse_up(cx) {
+                        this.pane_mouse_up(event, window, cx);
+                    }
+                }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, event, window, cx| this.pane_mouse_up(event, window, cx)),
+                cx.listener(|this, event, window, cx| {
+                    if !this.file_panel_mouse_up(cx) {
+                        this.pane_mouse_up(event, window, cx);
+                    }
+                }),
             )
             .child(body);
         if !self.overlay.host_center() {
@@ -92,6 +116,9 @@ impl Render for OcHerdrView {
             }
             Overlay::ContextMenu(menu) => {
                 root = root.child(self.render_context_menu(menu, cx));
+            }
+            Overlay::FileContextMenu(menu) => {
+                root = root.child(self.render_file_context_menu(menu, cx));
             }
             Overlay::ConfirmSwitchProfile { id, .. } => {
                 root = root.child(self.render_switch_host(&id, cx));
@@ -131,6 +158,9 @@ impl Render for OcHerdrView {
             && reorder_past_slop(&drag)
         {
             root = root.child(self.render_reorder_overlay(&drag, cx));
+        }
+        if self.file_panel.resize.is_some() {
+            root = root.child(self.render_file_panel_resize_overlay(cx));
         }
         root.child(self.notifications.clone())
     }

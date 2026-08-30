@@ -39,6 +39,7 @@ pub(crate) enum FailureKind {
     MissingTheme,
     AgentBlocked,
     ClipboardImagePaste,
+    FileOperation,
     /// Step 3 of an edge relocation failed: the pane landed on the mirrored
     /// side. The layout is legal, so this is a warning, not an error.
     PaneMisordered,
@@ -78,7 +79,8 @@ impl FailureKind {
             | Self::RenderTerminal
             | Self::TerminalStream
             | Self::TerminalRuntime
-            | Self::ClipboardImagePaste => NotificationLevel::Error,
+            | Self::ClipboardImagePaste
+            | Self::FileOperation => NotificationLevel::Error,
         }
     }
 
@@ -115,6 +117,7 @@ impl FailureKind {
             Self::MissingTheme => k::NOTIFY_MISSING_THEME,
             Self::AgentBlocked => k::NOTIFY_AGENT_BLOCKED,
             Self::ClipboardImagePaste => k::NOTIFY_CLIPBOARD_IMAGE_PASTE,
+            Self::FileOperation => k::NOTIFY_FILE_OPERATION,
             Self::PaneMisordered => k::NOTIFY_PANE_MISORDERED,
         }
     }

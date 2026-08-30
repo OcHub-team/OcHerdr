@@ -360,7 +360,10 @@ impl OcHerdrView {
         let modifiers = event.keystroke.modifiers;
         if modifiers.control && !modifiers.platform && !modifiers.alt && key == "b" {
             self.prefix_pending = true;
-            if matches!(self.overlay, Overlay::ContextMenu(_)) {
+            if matches!(
+                self.overlay,
+                Overlay::ContextMenu(_) | Overlay::FileContextMenu(_)
+            ) {
                 self.set_overlay(Overlay::None, cx);
             }
             cx.notify();
@@ -389,7 +392,10 @@ impl OcHerdrView {
             }
             if matches!(
                 self.overlay,
-                Overlay::ContextMenu(_) | Overlay::NodeManager | Overlay::HostSwitcher
+                Overlay::ContextMenu(_)
+                    | Overlay::FileContextMenu(_)
+                    | Overlay::NodeManager
+                    | Overlay::HostSwitcher
             ) {
                 self.set_overlay(Overlay::None, cx);
                 self.focus.focus(window, cx);
@@ -432,6 +438,14 @@ impl OcHerdrView {
                 }
                 ("n", true) => {
                     self.create_workspace(cx);
+                    true
+                }
+                ("e", true) => {
+                    self.toggle_file_panel(cx);
+                    true
+                }
+                ("l", false) if self.file_panel.open => {
+                    self.open_file_panel_address(window, cx);
                     true
                 }
                 (",", false) => {

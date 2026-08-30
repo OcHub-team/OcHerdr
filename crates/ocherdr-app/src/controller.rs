@@ -22,6 +22,7 @@ mod agent;
 mod app_update;
 mod appearance;
 mod events;
+mod files;
 mod hierarchy;
 mod input;
 mod pane_keyboard;
@@ -77,10 +78,14 @@ impl OcHerdrView {
         let i18n = I18n::new(loaded.language);
         let appearance = loaded.appearance;
         let settings = loaded.settings;
-        let pane_edge_relocation =
-            crate::config::values::AppConfig::from_document(&loaded.document)
-                .0
-                .pane_edge_relocation;
+        let (app_config, _) = crate::config::values::AppConfig::from_document(&loaded.document);
+        let pane_edge_relocation = app_config.pane_edge_relocation;
+        let file_panel = FilePanelState::new(
+            app_config.file_panel_open,
+            app_config.file_panel_width,
+            app_config.file_panel_show_hidden,
+            app_config.file_editor,
+        );
         let focus = cx.focus_handle();
         let dialog_focus = cx.focus_handle();
         let host_center = cx.new(|cx| HostCenter::new(settings, i18n, focus.clone(), cx));
@@ -205,6 +210,10 @@ impl OcHerdrView {
             agent_keys: HashMap::new(),
             agent_renames: HashMap::new(),
             worktree_list_task: None,
+            file_panel,
+            file_name_input: cx.new(|cx| TextInput::new(cx, i18n.text(k::COMMON_NAME))),
+            file_path_input: cx
+                .new(|cx| TextInput::new(cx, i18n.text(k::FILES_PATH_PLACEHOLDER)).compact()),
             appearance,
             config: loaded.document,
             i18n,
@@ -224,6 +233,14 @@ impl OcHerdrView {
         );
         bind_enter_submit(&view.agent_name_input, host, cx, |this, window, cx| {
             this.submit_agent_rename(window, cx);
+        });
+        let host = cx.weak_entity();
+        bind_enter_submit(&view.file_name_input, host, cx, |this, window, cx| {
+            this.submit_file_prompt(window, cx);
+        });
+        let host = cx.weak_entity();
+        bind_enter_submit(&view.file_path_input, host, cx, |this, window, cx| {
+            this.submit_file_panel_address(window, cx);
         });
         view.reload(None, cx);
         if let Some(notice) = missing_theme_notice(&view.appearance.theme_family, view.i18n) {

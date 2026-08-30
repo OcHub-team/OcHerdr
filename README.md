@@ -26,6 +26,8 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - native context menus for workspace, tab, and pane actions;
 - macOS shortcuts plus Herdr's `Ctrl+B` prefix workflow;
 - local clipboard image paste with `Cmd+V`, plus SSH-host paste with `Cmd+V` or `Ctrl+V`;
+- a dockable right-side file manager for local workspaces and SSH hosts over SFTP,
+  with typed paths, drag-and-drop transfer, contextual actions, and external-editor handoff;
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
 - runtime internationalization with system-language detection, English, and Simplified Chinese;
 - an Open TUI handoff for Herdr settings through the toolbar;
@@ -100,9 +102,17 @@ Authentication and host-key enrollment remain with OpenSSH and the system Termin
 
 OcHerdr supports `Cmd+T` (new tab), `Cmd+W` (close pane; last pane in a tab
 closes the tab), `Cmd+Shift+W` (close workspace), `Cmd+Shift+N` (new workspace),
-`Cmd+1…9` (switch tab), `Ctrl+Tab` (cycle tabs), `F2` (rename), and `Cmd+,`
+`Cmd+1…9` (switch tab), `Ctrl+Tab` (cycle tabs), `Cmd+Shift+E` (toggle files),
+`Cmd+L` (enter a path while the file panel is open), `F2` (rename), and `Cmd+,`
 (open OcHerdr appearance settings). Click the status-bar host to switch machines; `Hosts` in the
 toolbar opens the connection manager. `Cmd+W` is for panes, not hosts.
+
+In the file panel, single-click selects, double-click opens a folder or hands a file
+to the configured external editor, and right-click exposes transfer, path, rename,
+and delete actions. The system-associated app is the default; **Choose editor…** in
+the file menu can persist a `.app` or executable. Remote files are downloaded into an
+OcHerdr-owned temporary directory as read-only copies and are removed when OcHerdr exits.
+Download a remote file before editing it so changes are not lost.
 
 With an image-only or file-backed image clipboard (including PixPin and Finder),
 `Cmd+V` stays native for local panes. For an SSH pane, either `Cmd+V` or `Ctrl+V`
@@ -122,6 +132,7 @@ to open Herdr settings in Terminal.
 | --- | --- |
 | `ocherdr-app` | GPUI shell, `ochub-ui` composition, selection and terminal surfaces |
 | `ocherdr-core` | Connection/session hierarchy, layout snapshots, compatibility model |
+| `ocherdr-files` | Unified local/SFTP filesystem operations and recursive transfers |
 | `ocherdr-herdr` | Public JSON socket, dual-socket OpenSSH tunnel, and versioned terminal protocol codecs |
 | `ocherdr-terminal` | GhosttyKit runtime, leased IOSurface frames, and native input encoding |
 

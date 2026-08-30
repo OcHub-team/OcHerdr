@@ -464,10 +464,13 @@ impl OcHerdrView {
         let pane_id_zoom = self.selection.pane_id.clone();
         let pane_id_close = self.selection.pane_id.clone();
         let node_manager_open = self.overlay.host_center();
+        let file_panel_open = self.file_panel.open;
         let new_tab_hover = pane_tab_drop
             .as_ref()
             .is_some_and(|drag| drag.tab_target == Some(PaneTabDropTarget::NewTab));
         div()
+            .id("tab-bar")
+            .debug_selector(|| "tab-bar".to_owned())
             .flex()
             .items_center()
             .h(px(HEADER_HEIGHT))
@@ -632,6 +635,20 @@ impl OcHerdrView {
             )
             )
             .child(div().h(px(22.)).w(px(1.)).bg(theme::border()))
+            .child(
+                icon_action_tooltip(
+                    "toggle-files-tooltip",
+                    i18n.text(k::FILES_PANEL),
+                    icon_only_button_tone(
+                        "toggle-files",
+                        i18n.text(k::FILES_PANEL),
+                        IconName::Folder,
+                        if file_panel_open { ButtonTone::Primary } else { ButtonTone::Ghost },
+                        ButtonSize::Sm,
+                    )
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_file_panel(cx))),
+                ),
+            )
             .child(
                 icon_action_tooltip(
                     "open-appearance-tooltip",

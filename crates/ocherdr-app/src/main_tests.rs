@@ -946,6 +946,19 @@ fn keys_go_to_the_terminal_only_when_no_overlay_is_open() {
             y: 0.,
             agent_details: false,
         }),
+        Overlay::FileContextMenu(FileContextMenu {
+            entry: FileEntry {
+                path: "/tmp/file.txt".into(),
+                name: "file.txt".into(),
+                kind: ocherdr_files::EntryKind::File,
+                size: Some(1),
+                modified: None,
+                permissions: None,
+                hidden: false,
+            },
+            x: 0.,
+            y: 0.,
+        }),
         Overlay::Rename(target.clone()),
         Overlay::ConfirmClose(target),
         Overlay::ConfirmRemoveWorktree {

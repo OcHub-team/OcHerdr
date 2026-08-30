@@ -1802,6 +1802,7 @@ fn swapped_layout_event() -> Value {
 }
 
 mod creation;
+mod file_panel;
 mod pane;
 mod pane_tab_drop;
 mod relocation;

@@ -35,6 +35,7 @@
 "notify.detail.terminal_control_taken_over" = "另一客户端已接管此窗格。它将保持只读。"
 "notify.discover_sessions" = "无法发现 Herdr 会话"
 "notify.discovering" = "正在发现 Herdr 会话…"
+"notify.file_operation" = "无法完成文件操作"
 "notify.herdr_command" = "无法执行 Herdr 命令"
 "notify.invalid_ssh_destination" = "SSH 目标地址无效"
 "notify.invalid_ssh_port" = "SSH 端口无效"

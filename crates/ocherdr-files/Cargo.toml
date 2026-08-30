@@ -1,0 +1,20 @@
+[package]
+name = "ocherdr-files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local and SFTP filesystem backends for OcHerdr"
+
+[dependencies]
+futures.workspace = true
+ocherdr-core = { path = "../ocherdr-core" }
+openssh.workspace = true
+openssh-sftp-client.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+trash.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

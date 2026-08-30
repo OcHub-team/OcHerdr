@@ -14,6 +14,7 @@ use ocherdr_core::{
     predict_swap, rebuild_tree, reorder_insert_index, split_ratio_from_drag, split_rect,
     valid_split_ratio,
 };
+use ocherdr_files::{BackendKind as FileBackendKind, FileEntry, FileService};
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, MAX_CLIPBOARD_IMAGE_BYTES, SessionConnection,
     TerminalCommand, TerminalMode, TerminalScrollDirection, TerminalSession, attach_command,
@@ -29,12 +30,13 @@ use ochub_ui::components::{
 use ochub_ui::gpui::{
     Anchor, Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClickEvent,
     ClipboardEntry, ClipboardItem, Context, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent,
-    Keystroke, Menu, MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Task, TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window,
-    WindowAppearance, WindowBounds, WindowOptions, anchored, canvas, deferred, div, ease_out_quint,
-    linear_color_stop, linear_gradient, point, prelude::*, px, relative, size, surface,
+    EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding,
+    KeyDownEvent, Keystroke, Menu, MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Task, TextOverflow, TextRun, TitlebarOptions, UTF16Selection,
+    WeakEntity, Window, WindowAppearance, WindowBounds, WindowOptions, anchored, canvas, deferred,
+    div, ease_out_quint, linear_color_stop, linear_gradient, point, prelude::*, px, relative, size,
+    surface,
 };
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
@@ -47,6 +49,7 @@ mod a11y;
 mod config;
 mod controller;
 use controller::HerdrCapabilities;
+mod file_panel;
 mod fonts;
 mod host_center;
 mod host_model;
@@ -61,6 +64,7 @@ mod theme_ansi;
 mod ui;
 mod update;
 
+pub(crate) use file_panel::*;
 pub(crate) use host_model::*;
 pub(crate) use pane_model::*;
 pub(crate) use pane_tab_drop::*;
@@ -439,6 +443,13 @@ struct HierarchyContextMenu {
     /// Opened from the sidebar agent list: leads with "Details", the only way
     /// that list reaches the agent panel now that a click jumps to the pane.
     agent_details: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FileContextMenu {
+    entry: FileEntry,
+    x: f32,
+    y: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -876,6 +887,9 @@ struct OcHerdrView {
     agent_renames: HashMap<String, Task<()>>,
     /// Dropping this cancels an in-flight `worktree.list`.
     worktree_list_task: Option<Task<()>>,
+    file_panel: FilePanelState,
+    file_name_input: Entity<TextInput>,
+    file_path_input: Entity<TextInput>,
     appearance: AppearanceSettings,
     config: config::ConfigDocument,
     i18n: I18n,
@@ -908,6 +922,7 @@ enum Overlay {
     Appearance,
     HostSwitcher,
     ContextMenu(HierarchyContextMenu),
+    FileContextMenu(FileContextMenu),
     Rename(HierarchyTarget),
     ConfirmClose(HierarchyTarget),
     ConfirmRemoveWorktree {

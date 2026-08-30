@@ -35,6 +35,7 @@
 "notify.detail.terminal_control_taken_over" = "Another client took control of this pane. It remains read-only."
 "notify.discover_sessions" = "Could not discover Herdr sessions"
 "notify.discovering" = "Discovering Herdr sessions…"
+"notify.file_operation" = "Could not complete the file operation"
 "notify.herdr_command" = "Could not run the Herdr command"
 "notify.invalid_ssh_destination" = "Invalid SSH destination"
 "notify.invalid_ssh_port" = "Invalid SSH port"

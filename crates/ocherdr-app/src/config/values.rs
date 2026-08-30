@@ -1,5 +1,7 @@
 //! Typed OcHerdr config keys (spec 3.1 and 3.2).
 
+use std::path::PathBuf;
+
 use crate::i18n::Language;
 use crate::{AppearanceMode, AppearanceSettings, BackdropMode, TerminalFontSettings};
 
@@ -32,6 +34,10 @@ pub fn is_known_key(key: &str) -> bool {
             | "window-backdrop"
             | "language"
             | "pane-edge-relocation"
+            | "file-panel-open"
+            | "file-panel-width"
+            | "file-panel-show-hidden"
+            | "file-editor"
     )
 }
 
@@ -39,7 +45,14 @@ pub fn is_known_key(key: &str) -> bool {
 /// `strip_known_keys` (restore-appearance-defaults must not silently turn
 /// them off).
 pub fn is_experimental_key(key: &str) -> bool {
-    matches!(key, "pane-edge-relocation")
+    matches!(
+        key,
+        "pane-edge-relocation"
+            | "file-panel-open"
+            | "file-panel-width"
+            | "file-panel-show-hidden"
+            | "file-editor"
+    )
 }
 
 /// Ghostty metric delta: `1`, `-2`, or `20%`.
@@ -184,6 +197,10 @@ pub struct AppConfig {
     /// Design §13 step 3: four-edge pane relocation via the two-step
     /// `pane.move` orchestration. Off until it graduates (step 4).
     pub pane_edge_relocation: bool,
+    pub file_panel_open: bool,
+    pub file_panel_width: f32,
+    pub file_panel_show_hidden: bool,
+    pub file_editor: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -214,6 +231,10 @@ impl Default for AppConfig {
             window_backdrop: BackdropMode::Blurred,
             language: Language::System,
             pane_edge_relocation: false,
+            file_panel_open: false,
+            file_panel_width: crate::FILE_PANEL_DEFAULT_WIDTH,
+            file_panel_show_hidden: false,
+            file_editor: None,
         }
     }
 }
@@ -262,6 +283,23 @@ fn apply_assignment(
             Some(flag) => config.pane_edge_relocation = flag,
             None => invalid(warnings, line, key, value),
         },
+        "file-panel-open" => match parse_bool(value) {
+            Some(flag) => config.file_panel_open = flag,
+            None => invalid(warnings, line, key, value),
+        },
+        "file-panel-width" => match value.parse::<f32>() {
+            Ok(width)
+                if (crate::FILE_PANEL_MIN_WIDTH..=crate::FILE_PANEL_MAX_WIDTH).contains(&width) =>
+            {
+                config.file_panel_width = width
+            }
+            _ => invalid(warnings, line, key, value),
+        },
+        "file-panel-show-hidden" => match parse_bool(value) {
+            Some(flag) => config.file_panel_show_hidden = flag,
+            None => invalid(warnings, line, key, value),
+        },
+        "file-editor" => config.file_editor = Some(PathBuf::from(value)),
         "font-thicken-strength" => match value.parse::<u8>() {
             Ok(strength) => config.font_thicken_strength = strength,
             Err(_) => invalid(warnings, line, key, value),
@@ -356,6 +394,10 @@ fn reset_key(config: &mut AppConfig, key: &str) {
         "window-backdrop" => config.window_backdrop = default.window_backdrop,
         "language" => config.language = default.language,
         "pane-edge-relocation" => config.pane_edge_relocation = default.pane_edge_relocation,
+        "file-panel-open" => config.file_panel_open = default.file_panel_open,
+        "file-panel-width" => config.file_panel_width = default.file_panel_width,
+        "file-panel-show-hidden" => config.file_panel_show_hidden = default.file_panel_show_hidden,
+        "file-editor" => config.file_editor = None,
         _ => {}
     }
 }
@@ -673,6 +715,34 @@ language = en
         strip_known_keys(&mut document);
         let written = document.serialize();
         assert!(written.contains("pane-edge-relocation = true"));
+        assert!(!written.contains("font-size"));
+    }
+
+    #[test]
+    fn file_panel_settings_parse_validate_and_survive_appearance_reset() {
+        let source = "file-panel-open = true\nfile-panel-width = 420\nfile-panel-show-hidden = true\nfile-editor = \"/Applications/Visual Studio Code.app\"\n";
+        let (config, warnings) = AppConfig::from_document(&ConfigDocument::parse(source));
+        assert!(warnings.is_empty());
+        assert!(config.file_panel_open);
+        assert_eq!(config.file_panel_width, 420.);
+        assert!(config.file_panel_show_hidden);
+        assert_eq!(
+            config.file_editor,
+            Some(PathBuf::from("/Applications/Visual Studio Code.app"))
+        );
+
+        let (invalid, warnings) =
+            AppConfig::from_document(&ConfigDocument::parse("file-panel-width = 900\n"));
+        assert_eq!(invalid.file_panel_width, crate::FILE_PANEL_DEFAULT_WIDTH);
+        assert_eq!(warnings.len(), 1);
+
+        let mut document = ConfigDocument::parse(&format!("{source}font-size = 12\n"));
+        strip_known_keys(&mut document);
+        let written = document.serialize();
+        assert!(written.contains("file-panel-open = true"));
+        assert!(written.contains("file-panel-width = 420"));
+        assert!(written.contains("file-panel-show-hidden = true"));
+        assert!(written.contains("file-editor = \"/Applications/Visual Studio Code.app\""));
         assert!(!written.contains("font-size"));
     }
 

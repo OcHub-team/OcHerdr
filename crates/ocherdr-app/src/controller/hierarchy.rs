@@ -98,7 +98,10 @@ impl OcHerdrView {
             (Overlay::AgentPanel { .. }, false) => self.close_agent_panel(window, cx),
             (Overlay::Update(_), true) => self.confirm_update_dialog(cx),
             (Overlay::Update(_), false) => self.close_update_dialog(window, cx),
-            (Overlay::ContextMenu(_) | Overlay::NodeManager, false) => {
+            (
+                Overlay::ContextMenu(_) | Overlay::FileContextMenu(_) | Overlay::NodeManager,
+                false,
+            ) => {
                 self.set_overlay(Overlay::None, cx);
                 self.focus.focus(window, cx);
             }
@@ -205,7 +208,10 @@ impl OcHerdrView {
     }
 
     pub(crate) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.overlay, Overlay::ContextMenu(_)) {
+        if matches!(
+            self.overlay,
+            Overlay::ContextMenu(_) | Overlay::FileContextMenu(_)
+        ) {
             self.set_overlay(Overlay::None, cx);
         }
     }
