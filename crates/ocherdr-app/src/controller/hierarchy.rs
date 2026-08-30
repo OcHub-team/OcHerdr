@@ -96,6 +96,8 @@ impl OcHerdrView {
             (Overlay::HostSwitcher, false) => self.close_host_switcher(cx),
             (Overlay::Appearance, false) => self.close_appearance(window, cx),
             (Overlay::AgentPanel { .. }, false) => self.close_agent_panel(window, cx),
+            (Overlay::Update(_), true) => self.confirm_update_dialog(cx),
+            (Overlay::Update(_), false) => self.close_update_dialog(window, cx),
             (Overlay::ContextMenu(_) | Overlay::NodeManager, false) => {
                 self.set_overlay(Overlay::None, cx);
                 self.focus.focus(window, cx);

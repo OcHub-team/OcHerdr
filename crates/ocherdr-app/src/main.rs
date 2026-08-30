@@ -59,6 +59,7 @@ mod pane_templates;
 mod reorder_model;
 mod theme_ansi;
 mod ui;
+mod update;
 
 pub(crate) use host_model::*;
 pub(crate) use pane_model::*;
@@ -70,7 +71,7 @@ use host_center::{HostCenter, HostCenterEvent, HostRollback, HostSaveThen};
 use i18n::{I18n, Language, k};
 use notify::{FailureKind, FailureNotice, notification_for};
 
-gpui::actions!(ocherdr, [Quit]);
+gpui::actions!(ocherdr, [Quit, CheckForUpdates]);
 
 const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;
@@ -754,6 +755,10 @@ struct OcHerdrView {
     selection: Selection,
     operation: Option<SharedString>,
     notifications: Entity<NotificationHost>,
+    update_info: Option<update::UpdateInfo>,
+    update_state: update::UpdateState,
+    update_checking: bool,
+    update_installing: bool,
     focus: FocusHandle,
     /// Focus for the confirm dialogs, so Enter/Esc reach them and nothing
     /// leaks to the terminal underneath while one is open.
@@ -917,6 +922,28 @@ enum Overlay {
     AgentPanel {
         pane_id: String,
     },
+    Update(UpdateDialog),
+}
+
+#[derive(Clone, Debug)]
+enum UpdateDialog {
+    Checking,
+    Current {
+        version: String,
+    },
+    Available(update::UpdateInfo),
+    Downloading {
+        version: String,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    Failed {
+        message: String,
+        release_url: String,
+    },
+    Installed {
+        version: String,
+    },
 }
 
 enum AgentNameState {
@@ -981,6 +1008,7 @@ impl Overlay {
                 | Self::ConfirmRemoveProfile(_)
                 | Self::ConfirmSwitchProfile { .. }
                 | Self::ConfirmBulkRemove
+                | Self::Update(_)
         )
     }
 
@@ -1070,6 +1098,7 @@ fn main() {
         .with_assets(OcHerdrAssets)
         .run(|cx: &mut App| {
             let loaded = load_settings();
+            let menu_i18n = I18n::new(loaded.language);
             I18n::install(loaded.language);
             if let Some(directory) = dirs::config_dir() {
                 theme::set_themes_dir(directory.join("OcHerdr/themes"));
@@ -1077,7 +1106,11 @@ fn main() {
             ochub_ui::install(cx);
             cx.on_action(quit_app);
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-            cx.set_menus([Menu::new("OcHerdr").items([MenuItem::action("Quit OcHerdr", Quit)])]);
+            cx.set_menus([Menu::new("OcHerdr").items([
+                MenuItem::action(menu_i18n.text(k::UPDATE_MENU_CHECK), CheckForUpdates),
+                MenuItem::separator(),
+                MenuItem::action("Quit OcHerdr", Quit),
+            ])]);
             install_appearance(&loaded.appearance, cx.window_appearance());
             cx.on_window_closed(|cx, _window_id| {
                 if cx.windows().is_empty() {

@@ -42,6 +42,22 @@ or private keys. Unknown protocol versions fail closed with an upgrade error.
 - Xcode Command Line Tools
 - Herdr 0.8.1 or newer
 
+## Install
+
+Published builds can be installed and upgraded through the OcHub Homebrew tap:
+
+```sh
+brew tap OcHub-team/tap
+brew install --cask ocherdr
+```
+
+The same signed DMGs are available from
+[GitHub Releases](https://github.com/OcHub-team/OcHerdr/releases). OcHerdr checks for a
+new signed release once per day and also exposes **OcHerdr → Check for Updates…**.
+Application replacement is offered only when both the updater minisign signature and
+the macOS code-signing identity are valid; source builds and binaries launched outside
+an app bundle fall back to the release page.
+
 Install the pinned GhosttyKit artifact once before the first build:
 
 ```sh
@@ -120,3 +136,6 @@ OcHerdr source is dual-licensed under MIT or Apache-2.0. See `NOTICE` for third-
 licensing details. Binary distributors must audit the complete GPUI dependency graph;
 some revisions can introduce GPL-licensed transitive code even though OcHerdr and
 `ochub-ui` source are permissively licensed.
+
+Maintainer release setup and the tag-to-Homebrew flow are documented in
+[`docs/releasing.md`](docs/releasing.md).

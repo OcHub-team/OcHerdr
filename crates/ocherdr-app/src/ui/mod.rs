@@ -5,6 +5,7 @@ mod appearance;
 mod hierarchy;
 mod overlays;
 mod remote;
+mod update;
 
 pub(crate) use appearance::AppearanceUi;
 
@@ -58,6 +59,9 @@ impl Render for OcHerdrView {
                 // GPUI bubbling: send_key stops propagation after handling.
                 this.send_key(event, window, cx);
             }))
+            .on_action(cx.listener(
+                |this, _: &CheckForUpdates, _window, cx| this.open_update_dialog(cx),
+            ))
             .on_key_up(cx.listener(|this, event, _window, cx| {
                 if key_goes_to_terminal(&this.overlay) {
                     this.send_key_release(event, cx);
@@ -115,6 +119,9 @@ impl Render for OcHerdrView {
             }
             Overlay::AgentPanel { pane_id } => {
                 root = root.child(self.render_agent_panel(&pane_id, cx));
+            }
+            Overlay::Update(state) => {
+                root = root.child(self.render_update_dialog(&state, cx));
             }
         }
         if let Some(preview) = self.render_tab_preview(window, cx) {

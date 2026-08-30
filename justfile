@@ -62,7 +62,7 @@ build-release: doctor
 qa-app: build-release
     install -d "{{ app_bundle }}/Contents/MacOS"
     install -m 755 target/release/ocherdr "{{ app_binary }}"
-    install -m 644 packaging/macos/Info.plist "{{ app_bundle }}/Contents/Info.plist"
+    install -m 644 packaging/macos/Info.qa.plist "{{ app_bundle }}/Contents/Info.plist"
     codesign --force --deep --sign - "{{ app_bundle }}"
     @echo "Built {{ app_bundle }}"
 

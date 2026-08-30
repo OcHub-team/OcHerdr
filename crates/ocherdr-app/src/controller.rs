@@ -19,6 +19,7 @@ use super::*;
 use crate::notify::{FailureKind, FailureNotice, command_notification, notification_for};
 
 mod agent;
+mod app_update;
 mod appearance;
 mod events;
 mod hierarchy;
@@ -134,6 +135,10 @@ impl OcHerdrView {
             },
             operation: None,
             notifications: cx.new(|_| NotificationHost::new()),
+            update_info: None,
+            update_state: crate::update::load_state(),
+            update_checking: false,
+            update_installing: false,
             focus,
             dialog_focus,
             pending_focus: None,
@@ -224,6 +229,8 @@ impl OcHerdrView {
         if let Some(notice) = missing_theme_notice(&view.appearance.theme_family, view.i18n) {
             view.post_notice(notice, cx);
         }
+        #[cfg(not(test))]
+        view.spawn_auto_update_check(cx);
         view
     }
 

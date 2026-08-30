@@ -1,0 +1,290 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  OCHERDR_UPDATER_PUBKEY: ${{ vars.OCHERDR_UPDATER_PUBKEY }}
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate tag and Cargo version
+        id: release
+        shell: bash
+        run: |
+          version="$(./scripts/release/verify-tag.sh "${RELEASE_TAG}")"
+          printf 'tag=%s\n' "${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+  quality:
+    name: Test release commit
+    needs: validate
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Cache Cargo inputs
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-quality
+          cache-bin: false
+
+      - name: Bootstrap GhosttyKit
+        run: ./scripts/bootstrap-ghosttykit.sh
+
+      - name: Run quality gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+  build:
+    name: Package ${{ matrix.name }}
+    needs:
+      - validate
+      - quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            os: macos-26
+            target: aarch64-apple-darwin
+            artifact: release-macos-arm64
+          - name: macOS Intel
+            os: macos-26-intel
+            target: x86_64-apple-darwin
+            artifact: release-macos-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Cache Cargo inputs
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+          cache-bin: true
+
+      - name: Bootstrap GhosttyKit
+        run: ./scripts/bootstrap-ghosttykit.sh
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
+
+      - name: Install cargo-packager
+        run: |
+          cargo binstall cargo-packager --version 0.11.8 --locked --no-confirm
+          brew install minisign
+
+      - name: Require release credentials
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          OCHERDR_SIGNING_PRIVATE_KEY: ${{ secrets.OCHERDR_SIGNING_PRIVATE_KEY }}
+          OCHERDR_UPDATER_PUBKEY: ${{ vars.OCHERDR_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          for variable in \
+            APPLE_SIGNING_IDENTITY \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_TEAM_ID \
+            OCHERDR_SIGNING_PRIVATE_KEY \
+            OCHERDR_UPDATER_PUBKEY; do
+            if [ -z "${!variable:-}" ]; then
+              printf '%s must be configured for releases\n' "${variable}" >&2
+              exit 1
+            fi
+          done
+          if [[ -n "${APPLE_ID:-}" && -z "${APPLE_PASSWORD:-}" ]] || \
+             [[ -z "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" ]]; then
+            printf 'APPLE_ID and APPLE_PASSWORD must be configured together\n' >&2
+            exit 1
+          fi
+
+      - name: Package macOS
+        shell: bash
+        env:
+          OCHERDR_BUILD_TARGET: ${{ matrix.target }}
+          MACOS_REQUIRE_DEVELOPER_ID_SIGNATURE: "true"
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./scripts/release/package-macos.sh dist
+
+      - name: Sign updater payload
+        shell: bash
+        env:
+          OCHERDR_SIGNING_PRIVATE_KEY: ${{ secrets.OCHERDR_SIGNING_PRIVATE_KEY }}
+          OCHERDR_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.OCHERDR_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/release/sign-updater-artifacts.sh dist
+
+      - name: Verify updater payload trust root
+        shell: bash
+        env:
+          OCHERDR_UPDATER_PUBKEY: ${{ vars.OCHERDR_UPDATER_PUBKEY }}
+        run: ./scripts/release/verify-updater-artifacts.sh dist
+
+      - name: Upload release package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.dmg
+            dist/*.app.tar.gz
+            dist/*.sig
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - quality
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Validate assets and write checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f -name '*.dmg' | wc -l)" -eq 2
+          test "$(find dist -maxdepth 1 -type f -name '*.app.tar.gz' | wc -l)" -eq 2
+          test "$(find dist -maxdepth 1 -type f -name '*.app.tar.gz.sig' | wc -l)" -eq 2
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 |
+              sort -z |
+              xargs -0 sha256sum |
+              sed 's#  \./#  #' > SHA256SUMS
+          )
+
+      - name: Generate latest.json
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          base_url="https://github.com/${REPO}/releases/download/${TAG}"
+          entries=""
+          for sig in dist/*.app.tar.gz.sig; do
+            payload="${sig%.sig}"
+            name="$(basename "${payload}")"
+            case "${name}" in
+              *macos_aarch64.app.tar.gz) key="darwin-aarch64" ;;
+              *macos_x86_64.app.tar.gz) key="darwin-x86_64" ;;
+              *) printf 'unmapped updater payload: %s\n' "${name}" >&2; exit 1 ;;
+            esac
+            entry="$(jq -cn \
+              --arg key "${key}" \
+              --arg signature "$(cat "${sig}")" \
+              --arg url "${base_url}/${name}" \
+              '{($key): {signature: $signature, url: $url}}')"
+            entries="${entries}${entry}"$'\n'
+          done
+          printf '%s' "${entries}" | jq -s \
+            --arg version "${VERSION}" \
+            --arg notes "Release ${TAG}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{schema_version: 1, version: $version, notes: $notes, pub_date: $pub_date, platforms: add}' \
+            > dist/latest.json
+          test "$(jq '.schema_version' dist/latest.json)" -eq 1
+          test "$(jq '.platforms | length' dist/latest.json)" -eq 2
+
+      - name: Attest release packages
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/*
+
+      - name: Create or update release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            test "$(gh release view "${TAG}" --json isDraft --jq .isDraft)" = true
+          else
+            gh release create "${TAG}" \
+              --draft \
+              --generate-notes \
+              --title "OcHerdr ${TAG}" \
+              --verify-tag
+          fi
+          gh release upload "${TAG}" dist/* --clobber
+          gh release edit "${TAG}" --draft=false --latest
+
+  notify-homebrew:
+    name: Notify Homebrew tap
+    needs:
+      - validate
+      - publish
+    uses: ./.github/workflows/update-homebrew.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+    secrets:
+      HOMEBREW_TAP_DISPATCH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
