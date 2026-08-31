@@ -646,7 +646,7 @@ impl OcHerdrView {
             div()
                 .flex()
                 .flex_col()
-                .min_h_0()
+                .flex_none()
                 .children(rows.into_iter().enumerate().map(|(index, row)| {
                     let entry = row.entry.clone();
                     let context_entry = entry.clone();

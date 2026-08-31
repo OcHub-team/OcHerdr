@@ -4,6 +4,73 @@ use ocherdr_core::WorkspaceWorktreeInfo;
 use ocherdr_files::{BackendKind, BackendSpec, EntryKind, FileEntry, FileService};
 
 #[gpui::test]
+fn file_panel_tree_scrolls_when_rows_overflow(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let entries = (0..48)
+        .map(|index| FileEntry {
+            path: root.join(format!("file-{index:02}.txt")),
+            name: format!("file-{index:02}.txt"),
+            kind: EntryKind::File,
+            size: Some(1),
+            modified: None,
+            permissions: Some(0o644),
+            hidden: false,
+        })
+        .collect();
+
+    let (view, cx) = open_view(cx);
+    view.update(cx, |this, cx| {
+        let mut snapshot = three_tab_snapshot();
+        snapshot.workspaces[0].worktree = Some(WorkspaceWorktreeInfo {
+            repo_key: "fixture".into(),
+            repo_name: "fixture".into(),
+            repo_root: root.to_string_lossy().into_owned(),
+            checkout_path: root.to_string_lossy().into_owned(),
+            is_linked_worktree: false,
+        });
+        this.snapshot = Some(snapshot);
+        this.selection = Selection {
+            connection_id: "local".into(),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-a".into()),
+            ..Default::default()
+        };
+        this.file_panel.open = true;
+        this.file_panel.source = Some(crate::FilePanelSource {
+            profile_id: "local".into(),
+            suggested_root: root.clone(),
+        });
+        this.file_panel.service = Some(FileService::new(BackendSpec::Local).unwrap());
+        this.file_panel.backend_kind = Some(BackendKind::Local);
+        this.file_panel.root = Some(root.clone());
+        this.file_panel.expanded.insert(root.clone());
+        this.file_panel.children.insert(root, entries);
+        cx.notify();
+    });
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(320.)));
+    cx.run_until_parked();
+
+    let tree_bounds = cx.debug_bounds("file-tree-scroll").expect("file tree");
+    let scroll = view.read_with(cx, |this, _| this.file_panel.tree_scroll.clone());
+    assert!(
+        scroll.max_offset().y > gpui::px(0.),
+        "an overflowing file tree must expose vertical scroll range"
+    );
+    let before = scroll.offset().y;
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: tree_bounds.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-120.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    assert!(
+        scroll.offset().y < before,
+        "a wheel gesture over the file tree must reveal later rows"
+    );
+}
+
+#[gpui::test]
 fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
