@@ -2,7 +2,7 @@ use super::*;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 #[cfg(windows)]
-use std::os::windows::net::UnixListener;
+use uds_windows::UnixListener;
 
 #[test]
 fn quotes_remote_arguments_without_shell_injection() {

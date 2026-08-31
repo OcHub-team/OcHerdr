@@ -11,8 +11,6 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-#[cfg(windows)]
-use std::os::windows::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -20,6 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 use futures::channel::mpsc::{self as futures_mpsc, Receiver, UnboundedReceiver};
 use futures::{FutureExt as _, SinkExt as _, Stream};

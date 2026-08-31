@@ -514,7 +514,7 @@ fn run_worker(spec: BackendSpec, rx: mpsc::UnboundedReceiver<Command>) {
 
 enum Worker {
     Local,
-    Sftp(RemoteWorker),
+    Sftp(Box<RemoteWorker>),
 }
 
 impl Worker {
@@ -525,14 +525,14 @@ impl Worker {
                 destination,
                 port,
                 identity_file,
-            } => Self::Sftp(RemoteWorker {
+            } => Self::Sftp(Box::new(RemoteWorker {
                 destination,
                 port,
                 identity_file,
                 session: None,
                 #[cfg(windows)]
                 ssh_child: None,
-            }),
+            })),
         }
     }
 

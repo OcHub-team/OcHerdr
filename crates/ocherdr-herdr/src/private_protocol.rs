@@ -5,9 +5,9 @@
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-#[cfg(windows)]
-use std::os::windows::net::UnixStream;
 use std::time::Duration;
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 use crate::private_v20 as v20;
 use crate::{
@@ -308,9 +308,9 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
-    #[cfg(windows)]
-    use std::os::windows::net::UnixListener;
     use std::thread;
+    #[cfg(windows)]
+    use uds_windows::UnixListener;
 
     #[test]
     fn protocol_registry_is_explicit_and_rejects_unknown_versions() {
