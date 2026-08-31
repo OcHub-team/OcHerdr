@@ -5,12 +5,13 @@ workflow; a tag whose version does not exactly match `Cargo.toml` is rejected be
 any macOS build starts.
 
 The pipeline builds Apple Silicon and Intel apps on their native GitHub runners,
-signs each updater archive with a separate minisign key, generates checksums and a
-versioned `latest.json`, attests every asset, and publishes one GitHub Release. When
-all Developer ID credentials are configured, it Developer ID-signs each app and DMG
-and optionally notarizes the DMG. Otherwise it produces an explicitly ad-hoc-signed
-release. A published release is immutable from this workflow: a manual rerun may
-resume a draft but will not overwrite a release that is already public.
+plus Linux x64 and Windows x64 packages. It signs each macOS updater archive with a
+separate minisign key, generates checksums and a versioned `latest.json`, attests
+every asset, and publishes one GitHub Release. When all Developer ID credentials are
+configured, it Developer ID-signs each macOS app and DMG and optionally notarizes
+the DMG. Otherwise it produces an explicitly ad-hoc-signed macOS release. A
+published release is immutable from this workflow: a manual rerun may resume a
+draft but will not overwrite a release that is already public.
 
 ## Repository configuration
 
@@ -73,18 +74,19 @@ packaging script to fail closed instead of falling back.
    ```
 
 5. Confirm the Release workflow publishes two DMGs, two `.app.tar.gz` updater
-   payloads, their `.sig` files, `SHA256SUMS`, and `latest.json`.
+   payloads, their `.sig` files, Linux `.deb`, AppImage and portable archive,
+   Windows NSIS installer and portable archive, `SHA256SUMS`, and `latest.json`.
 6. Confirm `OcHub-team/homebrew-tap` updates `Casks/ocherdr.rb`. If immediate dispatch
    is not configured, run its workflow manually or wait for the daily schedule.
 
 ## Update protocol and key rotation
 
 `latest.json` currently uses `schema_version: 1` and independent platform entries for
-`darwin-aarch64` and `darwin-x86_64`. Readers ignore additive JSON fields but fail
-closed on an unsupported schema version. This leaves room for future channels,
-rollouts, delta formats, or extra platforms without changing version 1 consumers; a
-breaking manifest change must increment the schema and ship reader support before a
-writer starts emitting it.
+`darwin-aarch64`, `darwin-x86_64`, `linux-x86_64`, and `windows-x86_64`. Readers
+ignore additive JSON fields but fail closed on an unsupported schema version. This
+leaves room for future channels, rollouts, delta formats, or extra platforms without
+changing version 1 consumers; a breaking manifest change must increment the schema
+and ship reader support before a writer starts emitting it.
 
 The updater accepts only archives signed by the public key compiled into that build.
 For a planned key rotation, first ship a reader capable of trusting both the old and
