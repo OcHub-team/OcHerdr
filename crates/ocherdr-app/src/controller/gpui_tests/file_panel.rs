@@ -62,16 +62,46 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
 
     cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(700.)));
     cx.run_until_parked();
-    let wide_main = cx.debug_bounds("tab-bar").expect("tab bar");
+    let wide_tab_bar = cx.debug_bounds("tab-bar").expect("tab bar");
     let wide_panel = cx.debug_bounds("file-panel").expect("file panel");
     assert_eq!(
         wide_panel.size.width,
         gpui::px(crate::FILE_PANEL_DEFAULT_WIDTH)
     );
     assert_eq!(
-        wide_main.origin.x + wide_main.size.width,
-        wide_panel.origin.x,
-        "a wide window reserves layout width for the docked panel"
+        wide_tab_bar.origin.x + wide_tab_bar.size.width,
+        wide_panel.origin.x + wide_panel.size.width,
+        "the top bar spans the whole content area while the file panel is open"
+    );
+    assert_eq!(
+        wide_tab_bar.origin.y + wide_tab_bar.size.height,
+        wide_panel.origin.y,
+        "the file panel starts below the stable top bar"
+    );
+    let toolbar = cx
+        .debug_bounds("file-panel-toolbar")
+        .expect("file panel toolbar");
+    assert_eq!(
+        toolbar.origin.y, wide_panel.origin.y,
+        "the redundant file-panel title must not reserve vertical space"
+    );
+    view.update(cx, |this, cx| {
+        this.file_panel.open = false;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let closed_tab_bar = cx.debug_bounds("tab-bar").expect("closed tab bar");
+    assert_eq!(closed_tab_bar, wide_tab_bar);
+    assert!(cx.debug_bounds("file-panel").is_none());
+    view.update(cx, |this, cx| {
+        this.file_panel.open = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.debug_bounds("tab-bar").expect("reopened tab bar"),
+        wide_tab_bar,
+        "opening or closing the file panel must not reflow the top bar"
     );
     let file_tree = cx.debug_bounds("file-tree-scroll").expect("file tree");
     assert_eq!(
@@ -241,11 +271,15 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
 
     cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
     cx.run_until_parked();
-    let narrow_main = cx.debug_bounds("tab-bar").expect("tab bar");
+    let narrow_tab_bar = cx.debug_bounds("tab-bar").expect("tab bar");
     let narrow_panel = cx.debug_bounds("file-panel").expect("file panel");
-    let main_right = narrow_main.origin.x + narrow_main.size.width;
+    let main_right = narrow_tab_bar.origin.x + narrow_tab_bar.size.width;
     let panel_right = narrow_panel.origin.x + narrow_panel.size.width;
     assert_eq!(main_right, panel_right);
+    assert_eq!(
+        narrow_tab_bar.origin.y + narrow_tab_bar.size.height,
+        narrow_panel.origin.y
+    );
     assert!(
         narrow_panel.origin.x < main_right,
         "a narrow window overlays the terminal instead of resizing it"

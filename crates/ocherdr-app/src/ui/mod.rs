@@ -15,6 +15,21 @@ impl Render for OcHerdrView {
         self.apply_pending_focus(window, cx);
         self.sync_file_panel_source(cx);
         let chrome = self.chrome_a11y();
+        let file_panel_overlay =
+            f32::from(window.viewport_size().width) < FILE_PANEL_OVERLAY_BREAKPOINT;
+        let file_panel = self
+            .file_panel
+            .open
+            .then(|| self.render_file_panel(file_panel_overlay, cx));
+        let content = div()
+            .relative()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(self.render_terminal(window, cx))
+            .when_some(file_panel, |content, panel| content.child(panel));
         let main = crate::a11y::apply_region(div().id(chrome.main.id), &chrome.main)
             .flex()
             .flex_col()
@@ -23,13 +38,7 @@ impl Render for OcHerdrView {
             .h_full()
             .bg(theme::surface().alpha(0.))
             .child(self.render_tab_bar(&chrome, window, cx))
-            .child(self.render_terminal(window, cx));
-        let file_panel_overlay =
-            f32::from(window.viewport_size().width) < FILE_PANEL_OVERLAY_BREAKPOINT;
-        let file_panel = self
-            .file_panel
-            .open
-            .then(|| self.render_file_panel(file_panel_overlay, cx));
+            .child(content);
         let workspace_body = div()
             .relative()
             .flex()
@@ -39,7 +48,6 @@ impl Render for OcHerdrView {
             .min_w_0()
             .child(self.render_sidebar(&chrome, cx))
             .child(main)
-            .when_some(file_panel, |body, panel| body.child(panel))
             .into_any_element();
         let body = if self.overlay.host_center() {
             self.host_center.clone().into_any_element()

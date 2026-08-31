@@ -55,7 +55,6 @@ impl OcHerdrView {
                         }),
                     ),
             )
-            .child(self.render_file_panel_header(cx))
             .child(self.render_file_panel_toolbar(cx))
             .child(self.render_file_panel_breadcrumb(cx))
             .when(
@@ -77,41 +76,6 @@ impl OcHerdrView {
         panel.into_any_element()
     }
 
-    fn render_file_panel_header(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let i18n = self.i18n;
-        let backend = match self.file_panel.backend_kind {
-            Some(FileBackendKind::Sftp) => i18n.text(k::FILES_BACKEND_REMOTE),
-            Some(FileBackendKind::Local) | None => i18n.text(k::FILES_BACKEND_LOCAL),
-        };
-        div()
-            .flex()
-            .items_center()
-            .h(px(HEADER_HEIGHT))
-            .flex_none()
-            .gap_2()
-            .pl_3()
-            .pr_2()
-            .border_b_1()
-            .border_color(theme::border())
-            .bg(theme::sidebar_background())
-            .child(icon(IconName::Folder, theme::accent(), 14.))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child(i18n.text(k::FILES_PANEL)),
-                    )
-                    .child(div().text_xs().text_color(theme::muted()).child(backend)),
-            )
-    }
-
     fn render_file_panel_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
         let show_hidden = self.file_panel.show_hidden;
@@ -124,6 +88,7 @@ impl OcHerdrView {
             .count();
         div()
             .id("file-panel-toolbar")
+            .debug_selector(|| "file-panel-toolbar".to_owned())
             .role(ochub_ui::gpui::Role::Toolbar)
             .aria_label(i18n.text(k::FILES_ACTIONS))
             .flex()

@@ -1,8 +1,6 @@
 # en — Right-side local and SFTP file manager.
 
 "files.actions" = "File actions"
-"files.backend.local" = "On this Mac"
-"files.backend.remote" = "SFTP"
 "files.copy_path" = "Copy absolute path"
 "files.create" = "Create"
 "files.delete" = "Delete"

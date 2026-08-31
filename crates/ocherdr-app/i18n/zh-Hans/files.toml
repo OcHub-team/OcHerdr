@@ -1,8 +1,6 @@
 # zh-Hans — 右侧本地与 SFTP 文件管理器。
 
 "files.actions" = "文件操作"
-"files.backend.local" = "这台 Mac"
-"files.backend.remote" = "SFTP"
 "files.copy_path" = "复制绝对路径"
 "files.create" = "创建"
 "files.delete" = "删除"
