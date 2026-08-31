@@ -28,7 +28,7 @@ gpui-platform = { git = "https://github.com/OcHub-team/zed", package = "gpui_pla
 parking_lot = "0.12"
 minisign-verify = "0.2.5"
 openssh = "0.11.6"
-openssh-sftp-client = { version = "0.15.8", features = ["openssh"] }
+openssh-sftp-client = "0.15.8"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls-no-alpn"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }

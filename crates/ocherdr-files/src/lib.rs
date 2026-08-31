@@ -14,14 +14,23 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use futures::channel::oneshot;
 use ocherdr_core::ConnectionProfile;
+#[cfg(unix)]
 use openssh::{KnownHosts, SessionBuilder};
 use openssh_sftp_client::{Sftp, SftpOptions};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::process::Stdio;
 use tokio::sync::mpsc;
+#[cfg(windows)]
+use tokio::{io::AsyncReadExt, process::Command as TokioCommand};
 
 const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 static TEMP_FILE_SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -521,6 +530,8 @@ impl Worker {
                 port,
                 identity_file,
                 session: None,
+                #[cfg(windows)]
+                ssh_child: None,
             }),
         }
     }
@@ -763,29 +774,96 @@ struct RemoteWorker {
     port: Option<u16>,
     identity_file: Option<PathBuf>,
     session: Option<Sftp>,
+    #[cfg(windows)]
+    ssh_child: Option<tokio::process::Child>,
 }
 
 impl RemoteWorker {
     async fn connect(&mut self) -> FileResult<&Sftp> {
         if self.session.is_none() {
-            let mut builder = SessionBuilder::default();
-            builder
-                .known_hosts_check(KnownHosts::Strict)
-                .connect_timeout(Duration::from_secs(12))
-                .server_alive_interval(Duration::from_secs(20));
-            if let Some(port) = self.port {
-                builder.port(port);
-            }
-            if let Some(identity_file) = &self.identity_file {
-                builder.keyfile(identity_file);
-            }
-            let ssh = builder
-                .connect(&self.destination)
-                .await
-                .map_err(|error| FileError::Connection(error.to_string()))?;
-            let sftp = Sftp::from_session(ssh, SftpOptions::default())
-                .await
-                .map_err(|error| FileError::Connection(error.to_string()))?;
+            #[cfg(unix)]
+            let sftp = {
+                let mut builder = SessionBuilder::default();
+                builder
+                    .known_hosts_check(KnownHosts::Strict)
+                    .connect_timeout(Duration::from_secs(12))
+                    .server_alive_interval(Duration::from_secs(20));
+                if let Some(port) = self.port {
+                    builder.port(port);
+                }
+                if let Some(identity_file) = &self.identity_file {
+                    builder.keyfile(identity_file);
+                }
+                let ssh = builder
+                    .connect(&self.destination)
+                    .await
+                    .map_err(|error| FileError::Connection(error.to_string()))?;
+                Sftp::from_session(ssh, SftpOptions::default())
+                    .await
+                    .map_err(|error| FileError::Connection(error.to_string()))?
+            };
+
+            #[cfg(windows)]
+            let sftp = {
+                let mut command = TokioCommand::new("ssh.exe");
+                command
+                    .arg("-o")
+                    .arg("BatchMode=yes")
+                    .arg("-o")
+                    .arg("StrictHostKeyChecking=yes")
+                    .arg("-o")
+                    .arg("ConnectTimeout=12")
+                    .arg("-o")
+                    .arg("ServerAliveInterval=20");
+                if let Some(port) = self.port {
+                    command.arg("-p").arg(port.to_string());
+                }
+                if let Some(identity_file) = &self.identity_file {
+                    command.arg("-i").arg(identity_file);
+                }
+                command
+                    .arg("-s")
+                    .arg(&self.destination)
+                    .arg("sftp")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                command.as_std_mut().creation_flags(0x0800_0000);
+                let mut child = command.spawn().map_err(|error| {
+                    FileError::Connection(format!("could not start ssh.exe: {error}"))
+                })?;
+                let stdin = child.stdin.take().ok_or_else(|| {
+                    FileError::Connection("ssh.exe did not expose its standard input".into())
+                })?;
+                let stdout = child.stdout.take().ok_or_else(|| {
+                    FileError::Connection("ssh.exe did not expose its standard output".into())
+                })?;
+                match Sftp::new(stdin, stdout, SftpOptions::default()).await {
+                    Ok(sftp) => {
+                        if let Some(mut stderr) = child.stderr.take() {
+                            tokio::spawn(async move {
+                                let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+                            });
+                        }
+                        self.ssh_child = Some(child);
+                        sftp
+                    }
+                    Err(error) => {
+                        let _ = child.kill().await;
+                        let mut stderr = String::new();
+                        if let Some(mut pipe) = child.stderr.take() {
+                            let _ = pipe.read_to_string(&mut stderr).await;
+                        }
+                        let detail = stderr.trim();
+                        return Err(FileError::Connection(if detail.is_empty() {
+                            error.to_string()
+                        } else {
+                            format!("{error}: {detail}")
+                        }));
+                    }
+                }
+            };
             self.session = Some(sftp);
         }
         self.session.as_ref().ok_or(FileError::ServiceStopped)
@@ -1155,7 +1233,13 @@ fn local_file_entry(
     hidden: bool,
     metadata: fs::Metadata,
 ) -> FileEntry {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode() & 0o7777)
+    };
+    #[cfg(windows)]
+    let permissions = None;
     let file_type = metadata.file_type();
     FileEntry {
         path,
@@ -1171,7 +1255,7 @@ fn local_file_entry(
         },
         size: metadata.is_file().then_some(metadata.len()),
         modified: metadata.modified().ok().and_then(system_time_seconds),
-        permissions: Some(metadata.permissions().mode() & 0o7777),
+        permissions,
         hidden,
     }
 }

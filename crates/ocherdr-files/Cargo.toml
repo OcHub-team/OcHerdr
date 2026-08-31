@@ -10,11 +10,18 @@ description = "Local and SFTP filesystem backends for OcHerdr"
 [dependencies]
 futures.workspace = true
 ocherdr-core = { path = "../ocherdr-core" }
-openssh.workspace = true
-openssh-sftp-client.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 trash.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+openssh.workspace = true
+openssh-sftp-client = { workspace = true, features = ["openssh"] }
+
+[target.'cfg(windows)'.dependencies]
+openssh-sftp-client.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "process"] }
+trash = { workspace = true, features = ["coinit_apartmentthreaded"] }
 
 [dev-dependencies]
 tempfile.workspace = true

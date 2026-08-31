@@ -225,46 +225,50 @@ fn terminal_frame_element(
 ) -> ochub_ui::gpui::AnyElement {
     let font_family = SharedString::from(frame.font_family.to_string());
     let line_height = frame.cell_height_px.max(1) as f32;
-    let rows = frame.lines.iter().map(|line| {
-        let runs = line
-            .runs
-            .iter()
-            .map(|run| {
-                let mut terminal_font = font(font_family.clone());
-                terminal_font.weight = if run.bold {
-                    GpuiFontWeight::BOLD
-                } else {
-                    GpuiFontWeight::NORMAL
-                };
-                terminal_font.style = if run.italic {
-                    FontStyle::Italic
-                } else {
-                    FontStyle::Normal
-                };
-                let mut color = ochub_ui::gpui::Hsla::from(rgba((run.foreground << 8) | 0xff));
-                if run.dim {
-                    color = color.alpha(0.6);
-                }
-                TextRun {
-                    len: run.len,
-                    font: terminal_font,
-                    color,
-                    background_color: Some(rgba((run.background << 8) | 0xff).into()),
-                    underline: run.underline.then_some(UnderlineStyle {
-                        thickness: px(1.),
-                        color: None,
-                        wavy: false,
-                    }),
-                    strikethrough: None,
-                }
-            })
-            .collect::<Vec<_>>();
-        div()
-            .h(px(line_height))
-            .line_height(px(line_height))
-            .whitespace_nowrap()
-            .child(StyledText::new(line.text.clone()).with_runs(runs))
-    });
+    let rows = frame
+        .lines
+        .iter()
+        .map(|line| {
+            let runs = line
+                .runs
+                .iter()
+                .map(|run| {
+                    let mut terminal_font = font(font_family.clone());
+                    terminal_font.weight = if run.bold {
+                        GpuiFontWeight::BOLD
+                    } else {
+                        GpuiFontWeight::NORMAL
+                    };
+                    terminal_font.style = if run.italic {
+                        FontStyle::Italic
+                    } else {
+                        FontStyle::Normal
+                    };
+                    let mut color = ochub_ui::gpui::Hsla::from(rgba((run.foreground << 8) | 0xff));
+                    if run.dim {
+                        color = color.alpha(0.6);
+                    }
+                    TextRun {
+                        len: run.len,
+                        font: terminal_font,
+                        color,
+                        background_color: Some(rgba((run.background << 8) | 0xff).into()),
+                        underline: run.underline.then_some(UnderlineStyle {
+                            thickness: px(1.),
+                            color: None,
+                            wavy: false,
+                        }),
+                        strikethrough: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            div()
+                .h(px(line_height))
+                .line_height(px(line_height))
+                .whitespace_nowrap()
+                .child(StyledText::new(line.text.clone()).with_runs(runs))
+        })
+        .collect::<Vec<_>>();
     let content = div()
         .size_full()
         .overflow_hidden()
