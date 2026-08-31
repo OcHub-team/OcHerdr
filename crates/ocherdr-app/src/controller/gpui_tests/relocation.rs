@@ -819,6 +819,7 @@ fn notification_copy_button_wins_over_the_terminal_behind_it(cx: &mut TestAppCon
 /// Real Ghostty surfaces (not `headless_terminals`): a key press takes control,
 /// then libghostty encodes it and sends its bytes to that pane's stream.
 #[gpui::test]
+#[cfg(target_os = "macos")]
 fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut TestAppContext) {
     let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
     let (view, cx) = open_view(cx);

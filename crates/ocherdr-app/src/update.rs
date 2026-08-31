@@ -520,7 +520,11 @@ mod tests {
                 "notes": "Release v0.2.0",
                 "platforms": {
                     "darwin-aarch64": {"signature":"a", "url":"https://github.com/a"},
-                    "darwin-x86_64": {"signature":"b", "url":"https://github.com/b"}
+                    "darwin-x86_64": {"signature":"b", "url":"https://github.com/b"},
+                    "linux-aarch64": {"signature":"c", "url":"https://github.com/c"},
+                    "linux-x86_64": {"signature":"d", "url":"https://github.com/d"},
+                    "windows-aarch64": {"signature":"e", "url":"https://github.com/e"},
+                    "windows-x86_64": {"signature":"f", "url":"https://github.com/f"}
                 }
             }"#,
         )

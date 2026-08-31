@@ -46,6 +46,19 @@ fn install_app(cx: &mut TestAppContext) {
     });
 }
 
+fn app_primary_modifiers() -> gpui::Modifiers {
+    let mut modifiers = gpui::Modifiers::default();
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.platform = true;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.control = true;
+    }
+    modifiers
+}
+
 /// Construct the production view, then drop the constructor's `reload` so a
 /// real Herdr on PATH cannot apply over the test's setup.
 fn open_view(cx: &mut TestAppContext) -> (Entity<OcHerdrView>, &mut VisualTestContext) {

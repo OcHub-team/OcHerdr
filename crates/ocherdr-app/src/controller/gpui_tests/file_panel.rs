@@ -241,10 +241,7 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
     view.update_in(cx, |this, window, cx| {
         let event = gpui::KeyDownEvent {
             keystroke: gpui::Keystroke {
-                modifiers: gpui::Modifiers {
-                    platform: true,
-                    ..Default::default()
-                },
+                modifiers: app_primary_modifiers(),
                 key: "l".into(),
                 key_char: Some("l".into()),
             },

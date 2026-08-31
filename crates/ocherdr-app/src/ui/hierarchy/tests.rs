@@ -49,10 +49,14 @@ fn pane_layout(area: LayoutRect, panes: &[(&str, LayoutRect)]) -> PaneLayout {
 
 #[test]
 fn ghostty_style_tab_hints_use_command_glyph() {
+    #[cfg(target_os = "macos")]
+    let prefix = "⌘";
+    #[cfg(not(target_os = "macos"))]
+    let prefix = "Ctrl+";
     assert_eq!(tab_key_equivalent(0, 1), None);
-    assert_eq!(tab_key_equivalent(0, 2).as_deref(), Some("⌘1"));
-    assert_eq!(tab_key_equivalent(1, 2).as_deref(), Some("⌘2"));
-    assert_eq!(tab_key_equivalent(8, 9).as_deref(), Some("⌘9"));
+    assert_eq!(tab_key_equivalent(0, 2), Some(format!("{prefix}1")));
+    assert_eq!(tab_key_equivalent(1, 2), Some(format!("{prefix}2")));
+    assert_eq!(tab_key_equivalent(8, 9), Some(format!("{prefix}9")));
     assert_eq!(tab_key_equivalent(9, 10), None);
 }
 

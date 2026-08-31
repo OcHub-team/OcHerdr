@@ -7,10 +7,7 @@ fn command_comma_opens_ocherdr_settings_in_place(cx: &mut TestAppContext) {
         this.focus.focus(window, cx);
         let event = gpui::KeyDownEvent {
             keystroke: gpui::Keystroke {
-                modifiers: gpui::Modifiers {
-                    platform: true,
-                    ..Default::default()
-                },
+                modifiers: app_primary_modifiers(),
                 key: ",".into(),
                 key_char: Some(",".into()),
             },
@@ -269,16 +266,13 @@ fn tab_shortcut_hints_show_only_while_command_is_held(cx: &mut TestAppContext) {
     assert_eq!(cx.debug_bounds("tab-shortcut-t-a"), None, "hidden at rest");
     let title_at_rest = cx.debug_bounds("tab-title-t-a").expect("title");
 
-    let command = gpui::Modifiers {
-        platform: true,
-        ..Default::default()
-    };
+    let command = app_primary_modifiers();
     cx.simulate_modifiers_change(command);
     cx.run_until_parked();
     view.read_with(cx, |this, _| assert!(this.command_held));
     let hint = cx
         .debug_bounds("tab-shortcut-t-a")
-        .expect("hint appears while Command is down");
+        .expect("hint appears while the primary modifier is down");
     let tab = cx.debug_bounds("tab-t-a").unwrap();
     assert!(tab.contains(&hint.center()));
     assert_eq!(
@@ -296,7 +290,7 @@ fn tab_shortcut_hints_show_only_while_command_is_held(cx: &mut TestAppContext) {
         "hidden on release"
     );
 
-    // Cmd-Tab away: the release happens in another app, so losing key
+    // Switching apps can hide the release, so losing key
     // status must drop the hints on its own.
     view.update_in(cx, |_, window, _| window.activate_window());
     cx.run_until_parked();
