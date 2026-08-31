@@ -75,7 +75,7 @@ config_json="$({
                     "libxkbcommon-x11-0"
                 ]
             },
-            nsis: { installMode: "perUser" }
+            nsis: { installMode: "currentUser" }
         }'
 })"
 

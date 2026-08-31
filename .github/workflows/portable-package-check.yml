@@ -2,6 +2,9 @@ name: Portable package check
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feat/windows-linux-support
 
 permissions:
   contents: read
