@@ -1,6 +1,24 @@
 use super::*;
-use ocherdr_files::{BackendSpec, TransferSummary};
+use ocherdr_files::{BackendSpec, FileError};
 use std::path::Path;
+
+const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(80);
+const EDITOR_WATCH_INTERVAL: Duration = Duration::from_millis(350);
+const EDITOR_SAVE_DEBOUNCE: Duration = Duration::from_millis(550);
+const MAX_VISIBLE_TRANSFERS: usize = 40;
+
+enum EditorWatchAction {
+    Wait,
+    Stop,
+    Sync {
+        local_path: PathBuf,
+        remote_path: PathBuf,
+        expected: FileVersion,
+        revision: LocalFileRevision,
+        transfer_id: u64,
+        monitor: TransferMonitor,
+    },
+}
 
 impl OcHerdrView {
     pub(crate) fn sync_file_panel_source(&mut self, cx: &mut Context<Self>) {
@@ -8,16 +26,6 @@ impl OcHerdrView {
             return;
         }
         let desired = self.desired_file_panel_source();
-        if self.file_panel.pinned
-            && self
-                .file_panel
-                .source
-                .as_ref()
-                .is_some_and(|source| source.profile_id == desired.profile_id)
-            && self.file_panel.service.is_some()
-        {
-            return;
-        }
         if self.file_panel.source.as_ref() == Some(&desired) && self.file_panel.service.is_some() {
             return;
         }
@@ -136,21 +144,6 @@ impl OcHerdrView {
         );
         self.persist_settings(FailureKind::FileOperation, cx);
         if self.file_panel.open {
-            self.sync_file_panel_source(cx);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn close_file_panel(&mut self, cx: &mut Context<Self>) {
-        if self.file_panel.open {
-            self.toggle_file_panel(cx);
-        }
-    }
-
-    pub(crate) fn toggle_file_panel_pin(&mut self, cx: &mut Context<Self>) {
-        self.file_panel.pinned = !self.file_panel.pinned;
-        if !self.file_panel.pinned {
-            self.file_panel.source = None;
             self.sync_file_panel_source(cx);
         }
         cx.notify();
@@ -635,13 +628,10 @@ impl OcHerdrView {
     }
 
     pub(crate) fn choose_file_panel_upload(&mut self, cx: &mut Context<Self>) {
-        if self.file_panel.busy.is_some() {
+        if self.file_panel.operation_task.is_some() {
             return;
         }
         let Some(destination) = self.file_panel.selected_directory() else {
-            return;
-        };
-        let Some(service) = self.file_panel.service.clone() else {
             return;
         };
         let receiver = cx.prompt_for_paths(PathPromptOptions {
@@ -650,44 +640,15 @@ impl OcHerdrView {
             multiple: true,
             prompt: Some(self.i18n.text(k::FILES_UPLOAD).into()),
         });
-        let generation = self.file_panel.generation;
-        self.file_panel.busy = Some(FileBusyKind::Uploading);
         self.file_panel.operation_task = Some(cx.spawn(async move |this, cx| {
-            let result: Result<Option<TransferSummary>, String> = async {
-                let selection = receiver
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
-                let Some(paths) = selection else {
-                    return Ok(None);
-                };
-                service
-                    .upload(paths, destination.clone())
-                    .await
-                    .map(Some)
-                    .map_err(|error| error.to_string())
-            }
-            .await;
+            let result = receiver.await;
             this.update(cx, |this, cx| {
-                if this.file_panel.generation != generation {
-                    return;
-                }
                 this.file_panel.operation_task = None;
-                this.file_panel.busy = None;
                 match result {
-                    Ok(Some(summary)) => {
-                        this.file_panel.status = Some(transfer_status(
-                            summary,
-                            this.i18n.text(k::FILES_STATUS_UPLOADED),
-                            this.i18n,
-                        ));
-                        this.load_file_panel_directory(destination, true, cx);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        this.file_panel.status = Some(error.clone());
-                        this.notify_failure(FailureKind::FileOperation, error, cx);
-                    }
+                    Ok(Ok(Some(paths))) => this.file_panel_upload_paths_to(paths, destination, cx),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => this.notify_failure(FailureKind::FileOperation, error, cx),
+                    Err(error) => this.notify_failure(FailureKind::FileOperation, error, cx),
                 }
                 cx.notify();
             })
@@ -697,48 +658,69 @@ impl OcHerdrView {
     }
 
     pub(crate) fn file_panel_upload_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        if paths.is_empty() || self.file_panel.busy.is_some() {
+        let Some(destination) = self.file_panel.root.clone() else {
             return;
-        }
-        let Some(destination) = self.file_panel.selected_directory() else {
+        };
+        self.file_panel_upload_paths_to(paths, destination, cx);
+    }
+
+    pub(crate) fn file_panel_upload_paths_to(
+        &mut self,
+        paths: Vec<PathBuf>,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
             return;
         };
         let Some(service) = self.file_panel.service.clone() else {
             return;
         };
-        let generation = self.file_panel.generation;
-        self.file_panel.busy = Some(FileBusyKind::Uploading);
-        self.file_panel.operation_task = Some(cx.spawn(async move |this, cx| {
-            let result = service.upload(paths, destination.clone()).await;
+        let name = transfer_sources_label(&paths, self.i18n);
+        let detail = destination.to_string_lossy().into_owned();
+        let (transfer_id, monitor) =
+            self.begin_file_transfer(FileTransferKind::Upload, name, detail, None, cx);
+        let source_id = self
+            .file_panel
+            .source
+            .as_ref()
+            .map(|source| source.profile_id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = service
+                .upload_tracked(paths, destination.clone(), monitor)
+                .await;
             this.update(cx, |this, cx| {
-                if this.file_panel.generation != generation {
-                    return;
+                let succeeded = result.is_ok();
+                let failure = result
+                    .as_ref()
+                    .err()
+                    .filter(|error| !matches!(error, FileError::Cancelled))
+                    .map(ToString::to_string);
+                this.finish_file_transfer(transfer_id, result.map(|_| ()), cx);
+                if let Some(failure) = failure {
+                    this.notify_failure(FailureKind::FileOperation, failure, cx);
                 }
-                this.file_panel.operation_task = None;
-                this.file_panel.busy = None;
-                match result {
-                    Ok(summary) => {
-                        this.file_panel.status = Some(transfer_status(
-                            summary,
-                            this.i18n.text(k::FILES_STATUS_UPLOADED),
-                            this.i18n,
-                        ));
-                        this.load_file_panel_directory(destination, true, cx);
-                    }
-                    Err(error) => {
-                        this.file_panel.status = Some(error.to_string());
-                        this.notify_failure(FailureKind::FileOperation, error, cx);
-                    }
+                if succeeded
+                    && this
+                        .file_panel
+                        .source
+                        .as_ref()
+                        .map(|source| &source.profile_id)
+                        == source_id.as_ref()
+                    && this.file_panel.children.contains_key(&destination)
+                {
+                    this.load_file_panel_directory(destination, true, cx);
                 }
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
     }
 
     pub(crate) fn choose_file_panel_download(&mut self, cx: &mut Context<Self>) {
-        if self.file_panel.busy.is_some() {
+        if self.file_panel.operation_task.is_some() {
             return;
         }
         let Some(entry) = self.file_panel.selected.clone() else {
@@ -751,49 +733,188 @@ impl OcHerdrView {
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         let receiver = cx.prompt_for_new_path(&directory, Some(&entry.name));
-        let generation = self.file_panel.generation;
-        self.file_panel.busy = Some(FileBusyKind::Downloading);
         self.file_panel.operation_task = Some(cx.spawn(async move |this, cx| {
-            let result: Result<Option<TransferSummary>, String> = async {
-                let selection = receiver
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
-                let Some(destination) = selection else {
-                    return Ok(None);
-                };
-                service
-                    .download(entry.path, destination)
-                    .await
-                    .map(Some)
-                    .map_err(|error| error.to_string())
-            }
-            .await;
+            let result = receiver.await;
             this.update(cx, |this, cx| {
-                if this.file_panel.generation != generation {
-                    return;
-                }
                 this.file_panel.operation_task = None;
-                this.file_panel.busy = None;
                 match result {
-                    Ok(Some(summary)) => {
-                        this.file_panel.status = Some(transfer_status(
-                            summary,
-                            this.i18n.text(k::FILES_STATUS_DOWNLOADED),
-                            this.i18n,
-                        ));
+                    Ok(Ok(Some(destination))) => {
+                        this.start_file_panel_download(entry, destination, service, cx)
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        this.file_panel.status = Some(error.clone());
-                        this.notify_failure(FailureKind::FileOperation, error, cx);
-                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => this.notify_failure(FailureKind::FileOperation, error, cx),
+                    Err(error) => this.notify_failure(FailureKind::FileOperation, error, cx),
                 }
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    fn start_file_panel_download(
+        &mut self,
+        entry: FileEntry,
+        destination: PathBuf,
+        service: FileService,
+        cx: &mut Context<Self>,
+    ) {
+        let (transfer_id, monitor) = self.begin_file_transfer(
+            FileTransferKind::Download,
+            entry.name,
+            destination.to_string_lossy().into_owned(),
+            Some(destination.clone()),
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let result = service
+                .download_tracked(entry.path, destination, monitor)
+                .await;
+            this.update(cx, |this, cx| {
+                let failure = result
+                    .as_ref()
+                    .err()
+                    .filter(|error| !matches!(error, FileError::Cancelled))
+                    .map(ToString::to_string);
+                this.finish_file_transfer(transfer_id, result.map(|_| ()), cx);
+                if let Some(failure) = failure {
+                    this.notify_failure(FailureKind::FileOperation, failure, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn begin_file_transfer(
+        &mut self,
+        kind: FileTransferKind,
+        name: String,
+        detail: String,
+        reveal_path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> (u64, TransferMonitor) {
+        self.file_panel.next_transfer_id = self.file_panel.next_transfer_id.wrapping_add(1);
+        let id = self.file_panel.next_transfer_id;
+        let monitor = TransferMonitor::new();
+        if kind != FileTransferKind::EditorSync {
+            self.file_panel.transfers_open = true;
+        }
+        if self.file_panel.transfers.len() >= MAX_VISIBLE_TRANSFERS
+            && let Some(index) = self
+                .file_panel
+                .transfers
+                .iter()
+                .position(|transfer| !transfer.running())
+        {
+            self.file_panel.transfers.remove(index);
+        }
+        self.file_panel.transfers.push(FileTransfer {
+            id,
+            kind,
+            name,
+            detail,
+            progress: monitor.snapshot(),
+            monitor: monitor.clone(),
+            state: FileTransferState::Running,
+            reveal_path,
+        });
+        self.poll_file_transfer(id, monitor.clone(), cx);
+        cx.notify();
+        (id, monitor)
+    }
+
+    fn poll_file_transfer(
+        &self,
+        transfer_id: u64,
+        monitor: TransferMonitor,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TRANSFER_POLL_INTERVAL).await;
+                let progress = monitor.snapshot();
+                let finished = monitor.is_finished();
+                let keep_polling = this
+                    .update(cx, |this, cx| {
+                        let Some(transfer) = this
+                            .file_panel
+                            .transfers
+                            .iter_mut()
+                            .find(|transfer| transfer.id == transfer_id)
+                        else {
+                            return false;
+                        };
+                        transfer.progress = progress;
+                        cx.notify();
+                        !finished
+                    })
+                    .unwrap_or(false);
+                if !keep_polling {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn finish_file_transfer(
+        &mut self,
+        transfer_id: u64,
+        result: Result<(), FileError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(transfer) = self
+            .file_panel
+            .transfers
+            .iter_mut()
+            .find(|transfer| transfer.id == transfer_id)
+        else {
+            return;
+        };
+        transfer.progress = transfer.monitor.snapshot();
+        transfer.state = match result {
+            Ok(()) => FileTransferState::Completed,
+            Err(FileError::Cancelled) => FileTransferState::Cancelled,
+            Err(FileError::Conflict { .. }) => FileTransferState::Conflict,
+            Err(error) => FileTransferState::Failed(error.to_string()),
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_file_transfers(&mut self, cx: &mut Context<Self>) {
+        self.file_panel.transfers_open = !self.file_panel.transfers_open;
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_file_transfer(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(transfer) = self
+            .file_panel
+            .transfers
+            .iter()
+            .find(|transfer| transfer.id == id && transfer.running())
+        {
+            transfer.monitor.cancel();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn clear_finished_file_transfers(&mut self, cx: &mut Context<Self>) {
+        self.file_panel.transfers.retain(FileTransfer::running);
+        cx.notify();
+    }
+
+    pub(crate) fn reveal_file_transfer(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .file_panel
+            .transfers
+            .iter()
+            .find(|transfer| transfer.id == id)
+            .and_then(|transfer| transfer.reveal_path.as_ref())
+        else {
+            return;
+        };
+        cx.open_with_system(path.parent().unwrap_or(path));
     }
 
     pub(crate) fn copy_file_panel_path(&mut self, cx: &mut Context<Self>) {
@@ -889,45 +1010,209 @@ impl OcHerdrView {
             .path()
             .join(format!("{:016x}", self.file_panel.editor_open_serial))
             .join(&entry.name);
-        let generation = self.file_panel.generation;
+        let session_id = self.file_panel.editor_open_serial;
+        let (transfer_id, monitor) = self.begin_file_transfer(
+            FileTransferKind::Download,
+            entry.name.clone(),
+            destination.to_string_lossy().into_owned(),
+            None,
+            cx,
+        );
         self.file_panel.busy = Some(FileBusyKind::Opening);
-        self.file_panel.operation_task = Some(cx.spawn(async move |this, cx| {
-            let result = service.download(entry.path, destination.clone()).await;
-            this.update(cx, |this, cx| {
-                if this.file_panel.generation != generation {
-                    return;
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let before = service.version(entry.path.clone()).await?;
+                service
+                    .download_tracked(entry.path.clone(), destination.clone(), monitor)
+                    .await?;
+                let after = service.version(entry.path.clone()).await?;
+                if before != after {
+                    return Err(FileError::Conflict {
+                        path: entry.path.to_string_lossy().into_owned(),
+                    });
                 }
-                this.file_panel.operation_task = None;
+                Ok(after)
+            }
+            .await;
+            this.update(cx, |this, cx| {
                 this.file_panel.busy = None;
                 match result {
-                    Ok(_) => match mark_editor_copy_read_only(&destination, this.i18n) {
-                        Ok(()) => {
-                            match launch_file_editor(&destination, editor.as_deref(), this.i18n, cx)
-                            {
-                                Ok(()) => {
-                                    this.file_panel.status = Some(crate::tf!(
-                                        this.i18n,
-                                        k::FILES_STATUS_OPENED_REMOTE,
-                                        name = entry.name
-                                    ));
-                                }
-                                Err(error) => {
-                                    this.notify_failure(FailureKind::FileOperation, error, cx)
-                                }
+                    Ok(version) => {
+                        this.finish_file_transfer(transfer_id, Ok(()), cx);
+                        match local_file_revision(&destination).and_then(|revision| {
+                            launch_file_editor(&destination, editor.as_deref(), this.i18n, cx)?;
+                            Ok(revision)
+                        }) {
+                            Ok(revision) => {
+                                this.file_panel.editor_sessions.insert(
+                                    session_id,
+                                    RemoteEditSession {
+                                        name: entry.name.clone(),
+                                        remote_path: entry.path.clone(),
+                                        local_path: destination.clone(),
+                                        expected_remote: version,
+                                        synced_revision: revision,
+                                        pending_revision: None,
+                                        pending_since: None,
+                                        syncing: false,
+                                        conflict: false,
+                                    },
+                                );
+                                this.watch_remote_editor(session_id, service.clone(), cx);
+                                this.file_panel.status = Some(crate::tf!(
+                                    this.i18n,
+                                    k::FILES_STATUS_OPENED_REMOTE,
+                                    name = entry.name
+                                ));
+                            }
+                            Err(error) => {
+                                this.notify_failure(FailureKind::FileOperation, error, cx)
                             }
                         }
-                        Err(error) => this.notify_failure(FailureKind::FileOperation, error, cx),
-                    },
+                    }
                     Err(error) => {
-                        this.file_panel.status = Some(error.to_string());
-                        this.notify_failure(FailureKind::FileOperation, error, cx);
+                        let message = error.to_string();
+                        this.finish_file_transfer(transfer_id, Err(error), cx);
+                        this.file_panel.status = Some(message.clone());
+                        this.notify_failure(FailureKind::FileOperation, message, cx);
                     }
                 }
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
+    }
+
+    pub(crate) fn watch_remote_editor(
+        &mut self,
+        session_id: u64,
+        service: FileService,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(EDITOR_WATCH_INTERVAL).await;
+                let request = this
+                    .update(cx, |this, cx| {
+                        let request = {
+                            let Some(session) =
+                                this.file_panel.editor_sessions.get_mut(&session_id)
+                            else {
+                                return EditorWatchAction::Stop;
+                            };
+                            if session.conflict {
+                                return EditorWatchAction::Stop;
+                            }
+                            let Ok(revision) = local_file_revision(&session.local_path) else {
+                                return EditorWatchAction::Wait;
+                            };
+                            if revision == session.synced_revision {
+                                session.pending_revision = None;
+                                session.pending_since = None;
+                                return EditorWatchAction::Wait;
+                            }
+                            if session.pending_revision != Some(revision) {
+                                session.pending_revision = Some(revision);
+                                session.pending_since = Some(Instant::now());
+                                return EditorWatchAction::Wait;
+                            }
+                            if session.syncing
+                                || session
+                                    .pending_since
+                                    .is_none_or(|since| since.elapsed() < EDITOR_SAVE_DEBOUNCE)
+                            {
+                                return EditorWatchAction::Wait;
+                            }
+                            session.syncing = true;
+                            session.pending_revision = None;
+                            session.pending_since = None;
+                            (
+                                session.name.clone(),
+                                session.local_path.clone(),
+                                session.remote_path.clone(),
+                                session.expected_remote,
+                                revision,
+                            )
+                        };
+                        let (name, local_path, remote_path, expected, revision) = request;
+                        let (transfer_id, monitor) = this.begin_file_transfer(
+                            FileTransferKind::EditorSync,
+                            name,
+                            remote_path.to_string_lossy().into_owned(),
+                            None,
+                            cx,
+                        );
+                        EditorWatchAction::Sync {
+                            local_path,
+                            remote_path,
+                            expected,
+                            revision,
+                            transfer_id,
+                            monitor,
+                        }
+                    })
+                    .unwrap_or(EditorWatchAction::Stop);
+                let EditorWatchAction::Sync {
+                    local_path,
+                    remote_path,
+                    expected,
+                    revision,
+                    transfer_id,
+                    monitor,
+                } = request
+                else {
+                    if matches!(request, EditorWatchAction::Stop) {
+                        break;
+                    }
+                    continue;
+                };
+
+                let result = service
+                    .sync_file(local_path, remote_path, Some(expected), monitor)
+                    .await;
+                let should_stop = this
+                    .update(cx, |this, cx| match result {
+                        Ok(version) => {
+                            this.finish_file_transfer(transfer_id, Ok(()), cx);
+                            if let Some(session) =
+                                this.file_panel.editor_sessions.get_mut(&session_id)
+                            {
+                                session.expected_remote = version;
+                                session.synced_revision = revision;
+                                session.syncing = false;
+                            }
+                            this.file_panel.status =
+                                Some(this.i18n.text(k::FILES_EDITOR_SYNCED).to_owned());
+                            false
+                        }
+                        Err(error) => {
+                            let conflict = matches!(&error, FileError::Conflict { .. });
+                            let message = error.to_string();
+                            this.finish_file_transfer(transfer_id, Err(error), cx);
+                            if let Some(session) =
+                                this.file_panel.editor_sessions.get_mut(&session_id)
+                            {
+                                session.syncing = false;
+                                session.conflict = true;
+                            }
+                            this.file_panel.status = Some(if conflict {
+                                this.i18n.text(k::FILES_EDITOR_CONFLICT).to_owned()
+                            } else {
+                                message.clone()
+                            });
+                            this.notify_failure(FailureKind::FileOperation, message, cx);
+                            true
+                        }
+                    })
+                    .unwrap_or(true);
+                if should_stop {
+                    break;
+                }
+            }
+        });
+        self.file_panel.editor_watch_tasks.insert(session_id, task);
     }
 
     pub(crate) fn choose_file_panel_editor(&mut self, cx: &mut Context<Self>) {
@@ -1149,116 +1434,30 @@ fn is_editor_path(path: &Path) -> bool {
     path.is_file()
 }
 
-fn mark_editor_copy_read_only(path: &Path, i18n: I18n) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).map_err(|error| {
-            crate::tf!(
-                i18n,
-                k::FILES_EDITOR_READ_ONLY_FAILED,
-                path = path.display(),
-                error = error
-            )
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let mut permissions = std::fs::metadata(path)
-            .map_err(|error| error.to_string())?
-            .permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(path, permissions).map_err(|error| error.to_string())
-    }
+fn local_file_revision(path: &Path) -> Result<LocalFileRevision, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    Ok(LocalFileRevision {
+        len: metadata.len(),
+        modified_nanos,
+    })
 }
 
-fn transfer_status(summary: TransferSummary, verb: &str, i18n: I18n) -> String {
-    crate::tf!(
-        i18n,
-        k::FILES_STATUS_TRANSFER,
-        verb = verb,
-        files = summary.files,
-        folders = summary.directories,
-        size = human_file_size(summary.bytes),
-    )
+fn transfer_sources_label(paths: &[PathBuf], i18n: I18n) -> String {
+    if paths.len() == 1 {
+        paths[0]
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| paths[0].to_string_lossy().into_owned())
+    } else {
+        crate::tf!(i18n, k::FILES_TRANSFER_ITEMS, count = paths.len())
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ocherdr_files::FileError;
-
-    #[test]
-    fn file_errors_keep_operation_context() {
-        let error = FileError::InvalidName("../bad".into());
-        assert!(error.to_string().contains("../bad"));
-    }
-
-    #[test]
-    fn addresses_support_absolute_relative_and_home_paths() {
-        let current = Path::new("/repo/src");
-        let home = Path::new("/Users/tester");
-        assert_eq!(
-            resolve_file_panel_address("/tmp", FileBackendKind::Local, current, Some(home)),
-            Ok(PathBuf::from("/tmp"))
-        );
-        assert_eq!(
-            resolve_file_panel_address("../docs", FileBackendKind::Local, current, Some(home)),
-            Ok(PathBuf::from("/repo/src/../docs"))
-        );
-        assert_eq!(
-            resolve_file_panel_address("~/code", FileBackendKind::Local, current, Some(home)),
-            Ok(PathBuf::from("/Users/tester/code"))
-        );
-        assert_eq!(
-            resolve_file_panel_address("~/code", FileBackendKind::Sftp, current, None),
-            Ok(PathBuf::from("./code"))
-        );
-    }
-
-    #[test]
-    fn addresses_reject_empty_or_named_home_shortcuts() {
-        assert_eq!(
-            resolve_file_panel_address(" ", FileBackendKind::Local, Path::new("/"), None),
-            Err(FileAddressError::Empty)
-        );
-        assert_eq!(
-            resolve_file_panel_address("~other", FileBackendKind::Sftp, Path::new("/"), None),
-            Err(FileAddressError::UnsupportedTilde)
-        );
-    }
-
-    #[test]
-    fn editor_paths_accept_apps_and_executables_only() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = directory.path().join("Editor.app");
-        std::fs::create_dir(&app).unwrap();
-        let executable = directory.path().join("editor");
-        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let ordinary_directory = directory.path().join("folder");
-        std::fs::create_dir(&ordinary_directory).unwrap();
-        assert!(is_editor_path(&app));
-        assert!(is_editor_path(&executable));
-        assert!(!is_editor_path(&ordinary_directory));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_editor_copies_are_read_only() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("remote.txt");
-        std::fs::write(&path, b"remote contents").unwrap();
-        mark_editor_copy_read_only(&path, I18n::new(Language::English)).unwrap();
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o444
-        );
-    }
-}
+#[path = "files_tests.rs"]
+mod tests;

@@ -11,7 +11,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,7 @@ use openssh_sftp_client::{Sftp, SftpOptions};
 use tokio::sync::mpsc;
 
 const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+static TEMP_FILE_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 /// The concrete transport behind a file service.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +105,128 @@ pub struct TransferSummary {
     pub bytes: u64,
 }
 
+/// A lightweight remote/local version token used to prevent an editor save
+/// from silently overwriting a file that changed after it was opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileVersion {
+    pub size: Option<u64>,
+    pub modified: Option<u64>,
+}
+
+/// The latest observable state of a file transfer. Totals are optional because
+/// a remote directory may be streamed before its complete size is known.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransferProgress {
+    pub bytes_transferred: u64,
+    pub total_bytes: Option<u64>,
+    pub files_transferred: usize,
+    pub total_files: Option<usize>,
+    pub directories_transferred: usize,
+    pub total_directories: Option<usize>,
+    pub current_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct TransferMonitorInner {
+    progress: Mutex<TransferProgress>,
+    cancelled: AtomicBool,
+    finished: AtomicBool,
+}
+
+/// Shared progress and cancellation handle for uploads, downloads, and editor
+/// synchronization. Reading a snapshot never blocks the filesystem worker for
+/// longer than a small in-memory update.
+#[derive(Clone, Debug)]
+pub struct TransferMonitor {
+    inner: Arc<TransferMonitorInner>,
+}
+
+impl Default for TransferMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TransferMonitor {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(TransferMonitorInner {
+                progress: Mutex::new(TransferProgress::default()),
+                cancelled: AtomicBool::new(false),
+                finished: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub fn snapshot(&self) -> TransferProgress {
+        self.with_progress(|progress| progress.clone())
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.inner.finished.load(Ordering::Acquire)
+    }
+
+    fn with_progress<T>(&self, f: impl FnOnce(&mut TransferProgress) -> T) -> T {
+        let mut progress = self
+            .inner
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut progress)
+    }
+
+    fn set_totals(&self, bytes: u64, files: usize, directories: usize) {
+        self.with_progress(|progress| {
+            progress.total_bytes = Some(bytes);
+            progress.total_files = Some(files);
+            progress.total_directories = Some(directories);
+        });
+    }
+
+    fn set_current(&self, path: &Path) {
+        self.with_progress(|progress| progress.current_path = Some(path.to_path_buf()));
+    }
+
+    fn add_bytes(&self, bytes: u64) {
+        self.with_progress(|progress| {
+            progress.bytes_transferred = progress.bytes_transferred.saturating_add(bytes);
+        });
+    }
+
+    fn finish_file(&self) {
+        self.with_progress(|progress| {
+            progress.files_transferred = progress.files_transferred.saturating_add(1);
+        });
+    }
+
+    fn finish_directory(&self) {
+        self.with_progress(|progress| {
+            progress.directories_transferred = progress.directories_transferred.saturating_add(1);
+        });
+    }
+
+    fn ensure_active(&self) -> FileResult<()> {
+        if self.is_cancelled() {
+            Err(FileError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish(&self) {
+        self.with_progress(|progress| progress.current_path = None);
+        self.inner.finished.store(true, Ordering::Release);
+    }
+}
+
 impl TransferSummary {
     fn add_file(&mut self, bytes: u64) {
         self.files += 1;
@@ -130,6 +254,10 @@ pub enum FileError {
     },
     #[error("SSH connection failed: {0}")]
     Connection(String),
+    #[error("transfer cancelled")]
+    Cancelled,
+    #[error("file changed since it was opened: `{path}`")]
+    Conflict { path: String },
 }
 
 impl FileError {
@@ -220,10 +348,21 @@ impl FileService {
         sources: Vec<PathBuf>,
         destination_dir: PathBuf,
     ) -> FileResult<TransferSummary> {
+        self.upload_tracked(sources, destination_dir, TransferMonitor::new())
+            .await
+    }
+
+    pub async fn upload_tracked(
+        &self,
+        sources: Vec<PathBuf>,
+        destination_dir: PathBuf,
+        monitor: TransferMonitor,
+    ) -> FileResult<TransferSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::Upload {
             sources,
             destination_dir,
+            monitor,
             tx,
         })?;
         receive(rx).await
@@ -236,10 +375,48 @@ impl FileService {
         source: PathBuf,
         destination: PathBuf,
     ) -> FileResult<TransferSummary> {
+        self.download_tracked(source, destination, TransferMonitor::new())
+            .await
+    }
+
+    pub async fn download_tracked(
+        &self,
+        source: PathBuf,
+        destination: PathBuf,
+        monitor: TransferMonitor,
+    ) -> FileResult<TransferSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::Download {
             source,
             destination,
+            monitor,
+            tx,
+        })?;
+        receive(rx).await
+    }
+
+    pub async fn version(&self, path: PathBuf) -> FileResult<FileVersion> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::Version { path, tx })?;
+        receive(rx).await
+    }
+
+    /// Replace one service file from a local source after checking the version
+    /// observed when the editor session began. `None` explicitly requests an
+    /// overwrite, which is reserved for a user-confirmed conflict resolution.
+    pub async fn sync_file(
+        &self,
+        source: PathBuf,
+        destination: PathBuf,
+        expected: Option<FileVersion>,
+        monitor: TransferMonitor,
+    ) -> FileResult<FileVersion> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::SyncFile {
+            source,
+            destination,
+            expected,
+            monitor,
             tx,
         })?;
         receive(rx).await
@@ -289,12 +466,25 @@ enum Command {
     Upload {
         sources: Vec<PathBuf>,
         destination_dir: PathBuf,
+        monitor: TransferMonitor,
         tx: oneshot::Sender<FileResult<TransferSummary>>,
     },
     Download {
         source: PathBuf,
         destination: PathBuf,
+        monitor: TransferMonitor,
         tx: oneshot::Sender<FileResult<TransferSummary>>,
+    },
+    Version {
+        path: PathBuf,
+        tx: oneshot::Sender<FileResult<FileVersion>>,
+    },
+    SyncFile {
+        source: PathBuf,
+        destination: PathBuf,
+        expected: Option<FileVersion>,
+        monitor: TransferMonitor,
+        tx: oneshot::Sender<FileResult<FileVersion>>,
     },
 }
 
@@ -363,16 +553,38 @@ impl Worker {
                 Command::Upload {
                     sources,
                     destination_dir,
+                    monitor,
                     tx,
                 } => {
-                    let _ = tx.send(self.upload(sources, destination_dir).await);
+                    let result = self.upload(sources, destination_dir, &monitor).await;
+                    monitor.finish();
+                    let _ = tx.send(result);
                 }
                 Command::Download {
                     source,
                     destination,
+                    monitor,
                     tx,
                 } => {
-                    let _ = tx.send(self.download(source, destination).await);
+                    let result = self.download(source, destination, &monitor).await;
+                    monitor.finish();
+                    let _ = tx.send(result);
+                }
+                Command::Version { path, tx } => {
+                    let _ = tx.send(self.version(&path).await);
+                }
+                Command::SyncFile {
+                    source,
+                    destination,
+                    expected,
+                    monitor,
+                    tx,
+                } => {
+                    let result = self
+                        .sync_file(&source, &destination, expected, &monitor)
+                        .await;
+                    monitor.finish();
+                    let _ = tx.send(result);
                 }
             }
         }
@@ -445,7 +657,11 @@ impl Worker {
         &mut self,
         sources: Vec<PathBuf>,
         destination_dir: PathBuf,
+        monitor: &TransferMonitor,
     ) -> FileResult<TransferSummary> {
+        monitor.ensure_active()?;
+        let totals = measure_local_paths(&sources)?;
+        monitor.set_totals(totals.bytes, totals.files, totals.directories);
         let mut summary = TransferSummary {
             files: 0,
             directories: 0,
@@ -459,11 +675,11 @@ impl Worker {
             match self {
                 Self::Local => {
                     reject_recursive_local_copy(&source, &destination)?;
-                    copy_local_recursive(&source, &destination, &mut summary)?
+                    copy_local_recursive_tracked(&source, &destination, &mut summary, monitor)?
                 }
                 Self::Sftp(remote) => {
                     remote
-                        .upload_recursive(&source, &destination, &mut summary)
+                        .upload_recursive(&source, &destination, &mut summary, monitor)
                         .await?
                 }
             }
@@ -475,7 +691,9 @@ impl Worker {
         &mut self,
         source: PathBuf,
         destination: PathBuf,
+        monitor: &TransferMonitor,
     ) -> FileResult<TransferSummary> {
+        monitor.ensure_active()?;
         let mut summary = TransferSummary {
             files: 0,
             directories: 0,
@@ -483,16 +701,60 @@ impl Worker {
         };
         match self {
             Self::Local => {
+                let totals = measure_local_paths(std::slice::from_ref(&source))?;
+                monitor.set_totals(totals.bytes, totals.files, totals.directories);
                 reject_recursive_local_copy(&source, &destination)?;
-                copy_local_recursive(&source, &destination, &mut summary)?
+                copy_local_recursive_tracked(&source, &destination, &mut summary, monitor)?
             }
             Self::Sftp(remote) => {
                 remote
-                    .download_recursive(&source, &destination, &mut summary)
+                    .download_recursive(&source, &destination, &mut summary, monitor)
                     .await?
             }
         }
         Ok(summary)
+    }
+
+    async fn version(&mut self, path: &Path) -> FileResult<FileVersion> {
+        match self {
+            Self::Local => fs::symlink_metadata(path)
+                .map(|metadata| file_version(&metadata))
+                .map_err(|error| FileError::operation("read metadata", path, error)),
+            Self::Sftp(remote) => remote.version(path).await,
+        }
+    }
+
+    async fn sync_file(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        expected: Option<FileVersion>,
+        monitor: &TransferMonitor,
+    ) -> FileResult<FileVersion> {
+        monitor.ensure_active()?;
+        let actual = self.version(destination).await?;
+        if expected.is_some_and(|expected| expected != actual) {
+            return Err(FileError::Conflict {
+                path: destination.to_string_lossy().into_owned(),
+            });
+        }
+        let source_metadata = fs::symlink_metadata(source)
+            .map_err(|error| FileError::operation("read upload source", source, error))?;
+        if !source_metadata.is_file() {
+            return Err(FileError::operation(
+                "sync file",
+                source,
+                "editor source is not a regular file",
+            ));
+        }
+        monitor.set_totals(source_metadata.len(), 1, 0);
+        monitor.set_current(destination);
+        match self {
+            Self::Local => sync_local_file(source, destination, monitor)?,
+            Self::Sftp(remote) => remote.sync_file(source, destination, monitor).await?,
+        }
+        monitor.finish_file();
+        self.version(destination).await
     }
 }
 
@@ -534,6 +796,14 @@ impl RemoteWorker {
         fs.canonicalize(path)
             .await
             .map_err(|error| FileError::operation("canonicalize", path, error))
+    }
+
+    async fn version(&mut self, path: &Path) -> FileResult<FileVersion> {
+        let mut fs = self.connect().await?.fs();
+        fs.symlink_metadata(path)
+            .await
+            .map(|metadata| remote_file_version(&metadata))
+            .map_err(|error| FileError::operation("read metadata", path, error))
     }
 
     async fn list_dir(&mut self, path: &Path, show_hidden: bool) -> FileResult<Vec<FileEntry>> {
@@ -632,9 +902,12 @@ impl RemoteWorker {
         source: &Path,
         destination: &Path,
         summary: &mut TransferSummary,
+        monitor: &TransferMonitor,
     ) -> FileResult<()> {
         let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
         while let Some((local, remote)) = pending.pop() {
+            monitor.ensure_active()?;
+            monitor.set_current(&remote);
             let metadata = fs::symlink_metadata(&local)
                 .map_err(|error| FileError::operation("read upload source", &local, error))?;
             if metadata.is_dir() {
@@ -649,6 +922,7 @@ impl RemoteWorker {
                     }
                 }
                 summary.add_directory();
+                monitor.finish_directory();
                 let mut children = fs::read_dir(&local)
                     .map_err(|error| FileError::operation("read upload directory", &local, error))?
                     .collect::<Result<Vec<_>, _>>()
@@ -660,8 +934,9 @@ impl RemoteWorker {
                     pending.push((child.path(), remote.join(child.file_name())));
                 }
             } else if metadata.is_file() {
-                self.upload_file(&local, &remote).await?;
+                self.upload_file(&local, &remote, monitor).await?;
                 summary.add_file(metadata.len());
+                monitor.finish_file();
             } else {
                 return Err(FileError::operation(
                     "upload",
@@ -673,32 +948,86 @@ impl RemoteWorker {
         Ok(())
     }
 
-    async fn upload_file(&mut self, source: &Path, destination: &Path) -> FileResult<()> {
+    async fn upload_file(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        monitor: &TransferMonitor,
+    ) -> FileResult<()> {
         let mut input = fs::File::open(source)
             .map_err(|error| FileError::operation("open upload source", source, error))?;
+        let temporary = transfer_temp_path(destination)?;
+        let existing_permissions = {
+            let mut remote_fs = self.connect().await?.fs();
+            remote_fs
+                .symlink_metadata(destination)
+                .await
+                .ok()
+                .and_then(|metadata| metadata.permissions())
+        };
         let mut output = self
             .connect()
             .await?
-            .create(destination)
+            .create(&temporary)
             .await
-            .map_err(|error| FileError::operation("create remote file", destination, error))?;
-        let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
-        loop {
-            let read = input
-                .read(&mut buffer)
-                .map_err(|error| FileError::operation("read upload source", source, error))?;
-            if read == 0 {
-                break;
+            .map_err(|error| FileError::operation("create remote file", &temporary, error))?;
+        let write_result = async {
+            let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
+            loop {
+                monitor.ensure_active()?;
+                let read = input
+                    .read(&mut buffer)
+                    .map_err(|error| FileError::operation("read upload source", source, error))?;
+                if read == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..read]).await.map_err(|error| {
+                    FileError::operation("write remote file", &temporary, error)
+                })?;
+                monitor.add_bytes(read as u64);
             }
             output
-                .write_all(&buffer[..read])
+                .close()
                 .await
-                .map_err(|error| FileError::operation("write remote file", destination, error))?;
+                .map_err(|error| FileError::operation("close remote file", &temporary, error))?;
+            monitor.ensure_active()
         }
-        output
-            .close()
-            .await
-            .map_err(|error| FileError::operation("close remote file", destination, error))
+        .await;
+        if let Err(error) = write_result {
+            let mut remote_fs = self.connect().await?.fs();
+            let _ = remote_fs.remove_file(&temporary).await;
+            return Err(error);
+        }
+
+        let mut remote_fs = self.connect().await?.fs();
+        if let Some(permissions) = existing_permissions
+            && let Err(error) = remote_fs.set_permissions(&temporary, permissions).await
+        {
+            let _ = remote_fs.remove_file(&temporary).await;
+            return Err(FileError::operation(
+                "preserve remote permissions",
+                &temporary,
+                error,
+            ));
+        }
+        if let Err(error) = remote_fs.rename(&temporary, destination).await {
+            let _ = remote_fs.remove_file(&temporary).await;
+            return Err(FileError::operation(
+                "replace remote file",
+                destination,
+                error,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn sync_file(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        monitor: &TransferMonitor,
+    ) -> FileResult<()> {
+        self.upload_file(source, destination, monitor).await
     }
 
     async fn download_recursive(
@@ -706,9 +1035,12 @@ impl RemoteWorker {
         source: &Path,
         destination: &Path,
         summary: &mut TransferSummary,
+        monitor: &TransferMonitor,
     ) -> FileResult<()> {
         let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
         while let Some((remote, local)) = pending.pop() {
+            monitor.ensure_active()?;
+            monitor.set_current(&remote);
             let mut remote_fs = self.connect().await?.fs();
             let metadata = remote_fs
                 .symlink_metadata(&remote)
@@ -720,13 +1052,15 @@ impl RemoteWorker {
                     FileError::operation("create download directory", &local, error)
                 })?;
                 summary.add_directory();
+                monitor.finish_directory();
                 let children = self.list_dir(&remote, true).await?;
                 for child in children.into_iter().rev() {
                     pending.push((child.path, local.join(child.name)));
                 }
             } else if kind == EntryKind::File {
-                self.download_file(&remote, &local).await?;
+                self.download_file(&remote, &local, monitor).await?;
                 summary.add_file(metadata.len().unwrap_or(0));
+                monitor.finish_file();
             } else {
                 return Err(FileError::operation(
                     "download",
@@ -738,36 +1072,61 @@ impl RemoteWorker {
         Ok(())
     }
 
-    async fn download_file(&mut self, source: &Path, destination: &Path) -> FileResult<()> {
+    async fn download_file(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        monitor: &TransferMonitor,
+    ) -> FileResult<()> {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 FileError::operation("create download directory", parent, error)
             })?;
         }
+        let temporary = transfer_temp_path(destination)?;
         let mut input = self
             .connect()
             .await?
             .open(source)
             .await
             .map_err(|error| FileError::operation("open remote file", source, error))?;
-        let mut output = fs::File::create(destination)
-            .map_err(|error| FileError::operation("create download file", destination, error))?;
-        loop {
-            let Some(bytes) = input
-                .read(TRANSFER_CHUNK_BYTES as u32, Default::default())
+        let mut output = fs::File::create(&temporary)
+            .map_err(|error| FileError::operation("create download file", &temporary, error))?;
+        let copy_result = async {
+            loop {
+                monitor.ensure_active()?;
+                let Some(bytes) = input
+                    .read(TRANSFER_CHUNK_BYTES as u32, Default::default())
+                    .await
+                    .map_err(|error| FileError::operation("read remote file", source, error))?
+                else {
+                    break;
+                };
+                output.write_all(&bytes).map_err(|error| {
+                    FileError::operation("write download file", &temporary, error)
+                })?;
+                monitor.add_bytes(bytes.len() as u64);
+            }
+            input
+                .close()
                 .await
-                .map_err(|error| FileError::operation("read remote file", source, error))?
-            else {
-                break;
-            };
-            output
-                .write_all(&bytes)
-                .map_err(|error| FileError::operation("write download file", destination, error))?;
+                .map_err(|error| FileError::operation("close remote file", source, error))?;
+            monitor.ensure_active()
         }
-        input
-            .close()
-            .await
-            .map_err(|error| FileError::operation("close remote file", source, error))
+        .await;
+        if let Err(error) = copy_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(FileError::operation(
+                "replace download file",
+                destination,
+                error,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -817,11 +1176,63 @@ fn local_file_entry(
     }
 }
 
+#[cfg(test)]
 fn copy_local_recursive(
     source: &Path,
     destination: &Path,
     summary: &mut TransferSummary,
 ) -> FileResult<()> {
+    copy_local_recursive_tracked(source, destination, summary, &TransferMonitor::new())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TransferTotals {
+    bytes: u64,
+    files: usize,
+    directories: usize,
+}
+
+fn measure_local_paths(paths: &[PathBuf]) -> FileResult<TransferTotals> {
+    let mut totals = TransferTotals::default();
+    let mut pending = paths.to_vec();
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| FileError::operation("read source metadata", &path, error))?;
+        if metadata.is_dir() {
+            totals.directories = totals.directories.saturating_add(1);
+            let entries = fs::read_dir(&path)
+                .map_err(|error| FileError::operation("read source directory", &path, error))?;
+            for entry in entries {
+                pending.push(
+                    entry
+                        .map_err(|error| {
+                            FileError::operation("read source directory", &path, error)
+                        })?
+                        .path(),
+                );
+            }
+        } else if metadata.is_file() {
+            totals.files = totals.files.saturating_add(1);
+            totals.bytes = totals.bytes.saturating_add(metadata.len());
+        } else {
+            return Err(FileError::operation(
+                "transfer",
+                &path,
+                "symbolic links and special files are not transferred",
+            ));
+        }
+    }
+    Ok(totals)
+}
+
+fn copy_local_recursive_tracked(
+    source: &Path,
+    destination: &Path,
+    summary: &mut TransferSummary,
+    monitor: &TransferMonitor,
+) -> FileResult<()> {
+    monitor.ensure_active()?;
+    monitor.set_current(destination);
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| FileError::operation("read source metadata", source, error))?;
     if metadata.is_dir() {
@@ -829,12 +1240,18 @@ fn copy_local_recursive(
             FileError::operation("create destination directory", destination, error)
         })?;
         summary.add_directory();
+        monitor.finish_directory();
         let read = fs::read_dir(source)
             .map_err(|error| FileError::operation("read source directory", source, error))?;
         for entry in read {
             let entry = entry
                 .map_err(|error| FileError::operation("read source directory", source, error))?;
-            copy_local_recursive(&entry.path(), &destination.join(entry.file_name()), summary)?;
+            copy_local_recursive_tracked(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                summary,
+                monitor,
+            )?;
         }
     } else if metadata.is_file() {
         if let Some(parent) = destination.parent() {
@@ -842,9 +1259,9 @@ fn copy_local_recursive(
                 FileError::operation("create destination directory", parent, error)
             })?;
         }
-        let bytes = fs::copy(source, destination)
-            .map_err(|error| FileError::operation("copy file", source, error))?;
+        let bytes = copy_local_file_tracked(source, destination, monitor)?;
         summary.add_file(bytes);
+        monitor.finish_file();
     } else {
         return Err(FileError::operation(
             "copy",
@@ -853,6 +1270,112 @@ fn copy_local_recursive(
         ));
     }
     Ok(())
+}
+
+fn copy_local_file_tracked(
+    source: &Path,
+    destination: &Path,
+    monitor: &TransferMonitor,
+) -> FileResult<u64> {
+    let mut input = fs::File::open(source)
+        .map_err(|error| FileError::operation("open copy source", source, error))?;
+    let temporary = transfer_temp_path(destination)?;
+    let mut output = fs::File::create(&temporary)
+        .map_err(|error| FileError::operation("create copy destination", &temporary, error))?;
+    let result = (|| {
+        let mut copied = 0_u64;
+        let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
+        loop {
+            monitor.ensure_active()?;
+            let read = input
+                .read(&mut buffer)
+                .map_err(|error| FileError::operation("read copy source", source, error))?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read]).map_err(|error| {
+                FileError::operation("write copy destination", &temporary, error)
+            })?;
+            copied = copied.saturating_add(read as u64);
+            monitor.add_bytes(read as u64);
+        }
+        output
+            .flush()
+            .map_err(|error| FileError::operation("flush copy destination", &temporary, error))?;
+        monitor.ensure_active()?;
+        Ok(copied)
+    })();
+    let copied = match result {
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(output);
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+
+    let permissions = fs::symlink_metadata(source)
+        .map_err(|error| FileError::operation("read source metadata", source, error))?
+        .permissions();
+    if let Err(error) = fs::set_permissions(&temporary, permissions) {
+        drop(output);
+        let _ = fs::remove_file(&temporary);
+        return Err(FileError::operation(
+            "preserve file permissions",
+            &temporary,
+            error,
+        ));
+    }
+    drop(output);
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(FileError::operation(
+            "replace copied file",
+            destination,
+            error,
+        ));
+    }
+    Ok(copied)
+}
+
+fn sync_local_file(source: &Path, destination: &Path, monitor: &TransferMonitor) -> FileResult<()> {
+    let destination_permissions = fs::symlink_metadata(destination)
+        .map_err(|error| FileError::operation("read destination metadata", destination, error))?
+        .permissions();
+    copy_local_file_tracked(source, destination, monitor)?;
+    fs::set_permissions(destination, destination_permissions).map_err(|error| {
+        FileError::operation("preserve destination permissions", destination, error)
+    })
+}
+
+fn transfer_temp_path(destination: &Path) -> FileResult<PathBuf> {
+    let name = destination.file_name().ok_or_else(|| {
+        FileError::operation(
+            "create transfer temporary file",
+            destination,
+            "destination has no file name",
+        )
+    })?;
+    let serial = TEMP_FILE_SERIAL.fetch_add(1, Ordering::Relaxed);
+    Ok(destination.with_file_name(format!(
+        ".{}.ocherdr-transfer-{}-{serial}",
+        name.to_string_lossy(),
+        std::process::id()
+    )))
+}
+
+fn file_version(metadata: &fs::Metadata) -> FileVersion {
+    FileVersion {
+        size: metadata.is_file().then_some(metadata.len()),
+        modified: metadata.modified().ok().and_then(system_time_seconds),
+    }
+}
+
+fn remote_file_version(metadata: &openssh_sftp_client::metadata::MetaData) -> FileVersion {
+    FileVersion {
+        size: metadata.len(),
+        modified: metadata.modified().map(|time| u64::from(time.into_raw())),
+    }
 }
 
 fn reject_recursive_local_copy(source: &Path, destination: &Path) -> FileResult<()> {
@@ -973,99 +1496,5 @@ fn remote_permissions_mode(permissions: openssh_sftp_client::metadata::Permissio
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names_are_single_safe_path_components() {
-        for invalid in ["", ".", "..", "a/b", "bad\0name"] {
-            assert!(validate_name(invalid).is_err(), "{invalid:?}");
-        }
-        for valid in ["main.rs", ".env", "资料"] {
-            assert!(validate_name(valid).is_ok(), "{valid:?}");
-        }
-    }
-
-    #[test]
-    fn local_listing_sorts_directories_first_and_filters_hidden() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("z.txt"), b"z").unwrap();
-        fs::write(temp.path().join("A.txt"), b"a").unwrap();
-        fs::write(temp.path().join(".secret"), b"x").unwrap();
-        fs::create_dir(temp.path().join("folder")).unwrap();
-
-        let entries = list_local_dir(temp.path(), false)
-            .map(|mut entries| {
-                sort_entries(&mut entries);
-                entries
-            })
-            .unwrap();
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["folder", "A.txt", "z.txt"]
-        );
-        assert_eq!(entries[0].kind, EntryKind::Directory);
-    }
-
-    #[test]
-    fn local_service_handles_repeated_navigation_requests() {
-        let temp = tempfile::tempdir().unwrap();
-        let nested = temp.path().join("nested");
-        fs::create_dir(&nested).unwrap();
-        fs::write(nested.join("file.txt"), b"contents").unwrap();
-        let service = FileService::new(BackendSpec::Local).unwrap();
-
-        let first = futures::executor::block_on(service.canonicalize(temp.path().into())).unwrap();
-        assert_eq!(
-            futures::executor::block_on(service.list_dir(first, false))
-                .unwrap()
-                .len(),
-            1
-        );
-        let second = futures::executor::block_on(service.canonicalize(nested)).unwrap();
-        assert_eq!(
-            futures::executor::block_on(service.list_dir(second, false))
-                .unwrap()
-                .first()
-                .map(|entry| entry.name.as_str()),
-            Some("file.txt")
-        );
-    }
-
-    #[test]
-    fn local_copy_preserves_a_directory_tree() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        fs::create_dir_all(source.join("nested")).unwrap();
-        fs::write(source.join("nested/data.txt"), b"payload").unwrap();
-        let mut summary = TransferSummary {
-            files: 0,
-            directories: 0,
-            bytes: 0,
-        };
-        copy_local_recursive(&source, &destination, &mut summary).unwrap();
-        assert_eq!(
-            fs::read(destination.join("nested/data.txt")).unwrap(),
-            b"payload"
-        );
-        assert_eq!(summary.files, 1);
-        assert_eq!(summary.directories, 2);
-        assert_eq!(summary.bytes, 7);
-    }
-
-    #[test]
-    fn local_copy_rejects_source_and_descendant_destinations() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(source.join("child")).unwrap();
-
-        assert!(reject_recursive_local_copy(&source, &source).is_err());
-        assert!(reject_recursive_local_copy(&source, &source.join("child/copy")).is_err());
-        assert!(reject_recursive_local_copy(&source, &temp.path().join("copy")).is_ok());
-    }
-}
+#[path = "tests.rs"]
+mod tests;

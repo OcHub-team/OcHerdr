@@ -35,8 +35,58 @@ pub(crate) enum FileBusyKind {
     Opening,
     Renaming,
     Removing,
-    Uploading,
-    Downloading,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileTransferKind {
+    Upload,
+    Download,
+    EditorSync,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FileTransferState {
+    Running,
+    Completed,
+    Cancelled,
+    Conflict,
+    Failed(String),
+}
+
+#[derive(Clone)]
+pub(crate) struct FileTransfer {
+    pub id: u64,
+    pub kind: FileTransferKind,
+    pub name: String,
+    pub detail: String,
+    pub progress: TransferProgress,
+    pub monitor: TransferMonitor,
+    pub state: FileTransferState,
+    pub reveal_path: Option<PathBuf>,
+}
+
+impl FileTransfer {
+    pub fn running(&self) -> bool {
+        self.state == FileTransferState::Running
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalFileRevision {
+    pub len: u64,
+    pub modified_nanos: u128,
+}
+
+pub(crate) struct RemoteEditSession {
+    pub name: String,
+    pub remote_path: PathBuf,
+    pub local_path: PathBuf,
+    pub expected_remote: FileVersion,
+    pub synced_revision: LocalFileRevision,
+    pub pending_revision: Option<LocalFileRevision>,
+    pub pending_since: Option<Instant>,
+    pub syncing: bool,
+    pub conflict: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,7 +99,6 @@ pub(crate) struct FilePanelState {
     pub open: bool,
     pub width: f32,
     pub show_hidden: bool,
-    pub pinned: bool,
     pub source: Option<FilePanelSource>,
     pub service: Option<FileService>,
     pub backend_kind: Option<FileBackendKind>,
@@ -75,6 +124,11 @@ pub(crate) struct FilePanelState {
     pub editor: Option<PathBuf>,
     pub editor_temp_dir: Option<tempfile::TempDir>,
     pub editor_open_serial: u64,
+    pub transfers_open: bool,
+    pub transfers: Vec<FileTransfer>,
+    pub next_transfer_id: u64,
+    pub editor_sessions: HashMap<u64, RemoteEditSession>,
+    pub editor_watch_tasks: HashMap<u64, Task<()>>,
 }
 
 impl FilePanelState {
@@ -83,7 +137,6 @@ impl FilePanelState {
             open,
             width: width.clamp(FILE_PANEL_MIN_WIDTH, FILE_PANEL_MAX_WIDTH),
             show_hidden,
-            pinned: false,
             source: None,
             service: None,
             backend_kind: None,
@@ -109,6 +162,11 @@ impl FilePanelState {
             editor,
             editor_temp_dir: None,
             editor_open_serial: 0,
+            transfers_open: false,
+            transfers: Vec::new(),
+            next_transfer_id: 0,
+            editor_sessions: HashMap::new(),
+            editor_watch_tasks: HashMap::new(),
         }
     }
 

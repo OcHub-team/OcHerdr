@@ -62,7 +62,10 @@ impl OcHerdrView {
                 !matches!(self.file_panel.prompt, FilePanelPrompt::None),
                 |panel| panel.child(self.render_file_panel_prompt(cx)),
             )
-            .child(self.render_file_tree(drop_hint, cx));
+            .child(self.render_file_tree(drop_hint, cx))
+            .when(self.file_panel.transfers_open, |panel| {
+                panel.child(self.render_file_transfers(cx))
+            });
         if overlay {
             panel = panel
                 .absolute()
@@ -74,9 +77,8 @@ impl OcHerdrView {
         panel.into_any_element()
     }
 
-    fn render_file_panel_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_file_panel_header(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
-        let pinned = self.file_panel.pinned;
         let backend = match self.file_panel.backend_kind {
             Some(FileBackendKind::Sftp) => i18n.text(k::FILES_BACKEND_REMOTE),
             Some(FileBackendKind::Local) | None => i18n.text(k::FILES_BACKEND_LOCAL),
@@ -108,42 +110,18 @@ impl OcHerdrView {
                     )
                     .child(div().text_xs().text_color(theme::muted()).child(backend)),
             )
-            .child(
-                button(
-                    "file-panel-pin",
-                    if pinned {
-                        i18n.text(k::FILES_FOLLOW)
-                    } else {
-                        i18n.text(k::FILES_PIN)
-                    },
-                    if pinned {
-                        ButtonTone::Primary
-                    } else {
-                        ButtonTone::Ghost
-                    },
-                    ButtonSize::Sm,
-                )
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.toggle_file_panel_pin(cx);
-                })),
-            )
-            .child(icon_action_tooltip(
-                "close-file-panel-tooltip",
-                i18n.text(k::COMMON_CLOSE),
-                icon_only_button_tone(
-                    "close-file-panel",
-                    i18n.text(k::COMMON_CLOSE),
-                    IconName::Close,
-                    ButtonTone::Ghost,
-                    ButtonSize::Sm,
-                )
-                .on_click(cx.listener(|this, _, _window, cx| this.close_file_panel(cx))),
-            ))
     }
 
     fn render_file_panel_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let i18n = self.i18n;
         let show_hidden = self.file_panel.show_hidden;
+        let transfers_open = self.file_panel.transfers_open;
+        let active_transfers = self
+            .file_panel
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.running())
+            .count();
         div()
             .id("file-panel-toolbar")
             .role(ochub_ui::gpui::Role::Toolbar)
@@ -161,6 +139,48 @@ impl OcHerdrView {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .child(
+                        div()
+                            .relative()
+                            .child(icon_action_tooltip(
+                                "file-transfers-tooltip",
+                                i18n.text(k::FILES_TRANSFERS),
+                                icon_only_button_tone(
+                                    "file-transfers",
+                                    i18n.text(k::FILES_TRANSFERS),
+                                    IconName::Archive,
+                                    if transfers_open {
+                                        ButtonTone::Primary
+                                    } else {
+                                        ButtonTone::Ghost
+                                    },
+                                    ButtonSize::Sm,
+                                )
+                                .debug_selector(|| "file-transfers".into())
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| {
+                                        this.toggle_file_transfers(cx);
+                                    },
+                                )),
+                            ))
+                            .when(active_transfers > 0, |badge| {
+                                badge.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(-2.))
+                                        .top(px(-2.))
+                                        .min_w(px(14.))
+                                        .h(px(14.))
+                                        .px(px(3.))
+                                        .rounded(px(7.))
+                                        .bg(theme::accent())
+                                        .text_color(theme::accent_text())
+                                        .text_size(px(9.))
+                                        .text_center()
+                                        .child(active_transfers.to_string()),
+                                )
+                            }),
+                    )
                     .child(icon_action_tooltip(
                         "file-new-file-tooltip",
                         i18n.text(k::FILES_NEW_FILE),
@@ -665,6 +685,7 @@ impl OcHerdrView {
                 .children(rows.into_iter().enumerate().map(|(index, row)| {
                     let entry = row.entry.clone();
                     let context_entry = entry.clone();
+                    let drop_destination = entry.path.clone();
                     let is_selected = selected.as_ref() == Some(&entry.path);
                     let expanded = row.expanded;
                     let size = entry.size.map(human_file_size);
@@ -707,6 +728,27 @@ impl OcHerdrView {
                             theme::surface().alpha(0.)
                         })
                         .hover(|style| style.bg(theme::surface_hover()).text_color(theme::text()))
+                        .when(entry.kind == EntryKind::Directory, |file_row| {
+                            file_row
+                                .can_drop(|value, _, _| {
+                                    value.downcast_ref::<ExternalPaths>().is_some()
+                                })
+                                .drag_over::<ExternalPaths>(|style, _, _, _| {
+                                    style
+                                        .bg(theme::accent().alpha(0.14))
+                                        .text_color(theme::text())
+                                })
+                                .on_drop(cx.listener(
+                                    move |this, paths: &ExternalPaths, _window, cx| {
+                                        this.file_panel_upload_paths_to(
+                                            paths.paths().to_vec(),
+                                            drop_destination.clone(),
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    },
+                                ))
+                        })
                         .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
                             this.activate_file_entry(entry.clone(), event.click_count() >= 2, cx);
                         }))
@@ -775,6 +817,224 @@ impl OcHerdrView {
                     .opacity(0.)
                     .group_drag_over::<ExternalPaths>("file-panel-drop", |style| style.opacity(1.))
                     .child(drop_hint),
+            )
+    }
+
+    fn render_file_transfers(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
+        let transfers = self.file_panel.transfers.clone();
+        let has_finished = transfers.iter().any(|transfer| !transfer.running());
+        div()
+            .id("file-transfer-drawer")
+            .debug_selector(|| "file-transfer-drawer".to_owned())
+            .flex()
+            .flex_col()
+            .flex_none()
+            .max_h(px(220.))
+            .border_t_1()
+            .border_color(theme::border())
+            .bg(theme::sidebar_background())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(34.))
+                    .flex_none()
+                    .px_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(i18n.text(k::FILES_TRANSFERS)),
+                    )
+                    .when(has_finished, |header| {
+                        header.child(
+                            button(
+                                "file-transfers-clear",
+                                i18n.text(k::FILES_TRANSFERS_CLEAR),
+                                ButtonTone::Ghost,
+                                ButtonSize::Sm,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _window, cx| {
+                                    this.clear_finished_file_transfers(cx);
+                                },
+                            )),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("file-transfer-list")
+                    .flex()
+                    .flex_col()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(transfers.is_empty(), |list| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .pb_3()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(i18n.text(k::FILES_TRANSFERS_EMPTY)),
+                        )
+                    })
+                    .children(transfers.into_iter().rev().map(|transfer| {
+                        let transfer_id = transfer.id;
+                        let state_color = match &transfer.state {
+                            FileTransferState::Completed => theme::green(),
+                            FileTransferState::Failed(_) | FileTransferState::Conflict => {
+                                theme::red()
+                            }
+                            FileTransferState::Cancelled => theme::muted(),
+                            FileTransferState::Running => theme::accent(),
+                        };
+                        let kind = match transfer.kind {
+                            FileTransferKind::Upload => i18n.text(k::FILES_TRANSFER_UPLOAD),
+                            FileTransferKind::Download => i18n.text(k::FILES_TRANSFER_DOWNLOAD),
+                            FileTransferKind::EditorSync => i18n.text(k::FILES_TRANSFER_SYNC),
+                        };
+                        let state = match &transfer.state {
+                            FileTransferState::Running => i18n.text(k::FILES_TRANSFER_RUNNING),
+                            FileTransferState::Completed => i18n.text(k::FILES_TRANSFER_COMPLETED),
+                            FileTransferState::Cancelled => i18n.text(k::FILES_TRANSFER_CANCELLED),
+                            FileTransferState::Conflict => i18n.text(k::FILES_TRANSFER_CONFLICT),
+                            FileTransferState::Failed(_) => i18n.text(k::FILES_TRANSFER_FAILED),
+                        };
+                        let ratio = transfer
+                            .progress
+                            .total_bytes
+                            .filter(|total| *total > 0)
+                            .map(|total| {
+                                (transfer.progress.bytes_transferred as f32 / total as f32)
+                                    .clamp(0., 1.)
+                            });
+                        let progress = transfer_progress_label(&transfer.progress, i18n);
+                        let failure = match &transfer.state {
+                            FileTransferState::Failed(error) => Some(error.clone()),
+                            FileTransferState::Conflict => {
+                                Some(i18n.text(k::FILES_EDITOR_CONFLICT).to_owned())
+                            }
+                            _ => None,
+                        };
+                        div()
+                            .id(("file-transfer-row", transfer_id as usize))
+                            .debug_selector(move || format!("file-transfer-row-{transfer_id}"))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .px_3()
+                            .py_2()
+                            .border_t_1()
+                            .border_color(theme::border().alpha(0.65))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(theme::text())
+                                                    .child(transfer.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(10.))
+                                                    .text_color(theme::muted())
+                                                    .child(format!(
+                                                        "{kind} · {state} · {progress}"
+                                                    )),
+                                            ),
+                                    )
+                                    .child(if transfer.running() {
+                                        icon_only_button_tone(
+                                            ("file-transfer-cancel", transfer_id as usize),
+                                            i18n.text(k::FILES_TRANSFER_CANCEL),
+                                            IconName::Close,
+                                            ButtonTone::Ghost,
+                                            ButtonSize::Sm,
+                                        )
+                                        .on_click(cx.listener(move |this, _, _window, cx| {
+                                            this.cancel_file_transfer(transfer_id, cx);
+                                        }))
+                                        .into_any_element()
+                                    } else if transfer.reveal_path.is_some()
+                                        && transfer.state == FileTransferState::Completed
+                                    {
+                                        icon_only_button_tone(
+                                            ("file-transfer-reveal", transfer_id as usize),
+                                            i18n.text(k::FILES_TRANSFER_REVEAL),
+                                            IconName::Folder,
+                                            ButtonTone::Ghost,
+                                            ButtonSize::Sm,
+                                        )
+                                        .on_click(cx.listener(move |this, _, _window, cx| {
+                                            this.reveal_file_transfer(transfer_id, cx);
+                                        }))
+                                        .into_any_element()
+                                    } else {
+                                        icon(
+                                            if transfer.state == FileTransferState::Completed {
+                                                IconName::Check
+                                            } else {
+                                                IconName::Diamond
+                                            },
+                                            state_color,
+                                            12.,
+                                        )
+                                        .into_any_element()
+                                    }),
+                            )
+                            .when(transfer.running(), |row| {
+                                row.child(
+                                    div()
+                                        .relative()
+                                        .h(px(2.))
+                                        .w_full()
+                                        .rounded(px(1.))
+                                        .bg(theme::border())
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .top_0()
+                                                .bottom_0()
+                                                .w(relative(ratio.unwrap_or(0.28)))
+                                                .rounded(px(1.))
+                                                .bg(theme::accent()),
+                                        ),
+                                )
+                            })
+                            .when_some(failure, |row, failure| {
+                                row.child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(theme::red())
+                                        .whitespace_normal()
+                                        .child(failure),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.))
+                                    .text_color(theme::muted())
+                                    .child(transfer.detail.clone()),
+                            )
+                    })),
             )
     }
 
@@ -862,11 +1122,20 @@ impl OcHerdrView {
         items.push(
             context_menu_item(
                 "file-menu-download",
-                i18n.text(k::FILES_DOWNLOAD),
+                if self.file_panel.backend_kind == Some(FileBackendKind::Sftp) {
+                    if menu.entry.kind.is_directory() {
+                        i18n.text(k::FILES_DOWNLOAD_FOLDER)
+                    } else {
+                        i18n.text(k::FILES_DOWNLOAD_FILE)
+                    }
+                } else {
+                    i18n.text(k::FILES_COPY_TO)
+                },
                 None::<&str>,
                 Some(IconName::Archive),
                 false,
             )
+            .debug_selector(|| "file-menu-download".into())
             .on_click(cx.listener(|this, _, _window, cx| {
                 this.close_context_menu(cx);
                 this.choose_file_panel_download(cx);
@@ -982,4 +1251,20 @@ fn file_editor_name(path: &Path) -> String {
         .or_else(|| path.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn transfer_progress_label(progress: &TransferProgress, i18n: I18n) -> String {
+    match progress.total_bytes {
+        Some(total) if total > 0 => crate::tf!(
+            i18n,
+            k::FILES_TRANSFER_PROGRESS,
+            transferred = human_file_size(progress.bytes_transferred),
+            total = human_file_size(total)
+        ),
+        _ => crate::tf!(
+            i18n,
+            k::FILES_TRANSFER_PROGRESS_UNKNOWN,
+            transferred = human_file_size(progress.bytes_transferred)
+        ),
+    }
 }

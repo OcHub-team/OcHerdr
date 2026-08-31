@@ -27,7 +27,8 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - macOS shortcuts plus Herdr's `Ctrl+B` prefix workflow;
 - local clipboard image paste with `Cmd+V`, plus SSH-host paste with `Cmd+V` or `Ctrl+V`;
 - a dockable right-side file manager for local workspaces and SSH hosts over SFTP,
-  with typed paths, drag-and-drop transfer, contextual actions, and external-editor handoff;
+  with typed paths, drag-and-drop transfer, progress and cancellation, contextual actions,
+  and safe external-editor synchronization;
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
 - runtime internationalization with system-language detection, English, and Simplified Chinese;
 - an Open TUI handoff for Herdr settings through the toolbar;
@@ -110,9 +111,15 @@ toolbar opens the connection manager. `Cmd+W` is for panes, not hosts.
 In the file panel, single-click selects, double-click opens a folder or hands a file
 to the configured external editor, and right-click exposes transfer, path, rename,
 and delete actions. The system-associated app is the default; **Choose editor…** in
-the file menu can persist a `.app` or executable. Remote files are downloaded into an
-OcHerdr-owned temporary directory as read-only copies and are removed when OcHerdr exits.
-Download a remote file before editing it so changes are not lost.
+the file menu can persist a `.app` or executable. Drop local files or folders onto the
+file tree (or a specific folder row) to upload them. The transfer drawer reports byte
+progress, completion, failures, and cancellation, while the download action can save a
+remote file or directory anywhere on the Mac.
+
+Remote files opened in an editor use a writable OcHerdr-owned temporary copy. Stable
+saves are uploaded automatically with an observed-version check and a temporary-file
+replacement, so a remote change pauses synchronization instead of being overwritten.
+These editor copies are removed when OcHerdr exits.
 
 With an image-only or file-backed image clipboard (including PixPin and Finder),
 `Cmd+V` stays native for local panes. For an SSH pane, either `Cmd+V` or `Ctrl+V`

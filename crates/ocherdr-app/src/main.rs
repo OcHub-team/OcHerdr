@@ -14,7 +14,10 @@ use ocherdr_core::{
     predict_swap, rebuild_tree, reorder_insert_index, split_ratio_from_drag, split_rect,
     valid_split_ratio,
 };
-use ocherdr_files::{BackendKind as FileBackendKind, FileEntry, FileService};
+use ocherdr_files::{
+    BackendKind as FileBackendKind, FileEntry, FileService, FileVersion, TransferMonitor,
+    TransferProgress,
+};
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, MAX_CLIPBOARD_IMAGE_BYTES, SessionConnection,
     TerminalCommand, TerminalMode, TerminalScrollDirection, TerminalSession, attach_command,

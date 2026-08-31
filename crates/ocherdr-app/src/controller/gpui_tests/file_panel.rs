@@ -1,4 +1,5 @@
 use super::*;
+use gpui::{ExternalPaths, FileDropEvent};
 use ocherdr_core::WorkspaceWorktreeInfo;
 use ocherdr_files::{BackendKind, BackendSpec, EntryKind, FileEntry, FileService};
 
@@ -10,6 +11,9 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
     std::fs::write(&file_path, b"hello\nworld\n").unwrap();
     let nested = root.join("src");
     std::fs::create_dir(&nested).unwrap();
+    let upload_source = tempfile::tempdir().unwrap();
+    let dropped_file = upload_source.path().join("dropped.txt");
+    std::fs::write(&dropped_file, b"dragged contents").unwrap();
 
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
@@ -76,6 +80,15 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
         "the file tree reaches the bottom without a persistent status subtitle"
     );
     assert!(cx.debug_bounds("file-selected-actions").is_none());
+    assert!(
+        cx.debug_bounds("file-panel-pin").is_none(),
+        "the title bar no longer exposes pinning"
+    );
+    assert!(
+        cx.debug_bounds("close-file-panel").is_none(),
+        "the global file toggle is the only close control"
+    );
+    assert!(cx.debug_bounds("file-transfers").is_some());
 
     let file_row = cx.debug_bounds("file-row-0").expect("file row");
     cx.simulate_mouse_down(
@@ -92,9 +105,50 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
     });
     assert!(cx.debug_bounds("file-menu-open").is_some());
     assert!(cx.debug_bounds("file-menu-choose-editor").is_some());
+    assert!(cx.debug_bounds("file-menu-download").is_some());
 
     view.update(cx, |this, cx| this.close_context_menu(cx));
     cx.run_until_parked();
+
+    let transfers = cx
+        .debug_bounds("file-transfers")
+        .expect("transfer history toggle");
+    cx.simulate_click(transfers.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("file-transfer-drawer").is_some());
+    cx.simulate_click(transfers.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("file-transfer-drawer").is_none());
+
+    let drop_position = cx
+        .debug_bounds("file-tree-scroll")
+        .expect("file drop surface")
+        .center();
+    cx.simulate_event(FileDropEvent::Entered {
+        position: drop_position,
+        paths: ExternalPaths([dropped_file.clone()].into_iter().collect()),
+    });
+    cx.simulate_event(FileDropEvent::Submit {
+        position: drop_position,
+    });
+    for _ in 0..20 {
+        cx.run_until_parked();
+        if root.join("dropped.txt").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read(root.join("dropped.txt")).unwrap(),
+        b"dragged contents"
+    );
+    view.read_with(cx, |this, _| {
+        assert!(this.file_panel.transfers.iter().any(|transfer| {
+            transfer.name == "dropped.txt" && transfer.state == crate::FileTransferState::Completed
+        }));
+    });
 
     let edit_address = cx
         .debug_bounds("file-address-edit")
@@ -196,4 +250,76 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
         narrow_panel.origin.x < main_right,
         "a narrow window overlays the terminal instead of resizing it"
     );
+}
+
+#[gpui::test]
+fn remote_editor_save_is_debounced_and_uploaded(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.txt");
+    let local = temp.path().join("editor-copy.txt");
+    std::fs::write(&remote, b"original").unwrap();
+    std::fs::write(&local, b"original").unwrap();
+    let service = FileService::new(BackendSpec::Local).unwrap();
+    let expected = futures::executor::block_on(service.version(remote.clone())).unwrap();
+    let initial_metadata = std::fs::metadata(&local).unwrap();
+    let initial_revision = crate::LocalFileRevision {
+        len: initial_metadata.len(),
+        modified_nanos: initial_metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    };
+    std::fs::write(&local, b"saved in editor").unwrap();
+    let saved_metadata = std::fs::metadata(&local).unwrap();
+    let saved_revision = crate::LocalFileRevision {
+        len: saved_metadata.len(),
+        modified_nanos: saved_metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    };
+
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, cx| {
+        this.file_panel.editor_sessions.insert(
+            1,
+            crate::RemoteEditSession {
+                name: "remote.txt".into(),
+                remote_path: remote.clone(),
+                local_path: local.clone(),
+                expected_remote: expected,
+                synced_revision: initial_revision,
+                pending_revision: Some(saved_revision),
+                pending_since: Some(Instant::now() - Duration::from_secs(1)),
+                syncing: false,
+                conflict: false,
+            },
+        );
+        this.watch_remote_editor(1, service.clone(), cx);
+    });
+
+    cx.executor().advance_clock(Duration::from_millis(350));
+    for _ in 0..20 {
+        cx.run_until_parked();
+        if std::fs::read(&remote).is_ok_and(|contents| contents == b"saved in editor") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read(&remote).unwrap(), b"saved in editor");
+    view.read_with(cx, |this, _| {
+        let session = this.file_panel.editor_sessions.get(&1).unwrap();
+        assert_eq!(session.synced_revision, saved_revision);
+        assert!(!session.syncing);
+        assert!(!session.conflict);
+        assert!(this.file_panel.transfers.iter().any(|transfer| {
+            transfer.kind == crate::FileTransferKind::EditorSync
+                && transfer.state == crate::FileTransferState::Completed
+        }));
+    });
 }
