@@ -1112,7 +1112,9 @@ fn bind_enter_submit<T: 'static>(
 }
 
 /// Adds a discoverable hover label to a compact icon action. Deferred paint
-/// keeps the tooltip above terminal textures and other later siblings.
+/// keeps the tooltip above terminal textures and other later siblings. The
+/// label stays pointer-transparent so an invisible tooltip cannot mask nearby
+/// controls before it is shown.
 fn icon_action_tooltip(
     group: &'static str,
     label: impl Into<SharedString>,
@@ -1147,7 +1149,6 @@ fn icon_action_tooltip(
                             .text_xs()
                             .text_color(theme::text())
                             .whitespace_normal()
-                            .occlude()
                             .child(label),
                     ),
             )

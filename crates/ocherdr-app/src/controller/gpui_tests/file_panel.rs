@@ -69,7 +69,12 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
         wide_panel.origin.x,
         "a wide window reserves layout width for the docked panel"
     );
-    assert!(cx.debug_bounds("file-tree-scroll").is_some());
+    let file_tree = cx.debug_bounds("file-tree-scroll").expect("file tree");
+    assert_eq!(
+        file_tree.origin.y + file_tree.size.height,
+        wide_panel.origin.y + wide_panel.size.height,
+        "the file tree reaches the bottom without a persistent status subtitle"
+    );
     assert!(cx.debug_bounds("file-selected-actions").is_none());
 
     let file_row = cx.debug_bounds("file-row-0").expect("file row");
@@ -95,6 +100,60 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
         .debug_bounds("file-address-edit")
         .expect("editable file-panel path");
     assert!(edit_address.size.width > gpui::px(0.));
+    let parent = root.parent().unwrap().to_path_buf();
+    let up = cx.debug_bounds("file-up").expect("parent-directory button");
+    let generation = view.read_with(cx, |this, _| this.file_panel.generation);
+    cx.simulate_click(up.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.file_panel.generation > generation,
+            "the parent-directory button must navigate up"
+        );
+    });
+    view.update(cx, |this, cx| {
+        this.file_panel.root_task = None;
+        this.file_panel.root = Some(parent.clone());
+        this.file_panel.expanded.insert(parent.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let root_crumb = cx
+        .debug_bounds("file-crumb-0")
+        .expect("root breadcrumb segment");
+    let generation = view.read_with(cx, |this, _| this.file_panel.generation);
+    cx.simulate_click(root_crumb.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.file_panel.generation > generation,
+            "a breadcrumb click must start navigation"
+        );
+    });
+    view.update(cx, |this, cx| {
+        this.file_panel.root_task = None;
+        this.file_panel.root = Some(std::path::PathBuf::from("/"));
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let edit_address = cx
+        .debug_bounds("file-address-edit")
+        .expect("editable file-panel path");
+    cx.simulate_click(edit_address.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.file_panel.address_editing,
+            "the path edit button must enter address-editing mode"
+        );
+    });
+    view.update_in(cx, |this, window, cx| {
+        this.cancel_file_panel_address(window, cx)
+    });
+    cx.run_until_parked();
+
     view.update_in(cx, |this, window, cx| {
         let event = gpui::KeyDownEvent {
             keystroke: gpui::Keystroke {

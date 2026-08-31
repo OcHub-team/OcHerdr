@@ -62,8 +62,7 @@ impl OcHerdrView {
                 !matches!(self.file_panel.prompt, FilePanelPrompt::None),
                 |panel| panel.child(self.render_file_panel_prompt(cx)),
             )
-            .child(self.render_file_tree(drop_hint, cx))
-            .child(self.render_file_panel_status());
+            .child(self.render_file_tree(drop_hint, cx));
         if overlay {
             panel = panel
                 .absolute()
@@ -352,6 +351,7 @@ impl OcHerdrView {
                     ButtonTone::Ghost,
                     ButtonSize::Sm,
                 )
+                .debug_selector(|| "file-up".into())
                 .opacity(if has_parent { 1. } else { 0.35 })
                 .when(has_parent, |button| {
                     button.on_click(cx.listener(|this, _, _window, cx| {
@@ -382,6 +382,7 @@ impl OcHerdrView {
                                 elements.push(
                                     div()
                                         .id(("file-crumb", index))
+                                        .debug_selector(move || format!("file-crumb-{index}"))
                                         .flex_none()
                                         .max_w(px(112.))
                                         .truncate()
@@ -775,37 +776,6 @@ impl OcHerdrView {
                     .group_drag_over::<ExternalPaths>("file-panel-drop", |style| style.opacity(1.))
                     .child(drop_hint),
             )
-    }
-
-    fn render_file_panel_status(&self) -> impl IntoElement {
-        let busy = self.file_panel.busy.map(|busy| match busy {
-            FileBusyKind::Creating => self.i18n.text(k::FILES_BUSY_CREATING),
-            FileBusyKind::Opening => self.i18n.text(k::FILES_BUSY_OPENING),
-            FileBusyKind::Renaming => self.i18n.text(k::FILES_BUSY_RENAMING),
-            FileBusyKind::Removing => self.i18n.text(k::FILES_BUSY_REMOVING),
-            FileBusyKind::Uploading => self.i18n.text(k::FILES_BUSY_UPLOADING),
-            FileBusyKind::Downloading => self.i18n.text(k::FILES_BUSY_DOWNLOADING),
-        });
-        let text = busy
-            .map(str::to_owned)
-            .or_else(|| self.file_panel.status.clone())
-            .unwrap_or_default();
-        div()
-            .flex()
-            .items_center()
-            .h(px(24.))
-            .flex_none()
-            .gap_2()
-            .px_3()
-            .border_t_1()
-            .border_color(theme::border())
-            .bg(theme::sidebar_background())
-            .text_xs()
-            .text_color(theme::muted())
-            .when(busy.is_some(), |status| {
-                status.child(spinner(theme::muted(), 10.))
-            })
-            .child(div().min_w_0().truncate().child(text))
     }
 
     pub(super) fn render_file_context_menu(
