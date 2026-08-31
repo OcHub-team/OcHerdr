@@ -239,9 +239,11 @@ fn file_panel_docks_wide_and_overlays_the_terminal_when_narrow(cx: &mut TestAppC
     cx.run_until_parked();
 
     view.update_in(cx, |this, window, cx| {
+        let mut modifiers = app_primary_modifiers();
+        modifiers.shift = !cfg!(target_os = "macos");
         let event = gpui::KeyDownEvent {
             keystroke: gpui::Keystroke {
-                modifiers: app_primary_modifiers(),
+                modifiers,
                 key: "l".into(),
                 key_char: Some("l".into()),
             },
