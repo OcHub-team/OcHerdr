@@ -83,8 +83,6 @@ gpui::actions!(ocherdr, [Quit, CheckForUpdates]);
 const SIDEBAR_WIDTH: f32 = 252.;
 const HEADER_HEIGHT: f32 = 46.;
 const TAB_PILL_HEIGHT: f32 = 28.;
-/// Gutter left of the first tab; `pl_3` in the strip's own units.
-const TAB_STRIP_LEAD_INSET: f32 = 12.;
 const STATUS_BAR_HEIGHT: f32 = 28.;
 const PANE_HEADER_HEIGHT: f32 = 26.;
 const SPLIT_HANDLE_HIT_PX: f32 = 10.;

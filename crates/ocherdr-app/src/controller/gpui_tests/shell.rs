@@ -72,12 +72,11 @@ fn overflowing_tab_bar_scrolls_horizontally_with_the_wheel(cx: &mut TestAppConte
     );
 }
 
-/// The strip's move areas are laid out as full-height siblings of the
-/// controls, so "empty strip space" is exactly what they cover: the gutter
-/// before the first tab and everything between `+` and the toolbar. A press
-/// there reaches no tab, so selection and the reorder machinery stay put.
+/// Tabs start flush with the content area's left edge. Everything between `+`
+/// and the toolbar remains a full-height move area, so a press there reaches
+/// no tab and leaves selection and reordering untouched.
 #[gpui::test]
-fn empty_tab_strip_space_is_a_full_height_window_move_area(cx: &mut TestAppContext) {
+fn tabs_are_flush_left_and_trailing_space_moves_the_window(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);
     view.update(cx, |this, cx| {
         this.snapshot = Some(three_tab_snapshot());
@@ -92,21 +91,17 @@ fn empty_tab_strip_space_is_a_full_height_window_move_area(cx: &mut TestAppConte
     cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(500.)));
     cx.run_until_parked();
 
-    let lead = cx
-        .debug_bounds("tab-strip-lead")
-        .expect("leading move area");
+    let bar = cx.debug_bounds("tab-bar").expect("tab bar");
     let space = cx
         .debug_bounds("tab-strip-space")
         .expect("trailing move area");
     let first = cx.debug_bounds("tab-t-a").expect("first tab");
     let last = cx.debug_bounds("tab-t-c").expect("last tab");
     // The strip's content box: its height minus the 1px bottom border.
-    assert_eq!(lead.size.height, gpui::px(HEADER_HEIGHT - 1.));
     assert_eq!(space.size.height, gpui::px(HEADER_HEIGHT - 1.));
-    assert_eq!(lead.size.width, gpui::px(TAB_STRIP_LEAD_INSET));
-    assert!(
-        lead.origin.x + lead.size.width <= first.origin.x,
-        "the gutter ends where the first tab starts: {lead:?} vs {first:?}"
+    assert_eq!(
+        first.origin.x, bar.origin.x,
+        "the first tab is flush with the left edge: {bar:?} vs {first:?}"
     );
     assert!(
         space.origin.x > last.origin.x + last.size.width,
@@ -118,7 +113,7 @@ fn empty_tab_strip_space_is_a_full_height_window_move_area(cx: &mut TestAppConte
     );
     for tab in ["tab-t-a", "tab-t-b", "tab-t-c"] {
         let bounds = cx.debug_bounds(tab).unwrap();
-        assert!(!bounds.intersects(&space) && !bounds.intersects(&lead));
+        assert!(!bounds.intersects(&space));
     }
     // The press itself cannot be simulated: the test platform's
     // `start_window_move` is `unimplemented!()`.

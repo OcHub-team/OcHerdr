@@ -479,12 +479,6 @@ impl OcHerdrView {
             .border_b_1()
             .border_color(theme::border())
             .bg(theme::sidebar_background())
-            // The strip's leading inset is a move area rather than padding so
-            // the gutter left of the first tab also drags the window.
-            .child(
-                self.window_move_area("tab-strip-lead", cx)
-                    .w(px(TAB_STRIP_LEAD_INSET)),
-            )
             .child(
                 apply_list(div().id(chrome.tabs.id), &chrome.tabs)
                     .flex()

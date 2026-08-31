@@ -30,7 +30,7 @@ use crate::{
     AgentOutputState, AgentPromptPhase, AppearanceSettings, CachedHostHealth, EventStreamState,
     HEADER_HEIGHT, HostHealthView, I18n, Language, OcHerdrView, PendingListReorder, ReorderList,
     Settings, TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_GAP, TAB_PREVIEW_HEIGHT,
-    TAB_PREVIEW_WIDTH, TAB_STRIP_LEAD_INSET, install_appearance, reorder_projection,
+    TAB_PREVIEW_WIDTH, install_appearance, reorder_projection,
 };
 
 use creation::{
