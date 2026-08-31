@@ -1205,10 +1205,7 @@ impl OcHerdrView {
             cx.notify();
             return;
         }
-        let opened = Command::new("open")
-            .arg(&path)
-            .status()
-            .is_ok_and(|status| status.success());
+        let opened = open_path_with_system(&path);
         self.appearance_ui.status = if opened {
             None
         } else {
@@ -1238,6 +1235,19 @@ impl OcHerdrView {
     fn select_row_state(&self, id: &str) -> SelectRowState {
         SelectRowState::new(false, self.open_select.as_deref() == Some(id))
     }
+}
+
+fn open_path_with_system(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = Command::new("explorer.exe");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(path)
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 mod support;

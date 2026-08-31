@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+#[cfg(windows)]
+use std::os::windows::net::UnixListener;
 
 #[test]
 fn quotes_remote_arguments_without_shell_injection() {
@@ -316,7 +320,7 @@ fn unknown_event_types_are_unknown_and_broken_payloads_error() {
 fn connect_returns_err_when_subscribe_is_rejected() {
     let directory = tempfile::TempDir::new().unwrap();
     let socket_path = directory.path().join("api.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = UnixListener::bind(&socket_path).unwrap();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut line = String::new();
@@ -349,7 +353,7 @@ fn connect_returns_err_when_subscribe_is_rejected() {
 fn session_subscribe_sends_only_session_wide_types() {
     let directory = tempfile::TempDir::new().unwrap();
     let socket_path = directory.path().join("api.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = UnixListener::bind(&socket_path).unwrap();
     let (request_tx, request_rx) = mpsc::channel();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -391,7 +395,7 @@ fn session_subscribe_sends_only_session_wide_types() {
 fn agent_status_subscribe_sends_only_parameterized_pane_entries() {
     let directory = tempfile::TempDir::new().unwrap();
     let socket_path = directory.path().join("api.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = UnixListener::bind(&socket_path).unwrap();
     let (request_tx, request_rx) = mpsc::channel();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -432,7 +436,7 @@ fn agent_status_subscribe_sends_only_parameterized_pane_entries() {
 fn request_socket_times_out_when_the_server_never_replies() {
     let directory = tempfile::TempDir::new().unwrap();
     let socket_path = directory.path().join("api.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = UnixListener::bind(&socket_path).unwrap();
     let (held_tx, held_rx) = mpsc::channel();
     thread::spawn(move || {
         held_tx.send(listener.accept().unwrap().0).unwrap();
@@ -452,7 +456,7 @@ fn request_socket_times_out_when_the_server_never_replies() {
 fn request_socket_returns_the_result_when_the_server_replies() {
     let directory = tempfile::TempDir::new().unwrap();
     let socket_path = directory.path().join("api.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = UnixListener::bind(&socket_path).unwrap();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut line = String::new();

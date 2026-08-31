@@ -3,7 +3,10 @@
 //! The rest of OcHerdr must not depend on a versioned wire enum. Adding a future
 //! protocol is intentionally confined to this module plus a new `private_vXX` schema.
 
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use std::os::windows::net::UnixStream;
 use std::time::Duration;
 
 use crate::private_v20 as v20;
@@ -303,7 +306,10 @@ fn protocol_error(error: v20::FramingError) -> HerdrError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    #[cfg(windows)]
+    use std::os::windows::net::UnixListener;
     use std::thread;
 
     #[test]

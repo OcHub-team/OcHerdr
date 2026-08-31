@@ -1,12 +1,16 @@
 //! Installed monospaced families for the appearance font picker.
 
 use std::collections::BTreeSet;
-use std::ffi::c_void;
 use std::sync::OnceLock;
 
+#[cfg(target_os = "macos")]
 use core_foundation::array::CFArray;
+#[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
+#[cfg(target_os = "macos")]
 use core_foundation::string::CFString;
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 
 const MONO_NEEDLES: &[&str] = &[
     "andale",
@@ -60,6 +64,7 @@ const MONO_NEEDLES: &[&str] = &[
     "victor",
 ];
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreText", kind = "framework")]
 unsafe extern "C" {
     fn CTFontManagerCopyAvailableFontFamilyNames() -> *const c_void;
@@ -86,6 +91,7 @@ fn discover() -> Vec<String> {
     families.into_iter().collect()
 }
 
+#[cfg(target_os = "macos")]
 fn installed_family_names() -> Vec<String> {
     unsafe {
         let array_ref = CTFontManagerCopyAvailableFontFamilyNames();
@@ -104,6 +110,34 @@ fn installed_family_names() -> Vec<String> {
         }
         names
     }
+}
+
+#[cfg(target_os = "windows")]
+fn installed_family_names() -> Vec<String> {
+    [
+        "Cascadia Code",
+        "Cascadia Mono",
+        "Consolas",
+        "Courier New",
+        "JetBrains Mono",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn installed_family_names() -> Vec<String> {
+    [
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "Noto Sans Mono",
+        "Ubuntu Mono",
+        "JetBrains Mono",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 #[cfg(test)]

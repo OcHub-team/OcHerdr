@@ -5,12 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A native macOS GUI client for Herdr"
+description = "A native cross-platform GUI client for Herdr"
 
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
-core-foundation = "0.10"
 dirs.workspace = true
 futures.workspace = true
 gpui.workspace = true
@@ -29,6 +28,9 @@ serde_json.workspace = true
 sys-locale.workspace = true
 tempfile.workspace = true
 url.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
 
 [[bin]]
 name = "ocherdr"

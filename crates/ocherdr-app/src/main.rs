@@ -35,12 +35,17 @@ use ochub_ui::gpui::{
     ClipboardEntry, ClipboardItem, Context, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding,
     KeyDownEvent, Keystroke, Menu, MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Render, ScrollDelta, ScrollHandle,
+    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, SharedString, Task, TextOverflow, TextRun, TitlebarOptions, UTF16Selection,
     WeakEntity, Window, WindowAppearance, WindowBounds, WindowOptions, anchored, canvas, deferred,
     div, ease_out_quint, linear_color_stop, linear_gradient, point, prelude::*, px, relative, size,
-    surface,
 };
+#[cfg(not(target_os = "macos"))]
+use ochub_ui::gpui::{
+    FontStyle, FontWeight as GpuiFontWeight, StyledText, UnderlineStyle, font, rgba,
+};
+#[cfg(target_os = "macos")]
+use ochub_ui::gpui::{ObjectFit, surface};
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
 use ochub_ui::text_input::TextInput;
@@ -146,6 +151,28 @@ const CORNER_PANEL: f32 = 10.;
 const CORNER_CONTROL: f32 = 7.;
 const CORNER_COMPACT: f32 = 5.;
 
+#[cfg(target_os = "macos")]
+const PRIMARY_SHORTCUT_SYMBOL: &str = "⌘";
+#[cfg(not(target_os = "macos"))]
+const PRIMARY_SHORTCUT_SYMBOL: &str = "Ctrl+";
+
+fn primary_modifier(modifiers: ochub_ui::gpui::Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    return modifiers.platform;
+    #[cfg(not(target_os = "macos"))]
+    return modifiers.control;
+}
+
+fn only_primary_modifier(modifiers: ochub_ui::gpui::Modifiers) -> bool {
+    primary_modifier(modifiers)
+        && !modifiers.alt
+        && if cfg!(target_os = "macos") {
+            !modifiers.control
+        } else {
+            !modifiers.platform
+        }
+}
+
 struct OcHerdrAssets;
 
 impl AssetSource for OcHerdrAssets {
@@ -169,6 +196,93 @@ struct TabPreviewCard {
     title: SharedString,
     panes: Vec<TabPreviewPane>,
     waiting: SharedString,
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_frame_element(
+    frame: RenderedFrame,
+    frozen_size: Option<(f32, f32)>,
+) -> ochub_ui::gpui::AnyElement {
+    let surface = surface(frame.pixel_buffer)
+        .with_frame_lifetime(frame.lifetime)
+        .object_fit(ObjectFit::Contain);
+    match frozen_size {
+        Some((width, height)) => surface
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(px(width))
+            .h(px(height))
+            .into_any_element(),
+        None => surface.w_full().h_full().into_any_element(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn terminal_frame_element(
+    frame: RenderedFrame,
+    frozen_size: Option<(f32, f32)>,
+) -> ochub_ui::gpui::AnyElement {
+    let font_family = SharedString::from(frame.font_family.to_string());
+    let line_height = frame.cell_height_px.max(1) as f32;
+    let rows = frame.lines.iter().map(|line| {
+        let runs = line
+            .runs
+            .iter()
+            .map(|run| {
+                let mut terminal_font = font(font_family.clone());
+                terminal_font.weight = if run.bold {
+                    GpuiFontWeight::BOLD
+                } else {
+                    GpuiFontWeight::NORMAL
+                };
+                terminal_font.style = if run.italic {
+                    FontStyle::Italic
+                } else {
+                    FontStyle::Normal
+                };
+                let mut color = ochub_ui::gpui::Hsla::from(rgba((run.foreground << 8) | 0xff));
+                if run.dim {
+                    color = color.alpha(0.6);
+                }
+                TextRun {
+                    len: run.len,
+                    font: terminal_font,
+                    color,
+                    background_color: Some(rgba((run.background << 8) | 0xff).into()),
+                    underline: run.underline.then_some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: None,
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        div()
+            .h(px(line_height))
+            .line_height(px(line_height))
+            .whitespace_nowrap()
+            .child(StyledText::new(line.text.clone()).with_runs(runs))
+    });
+    let content = div()
+        .size_full()
+        .overflow_hidden()
+        .pl(px(frame.padding_x as f32))
+        .pt(px(frame.padding_y as f32))
+        .text_size(px(frame.font_size as f32))
+        .font_family(font_family)
+        .children(rows);
+    match frozen_size {
+        Some((width, height)) => content
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(px(width))
+            .h(px(height))
+            .into_any_element(),
+        None => content.into_any_element(),
+    }
 }
 
 impl TabPreviewCard {
@@ -202,12 +316,7 @@ impl TabPreviewCard {
                             .border_color(theme::border_strong())
                             .bg(theme::current().bg.rgba())
                             .when_some(pane.frame.clone(), |pane, frame| {
-                                pane.child(
-                                    surface(frame.pixel_buffer)
-                                        .with_frame_lifetime(frame.lifetime)
-                                        .object_fit(ObjectFit::Contain)
-                                        .size_full(),
-                                )
+                                pane.child(terminal_frame_element(frame, None))
                             })
                             .when(pane.frame.is_none(), |pane| {
                                 pane.child(

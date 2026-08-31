@@ -9,7 +9,10 @@ mod private_v20;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use std::os::windows::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -173,7 +176,7 @@ fn probe_ssh(profile: &ConnectionProfile) -> Result<()> {
     else {
         return Ok(());
     };
-    let mut command = Command::new("/usr/bin/ssh");
+    let mut command = Command::new(system_ssh());
     add_ssh_common(&mut command, destination, *port, identity_file.as_deref());
     let output = command
         .arg("--")
@@ -290,7 +293,7 @@ fn command_for(profile: &ConnectionProfile, args: &[&str]) -> Result<Command> {
             herdr_path,
             ..
         } => {
-            let mut command = Command::new("/usr/bin/ssh");
+            let mut command = Command::new(system_ssh());
             add_ssh_common(&mut command, destination, *port, identity_file.as_deref());
             let remote = remote_herdr_command(herdr_path, args);
             command.arg("--").arg(remote);
@@ -591,22 +594,36 @@ impl SshTunnel {
         remote_api_socket: &Path,
         remote_client_socket: &Path,
     ) -> Result<Self> {
+        #[cfg(target_os = "windows")]
+        let temporary_root = std::env::temp_dir();
+        #[cfg(not(target_os = "windows"))]
+        let temporary_root = PathBuf::from("/tmp");
         let directory = tempfile::Builder::new()
             .prefix("ocherdr-")
-            .tempdir_in("/tmp")?;
+            .tempdir_in(temporary_root)?;
         let local_api_socket = directory.path().join("api.sock");
         let local_client_socket = directory.path().join("client.sock");
+        #[cfg(target_os = "windows")]
+        let local_api_forward = Path::new("api.sock");
+        #[cfg(not(target_os = "windows"))]
+        let local_api_forward = local_api_socket.as_path();
+        #[cfg(target_os = "windows")]
+        let local_client_forward = Path::new("client.sock");
+        #[cfg(not(target_os = "windows"))]
+        let local_client_forward = local_client_socket.as_path();
         let api_forwarding = format!(
             "{}:{}",
-            local_api_socket.display(),
+            local_api_forward.display(),
             remote_api_socket.display()
         );
         let client_forwarding = format!(
             "{}:{}",
-            local_client_socket.display(),
+            local_client_forward.display(),
             remote_client_socket.display()
         );
         let mut command = ssh_tunnel_command(profile, &api_forwarding, &client_forwarding)?;
+        #[cfg(target_os = "windows")]
+        command.current_dir(directory.path());
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -663,7 +680,7 @@ fn ssh_tunnel_command(
             "SSH tunnel requires an SSH profile".into(),
         ));
     };
-    let mut command = Command::new("/usr/bin/ssh");
+    let mut command = Command::new(system_ssh());
     command
         .args(["-N", "-T", "-o", "BatchMode=yes"])
         .args(["-o", "ConnectTimeout=8", "-o", "ExitOnForwardFailure=yes"])
@@ -685,6 +702,13 @@ fn ssh_tunnel_command(
     }
     command.arg(destination);
     Ok(command)
+}
+
+fn system_ssh() -> &'static str {
+    #[cfg(target_os = "windows")]
+    return "ssh.exe";
+    #[cfg(not(target_os = "windows"))]
+    return "/usr/bin/ssh";
 }
 
 impl Drop for SshTunnel {
@@ -1299,10 +1323,39 @@ pub fn open_system_terminal(command: &str) -> Result<()> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn open_system_terminal(_command: &str) -> Result<()> {
+#[cfg(target_os = "windows")]
+pub fn open_system_terminal(command: &str) -> Result<()> {
+    Command::new("wt.exe")
+        .args(["powershell.exe", "-NoExit", "-Command", command])
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| HerdrError::Command(format!("failed to open Windows Terminal: {error}")))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn open_system_terminal(command: &str) -> Result<()> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let script = format!("{command}; exec {}", posix_quote(&shell));
+    let candidates: &[(&str, &[&str])] = &[
+        ("x-terminal-emulator", &["-e", "sh", "-lc"]),
+        ("gnome-terminal", &["--", "sh", "-lc"]),
+        ("konsole", &["-e", "sh", "-lc"]),
+        ("kitty", &["sh", "-lc"]),
+        ("xterm", &["-e", "sh", "-lc"]),
+    ];
+    for (program, arguments) in candidates {
+        match Command::new(program).args(*arguments).arg(&script).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(HerdrError::Command(format!(
+                    "failed to open {program}: {error}"
+                )));
+            }
+        }
+    }
     Err(HerdrError::Command(
-        "opening the system terminal is currently supported on macOS only".into(),
+        "no supported terminal emulator was found".into(),
     ))
 }
 

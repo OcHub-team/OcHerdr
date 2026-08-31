@@ -28,7 +28,7 @@
 "files.open_folder" = "打开文件夹"
 "files.panel" = "文件"
 "files.parent" = "上级文件夹"
-"files.path.edit" = "输入路径（⌘L）"
+"files.path.edit" = "输入路径"
 "files.path.empty" = "请输入目录路径。"
 "files.path.go" = "前往"
 "files.path.home_unavailable" = "无法获取用户主目录。"

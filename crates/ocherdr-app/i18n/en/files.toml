@@ -28,7 +28,7 @@
 "files.open_folder" = "Open folder"
 "files.panel" = "Files"
 "files.parent" = "Parent folder"
-"files.path.edit" = "Enter a path (⌘L)"
+"files.path.edit" = "Enter a path"
 "files.path.empty" = "Enter a directory path."
 "files.path.go" = "Go"
 "files.path.home_unavailable" = "The home directory is unavailable."

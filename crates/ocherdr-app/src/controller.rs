@@ -712,5 +712,5 @@ impl OcHerdrView {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod gpui_tests;

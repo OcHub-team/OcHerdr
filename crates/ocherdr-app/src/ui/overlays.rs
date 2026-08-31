@@ -375,7 +375,11 @@ impl OcHerdrView {
                     context_menu_item(
                         "tab-menu-new",
                         i18n.text(k::TERMINAL_NEW_TAB),
-                        Some("⌘T"),
+                        Some(if cfg!(target_os = "macos") {
+                            "⌘T"
+                        } else {
+                            "Ctrl+Shift+T"
+                        }),
                         Some(IconName::Add),
                         false,
                     )
@@ -436,7 +440,11 @@ impl OcHerdrView {
                     context_menu_item(
                         "pane-menu-copy",
                         i18n.text(k::COMMON_COPY),
-                        Some("⌘C"),
+                        Some(if cfg!(target_os = "macos") {
+                            "⌘C"
+                        } else {
+                            "Ctrl+Shift+C"
+                        }),
                         Some(IconName::Copy),
                         false,
                     )
@@ -542,7 +550,11 @@ impl OcHerdrView {
                     context_menu_item(
                         "pane-menu-close",
                         i18n.text(k::TERMINAL_CLOSE_PANE),
-                        Some("⌘W"),
+                        Some(if cfg!(target_os = "macos") {
+                            "⌘W"
+                        } else {
+                            "Ctrl+Shift+W"
+                        }),
                         Some(IconName::Close),
                         true,
                     )

@@ -8,11 +8,16 @@ repository.workspace = true
 build = "build.rs"
 
 [dependencies]
+futures.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-video = "0.5.2"
-futures.workspace = true
 io-surface = "0.16"
-thiserror.workspace = true
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+vt100.workspace = true
 
 [build-dependencies]
 bindgen = "0.72"

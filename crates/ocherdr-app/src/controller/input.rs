@@ -413,12 +413,13 @@ impl OcHerdrView {
                 return true;
             }
         }
-        if modifiers.platform && !modifiers.alt && !modifiers.control {
+        if only_primary_modifier(modifiers) {
             if let Some(number) = tab_index_from_keystroke(key, event.keystroke.key_char.as_deref())
             {
                 self.select_tab_number(number, cx);
                 return true;
             }
+            #[cfg(target_os = "macos")]
             let handled = match (key, modifiers.shift) {
                 ("t", false) => {
                     self.create_tab(cx);
@@ -465,6 +466,52 @@ impl OcHerdrView {
                     true
                 }
                 ("]", false) => {
+                    self.cycle_tab(1, cx);
+                    true
+                }
+                _ => false,
+            };
+            #[cfg(not(target_os = "macos"))]
+            let handled = match (key, modifiers.shift) {
+                ("t", true) => {
+                    self.create_tab(cx);
+                    true
+                }
+                ("w", true) => {
+                    if let Some(target) = self.cmd_w_close_target() {
+                        self.request_close(target, cx);
+                    }
+                    true
+                }
+                ("n", true) => {
+                    self.create_workspace(cx);
+                    true
+                }
+                ("e", true) => {
+                    self.toggle_file_panel(cx);
+                    true
+                }
+                ("l", true) if self.file_panel.open => {
+                    self.open_file_panel_address(window, cx);
+                    true
+                }
+                (",", false) => {
+                    self.open_appearance(cx);
+                    true
+                }
+                ("c", true) => {
+                    self.copy_selection(cx);
+                    true
+                }
+                ("a", true) => {
+                    self.select_all_visible(cx);
+                    true
+                }
+                ("[", true) => {
+                    self.cycle_tab(-1, cx);
+                    true
+                }
+                ("]", true) => {
                     self.cycle_tab(1, cx);
                     true
                 }

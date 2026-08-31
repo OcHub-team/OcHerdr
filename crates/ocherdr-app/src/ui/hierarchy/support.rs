@@ -30,7 +30,9 @@ pub(super) fn tab_key_equivalent(index: usize, tab_count: usize) -> Option<Strin
         return None;
     }
     let number = index + 1;
-    (1..=9).contains(&number).then(|| format!("⌘{number}"))
+    (1..=9)
+        .contains(&number)
+        .then(|| format!("{PRIMARY_SHORTCUT_SYMBOL}{number}"))
 }
 
 pub(super) fn section_label(id: &'static str, label: &'static str) -> impl IntoElement {

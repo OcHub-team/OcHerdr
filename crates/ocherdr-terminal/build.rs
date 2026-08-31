@@ -5,10 +5,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GHOSTTYKIT_XCFRAMEWORK");
 
     let target = env::var("TARGET").expect("Cargo must provide TARGET");
-    assert!(
-        target.ends_with("apple-darwin"),
-        "OcHerdr's native Ghostty renderer currently supports macOS only: {target}"
-    );
+    if !target.ends_with("apple-darwin") {
+        // Linux and Windows use the portable VT renderer and do not link
+        // GhosttyKit. Keeping this build script silent avoids requiring
+        // Apple SDKs or the macOS-only XCFramework on those runners.
+        return;
+    }
 
     let crate_directory = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("Cargo must provide CARGO_MANIFEST_DIR"),

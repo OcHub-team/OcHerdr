@@ -5,7 +5,23 @@
 //! protect an automatic installer from a compromised release account because
 //! the attacker could replace both files. The independent minisign key does.
 
+#[cfg(target_os = "macos")]
 mod macos;
+
+#[cfg(not(target_os = "macos"))]
+mod macos {
+    use std::path::PathBuf;
+
+    use anyhow::{Result, bail};
+
+    pub(super) fn running_bundle() -> Option<PathBuf> {
+        None
+    }
+
+    pub(super) fn apply(_payload: &[u8], _version: &str) -> Result<PathBuf> {
+        bail!("当前平台请通过系统安装包更新 OcHerdr")
+    }
+}
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -362,11 +378,23 @@ fn validate_download_url(value: &str) -> Result<()> {
 }
 
 fn current_target_key() -> &'static str {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     return "darwin-aarch64";
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     return "darwin-x86_64";
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return "linux-x86_64";
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return "linux-aarch64";
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    return "windows-x86_64";
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
     return "unsupported";
 }
 
@@ -400,10 +428,17 @@ pub(crate) fn open_release_page(url: &str) -> Result<()> {
     if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
         bail!("发布页 URL 不受信任");
     }
-    let status = Command::new("/usr/bin/open")
-        .arg(url)
-        .status()
-        .context("无法启动浏览器")?;
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("/usr/bin/open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "start", ""]);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    let status = command.arg(url).status().context("无法启动浏览器")?;
     if !status.success() {
         bail!("浏览器启动命令返回 {status}");
     }

@@ -301,19 +301,7 @@ pub(super) fn render_pane(
                             .size_full(),
                         )
                         .when_some(frame, |container, frame| {
-                            let surface = surface(frame.pixel_buffer)
-                                .with_frame_lifetime(frame.lifetime)
-                                .object_fit(ObjectFit::Contain);
-                            container.child(match frozen {
-                                Some((fw, fh)) => surface
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .w(px(fw))
-                                    .h(px(fh))
-                                    .into_any_element(),
-                                None => surface.w_full().h_full().into_any_element(),
-                            })
+                            container.child(terminal_frame_element(frame, frozen))
                         })
                         .when(waiting_for_frame, |container| {
                             container.child(
@@ -397,13 +385,7 @@ pub(super) fn pane_preview_card(
                         .w_full()
                         .overflow_hidden()
                         .when_some(frame, |body, frame| {
-                            body.child(
-                                surface(frame.pixel_buffer)
-                                    .with_frame_lifetime(frame.lifetime)
-                                    .object_fit(ObjectFit::Contain)
-                                    .w_full()
-                                    .h_full(),
-                            )
+                            body.child(terminal_frame_element(frame, None))
                         }),
                 ),
         )

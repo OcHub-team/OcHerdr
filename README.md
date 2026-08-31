@@ -1,6 +1,6 @@
 # OcHerdr
 
-OcHerdr is a native macOS client for [Herdr](https://herdr.dev). It presents Herdr's
+OcHerdr is a native macOS, Linux, and Windows client for [Herdr](https://herdr.dev). It presents Herdr's
 `Session → Workspace → Tab → Pane` model as a connection-aware desktop workspace,
 while Herdr remains the owner of PTYs, processes, persistence, layouts, and agent state.
 
@@ -10,12 +10,12 @@ OcHerdr is intentionally a client, not another multiplexer:
 - local and remote sessions share the same typed model;
 - remote transport uses the system OpenSSH client and SSH config;
 - terminal frames and input use a versioned facade over Herdr's private client protocol;
-- ANSI state, font shaping, colors, images, and terminal rendering use native Ghostty Metal;
+- terminal rendering uses Ghostty Metal on macOS and a portable styled VT renderer on Linux and Windows;
 - application controls come from [`ochub-ui`](https://github.com/OcHub-team/ochub-ui).
 
 ## Status
 
-The repository currently targets macOS and Herdr `0.8.1+`. The first milestone includes:
+The repository targets macOS, Linux, Windows, and Herdr `0.8.1+`. The first milestone includes:
 
 - local and SSH-host session discovery;
 - an in-app host center for filtering, organizing, diagnosing, and switching SSH hosts;
@@ -24,8 +24,8 @@ The repository currently targets macOS and Herdr `0.8.1+`. The first milestone i
 - read-only observation of untouched panes, with a bounded cache of hidden tab surfaces;
 - workspace/tab creation, rename, close, and pane operations through the public API;
 - native context menus for workspace, tab, and pane actions;
-- macOS shortcuts plus Herdr's `Ctrl+B` prefix workflow;
-- local clipboard image paste with `Cmd+V`, plus SSH-host paste with `Cmd+V` or `Ctrl+V`;
+- platform-native shortcuts plus Herdr's `Ctrl+B` prefix workflow;
+- local clipboard image paste, plus SSH-host paste through the platform clipboard shortcut;
 - a dockable right-side file manager for local workspaces and SSH hosts over SFTP,
   with typed paths, drag-and-drop transfer, progress and cancellation, contextual actions,
   and safe external-editor synchronization;
@@ -40,28 +40,28 @@ or private keys. Unknown protocol versions fail closed with an upgrade error.
 
 ## Requirements
 
-- macOS 14 or newer
+- macOS 14 or newer, a current x86_64 Linux desktop, or Windows 10/11 x86_64
 - Rust 1.97.1 (selected by `rust-toolchain.toml`)
-- Xcode Command Line Tools
+- Xcode Command Line Tools on macOS; standard Wayland/X11 development libraries on Linux
 - Herdr 0.8.1 or newer
 
 ## Install
 
-Published builds can be installed and upgraded through the OcHub Homebrew tap:
+macOS builds can be installed and upgraded through the OcHub Homebrew tap:
 
 ```sh
 brew tap OcHub-team/tap
 brew install --cask ocherdr
 ```
 
-The same release DMGs are available from
+DMGs, a Windows installer, Linux AppImage and Debian package, and portable archives are available from
 [GitHub Releases](https://github.com/OcHub-team/OcHerdr/releases). OcHerdr checks for a
 new signed release once per day and also exposes **OcHerdr → Check for Updates…**.
-Application replacement is offered only when both the updater minisign signature and
+On macOS, application replacement is offered only when both the updater minisign signature and
 the macOS Developer ID signature are valid; ad-hoc-signed releases, source builds, and
 binaries launched outside an app bundle fall back to the release page.
 
-Install the pinned GhosttyKit artifact once before the first build:
+On macOS, install the pinned GhosttyKit artifact once before the first build:
 
 ```sh
 ./scripts/bootstrap-ghosttykit.sh
@@ -101,12 +101,15 @@ Authentication and host-key enrollment remain with OpenSSH and the system Termin
 
 ## Keyboard
 
-OcHerdr supports `Cmd+T` (new tab), `Cmd+W` (close pane; last pane in a tab
+On macOS, OcHerdr supports `Cmd+T` (new tab), `Cmd+W` (close pane; last pane in a tab
 closes the tab), `Cmd+Shift+W` (close workspace), `Cmd+Shift+N` (new workspace),
 `Cmd+1…9` (switch tab), `Ctrl+Tab` (cycle tabs), `Cmd+Shift+E` (toggle files),
 `Cmd+L` (enter a path while the file panel is open), `F2` (rename), and `Cmd+,`
 (open OcHerdr appearance settings). Click the status-bar host to switch machines; `Hosts` in the
-toolbar opens the connection manager. `Cmd+W` is for panes, not hosts.
+toolbar opens the connection manager. `Cmd+W` is for panes, not hosts. On Linux and
+Windows, terminal-safe desktop equivalents use `Ctrl+Shift` (for example
+`Ctrl+Shift+T`, `Ctrl+Shift+W`, `Ctrl+Shift+C`, and `Ctrl+Shift+L`) so `Ctrl+C`,
+`Ctrl+W`, and `Ctrl+L` still reach the shell.
 
 In the file panel, single-click selects, double-click opens a folder or hands a file
 to the configured external editor, and right-click exposes transfer, path, rename,
@@ -141,9 +144,9 @@ to open Herdr settings in Terminal.
 | `ocherdr-core` | Connection/session hierarchy, layout snapshots, compatibility model |
 | `ocherdr-files` | Unified local/SFTP filesystem operations and recursive transfers |
 | `ocherdr-herdr` | Public JSON socket, dual-socket OpenSSH tunnel, and versioned terminal protocol codecs |
-| `ocherdr-terminal` | GhosttyKit runtime, leased IOSurface frames, and native input encoding |
+| `ocherdr-terminal` | GhosttyKit/Metal renderer on macOS and portable styled VT renderer on Linux/Windows |
 
-GhosttyKit is pinned and checksum-verified by `scripts/bootstrap-ghosttykit.sh`. GPUI
+On macOS, GhosttyKit is pinned and checksum-verified by `scripts/bootstrap-ghosttykit.sh`. GPUI
 is pinned to OcHerdr's leased-BGRA surface extension in the OcHub-team Zed fork. The
 surface path keeps Ghostty's frame lease alive through Metal completion and samples
 the leased BGRA IOSurface as sRGB.

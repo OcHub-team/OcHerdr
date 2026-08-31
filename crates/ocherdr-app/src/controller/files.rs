@@ -1321,10 +1321,8 @@ impl OcHerdrView {
         let modifiers = event.keystroke.modifiers;
         if self.file_panel.open
             && event.keystroke.key == "l"
-            && modifiers.platform
-            && !modifiers.alt
-            && !modifiers.control
-            && !modifiers.shift
+            && only_primary_modifier(modifiers)
+            && modifiers.shift == !cfg!(target_os = "macos")
         {
             self.open_file_panel_address(window, cx);
             return true;
