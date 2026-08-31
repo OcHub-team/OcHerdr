@@ -432,6 +432,7 @@ impl FakeHerdr {
     }
 
     /// Lossless payloads of every private-protocol `Input` for one pane.
+    #[cfg(target_os = "macos")]
     fn terminal_inputs(&self, pane_id: &str) -> Vec<Vec<u8>> {
         self.terminal_commands
             .lock()
@@ -448,6 +449,7 @@ impl FakeHerdr {
             .collect()
     }
 
+    #[cfg(target_os = "macos")]
     fn terminal_images(&self, pane_id: &str) -> Vec<(String, Vec<u8>)> {
         self.terminal_commands
             .lock()
