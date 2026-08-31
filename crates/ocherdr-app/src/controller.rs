@@ -56,7 +56,7 @@ fn preferred_session_index(
 }
 
 impl OcHerdrView {
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "windows")))]
     pub(super) fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_with(
             crate::config::LoadedApp {

@@ -731,7 +731,7 @@ impl OcHerdrView {
 
     /// Forward whatever Ghostty has queued for every pane's pty. Tests call
     /// this in place of the frame and event polls that do it in production.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "windows")))]
     pub(crate) fn pump_terminal_input(&mut self) {
         if let Some(session) = self.session_panes.as_mut() {
             for runtime in session.panes.values_mut() {
