@@ -74,7 +74,9 @@ impl Render for OcHerdrView {
                     cx.stop_propagation();
                     return;
                 }
-                if !key_goes_to_terminal(&this.overlay) {
+                if !key_goes_to_terminal(&this.overlay)
+                    || this.file_panel_input_focused(window, cx)
+                {
                     return;
                 }
                 // #terminal-surface also calls send_key. Duplicate dispatch is
@@ -84,8 +86,10 @@ impl Render for OcHerdrView {
             .on_action(cx.listener(
                 |this, _: &CheckForUpdates, _window, cx| this.open_update_dialog(cx),
             ))
-            .on_key_up(cx.listener(|this, event, _window, cx| {
-                if key_goes_to_terminal(&this.overlay) {
+            .on_key_up(cx.listener(|this, event, window, cx| {
+                if key_goes_to_terminal(&this.overlay)
+                    && !this.file_panel_input_focused(window, cx)
+                {
                     this.send_key_release(event, cx);
                 }
             }))

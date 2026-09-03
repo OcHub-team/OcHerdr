@@ -4,6 +4,46 @@ use ocherdr_core::WorkspaceWorktreeInfo;
 use ocherdr_files::{BackendKind, BackendSpec, EntryKind, FileEntry, FileService};
 
 #[gpui::test]
+#[cfg(target_os = "macos")]
+fn focused_file_path_input_keeps_text_out_of_the_terminal(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(three_tab_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+
+    view.update(cx, |this, cx| {
+        this.file_panel.open = true;
+        this.file_panel.service = Some(FileService::new(BackendSpec::Local).unwrap());
+        this.file_panel.backend_kind = Some(BackendKind::Local);
+        this.file_panel.root = Some(std::path::PathBuf::from("/tmp"));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.update_in(cx, |this, window, cx| {
+        this.open_file_panel_address(window, cx);
+    });
+    cx.run_until_parked();
+    let initial_path = view.read_with(cx, |this, cx| {
+        this.file_path_input.read(cx).content().to_owned()
+    });
+
+    cx.simulate_input("/typed-path");
+    cx.run_until_parked();
+    view.update(cx, |this, _| this.pump_terminal_input());
+
+    view.read_with(cx, |this, cx| {
+        assert_eq!(
+            this.file_path_input.read(cx).content(),
+            format!("{initial_path}/typed-path")
+        );
+    });
+    assert!(
+        fake.terminal_inputs("p-a").is_empty(),
+        "typing in the file path input must never reach the terminal"
+    );
+}
+
+#[gpui::test]
 fn file_panel_tree_scrolls_when_rows_overflow(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

@@ -1339,6 +1339,15 @@ impl OcHerdrView {
         }
         false
     }
+
+    /// File-panel inputs live beside the terminal while no modal overlay is
+    /// active. The root keyboard handler must therefore use focus, rather
+    /// than overlay state alone, before forwarding a key to Ghostty.
+    pub(crate) fn file_panel_input_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+        [&self.file_path_input, &self.file_name_input]
+            .into_iter()
+            .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
