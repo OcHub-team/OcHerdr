@@ -31,6 +31,7 @@ The repository targets macOS, Linux, Windows, and Herdr `0.8.1+`. The first mile
   and safe external-editor synchronization;
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
 - runtime internationalization with system-language detection, English, and Simplified Chinese;
+- Herdr system toasts delivered through the host notification center, including macOS Notification Center;
 - an Open TUI handoff for Herdr settings through the toolbar;
 - stopped-session guidance through the system Terminal.
 
@@ -138,6 +139,12 @@ The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 `Shift+N` for a workspace, `N/P` to cycle tabs, `Shift+T/W/P` to rename,
 `Shift+X/D` to close, `H/J/K/L` to focus panes, `1…9` to switch tabs, or `S`
 to open Herdr settings in Terminal.
+
+When Herdr's toast delivery is configured as `system`, OcHerdr forwards its
+`SystemToast` messages to the local operating system. On macOS, the packaged app
+asks for notification permission on the first message and posts through Notification
+Center even while OcHerdr is frontmost. Clicking a notification activates OcHerdr.
+Remote Herdr sessions use the Mac running OcHerdr as the notification destination.
 
 ## Architecture
 

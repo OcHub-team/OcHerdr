@@ -995,8 +995,25 @@ pub struct TerminalFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvent {
     Frame(TerminalFrame),
-    MouseCapture { enabled: bool, sgr_pixels: bool },
-    KittyKeyboardReportAll { enabled: bool },
+    Notify {
+        kind: TerminalNotificationKind,
+        message: String,
+        body: Option<String>,
+    },
+    MouseCapture {
+        enabled: bool,
+        sgr_pixels: bool,
+    },
+    KittyKeyboardReportAll {
+        enabled: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalNotificationKind {
+    Sound,
+    Toast,
+    SystemToast,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

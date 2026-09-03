@@ -12,7 +12,7 @@ use uds_windows::UnixStream;
 use crate::private_v20 as v20;
 use crate::{
     HerdrError, Result, TerminalCommand, TerminalEndpoint, TerminalEvent, TerminalFrame,
-    TerminalScrollDirection,
+    TerminalNotificationKind, TerminalScrollDirection,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -268,6 +268,22 @@ impl TerminalWireReader {
                 v20::ServerMessage::KittyKeyboardReportAll { enabled } => {
                     return Ok(Some(TerminalEvent::KittyKeyboardReportAll { enabled }));
                 }
+                v20::ServerMessage::Notify {
+                    kind,
+                    message,
+                    body,
+                } => {
+                    let kind = match kind {
+                        v20::NotifyKind::Sound => TerminalNotificationKind::Sound,
+                        v20::NotifyKind::Toast => TerminalNotificationKind::Toast,
+                        v20::NotifyKind::SystemToast => TerminalNotificationKind::SystemToast,
+                    };
+                    return Ok(Some(TerminalEvent::Notify {
+                        kind,
+                        message,
+                        body,
+                    }));
+                }
                 v20::ServerMessage::ServerShutdown { reason } => {
                     return Err(HerdrError::TerminalClosed(
                         reason.unwrap_or_else(|| "server closed the terminal stream".into()),
@@ -278,7 +294,6 @@ impl TerminalWireReader {
                 // changing the frozen v20 schema.
                 v20::ServerMessage::Frame(_)
                 | v20::ServerMessage::Graphics { .. }
-                | v20::ServerMessage::Notify { .. }
                 | v20::ServerMessage::Clipboard { .. }
                 | v20::ServerMessage::WindowTitle { .. }
                 | v20::ServerMessage::ReloadSoundConfig
@@ -389,6 +404,15 @@ mod tests {
                 &v20::ServerMessage::KittyKeyboardReportAll { enabled: true },
             )
             .unwrap();
+            v20::write_message(
+                &mut stream,
+                &v20::ServerMessage::Notify {
+                    kind: v20::NotifyKind::SystemToast,
+                    message: "codex finished".into(),
+                    body: Some("workspace 1".into()),
+                },
+            )
+            .unwrap();
 
             (0..4)
                 .map(|_| v20::read_message(&mut stream, v20::MAX_GRAPHICS_FRAME_SIZE).unwrap())
@@ -427,6 +451,14 @@ mod tests {
         assert_eq!(
             reader.read_event().unwrap(),
             Some(TerminalEvent::KittyKeyboardReportAll { enabled: true })
+        );
+        assert_eq!(
+            reader.read_event().unwrap(),
+            Some(TerminalEvent::Notify {
+                kind: TerminalNotificationKind::SystemToast,
+                message: "codex finished".into(),
+                body: Some("workspace 1".into()),
+            })
         );
 
         writer

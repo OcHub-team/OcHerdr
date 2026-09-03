@@ -40,6 +40,7 @@ use relocation::{layout_event, parked_pane_json, send_events, single_pane_layout
 
 fn install_app(cx: &mut TestAppContext) {
     cx.update(|cx| {
+        cx.set_app_identity("io.github.ochub-team.ocherdr", "OcHerdr");
         ochub_ui::install(cx);
         I18n::install(Language::English);
         install_appearance(&AppearanceSettings::default(), cx.window_appearance());

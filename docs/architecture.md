@@ -133,6 +133,14 @@ import it. `private_protocol.rs` owns the explicit version registry, handshake, 
 and mapping between wire values and the stable `TerminalCommand` / `TerminalEvent`
 facade.
 
+`Notify` messages are also part of the stable facade. Herdr `Toast` messages use
+OcHerdr's in-app notification host, while `SystemToast` messages are posted through
+GPUI's platform notification API. On macOS that API uses `UNUserNotificationCenter`,
+requests alert permission lazily, retains notifications in Notification Center, and
+opts into foreground banner/list presentation. The packaged app's bundle identifier
+provides its notification identity; source binaries run outside an app bundle safely
+leave system delivery disabled.
+
 For a future v21, add a new `private_v21.rs`, copy the released Herdr schema exactly,
 add independent golden fixtures, register one new codec variant, and implement only
 the facade mappings that changed. The SSH tunnel, pane lifecycle, clipboard reader,

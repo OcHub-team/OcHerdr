@@ -1,4 +1,7 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static HERDR_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 
 impl OcHerdrView {
     pub(crate) fn ensure_session_terminals(&mut self, cx: &mut Context<Self>) {
@@ -407,6 +410,7 @@ impl OcHerdrView {
         let mut hierarchy_changed = false;
         let mut control_loss = None;
         let mut changed = false;
+        let mut notifications = Vec::new();
         let keep = {
             let Some(runtime) = self.pane_for_owner_mut(owner, pane_id) else {
                 return false;
@@ -443,6 +447,11 @@ impl OcHerdrView {
                                     runtime.terminal.set_preedit(Some(preedit));
                                 }
                             }
+                            Ok(TerminalEvent::Notify {
+                                kind,
+                                message,
+                                body,
+                            }) => notifications.push((kind, message, body)),
                             Ok(TerminalEvent::MouseCapture {
                                 enabled,
                                 sgr_pixels,
@@ -498,6 +507,9 @@ impl OcHerdrView {
                 }
             }
         };
+        for (kind, message, body) in notifications {
+            self.post_herdr_notification(kind, message, body, cx);
+        }
         if !active {
             if !keep || error.is_some() {
                 if let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) {
@@ -527,6 +539,40 @@ impl OcHerdrView {
             cx.notify();
         }
         keep
+    }
+
+    fn post_herdr_notification(
+        &mut self,
+        kind: TerminalNotificationKind,
+        message: String,
+        body: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        match kind {
+            // Sound selection belongs to Herdr's local sound configuration.
+            // OcHerdr does not reinterpret those labels as visual notices.
+            TerminalNotificationKind::Sound => {}
+            TerminalNotificationKind::Toast => {
+                let mut request = ochub_ui::notifications::NotificationRequest::new(
+                    ochub_ui::notifications::NotificationLevel::Info,
+                    message,
+                );
+                if let Some(body) = body {
+                    request = request.message(body);
+                }
+                self.notifications
+                    .update(cx, |host, cx| host.notify(request, cx));
+            }
+            TerminalNotificationKind::SystemToast => {
+                let id = HERDR_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed);
+                cx.show_system_notification(SystemNotification {
+                    tag: format!("ocherdr-herdr-{id}").into(),
+                    title: message.into(),
+                    body: body.unwrap_or_default().into(),
+                    actions: Vec::new(),
+                });
+            }
+        }
     }
 
     pub(super) fn apply_ghostty_frame(

@@ -20,8 +20,8 @@ use ocherdr_files::{
 };
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, MAX_CLIPBOARD_IMAGE_BYTES, SessionConnection,
-    TerminalCommand, TerminalMode, TerminalScrollDirection, TerminalSession, attach_command,
-    discover_sessions, open_system_terminal, request_socket,
+    TerminalCommand, TerminalMode, TerminalNotificationKind, TerminalScrollDirection,
+    TerminalSession, attach_command, discover_sessions, open_system_terminal, request_socket,
 };
 use ocherdr_terminal::{KeyAction, KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
 use ochub_ui::anim::Transition;
@@ -36,9 +36,10 @@ use ochub_ui::gpui::{
     EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding,
     KeyDownEvent, Keystroke, Menu, MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, Task, TextOverflow, TextRun, TitlebarOptions, UTF16Selection,
-    WeakEntity, Window, WindowAppearance, WindowBounds, WindowOptions, anchored, canvas, deferred,
-    div, ease_out_quint, linear_color_stop, linear_gradient, point, prelude::*, px, relative, size,
+    ScrollWheelEvent, SharedString, SystemNotification, Task, TextOverflow, TextRun,
+    TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds,
+    WindowOptions, anchored, canvas, deferred, div, ease_out_quint, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, size,
 };
 #[cfg(not(target_os = "macos"))]
 use ochub_ui::gpui::{
@@ -1301,6 +1302,8 @@ fn main() {
     application()
         .with_assets(OcHerdrAssets)
         .run(|cx: &mut App| {
+            cx.set_app_identity("io.github.ochub-team.ocherdr", "OcHerdr");
+            cx.on_system_notification_response(|_, cx| cx.activate(true));
             let loaded = load_settings();
             let menu_i18n = I18n::new(loaded.language);
             I18n::install(loaded.language);

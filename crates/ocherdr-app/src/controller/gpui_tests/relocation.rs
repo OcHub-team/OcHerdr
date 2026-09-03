@@ -1,4 +1,5 @@
 use super::*;
+use ocherdr_herdr::{TerminalEvent, TerminalNotificationKind};
 
 pub(super) fn temp_tab() -> TabInfo {
     TabInfo {
@@ -1056,6 +1057,37 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
             ("png".into(), b"\x89PNG\r\n\x1a\nremote".to_vec()),
         ]
     );
+}
+
+#[gpui::test]
+#[cfg(target_os = "macos")]
+fn herdr_system_toast_reaches_the_os_notification_center(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    measure_two_terminal_bodies(&view, cx);
+
+    view.update(cx, |this, cx| {
+        let owner = this.current_session_key().expect("connected session");
+        assert!(this.apply_herdr_frames(
+            &owner,
+            "p-left",
+            Some(vec![Ok(TerminalEvent::Notify {
+                kind: TerminalNotificationKind::SystemToast,
+                message: "Codex finished".into(),
+                body: Some("workspace 1".into()),
+            })]),
+            cx,
+        ));
+    });
+
+    let shown = cx.shown_system_notifications();
+    assert_eq!(shown.len(), 1);
+    assert!(shown[0].tag.starts_with("ocherdr-herdr-"));
+    assert_eq!(shown[0].title, "Codex finished");
+    assert_eq!(shown[0].body, "workspace 1");
+    assert!(shown[0].actions.is_empty());
 }
 
 #[gpui::test]
