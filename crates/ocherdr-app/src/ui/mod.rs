@@ -128,9 +128,6 @@ impl Render for OcHerdrView {
             Overlay::FileContextMenu(menu) => {
                 root = root.child(self.render_file_context_menu(menu, cx));
             }
-            Overlay::ConfirmSwitchProfile { id, .. } => {
-                root = root.child(self.render_switch_host(&id, cx));
-            }
             Overlay::ConfirmBulkRemove => {
                 root = root.child(self.render_bulk_remove(cx));
             }

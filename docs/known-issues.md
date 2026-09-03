@@ -4,14 +4,23 @@
 
 Panes start as observers. A click, wheel gesture, or terminal input promotes
 only that visible pane to a private-protocol control connection with takeover; other panes
-already controlled by the same OcHerdr stay controlled. Panes on hidden tabs
-return to observe mode.
+already controlled by the same OcHerdr stay controlled, including across tab
+switches. This keeps client-scoped remote resources and terminal state attached
+to the same private stream until its pane is evicted or removed.
 
 Herdr still permits only one controller per terminal. If another OcHerdr or
 terminal-session client takes over a pane, this instance demotes only that
 pane to observe and keeps its other control streams. Interacting with the
 observed pane takes it back, so two clients repeatedly operating the same pane
 can still make its PTY size follow whichever client interacted last.
+
+## Connected hosts remain resident
+
+Switching machines keeps every visited live host connected so its Herdr client id, SSH tunnel,
+terminal streams, and staged clipboard images survive the switch. This intentionally trades some
+local memory, socket, and SSH-process usage for stable sessions. Use the red close button beside a
+host in the status-bar switcher to release that host explicitly; OcHerdr does not silently evict
+background host connections.
 
 ## Debug builds spin in `HashMap` unless the whole dev profile is optimised
 

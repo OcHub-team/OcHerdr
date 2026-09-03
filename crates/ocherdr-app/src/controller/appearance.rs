@@ -44,44 +44,6 @@ impl OcHerdrView {
         if index >= self.profiles.len() {
             return;
         }
-        if switch_requires_confirm(self.profile_index, index, self.live_herdr_session()) {
-            self.set_overlay(
-                Overlay::ConfirmSwitchProfile {
-                    id: self.profiles[index].id().to_owned(),
-                    from_hosts: self.overlay.host_center(),
-                },
-                cx,
-            );
-            return;
-        }
-        self.apply_profile(index, cx);
-    }
-
-    pub(crate) fn cancel_switch_profile(&mut self, cx: &mut Context<Self>) {
-        let from_hosts = match &self.overlay {
-            Overlay::ConfirmSwitchProfile { from_hosts, .. } => Some(*from_hosts),
-            _ => None,
-        };
-        if let Some(from_hosts) = from_hosts {
-            self.set_overlay(
-                if from_hosts {
-                    Overlay::NodeManager
-                } else {
-                    Overlay::None
-                },
-                cx,
-            );
-        }
-    }
-
-    pub(crate) fn confirm_switch_profile(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.overlay, Overlay::ConfirmSwitchProfile { .. }) {
-            return;
-        }
-        let Some(index) = confirmed_host_index(&self.overlay, &self.profiles) else {
-            self.cancel_switch_profile(cx);
-            return;
-        };
         self.apply_profile(index, cx);
     }
 
@@ -106,8 +68,16 @@ impl OcHerdrView {
         self.set_overlay(Overlay::None, cx);
         if index == self.profile_index {
             self.remember_current_host(cx);
-            self.reload(None, cx);
-            cx.notify();
+            let profile_id = self.current_profile().id().to_owned();
+            match self.host_connection_state(&profile_id) {
+                HostConnectionState::Connected | HostConnectionState::Connecting => cx.notify(),
+                HostConnectionState::Disconnected => self.reload(None, cx),
+                HostConnectionState::Degraded => {
+                    let preferred = self.current_session().map(|session| session.name.clone());
+                    self.disconnect_host(&profile_id, cx);
+                    self.reload(preferred, cx);
+                }
+            }
             return;
         }
         self.select_profile(index, cx);

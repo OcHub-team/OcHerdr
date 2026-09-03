@@ -16,6 +16,7 @@
 use ocherdr_core::{AgentNameError, AgentStatus};
 use serde::{Deserialize, Serialize};
 
+use crate::HostConnectionState;
 use crate::tf;
 
 include!(concat!(env!("OUT_DIR"), "/i18n_generated.rs"));
@@ -194,8 +195,17 @@ impl I18n {
         tf!(self, k::COMMON_CLOSE_TITLE, kind = self.text(kind))
     }
 
-    pub(crate) fn switch_host_prompt(self, current: &str, next: &str) -> String {
-        tf!(self, k::HOSTS_SWITCH_PROMPT, current = current, next = next)
+    pub(crate) fn disconnect_host(self, host: &str) -> String {
+        tf!(self, k::HOSTS_DISCONNECT, host = host)
+    }
+
+    pub(crate) fn host_connection_status(self, status: HostConnectionState) -> &'static str {
+        self.text(match status {
+            HostConnectionState::Disconnected => k::HOSTS_STATUS_DISCONNECTED,
+            HostConnectionState::Connecting => k::HOSTS_STATUS_CONNECTING,
+            HostConnectionState::Connected => k::HOSTS_STATUS_CONNECTED,
+            HostConnectionState::Degraded => k::HOSTS_STATUS_DEGRADED,
+        })
     }
 
     pub(crate) fn close_prompt(self, label: &str) -> String {

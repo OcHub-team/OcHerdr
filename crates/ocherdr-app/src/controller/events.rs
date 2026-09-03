@@ -1,18 +1,58 @@
 use super::*;
 
 impl OcHerdrView {
-    pub(super) fn listen_events(mut events: EventSubscription, cx: &mut Context<Self>) -> Task<()> {
+    pub(super) fn listen_events(
+        owner: SessionKey,
+        mut events: EventSubscription,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
                 let batch = events.next_batch().await;
                 let keep = this
-                    .update(cx, |this, cx| this.apply_event_batch(batch, cx))
+                    .update(cx, |this, cx| this.apply_event_batch_for(&owner, batch, cx))
                     .unwrap_or(false);
                 if !keep {
                     break;
                 }
             }
         })
+    }
+
+    fn apply_event_batch_for(
+        &mut self,
+        owner: &SessionKey,
+        batch: Option<Vec<std::result::Result<HerdrEvent, HerdrError>>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.is_active_session(owner) {
+            return self.apply_event_batch(batch, cx);
+        }
+        let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) else {
+            return false;
+        };
+        match batch {
+            None => {
+                runtime.event_stream = EventStreamState::Lost(
+                    HerdrError::EventStreamClosed("event worker stopped".into())
+                        .to_string()
+                        .into(),
+                );
+                cx.notify();
+                false
+            }
+            Some(items) => {
+                if let Some(error) = items.into_iter().find_map(|item| match item {
+                    Err(error) if !error.is_event_payload_error() => Some(error),
+                    _ => None,
+                }) {
+                    runtime.event_stream = EventStreamState::Lost(error.to_string().into());
+                    cx.notify();
+                    return false;
+                }
+                true
+            }
+        }
     }
 
     pub(super) fn schedule_startup_replay_quiet(&mut self, cx: &mut Context<Self>) {

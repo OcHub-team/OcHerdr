@@ -97,10 +97,6 @@ pub(crate) fn parse_host_tags(value: &str) -> Vec<String> {
     tags
 }
 
-pub(crate) fn switch_requires_confirm(from: usize, to: usize, live_session: bool) -> bool {
-    from != to && live_session
-}
-
 pub(crate) fn profile_index_by_id(profiles: &[ConnectionProfile], id: &str) -> Option<usize> {
     profiles.iter().position(|profile| profile.id() == id)
 }
@@ -110,7 +106,7 @@ pub(crate) fn confirmed_host_index(
     profiles: &[ConnectionProfile],
 ) -> Option<usize> {
     let id = match overlay {
-        Overlay::ConfirmSwitchProfile { id, .. } | Overlay::ConfirmRemoveProfile(id) => id.as_str(),
+        Overlay::ConfirmRemoveProfile(id) => id.as_str(),
         _ => return None,
     };
     profile_index_by_id(profiles, id)

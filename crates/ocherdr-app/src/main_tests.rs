@@ -826,13 +826,6 @@ fn recent_hosts_move_to_the_front_and_stay_bounded() {
     assert_eq!(recents[0], "h9");
 }
 
-#[test]
-fn switching_hosts_confirms_only_when_leaving_a_live_session() {
-    assert!(!switch_requires_confirm(0, 0, true));
-    assert!(!switch_requires_confirm(1, 2, false));
-    assert!(switch_requires_confirm(1, 2, true));
-}
-
 fn ssh_host(id: &str, label: &str) -> ConnectionProfile {
     ConnectionProfile::Ssh {
         id: id.into(),
@@ -845,14 +838,11 @@ fn ssh_host(id: &str, label: &str) -> ConnectionProfile {
 }
 
 #[test]
-fn a_host_confirmation_follows_the_host_id_after_the_list_is_reordered() {
+fn a_remove_host_confirmation_follows_the_host_id_after_the_list_is_reordered() {
     let alpha = ssh_host("manual-1", "alpha");
     let beta = ssh_host("manual-2", "beta");
     let gamma = ssh_host("manual-3", "gamma");
-    let overlay = Overlay::ConfirmSwitchProfile {
-        id: beta.id().to_owned(),
-        from_hosts: false,
-    };
+    let overlay = Overlay::ConfirmRemoveProfile(beta.id().to_owned());
 
     let original = [alpha.clone(), beta.clone(), gamma.clone()];
     assert_eq!(confirmed_host_index(&overlay, &original), Some(1));
@@ -978,14 +968,6 @@ fn keys_go_to_the_terminal_only_when_no_overlay_is_open() {
             workspace_id: "w1".into(),
         }),
         Overlay::ConfirmRemoveProfile("manual-1".into()),
-        Overlay::ConfirmSwitchProfile {
-            id: "local".into(),
-            from_hosts: false,
-        },
-        Overlay::ConfirmSwitchProfile {
-            id: "manual-1".into(),
-            from_hosts: true,
-        },
         Overlay::ConfirmBulkRemove,
     ];
     for overlay in overlays {

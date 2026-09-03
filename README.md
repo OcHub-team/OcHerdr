@@ -20,8 +20,8 @@ The repository targets macOS, Linux, Windows, and Herdr `0.8.1+`. The first mile
 - local and SSH-host session discovery;
 - an in-app host center for filtering, organizing, diagnosing, and switching SSH hosts;
 - live workspace, tab, pane, layout, and agent status rendering;
-- independent `--takeover` control for each visible pane after a click, wheel, or input action;
-- read-only observation of untouched panes, with a bounded cache of hidden tab surfaces;
+- independent `--takeover` control for each pane after a click, wheel, or input action;
+- read-only observation of untouched panes, with a bounded cache of hidden tab surfaces and streams;
 - workspace/tab creation, rename, close, and pane operations through the public API;
 - native context menus for workspace, tab, and pane actions;
 - platform-native shortcuts plus Herdr's `Ctrl+B` prefix workflow;
@@ -106,7 +106,9 @@ closes the tab), `Cmd+Shift+W` (close workspace), `Cmd+Shift+N` (new workspace),
 `Cmd+1…9` (switch tab), `Ctrl+Tab` (cycle tabs), `Cmd+Shift+E` (toggle files),
 `Cmd+L` (enter a path while the file panel is open), `F2` (rename), and `Cmd+,`
 (open OcHerdr appearance settings). Click the status-bar host to switch machines; `Hosts` in the
-toolbar opens the connection manager. `Cmd+W` is for panes, not hosts. On Linux and
+toolbar opens the connection manager. Switching machines parks the previous Herdr connection
+without detaching its panes or restarting SSH. The switcher shows each connection's live status;
+its red close button explicitly disconnects only that host. `Cmd+W` is for panes, not hosts. On Linux and
 Windows, terminal-safe desktop equivalents use `Ctrl+Shift` (for example
 `Ctrl+Shift+T`, `Ctrl+Shift+W`, `Ctrl+Shift+C`, and `Ctrl+Shift+L`) so `Ctrl+C`,
 `Ctrl+W`, and `Ctrl+L` still reach the shell.
@@ -129,7 +131,8 @@ With an image-only or file-backed image clipboard (including PixPin and Finder),
 reads and validates the local image in the background, then sends one `ClipboardImage`
 message over the pane's existing Herdr connection. Herdr stages the bytes on the target
 host and pastes its path. No extra SSH command, remote shell utility, X11 clipboard, or
-Herdr server modification is involved.
+Herdr server modification is involved. Switching machines keeps that same pane connection
+alive, so the client-scoped staged image remains valid until the host is explicitly disconnected.
 
 The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 `Shift+N` for a workspace, `N/P` to cycle tabs, `Shift+T/W/P` to rename,

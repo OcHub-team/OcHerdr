@@ -124,6 +124,8 @@ impl OcHerdrView {
             sessions: Vec::new(),
             session_index: None,
             connection: None,
+            parked_hosts: HashMap::new(),
+            failed_hosts: HashSet::new(),
             herdr_capabilities: HerdrCapabilities::default(),
             event_stream: EventStreamState::Idle,
             event_listen: None,
@@ -260,6 +262,142 @@ impl OcHerdrView {
             .and_then(|index| self.sessions.get(index))
     }
 
+    fn is_active_session(&self, owner: &SessionKey) -> bool {
+        self.current_session_key().as_ref() == Some(owner)
+    }
+
+    pub(super) fn host_connection_state(&self, profile_id: &str) -> HostConnectionState {
+        if self.current_profile().id() == profile_id {
+            if self.operation.is_some() && self.connection.is_none() {
+                return HostConnectionState::Connecting;
+            }
+            return match (&self.connection, &self.event_stream) {
+                (Some(_), EventStreamState::Lost(_)) => HostConnectionState::Degraded,
+                (Some(_), _) => HostConnectionState::Connected,
+                (None, _) if self.failed_hosts.contains(profile_id) => {
+                    HostConnectionState::Degraded
+                }
+                (None, _) => HostConnectionState::Disconnected,
+            };
+        }
+        self.parked_hosts
+            .get(profile_id)
+            .map(|runtime| match runtime.event_stream {
+                EventStreamState::Lost(_) => HostConnectionState::Degraded,
+                _ => HostConnectionState::Connected,
+            })
+            .unwrap_or_else(|| {
+                if self.failed_hosts.contains(profile_id) {
+                    HostConnectionState::Degraded
+                } else {
+                    HostConnectionState::Disconnected
+                }
+            })
+    }
+
+    fn park_current_host(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let profile_id = self.current_profile().id().to_owned();
+        let runtime = ParkedHostRuntime {
+            sessions: std::mem::take(&mut self.sessions),
+            session_index: self.session_index.take(),
+            connection,
+            herdr_capabilities: std::mem::take(&mut self.herdr_capabilities),
+            event_stream: std::mem::replace(&mut self.event_stream, EventStreamState::Idle),
+            event_listen: self.event_listen.take(),
+            snapshot: self.snapshot.take(),
+            selection: std::mem::take(&mut self.selection),
+            session_panes: self.session_panes.take(),
+            pane_viewports: std::mem::take(&mut self.pane_viewports),
+        };
+        self.parked_hosts.insert(profile_id, runtime);
+    }
+
+    fn activate_parked_host(&mut self, profile_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(runtime) = self.parked_hosts.remove(profile_id) else {
+            return false;
+        };
+        self.sessions = runtime.sessions;
+        self.session_index = runtime.session_index;
+        self.connection = Some(runtime.connection);
+        self.herdr_capabilities = runtime.herdr_capabilities;
+        self.event_stream = runtime.event_stream;
+        self.event_listen = runtime.event_listen;
+        self.snapshot = runtime.snapshot;
+        self.selection = runtime.selection;
+        self.session_panes = runtime.session_panes;
+        self.pane_viewports = runtime.pane_viewports;
+        self.selection.connection_id = profile_id.to_owned();
+
+        if !matches!(self.event_stream, EventStreamState::Live)
+            && let Some(connection) = &self.connection
+        {
+            match connection.subscribe_background() {
+                Ok(subscription) => {
+                    let owner = self.current_session_key();
+                    self.event_stream = EventStreamState::Live;
+                    self.event_listen =
+                        owner.map(|owner| Self::listen_events(owner, subscription, cx));
+                }
+                Err(error) => {
+                    self.event_stream = EventStreamState::Lost(error.to_string().into());
+                }
+            }
+        }
+        self.resync_snapshot(self.event_epoch, cx);
+        self.ensure_agent_status_stream(cx);
+        true
+    }
+
+    fn reset_for_host_transition(&mut self) {
+        self.load_epoch = self.load_epoch.wrapping_add(1);
+        self.event_epoch = self.event_epoch.wrapping_add(1);
+        self.startup_replay_sync = None;
+        self.startup_replay_serial = self.startup_replay_serial.wrapping_add(1);
+        self.agent_status_listen = None;
+        self.agent_status_rebuild = None;
+        self.agent_status_panes.clear();
+        self.agent_status_handoff = None;
+        self.snapshot_refreshing = false;
+        self.snapshot_refresh_pending = false;
+        self.pane_mount_scheduled = false;
+        self.pending_created_tab = None;
+        self.cancel_split_drag();
+        self.split_commit = None;
+        self.cancel_reorder_drag();
+        self.cancel_pane_drag();
+        self.cancel_keyboard_pane_move();
+        self.abandon_worktree_list();
+    }
+
+    pub(super) fn disconnect_host(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        self.failed_hosts.remove(profile_id);
+        if self.current_profile().id() != profile_id {
+            if let Some(mut runtime) = self.parked_hosts.remove(profile_id) {
+                runtime.event_listen = None;
+                runtime.session_panes = None;
+            }
+            cx.notify();
+            return;
+        }
+        self.reset_for_host_transition();
+        self.event_listen = None;
+        self.event_stream = EventStreamState::Idle;
+        self.sessions.clear();
+        self.session_index = None;
+        self.herdr_capabilities = HerdrCapabilities::default();
+        self.snapshot = None;
+        self.selection = Selection {
+            connection_id: profile_id.to_owned(),
+            ..Default::default()
+        };
+        self.stop_session_terminals();
+        self.connection = None;
+        cx.notify();
+    }
+
     fn notify_failure(
         &mut self,
         kind: FailureKind,
@@ -298,6 +436,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn reload(&mut self, preferred_session: Option<String>, cx: &mut Context<Self>) {
+        self.failed_hosts.remove(self.current_profile().id());
         self.load_epoch = self.load_epoch.wrapping_add(1);
         self.event_epoch = self.event_epoch.wrapping_add(1);
         self.event_listen = None;
@@ -364,6 +503,7 @@ impl OcHerdrView {
                 this.operation = None;
                 match loaded {
                     Ok(loaded) => {
+                        this.failed_hosts.remove(this.current_profile().id());
                         this.sessions = loaded.sessions;
                         this.session_index = loaded.selected;
                         this.connection = loaded.connection;
@@ -390,12 +530,16 @@ impl OcHerdrView {
                             LoadedEvents::Live(subscription) => {
                                 this.event_stream = EventStreamState::Live;
                                 this.schedule_startup_replay_quiet(cx);
-                                this.event_listen = Some(Self::listen_events(subscription, cx));
+                                let owner = this.current_session_key();
+                                this.event_listen =
+                                    owner.map(|owner| Self::listen_events(owner, subscription, cx));
                             }
                         }
                         this.ensure_agent_status_stream(cx);
                     }
                     Err(error) => {
+                        this.failed_hosts
+                            .insert(this.current_profile().id().to_owned());
                         this.sessions.clear();
                         this.session_index = None;
                         this.connection = None;
@@ -423,24 +567,31 @@ impl OcHerdrView {
         if index == self.profile_index {
             return;
         }
+        self.reset_for_host_transition();
+        self.park_current_host();
         self.profile_index = index;
         self.host_center
             .update(cx, |center, _| center.set_profile_index(index));
         self.remember_current_host(cx);
-        self.sessions.clear();
-        self.session_index = None;
-        self.connection = None;
-        self.herdr_capabilities = HerdrCapabilities::default();
-        self.event_stream = EventStreamState::Idle;
-        self.event_listen = None;
-        self.agent_status_listen = None;
-        self.agent_status_rebuild = None;
-        self.agent_status_panes.clear();
-        self.agent_status_handoff = None;
-        self.snapshot = None;
-        self.session_panes = None;
-        self.abandon_worktree_list();
-        self.reload(None, cx);
+        let profile_id = self.current_profile().id().to_owned();
+        if !self.activate_parked_host(&profile_id, cx) {
+            self.sessions.clear();
+            self.session_index = None;
+            self.connection = None;
+            self.herdr_capabilities = HerdrCapabilities::default();
+            self.event_stream = EventStreamState::Idle;
+            self.event_listen = None;
+            self.snapshot = None;
+            self.session_panes = None;
+            self.pane_viewports.clear();
+            self.selection = Selection {
+                connection_id: profile_id,
+                ..Default::default()
+            };
+            self.reload(None, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn remember_current_host(&mut self, cx: &mut Context<Self>) {
@@ -521,6 +672,13 @@ impl OcHerdrView {
                 self.adopt_profiles(profiles, cx);
                 self.set_overlay(Overlay::NodeManager, cx);
                 if then == HostSaveThen::Connect {
+                    if let Some(profile_id) = self
+                        .profiles
+                        .get(index)
+                        .map(|profile| profile.id().to_owned())
+                    {
+                        self.disconnect_host(&profile_id, cx);
+                    }
                     self.request_choose_node(index, cx);
                 }
             }
@@ -627,6 +785,10 @@ impl OcHerdrView {
         let lost_current = current_id
             .as_deref()
             .is_some_and(|id| !profiles.iter().any(|profile| profile.id() == id));
+        self.parked_hosts
+            .retain(|id, _| profiles.iter().any(|profile| profile.id() == id));
+        self.failed_hosts
+            .retain(|id| profiles.iter().any(|profile| profile.id() == id));
         self.profiles = profiles;
         self.profile_index = current_id
             .as_deref()
@@ -645,10 +807,8 @@ impl OcHerdrView {
         if confirmed_host_index(&self.overlay, &self.profiles).is_some() {
             return;
         }
-        match self.overlay {
-            Overlay::ConfirmSwitchProfile { .. } => self.cancel_switch_profile(cx),
-            Overlay::ConfirmRemoveProfile(_) => self.cancel_remove_node(cx),
-            _ => {}
+        if matches!(self.overlay, Overlay::ConfirmRemoveProfile(_)) {
+            self.cancel_remove_node(cx);
         }
     }
 
@@ -699,13 +859,24 @@ impl OcHerdrView {
         self.session_panes.as_mut()?.panes.get_mut(pane_id)
     }
 
-    fn live_herdr_session(&self) -> bool {
-        self.connection.is_some()
-            || self.snapshot.is_some()
-            || self
-                .session_panes
-                .as_ref()
-                .is_some_and(|session| !session.panes.is_empty())
+    fn pane_for_owner_mut(
+        &mut self,
+        owner: &SessionKey,
+        pane_id: &str,
+    ) -> Option<&mut PaneRuntime> {
+        if self.is_active_session(owner) {
+            let session = self.session_panes.as_mut()?;
+            if session.owner != *owner {
+                return None;
+            }
+            return session.panes.get_mut(pane_id);
+        }
+        let runtime = self.parked_hosts.get_mut(&owner.profile_id)?;
+        let session = runtime.session_panes.as_mut()?;
+        if session.owner != *owner {
+            return None;
+        }
+        session.panes.get_mut(pane_id)
     }
 }
 

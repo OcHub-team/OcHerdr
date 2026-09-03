@@ -2,67 +2,6 @@ use super::super::*;
 use crate::a11y::apply_dialog;
 
 impl OcHerdrView {
-    pub(super) fn render_switch_host(
-        &mut self,
-        id: &str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let i18n = self.i18n;
-        let current = profile_display_label(&self.current_profile(), i18n);
-        let Some(next) = profile_index_by_id(&self.profiles, id)
-            .map(|index| profile_display_label(&self.profiles[index], i18n))
-        else {
-            return div().into_any_element();
-        };
-        let cancel = cancel_dialog_button(
-            "cancel-switch-host",
-            i18n.text(k::COMMON_CANCEL),
-            ButtonTone::Neutral,
-            ButtonSize::Sm,
-        )
-        .on_click(cx.listener(|this, _, _window, cx| this.cancel_switch_profile(cx)))
-        .into_any_element();
-        let confirm = confirm_dialog_button(
-            "confirm-switch-host",
-            i18n.text(k::COMMON_SWITCH),
-            ButtonTone::Primary,
-            ButtonSize::Sm,
-        )
-        .on_click(cx.listener(|this, _, _window, cx| this.confirm_switch_profile(cx)))
-        .into_any_element();
-        modal_overlay(
-            apply_dialog(
-                modal_card(),
-                "switch-host-dialog",
-                i18n.text(k::HOSTS_SWITCH_TITLE),
-            )
-            .child(modal_header(i18n.text(k::HOSTS_SWITCH_TITLE)))
-            .child(
-                modal_body()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme::text())
-                            .child(i18n.switch_host_prompt(&current, &next)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .child(i18n.text(k::HOSTS_SWITCH_DETAIL)),
-                    ),
-            )
-            .child(modal_footer(vec![cancel, confirm])),
-        )
-        .top_0()
-        .left_0()
-        .track_focus(&self.dialog_focus)
-        .on_key_down(cx.listener(|this, event, window, cx| {
-            this.handle_overlay_key(event, window, cx);
-        }))
-        .into_any_element()
-    }
-
     pub(super) fn render_remove_node(
         &mut self,
         id: &str,

@@ -63,7 +63,7 @@ impl OcHerdrView {
                 session.access_serial = session.access_serial.wrapping_add(1);
                 session
                     .controls
-                    .retain(|pane_id, _| optimistic_visible.contains(pane_id));
+                    .retain(|pane_id, _| live_pane_ids.contains(pane_id));
                 prime_automatic_terminal_control(session, &optimistic_visible, &live_pane_ids);
                 (session.controls.clone(), session.access_serial)
             };
@@ -97,30 +97,11 @@ impl OcHerdrView {
                 .panes;
             panes.retain(|pane_id, _| live_pane_ids.contains(pane_id));
 
-            // A hidden pane must not keep writable ownership, but its Ghostty
-            // surface and last frame stay alive. Native private streams can be
-            // demoted independently without rebuilding that render state.
-            let hidden_controlled = panes
-                .iter()
-                .filter(|(pane_id, runtime)| {
-                    !optimistic_visible.contains(*pane_id) && runtime.mode.is_controlled()
-                })
-                .map(|(pane_id, _)| pane_id.clone())
-                .collect::<Vec<_>>();
-            for pane_id in hidden_controlled {
-                if let Some(runtime) = panes.get_mut(&pane_id)
-                    && let Some(frames) = sync_pane_session(
-                        runtime,
-                        TerminalMode::Observe,
-                        false,
-                        terminal_endpoint.clone(),
-                        terminal_protocol,
-                        pane_id.clone(),
-                    )
-                {
-                    pending_listens.push((pane_id, frames));
-                }
-            }
+            // Visibility and control ownership are independent. Keep a hidden
+            // pane's existing private stream intact so an ordinary tab switch
+            // does not detach from Herdr, discard client-scoped resources, and
+            // reconnect when the user returns. LRU eviction and real pane or
+            // session removal still drop the stream normally.
             for target in &wanted {
                 let pane_id = &target.pane_id;
                 let mode = target.mode;
@@ -265,7 +246,13 @@ impl OcHerdrView {
             self.notify_failure(FailureKind::SpawnTerminal, error, cx);
         }
         for (pane_id, frames) in pending_listens {
-            let task = Self::listen_pane(pane_id.clone(), frames, cx);
+            let owner = self
+                .session_panes
+                .as_ref()
+                .expect("pane listener requires a live session")
+                .owner
+                .clone();
+            let task = Self::listen_pane(owner, pane_id.clone(), frames, cx);
             if let Some(runtime) = self.pane_mut(&pane_id) {
                 runtime.listen = Some(task);
             }
@@ -357,6 +344,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn listen_pane(
+        owner: SessionKey,
         pane_id: String,
         mut frames: TerminalEventReceiver,
         cx: &mut Context<Self>,
@@ -366,7 +354,7 @@ impl OcHerdrView {
                 let herdr = next_batch(&mut frames);
                 let ghostty = poll_fn(|task_cx| {
                     this.update(cx, |this, _| {
-                        let Some(runtime) = this.pane_mut(&pane_id) else {
+                        let Some(runtime) = this.pane_for_owner_mut(&owner, &pane_id) else {
                             return Poll::Ready(None);
                         };
                         runtime.terminal.poll_frame(task_cx)
@@ -377,7 +365,9 @@ impl OcHerdrView {
                 match future::select(herdr, ghostty).await {
                     Either::Left((batch, _)) => {
                         let keep = this
-                            .update(cx, |this, cx| this.apply_herdr_frames(&pane_id, batch, cx))
+                            .update(cx, |this, cx| {
+                                this.apply_herdr_frames(&owner, &pane_id, batch, cx)
+                            })
                             .unwrap_or(false);
                         if !keep {
                             break;
@@ -385,7 +375,9 @@ impl OcHerdrView {
                     }
                     Either::Right((frame, _)) => {
                         let keep = this
-                            .update(cx, |this, cx| this.apply_ghostty_frame(&pane_id, frame, cx))
+                            .update(cx, |this, cx| {
+                                this.apply_ghostty_frame(&owner, &pane_id, frame, cx)
+                            })
                             .unwrap_or(false);
                         if !keep {
                             break;
@@ -398,19 +390,25 @@ impl OcHerdrView {
 
     pub(super) fn apply_herdr_frames(
         &mut self,
+        owner: &SessionKey,
         pane_id: &str,
         batch: Option<Vec<std::result::Result<TerminalEvent, HerdrError>>>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let composing = self.ime_marked.clone();
-        let selected_pane = self.selection.pane_id.clone();
-        let visible_pane_ids = self.optimistic_visible_pane_ids();
+        let active = self.is_active_session(owner);
+        let composing = active.then(|| self.ime_marked.clone()).flatten();
+        let selected_pane = active.then(|| self.selection.pane_id.clone()).flatten();
+        let visible_pane_ids = if active {
+            self.optimistic_visible_pane_ids()
+        } else {
+            HashSet::new()
+        };
         let mut error = None;
         let mut hierarchy_changed = false;
         let mut control_loss = None;
         let mut changed = false;
         let keep = {
-            let Some(runtime) = self.pane_mut(pane_id) else {
+            let Some(runtime) = self.pane_for_owner_mut(owner, pane_id) else {
                 return false;
             };
             match batch {
@@ -500,6 +498,19 @@ impl OcHerdrView {
                 }
             }
         };
+        if !active {
+            if !keep || error.is_some() {
+                if let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) {
+                    runtime.event_stream = EventStreamState::Lost(
+                        HerdrError::TerminalClosed("terminal stream disconnected".into())
+                            .to_string()
+                            .into(),
+                    );
+                }
+                cx.notify();
+            }
+            return keep;
+        }
         if let Some((kind, detail)) = error {
             self.notify_failure(kind, detail, cx);
         }
@@ -520,16 +531,22 @@ impl OcHerdrView {
 
     pub(super) fn apply_ghostty_frame(
         &mut self,
+        owner: &SessionKey,
         pane_id: &str,
         frame: Option<std::result::Result<RenderedFrame, ocherdr_terminal::TerminalError>>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let visible_pane_ids = self.optimistic_visible_pane_ids();
+        let active = self.is_active_session(owner);
+        let visible_pane_ids = if active {
+            self.optimistic_visible_pane_ids()
+        } else {
+            HashSet::new()
+        };
         let mut error = None;
         let mut changed = false;
         let mut hierarchy_changed = false;
         let keep = {
-            let Some(runtime) = self.pane_mut(pane_id) else {
+            let Some(runtime) = self.pane_for_owner_mut(owner, pane_id) else {
                 return false;
             };
             let Some(frame) = frame else {
@@ -553,6 +570,19 @@ impl OcHerdrView {
                 true
             }
         };
+        if !active {
+            if !keep || error.is_some() {
+                if let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) {
+                    runtime.event_stream = EventStreamState::Lost(
+                        HerdrError::TerminalClosed("terminal renderer disconnected".into())
+                            .to_string()
+                            .into(),
+                    );
+                }
+                cx.notify();
+            }
+            return keep;
+        }
         if let Some((kind, detail)) = error {
             self.notify_failure(kind, detail, cx);
         }

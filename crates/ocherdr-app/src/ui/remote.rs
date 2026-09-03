@@ -1291,12 +1291,29 @@ impl OcHerdrView {
         };
         let mut items = Vec::new();
         for (index, profile, label, active) in entries {
+            let profile_id = profile.id().to_owned();
+            let state = self.host_connection_state(&profile_id);
+            let state_label = i18n.host_connection_status(state);
+            let row_label = format!("{label}, {state_label}");
+            let dot_color = match state {
+                HostConnectionState::Disconnected => theme::muted(),
+                HostConnectionState::Connecting => theme::yellow(),
+                HostConnectionState::Connected => theme::green(),
+                HostConnectionState::Degraded => theme::red(),
+            };
+            let can_disconnect = matches!(
+                state,
+                HostConnectionState::Connected | HostConnectionState::Degraded
+            );
+            let disconnect_label = i18n.disconnect_host(&label);
+            let disconnect_profile_id = profile_id.clone();
+            let disconnect_debug_id = profile_id.clone();
             items.push(
                 div()
                     .id(("switch-host", index))
                     .role(ochub_ui::gpui::Role::Button)
                     .tab_stop(false)
-                    .aria_label(label.clone())
+                    .aria_label(row_label)
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1315,17 +1332,48 @@ impl OcHerdrView {
                             this.request_choose_node(index, cx)
                         }),
                     )
+                    .child(status_dot(dot_color))
                     .child(icon(
                         if matches!(profile, ConnectionProfile::Local { .. }) {
                             IconName::Desktop
                         } else {
                             IconName::Globe
                         },
-                        theme::muted(),
+                        if active {
+                            theme::accent()
+                        } else {
+                            theme::muted()
+                        },
                         13.,
                     ))
                     .child(div().flex_1().min_w_0().truncate().text_sm().child(label))
-                    .when(active, |row| row.child(status_dot(theme::green())))
+                    .when(can_disconnect, |row| {
+                        row.child(icon_action_tooltip(
+                            "disconnect-host",
+                            disconnect_label.clone(),
+                            icon_only_button_tone(
+                                ("disconnect-host", index),
+                                disconnect_label,
+                                IconName::Close,
+                                ButtonTone::Danger,
+                                ButtonSize::Sm,
+                            )
+                            .size(px(20.))
+                            .rounded_full()
+                            .debug_selector(move || {
+                                format!("disconnect-host-{disconnect_debug_id}")
+                            })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.disconnect_host(&disconnect_profile_id, cx)
+                                },
+                            )),
+                        ))
+                    })
                     .into_any_element(),
             );
         }

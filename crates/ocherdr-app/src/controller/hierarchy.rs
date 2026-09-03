@@ -90,8 +90,6 @@ impl OcHerdrView {
             (Overlay::ConfirmBulkRemove, false) => self.cancel_bulk_remove(cx),
             (Overlay::Rename(_), true) => self.submit_rename(window, cx),
             (Overlay::Rename(_), false) => self.cancel_rename(window, cx),
-            (Overlay::ConfirmSwitchProfile { .. }, true) => self.confirm_switch_profile(cx),
-            (Overlay::ConfirmSwitchProfile { .. }, false) => self.cancel_switch_profile(cx),
             (Overlay::RemoteForm(_), false) => self.close_add_remote(cx),
             (Overlay::HostSwitcher, false) => self.close_host_switcher(cx),
             (Overlay::Appearance, false) => self.close_appearance(window, cx),

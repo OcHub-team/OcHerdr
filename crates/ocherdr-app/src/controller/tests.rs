@@ -388,8 +388,8 @@ fn explicit_controls_coexist_while_focus_stays_on_the_selected_pane() {
     let controls = HashMap::from([
         ("p-a".to_owned(), TerminalMode::Control),
         ("p-a2".to_owned(), TerminalMode::ControlTakeover),
-        // A previously controlled hidden pane must observe until another
-        // direct interaction promotes it after its tab becomes visible.
+        // Hidden targets are not applied to cached runtimes. The retained
+        // control intent restores this mode when the tab becomes visible.
         ("p-b".to_owned(), TerminalMode::Control),
     ]);
     let targets = snapshot_runtime_targets(&snapshot, &controls, Some("t-a"), Some("p-a2"));

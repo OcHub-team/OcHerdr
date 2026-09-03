@@ -732,18 +732,11 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
         this.ensure_session_terminals(cx);
     });
 
-    // Stream replacement runs on the terminal worker. Wait until the hidden
-    // controller has actually reattached as an observer before checking that
-    // returning to the tab reuses it; fast local machines often complete this
-    // before the next assertion, while CI does not.
-    while fake.terminal_attach_modes("p-a") != [true, false] {
-        assert!(
-            Instant::now() < deadline,
-            "hidden pane never reattached as an observer"
-        );
-        cx.run_until_parked();
-        thread::sleep(Duration::from_millis(10));
-    }
+    assert_eq!(
+        fake.terminal_attach_modes("p-a"),
+        vec![true],
+        "hiding a controlled pane must not replace its private stream"
+    );
 
     view.update(cx, |this, cx| {
         this.selection.tab_id = Some("t-a".into());
@@ -757,9 +750,120 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
     });
     assert_eq!(
         fake.terminal_attach_modes("p-a"),
-        vec![true, false],
-        "hiding demotes the initial controller once; returning reuses the cached observer"
+        vec![true],
+        "switching away and back reuses the original control stream"
     );
+}
+
+#[gpui::test]
+fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppContext) {
+    let fake_a = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake_b = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake_a, cx);
+    measure_two_terminal_bodies(&view, cx);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake_a.terminal_attach_count("p-left") == 0 {
+        assert!(Instant::now() < deadline, "host A terminal never attached");
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    view.update(cx, |this, cx| {
+        let profile_b = ConnectionProfile::Ssh {
+            id: "remote-test".into(),
+            label: "Remote test".into(),
+            destination: "unused".into(),
+            port: None,
+            identity_file: None,
+            herdr_path: "herdr".into(),
+        };
+        let session_b = SessionSummary {
+            name: "beta".into(),
+            running: true,
+            socket_path: fake_b.socket_path(),
+            session_dir: fake_b._dir.path().join("beta"),
+            default: false,
+        };
+        let connection_b = SessionConnection::connect(&ConnectionProfile::default(), &session_b)
+            .expect("connect host B fake");
+        let snapshot_b = two_pane_snapshot();
+        let profile_b_index = this.profiles.len();
+        this.profiles.push(profile_b);
+        this.parked_hosts.insert(
+            "remote-test".into(),
+            crate::ParkedHostRuntime {
+                sessions: vec![session_b],
+                session_index: Some(0),
+                connection: connection_b,
+                herdr_capabilities: crate::controller::HerdrCapabilities::from_snapshot(
+                    &snapshot_b,
+                ),
+                event_stream: EventStreamState::Idle,
+                event_listen: None,
+                snapshot: Some(snapshot_b),
+                selection: Selection {
+                    connection_id: "remote-test".into(),
+                    session_name: Some("beta".into()),
+                    workspace_id: Some("w".into()),
+                    tab_id: Some("t-left".into()),
+                    pane_id: Some("p-left".into()),
+                },
+                session_panes: None,
+                pane_viewports: HashMap::new(),
+            },
+        );
+
+        this.select_profile(profile_b_index, cx);
+        assert!(this.parked_hosts.contains_key("local"));
+        assert_eq!(fake_a.terminal_detach_count("p-left"), 0);
+
+        this.select_profile(0, cx);
+        assert_eq!(this.current_profile().id(), "local");
+        assert_eq!(fake_a.terminal_attach_count("p-left"), 1);
+        assert_eq!(fake_a.terminal_detach_count("p-left"), 0);
+
+        this.disconnect_host("local", cx);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake_a.terminal_detach_count("p-left") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "explicit disconnect never detached host A"
+        );
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fake_a.terminal_detach_count("p-left"), 1);
+}
+
+#[gpui::test]
+fn host_switcher_red_x_disconnects_without_switching_hosts(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update(cx, |this, cx| this.toggle_host_switcher(cx));
+    cx.run_until_parked();
+
+    let disconnect = cx
+        .debug_bounds("disconnect-host-local")
+        .expect("connected host row exposes its explicit disconnect button")
+        .center();
+    cx.simulate_click(disconnect, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.current_profile().id(), "local");
+        assert!(this.connection.is_none());
+        assert_eq!(
+            this.host_connection_state("local"),
+            crate::HostConnectionState::Disconnected
+        );
+    });
 }
 
 #[gpui::test]

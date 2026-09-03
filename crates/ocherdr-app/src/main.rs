@@ -407,6 +407,15 @@ struct LoadedSession {
     snapshot: Option<HierarchySnapshot>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HostConnectionState {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+    Degraded,
+}
+
 enum LoadedEvents {
     Idle,
     Live(EventSubscription),
@@ -460,6 +469,22 @@ struct SessionPanes {
     access_serial: u64,
 }
 
+/// A live Herdr session parked while another host is visible. Ownership of
+/// the connection and pane runtimes stays here, so switching hosts does not
+/// kill the SSH tunnel or send terminal `Detach` messages.
+struct ParkedHostRuntime {
+    sessions: Vec<SessionSummary>,
+    session_index: Option<usize>,
+    connection: SessionConnection,
+    herdr_capabilities: HerdrCapabilities,
+    event_stream: EventStreamState,
+    event_listen: Option<Task<()>>,
+    snapshot: Option<HierarchySnapshot>,
+    selection: Selection,
+    session_panes: Option<SessionPanes>,
+    pane_viewports: HashMap<String, MeasuredPaneViewport>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MeasuredPaneViewport {
     body_bounds: (f32, f32, f32, f32),
@@ -484,8 +509,9 @@ impl SessionPanes {
 
 struct PaneRuntime {
     /// First-visible panes attempt non-takeover control so the remote PTY is
-    /// sized before it paints. Busy and recently visited hidden panes observe;
-    /// explicit interaction can promote an observer with takeover.
+    /// sized before it paints. Untouched panes observe; panes already controlled
+    /// by this OcHerdr keep their stream across tab switches. Explicit
+    /// interaction can promote an observer with takeover.
     session: TerminalSession,
     terminal: Terminal,
     frame: Option<RenderedFrame>,
@@ -866,6 +892,12 @@ struct OcHerdrView {
     sessions: Vec<SessionSummary>,
     session_index: Option<usize>,
     connection: Option<SessionConnection>,
+    /// Live hosts other than `profile_index`. Removing an entry is the
+    /// explicit disconnect operation and releases its Herdr clients/tunnel.
+    parked_hosts: HashMap<String, ParkedHostRuntime>,
+    /// Hosts whose most recent explicit connection attempt failed. This is UI
+    /// state only; it never causes an automatic reconnect.
+    failed_hosts: HashSet<String>,
     /// What the connected Herdr can do, derived from the last full snapshot.
     herdr_capabilities: HerdrCapabilities,
     event_stream: EventStreamState,
@@ -1050,10 +1082,6 @@ enum Overlay {
     },
     WorktreeOpen(WorktreeOpenState),
     ConfirmRemoveProfile(String),
-    ConfirmSwitchProfile {
-        id: String,
-        from_hosts: bool,
-    },
     ConfirmBulkRemove,
     AgentPanel {
         pane_id: String,
@@ -1142,7 +1170,6 @@ impl Overlay {
             Self::ConfirmClose(_)
                 | Self::ConfirmRemoveWorktree { .. }
                 | Self::ConfirmRemoveProfile(_)
-                | Self::ConfirmSwitchProfile { .. }
                 | Self::ConfirmBulkRemove
                 | Self::Update(_)
         )
@@ -1155,10 +1182,6 @@ impl Overlay {
                 | Self::RemoteForm(_)
                 | Self::ConfirmRemoveProfile(_)
                 | Self::ConfirmBulkRemove
-                | Self::ConfirmSwitchProfile {
-                    from_hosts: true,
-                    ..
-                }
         )
     }
 }

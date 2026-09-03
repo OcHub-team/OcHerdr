@@ -24,9 +24,9 @@ commands and events to the rest of the application.
    click, wheel gesture, or terminal input replaces that pane's connection with
    `ControlTerminal { takeover: true }` without releasing other controlled panes.
    Only the selected pane receives keyboard/IME input and terminal focus; wheel input
-   targets the pane under the pointer. Hidden panes return to observe, while recently
-   visited Ghostty surfaces and frames remain in a bounded LRU cache. Release every
-   private connection when its pane is evicted or the session changes.
+   targets the pane under the pointer. Hidden panes retain their existing stream mode,
+   while recently visited Ghostty surfaces and frames remain in a bounded LRU cache.
+   Release every private connection when its pane is evicted or the session changes.
 7. Feed decoded ANSI bytes into Ghostty's `manualMirror` surface. Ghostty owns VT
    state, shaping, glyph/image rendering, and produces a leased BGRA IOSurface.
 8. Wrap that IOSurface as a CoreVideo pixel buffer without copying it and without
@@ -36,6 +36,21 @@ commands and events to the rest of the application.
    frame token only after the command buffer completes. GhosttyKit labels leased
    Metal frames as Display P3, but OcHerdr does not forward that tag.
 9. Ghostty follows the application's effective light/dark appearance.
+
+## Host residency
+
+The status-bar host selector changes which host runtime is visible; it does not replace the
+runtime. A live background host retains its `SessionConnection`, OpenSSH tunnel, event worker,
+snapshot, selection, pane runtimes, and private terminal streams in a profile-keyed parking map.
+Terminal and event workers carry a `(profile_id, session_name)` owner key, so equal pane ids on
+different hosts cannot route frames into the active host by mistake. Events for a parked host are
+drained as connection liveness signals, and the current snapshot is fetched again when that host
+returns to the foreground.
+
+Only an explicit disconnect action, profile removal/reconfiguration, session replacement, or app
+shutdown releases a parked runtime. Normal tab and host switches therefore preserve Herdr's
+client id and client-scoped resources such as staged clipboard images. OcHerdr never evicts a live
+host connection automatically; the switcher exposes a disconnect button for that resource choice.
 
 ## SSH policy
 
@@ -64,8 +79,9 @@ the target pane while preserving the other controlled panes. Stream mode is sepa
 from focus: keyboard, IME, and focus-in/out reporting go to the selected pane, while
 wheel input goes to the pane under the pointer. A takeover by another client demotes
 only the affected pane locally; it is promoted again only by another direct
-interaction. Panes on hidden tabs are observers and retain their most recent surface
-until LRU eviction. A sequence gap in a delta frame
+interaction. Untouched panes on hidden tabs remain observers. Panes already controlled
+by OcHerdr retain that control stream across tab switches, and all hidden panes retain
+their most recent surface until LRU eviction. A sequence gap in a delta frame
 invalidates the local terminal state and requires a fresh bridge. A full frame is an
 ANSI redraw and is applied to the existing Ghostty surface; it does not destroy or
 recreate renderer state.

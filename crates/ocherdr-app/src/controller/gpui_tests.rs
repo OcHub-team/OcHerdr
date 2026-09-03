@@ -91,6 +91,7 @@ enum FakeTerminalCommand {
     Attach { controlled: bool },
     Input(Vec<u8>),
     ClipboardImage { extension: String, bytes: Vec<u8> },
+    Detach,
 }
 
 #[allow(dead_code)]
@@ -442,9 +443,9 @@ impl FakeHerdr {
             .flatten()
             .filter_map(|command| match command {
                 FakeTerminalCommand::Input(bytes) => Some(bytes.clone()),
-                FakeTerminalCommand::Attach { .. } | FakeTerminalCommand::ClipboardImage { .. } => {
-                    None
-                }
+                FakeTerminalCommand::Attach { .. }
+                | FakeTerminalCommand::ClipboardImage { .. }
+                | FakeTerminalCommand::Detach => None,
             })
             .collect()
     }
@@ -461,7 +462,9 @@ impl FakeHerdr {
                 FakeTerminalCommand::ClipboardImage { extension, bytes } => {
                     Some((extension.clone(), bytes.clone()))
                 }
-                FakeTerminalCommand::Attach { .. } | FakeTerminalCommand::Input(_) => None,
+                FakeTerminalCommand::Attach { .. }
+                | FakeTerminalCommand::Input(_)
+                | FakeTerminalCommand::Detach => None,
             })
             .collect()
     }
@@ -479,9 +482,22 @@ impl FakeHerdr {
             .flatten()
             .filter_map(|command| match command {
                 FakeTerminalCommand::Attach { controlled } => Some(*controlled),
-                FakeTerminalCommand::Input(_) | FakeTerminalCommand::ClipboardImage { .. } => None,
+                FakeTerminalCommand::Input(_)
+                | FakeTerminalCommand::ClipboardImage { .. }
+                | FakeTerminalCommand::Detach => None,
             })
             .collect()
+    }
+
+    fn terminal_detach_count(&self, pane_id: &str) -> usize {
+        self.terminal_commands
+            .lock()
+            .expect("fake terminal command log")
+            .get(pane_id)
+            .into_iter()
+            .flatten()
+            .filter(|command| matches!(command, FakeTerminalCommand::Detach))
+            .count()
     }
 
     fn socket_path(&self) -> PathBuf {
@@ -615,7 +631,15 @@ fn handle_private_terminal(
                     break;
                 }
             }
-            TestClientMessage::Detach => break,
+            TestClientMessage::Detach => {
+                commands
+                    .lock()
+                    .expect("fake terminal command log")
+                    .entry(target.clone())
+                    .or_default()
+                    .push(FakeTerminalCommand::Detach);
+                break;
+            }
             _ => {}
         }
     }
@@ -1583,7 +1607,8 @@ fn connect_view_to_fake_and_resync(
             .expect("connected above")
             .subscribe_background()
             .expect("subscribe to fake herdr events");
-        this.event_listen = Some(OcHerdrView::listen_events(subscription, cx));
+        let owner = this.current_session_key().expect("connected session key");
+        this.event_listen = Some(OcHerdrView::listen_events(owner, subscription, cx));
         this.event_stream = EventStreamState::Live;
         let epoch = this.event_epoch;
         this.resync_snapshot(epoch, cx);
