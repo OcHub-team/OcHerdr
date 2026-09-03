@@ -141,10 +141,12 @@ The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 to open Herdr settings in Terminal.
 
 When Herdr's toast delivery is configured as `system`, OcHerdr forwards its
-`SystemToast` messages to the local operating system. On macOS, the packaged app
-asks for notification permission on the first message and posts through Notification
-Center even while OcHerdr is frontmost. Clicking a notification activates OcHerdr.
-Remote Herdr sessions use the Mac running OcHerdr as the notification destination.
+`SystemToast` messages to the local operating system. It uses Notification Center on
+macOS, native Toast notifications on Windows, and the XDG notification service on
+Linux. On macOS, the packaged app asks for notification permission on the first
+message and posts even while OcHerdr is frontmost. Clicking a notification activates
+OcHerdr. Remote Herdr sessions use the computer running OcHerdr as the notification
+destination.
 
 ## Architecture
 

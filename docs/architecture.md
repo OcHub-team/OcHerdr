@@ -139,7 +139,9 @@ GPUI's platform notification API. On macOS that API uses `UNUserNotificationCent
 requests alert permission lazily, retains notifications in Notification Center, and
 opts into foreground banner/list presentation. The packaged app's bundle identifier
 provides its notification identity; source binaries run outside an app bundle safely
-leave system delivery disabled.
+leave system delivery disabled. Windows uses native Toast notifications with the
+OcHerdr AppUserModelID, while Linux uses the XDG notification D-Bus service through
+`notify-rust`.
 
 For a future v21, add a new `private_v21.rs`, copy the released Herdr schema exactly,
 add independent golden fixtures, register one new codec variant, and implement only
