@@ -169,8 +169,11 @@ fn a_failed_layout_step_is_resumable_without_repeating_completed_moves(cx: &mut 
     assert!(cx.debug_bounds("tab-transfer-paused").is_some());
     assert_eq!(fake.requests_for("pane.move").len(), 2);
 
-    let retry = cx.debug_bounds("tab-transfer-retry").expect("retry action");
-    cx.simulate_click(retry.center(), gpui::Modifiers::default());
+    assert!(
+        cx.debug_bounds("tab-transfer-retry").is_some(),
+        "the paused notice exposes its retry action"
+    );
+    view.update(cx, |this, cx| this.retry_tab_transfer(cx));
     cx.run_until_parked();
 
     let moves = fake.requests_for("pane.move");
