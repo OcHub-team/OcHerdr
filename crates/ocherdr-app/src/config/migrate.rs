@@ -114,7 +114,7 @@ impl ConfigStore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn temporary() -> Self {
         let temporary = Arc::new(tempfile::TempDir::new().expect("temporary config directory"));
         let store = Self::new(

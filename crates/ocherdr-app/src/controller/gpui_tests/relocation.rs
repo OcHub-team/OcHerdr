@@ -1,7 +1,10 @@
 use super::*;
+#[cfg(target_os = "macos")]
 use crate::Overlay;
 use ocherdr_core::HerdrEvent;
+#[cfg(target_os = "macos")]
 use ocherdr_herdr::{TerminalEvent, TerminalNotificationKind};
+#[cfg(target_os = "macos")]
 use ocherdr_terminal::SurfaceMouseButton;
 
 pub(super) fn temp_tab() -> TabInfo {
