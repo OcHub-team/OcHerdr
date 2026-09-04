@@ -32,12 +32,6 @@ impl OcHerdrView {
             .iter()
             .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
             .collect::<HashMap<_, _>>();
-        let agent_pane_ids = snapshot
-            .panes
-            .iter()
-            .filter(|pane| pane.agent.is_some())
-            .map(|pane| pane.pane_id.clone())
-            .collect::<HashSet<_>>();
         let incoming = SessionKey {
             profile_id,
             session_name: session_name.clone(),
@@ -126,11 +120,6 @@ impl OcHerdrView {
                     | VisiblePanePlan::DemoteToObserve => {
                         if let Some(runtime) = panes.get_mut(pane_id) {
                             runtime.last_visible_serial = access_serial;
-                            if runtime.mouse_capture.is_none() {
-                                runtime
-                                    .terminal
-                                    .set_mouse_capture(agent_pane_ids.contains(pane_id), false);
-                            }
                             if runtime.palette_signature != palette.signature() {
                                 if let Err(error) = runtime.terminal.apply_palette(&palette) {
                                     palette_error = Some(error);
@@ -166,13 +155,6 @@ impl OcHerdrView {
                         let rows = 24;
                         match Terminal::new(cols, rows, 10_000, &palette) {
                             Ok(terminal) => {
-                                if agent_pane_ids.contains(pane_id) {
-                                    // Herdr before the terminal-session mouse-capture fix does
-                                    // not publish the application's current mode. Coding-agent
-                                    // panes are TUI-first until the server supplies authority;
-                                    // Ghostty still reserves Shift for text selection.
-                                    terminal.set_mouse_capture(true, false);
-                                }
                                 let frame_context = 1;
                                 let resolved = terminal.resize_pixels(
                                     viewport.pixels.0,
@@ -425,18 +407,6 @@ impl OcHerdrView {
         } else {
             HashSet::new()
         };
-        let tui_mouse_fallback = if active {
-            self.snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.pane(pane_id))
-                .is_some_and(|pane| pane.agent.is_some())
-        } else {
-            self.parked_hosts
-                .get(&owner.profile_id)
-                .and_then(|host| host.snapshot.as_ref())
-                .and_then(|snapshot| snapshot.pane(pane_id))
-                .is_some_and(|pane| pane.agent.is_some())
-        };
         let mut error = None;
         let mut hierarchy_changed = false;
         let mut control_loss = None;
@@ -475,14 +445,16 @@ impl OcHerdrView {
                                 if frame.full {
                                     // A full Ghostty replay resets terminal modes. Herdr's ANSI
                                     // blit contains cells and cursor state, not the originating
-                                    // application's DEC mouse modes, so restore the side-channel
-                                    // authority (or the old-server fallback) after the reset.
-                                    let (mouse_enabled, sgr_pixels) = runtime
-                                        .mouse_capture
-                                        .unwrap_or((tui_mouse_fallback, false));
-                                    runtime
-                                        .terminal
-                                        .set_mouse_capture(mouse_enabled, sgr_pixels);
+                                    // application's DEC mouse modes. Restore Herdr's side-channel
+                                    // authority when available. Unknown is deliberately not
+                                    // guessed from agent detection: an agent can be at a shell or
+                                    // another non-mouse screen, where a normal drag must select.
+                                    if let Some((mouse_enabled, sgr_pixels)) = runtime.mouse_capture
+                                    {
+                                        runtime
+                                            .terminal
+                                            .set_mouse_capture(mouse_enabled, sgr_pixels);
+                                    }
                                 }
                                 if selected_pane.as_deref() == Some(pane_id)
                                     && let Some(preedit) = composing.as_deref()

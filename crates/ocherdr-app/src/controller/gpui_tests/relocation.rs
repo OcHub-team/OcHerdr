@@ -661,9 +661,7 @@ fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestCo
 
 #[gpui::test]
 #[cfg(target_os = "macos")]
-fn agent_panes_follow_ghostty_mouse_reporting_with_shift_selection_fallback(
-    cx: &mut TestAppContext,
-) {
+fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut TestAppContext) {
     let mut snapshot = two_pane_snapshot();
     let agent = snapshot
         .panes
@@ -682,8 +680,8 @@ fn agent_panes_follow_ghostty_mouse_reporting_with_shift_selection_fallback(
         let runtime = this.pane("p-left").expect("agent terminal");
         assert!(runtime.mouse_capture.is_none());
         assert!(
-            runtime.terminal.mouse_captured(),
-            "an old Herdr without MouseCapture events gets the agent-pane fallback"
+            !runtime.terminal.mouse_captured(),
+            "an agent label is not evidence that its terminal currently captures the mouse"
         );
     });
 
@@ -701,6 +699,51 @@ fn agent_panes_follow_ghostty_mouse_reporting_with_shift_selection_fallback(
         modifiers: Default::default(),
         click_count: 1,
     };
+    let drag_point = gpui::point(gpui::px(180.), gpui::px(120.));
+    let drag_move = gpui::MouseMoveEvent {
+        position: drag_point,
+        pressed_button: Some(gpui::MouseButton::Left),
+        modifiers: Default::default(),
+    };
+    let drag_up = gpui::MouseUpEvent {
+        position: drag_point,
+        ..left_up
+    };
+    view.update_in(cx, |this, window, cx| {
+        this.pane_mouse_down("p-left".into(), &left_down, window, cx);
+        assert!(matches!(
+            this.surface_drag,
+            crate::SurfaceDrag::Text {
+                captured: false,
+                ..
+            }
+        ));
+        this.pane_mouse_move(&drag_move, window, cx);
+        this.pane_mouse_up(&drag_up, window, cx);
+        this.pump_terminal_input();
+    });
+    assert!(
+        fake.terminal_inputs("p-left").is_empty(),
+        "unknown mouse state must remain a local text selection"
+    );
+    measure_two_terminal_bodies(&view, cx);
+
+    view.update_in(cx, |this, _window, cx| {
+        let owner = this.current_session_key().expect("connected session");
+        assert!(this.apply_herdr_frames(
+            &owner,
+            "p-left",
+            Some(vec![Ok(TerminalEvent::MouseCapture {
+                enabled: true,
+                sgr_pixels: false,
+            })]),
+            cx,
+        ));
+        let runtime = this.pane("p-left").expect("agent terminal");
+        assert_eq!(runtime.mouse_capture, Some((true, false)));
+        assert!(runtime.terminal.mouse_captured());
+    });
+
     view.update_in(cx, |this, window, cx| {
         this.pane_mouse_down("p-left".into(), &left_down, window, cx);
         assert!(matches!(

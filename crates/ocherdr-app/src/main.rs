@@ -547,9 +547,9 @@ struct PaneRuntime {
     /// The Herdr stream ended; keep the last frame until the snapshot drops this pane.
     exit_seen: bool,
     /// Whether Herdr has supplied the authoritative terminal mouse-reporting
-    /// state for this private stream. Older Herdr builds omit the event for
-    /// direct terminal attachments, so agent panes use a TUI-first fallback
-    /// until an explicit state arrives.
+    /// state for this private stream. `None` stays selection-first: agent
+    /// detection does not prove that the pane's current screen reports mouse
+    /// input, and guessing would make ordinary terminal text unselectable.
     mouse_capture: Option<(bool, bool)>,
     /// Leftover pixel delta from trackpad wheel events, in the pane's Y axis.
     scroll_px: f32,
