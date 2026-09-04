@@ -211,6 +211,9 @@ fn terminal_frame_element(
     frozen_size: Option<(f32, f32)>,
 ) -> ochub_ui::gpui::AnyElement {
     let surface = surface(frame.pixel_buffer)
+        .with_color_space(match frame.color_space {
+            ocherdr_terminal::FrameColorSpace::DisplayP3 => gpui::SurfaceColorSpace::DisplayP3,
+        })
         .with_frame_lifetime(frame.lifetime)
         .object_fit(ObjectFit::Contain);
     match frozen_size {
@@ -752,6 +755,7 @@ struct AppearanceSettings {
     window_padding_x: u32,
     window_padding_y: u32,
     palette: [Option<u32>; 16],
+    colors: TerminalColorOverrides,
     font: TerminalFontSettings,
 }
 
@@ -766,9 +770,20 @@ impl Default for AppearanceSettings {
             window_padding_x: 0,
             window_padding_y: 0,
             palette: [None; 16],
+            colors: TerminalColorOverrides::default(),
             font: TerminalFontSettings::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TerminalColorOverrides {
+    background: Option<u32>,
+    foreground: Option<u32>,
+    cursor: Option<u32>,
+    cursor_text: Option<u32>,
+    selection: Option<u32>,
+    selection_foreground: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1455,6 +1470,7 @@ fn main() {
                     ))),
                     window_min_size: Some(size(px(860.), px(560.))),
                     window_background: theme::window_background_appearance(),
+                    color_space: gpui::WindowColorSpace::DisplayP3,
                     titlebar: Some(TitlebarOptions {
                         title: Some(SharedString::new_static("OcHerdr")),
                         appears_transparent: true,

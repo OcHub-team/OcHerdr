@@ -186,8 +186,16 @@ OcHerdr.
 
 On macOS, GhosttyKit is pinned and checksum-verified by `scripts/bootstrap-ghosttykit.sh`. GPUI
 is pinned to OcHerdr's leased-BGRA surface extension in the OcHub-team Zed fork. The
-surface path keeps Ghostty's frame lease alive through Metal completion and samples
-the leased BGRA IOSurface as sRGB.
+surface path keeps Ghostty's frame lease alive through Metal completion and preserves
+the leased BGRA IOSurface's Display P3 color-space metadata. The macOS window uses
+color-managed Display P3 output; ordinary sRGB UI colors and images are converted
+before compositing. Core Animation handles the destination display profile.
+
+Terminal colors and fonts remain independently configurable. To match standalone
+Ghostty, use **Import Ghostty Config** in appearance settings: this imports its
+terminal theme and font settings without replacing the OcHerdr UI theme. Previously
+imported themes should be imported again to restore background, foreground, cursor,
+and selection colors that older versions omitted. See [color rendering](docs/color-rendering.md).
 
 ## License
 

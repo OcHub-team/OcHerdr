@@ -1056,8 +1056,12 @@ pub(super) fn wheel_scroll_lines(delta: ScrollDelta, line_height: f32, leftover:
 
 pub(super) fn current_terminal_palette(appearance: &AppearanceSettings) -> TerminalPalette {
     let dark = theme::is_dark();
-    let overlay = terminal_overlay(appearance, dark);
-    let mut palette = terminal_palette_from_theme(theme::current(), dark, overlay, appearance);
+    let family = terminal_theme_family(appearance, dark);
+    let overlay = crate::theme_ansi::overlay_for(family.as_ref());
+    let terminal_theme = family
+        .map(|family| if dark { family.dark } else { family.light })
+        .unwrap_or_else(theme::current);
+    let mut palette = terminal_palette_from_theme(terminal_theme, dark, overlay, appearance);
     palette.ansi = crate::theme_ansi::apply_overrides(palette.ansi, &appearance.palette);
     palette
 }
@@ -1066,6 +1070,13 @@ pub(crate) fn terminal_overlay(
     appearance: &AppearanceSettings,
     dark: bool,
 ) -> crate::theme_ansi::ThemeAnsi {
+    crate::theme_ansi::overlay_for(terminal_theme_family(appearance, dark).as_ref())
+}
+
+pub(super) fn terminal_theme_family(
+    appearance: &AppearanceSettings,
+    dark: bool,
+) -> Option<theme::ThemeFamily> {
     let family_id = match appearance
         .terminal_theme
         .as_deref()
@@ -1084,7 +1095,7 @@ pub(crate) fn terminal_overlay(
             }
         }
     };
-    crate::theme_ansi::overlay_for(theme::find_family(&family_id).as_ref())
+    theme::find_family(&family_id).or_else(|| theme::find_family(&appearance.theme_family))
 }
 
 pub(super) fn terminal_ansi(
@@ -1102,15 +1113,27 @@ pub(super) fn terminal_palette_from_theme(
     appearance: &AppearanceSettings,
 ) -> TerminalPalette {
     let font = &appearance.font;
+    let colors = &appearance.colors;
+    let variant = if dark { overlay.dark } else { overlay.light };
+    let background = colors.background.unwrap_or(theme.bg.0);
+    let foreground = colors.foreground.unwrap_or(theme.text.0);
     TerminalPalette {
         dark,
-        background: theme.bg.0,
+        background,
         background_opacity: crate::config::values::opacity_percent_u8(
             appearance.background_opacity,
         ),
-        foreground: theme.text.0,
-        cursor: theme.accent.0,
-        selection: theme.selection.0,
+        foreground,
+        cursor: colors.cursor.unwrap_or(theme.accent.0),
+        cursor_text: colors
+            .cursor_text
+            .or(variant.cursor_text.map(|color| color.0))
+            .unwrap_or(background),
+        selection: colors.selection.unwrap_or(theme.selection.0),
+        selection_foreground: colors
+            .selection_foreground
+            .or(variant.selection_foreground.map(|color| color.0))
+            .unwrap_or(foreground),
         ansi: terminal_ansi(overlay, &theme, dark),
         font_family: font.family.clone(),
         font_size: font.size.round().clamp(1.0, 255.0) as u8,

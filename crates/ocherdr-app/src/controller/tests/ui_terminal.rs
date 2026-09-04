@@ -1,6 +1,71 @@
 use super::*;
 
 #[test]
+fn independent_terminal_theme_applies_background_foreground_and_cursor() {
+    let appearance = AppearanceSettings {
+        terminal_theme: Some("ember".into()),
+        ..AppearanceSettings::default()
+    };
+    let family = theme::ember_family();
+    let expected = if theme::is_dark() {
+        family.dark
+    } else {
+        family.light
+    };
+    let palette = current_terminal_palette(&appearance);
+    assert_eq!(palette.background, expected.bg.0);
+    assert_eq!(palette.foreground, expected.text.0);
+    assert_eq!(palette.cursor, expected.accent.0);
+    assert_eq!(palette.selection, expected.selection.0);
+}
+
+#[test]
+fn explicit_terminal_colors_override_theme_without_changing_ui() {
+    let document = config::document::ConfigDocument::parse(
+        "terminal-theme = ember\nbackground = #010203\nforeground = #040506\ncursor-color = #070809\ncursor-text = #0a0b0c\nselection-background = #0d0e0f\nselection-foreground = #101112\n",
+    );
+    let (config, warnings) = config::values::AppConfig::from_document(&document);
+    assert!(warnings.is_empty());
+    let appearance = config::values::appearance_from_config(&config);
+    let before = theme::current();
+    let palette = current_terminal_palette(&appearance);
+    assert_eq!(palette.background, 0x010203);
+    assert_eq!(palette.foreground, 0x040506);
+    assert_eq!(palette.cursor, 0x070809);
+    assert_eq!(palette.cursor_text, 0x0a0b0c);
+    assert_eq!(palette.selection, 0x0d0e0f);
+    assert_eq!(palette.selection_foreground, 0x101112);
+    assert_eq!(theme::current(), before);
+}
+
+#[test]
+fn terminal_theme_pair_selects_the_matching_family_and_missing_theme_falls_back() {
+    let mut appearance = AppearanceSettings {
+        terminal_theme: Some("light:ochub,dark:ember".into()),
+        ..AppearanceSettings::default()
+    };
+    assert_eq!(
+        terminal_theme_family(&appearance, false)
+            .expect("light family")
+            .id,
+        "ochub"
+    );
+    assert_eq!(
+        terminal_theme_family(&appearance, true)
+            .expect("dark family")
+            .id,
+        "ember"
+    );
+    appearance.terminal_theme = Some("missing-terminal-theme".into());
+    assert_eq!(
+        terminal_theme_family(&appearance, true)
+            .expect("UI fallback")
+            .id,
+        appearance.theme_family
+    );
+}
+
+#[test]
 fn terminal_palette_follows_the_gui_light_and_dark_theme() {
     let family = ochub_ui::theme::ochub_family();
     let appearance = AppearanceSettings::default();
@@ -197,6 +262,7 @@ fn explicit_ansi_is_used_instead_of_deriving_from_tokens() {
     let overlay = crate::theme_ansi::ThemeAnsi {
         dark: crate::theme_ansi::ThemeAnsiPalette {
             ansi: Some(explicit.map(theme::ThemeColor::new)),
+            ..Default::default()
         },
         ..crate::theme_ansi::ThemeAnsi::default()
     };

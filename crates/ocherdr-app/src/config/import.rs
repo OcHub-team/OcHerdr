@@ -346,13 +346,19 @@ fn imported_theme(
     light: GhosttyThemePalette,
     dark: GhosttyThemePalette,
 ) -> Result<ImportedGhosttyTheme, GhosttyImportError> {
-    let family = imported_family(&id, &name);
+    let mut family = imported_family(&id, &name);
+    apply_terminal_colors(&mut family.light, &light);
+    apply_terminal_colors(&mut family.dark, &dark);
     let ansi = ThemeAnsi {
         light: ThemeAnsiPalette {
             ansi: ansi_from_palette(&light),
+            cursor_text: light.cursor_text.map(|color| ThemeColor(color.0)),
+            selection_foreground: light.selection_foreground.map(|color| ThemeColor(color.0)),
         },
         dark: ThemeAnsiPalette {
             ansi: ansi_from_palette(&dark),
+            cursor_text: dark.cursor_text.map(|color| ThemeColor(color.0)),
+            selection_foreground: dark.selection_foreground.map(|color| ThemeColor(color.0)),
         },
     };
     let file_json =
@@ -376,6 +382,21 @@ fn imported_family(id: &str, name: &str) -> ThemeFamily {
     family.author = "Ghostty".to_owned();
     family.description = format!("Imported from Ghostty ({name})");
     family
+}
+
+fn apply_terminal_colors(theme: &mut ochub_ui::theme::Theme, palette: &GhosttyThemePalette) {
+    if let Some(color) = palette.background {
+        theme.bg = ThemeColor(color.0);
+    }
+    if let Some(color) = palette.foreground {
+        theme.text = ThemeColor(color.0);
+    }
+    if let Some(color) = palette.cursor_color {
+        theme.accent = ThemeColor(color.0);
+    }
+    if let Some(color) = palette.selection_background {
+        theme.selection = ThemeColor(color.0);
+    }
 }
 
 fn ansi_from_palette(palette: &GhosttyThemePalette) -> Option<[ThemeColor; 16]> {
@@ -604,6 +625,24 @@ shell-integration = zsh
         assert_eq!(plan.themes[0].id, "imported-rose-pine-dawn-rose-pine");
         assert_eq!(plan.themes[0].light.background, Color::parse("#faf4ed"));
         assert_eq!(plan.themes[0].dark.background, Color::parse("#191724"));
+        let family: ThemeFamily = serde_json::from_str(&plan.themes[0].file_json).expect("theme");
+        assert_eq!(family.light.bg.0, 0xfaf4ed);
+        assert_eq!(family.dark.bg.0, 0x191724);
+        assert_eq!(
+            family.dark.text.0,
+            plan.themes[0].dark.foreground.expect("foreground").0
+        );
+        assert_eq!(
+            family.dark.accent.0,
+            plan.themes[0].dark.cursor_color.expect("cursor").0
+        );
+        assert_eq!(family.dark.selection.0, 0x333333);
+        let overlay = ThemeAnsi::from_json(&plan.themes[0].file_json).expect("terminal metadata");
+        assert_eq!(overlay.dark.cursor_text, Some(ThemeColor(0)));
+        assert_eq!(
+            overlay.dark.selection_foreground,
+            Some(ThemeColor(0xffffff))
+        );
         assert_eq!(
             plan.terminal_theme,
             Some(ThemeRef::Name("imported-rose-pine-dawn-rose-pine".into()))

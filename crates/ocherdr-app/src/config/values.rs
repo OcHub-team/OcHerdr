@@ -511,6 +511,14 @@ pub fn appearance_from_config(config: &AppConfig) -> AppearanceSettings {
         window_padding_x: config.window_padding_x,
         window_padding_y: config.window_padding_y,
         palette: config.palette.map(|slot| slot.map(|color| color.0)),
+        colors: crate::TerminalColorOverrides {
+            background: config.background.map(|color| color.0),
+            foreground: config.foreground.map(|color| color.0),
+            cursor: config.cursor_color.map(|color| color.0),
+            cursor_text: config.cursor_text.map(|color| color.0),
+            selection: config.selection_background.map(|color| color.0),
+            selection_foreground: config.selection_foreground.map(|color| color.0),
+        },
         font: TerminalFontSettings {
             family: config.font_family.first().cloned().unwrap_or_default(),
             size: config.font_size,

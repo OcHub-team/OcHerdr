@@ -148,7 +148,9 @@ keybind = alt+right=esc:f
         pub background_opacity: u8,
         pub foreground: u32,
         pub cursor: u32,
+        pub cursor_text: u32,
         pub selection: u32,
+        pub selection_foreground: u32,
         pub ansi: [u32; 16],
         pub font_family: String,
         pub font_size: u8,
@@ -177,9 +179,13 @@ keybind = alt+right=esc:f
             let _ = writeln!(out, "background-opacity-cells = true");
             let _ = writeln!(out, "foreground = {}", hex_color(self.foreground));
             let _ = writeln!(out, "cursor-color = {}", hex_color(self.cursor));
-            let _ = writeln!(out, "cursor-text = {}", hex_color(self.background));
+            let _ = writeln!(out, "cursor-text = {}", hex_color(self.cursor_text));
             let _ = writeln!(out, "selection-background = {}", hex_color(self.selection));
-            let _ = writeln!(out, "selection-foreground = {}", hex_color(self.foreground));
+            let _ = writeln!(
+                out,
+                "selection-foreground = {}",
+                hex_color(self.selection_foreground)
+            );
             for (index, color) in self.ansi.iter().copied().enumerate() {
                 let _ = writeln!(out, "palette = {index}={}", hex_color(color));
             }
@@ -401,10 +407,16 @@ keybind = alt+right=esc:f
     #[derive(Clone)]
     pub struct RenderedFrame {
         pub pixel_buffer: CVPixelBuffer,
+        pub color_space: FrameColorSpace,
         pub width_px: u32,
         pub height_px: u32,
         pub host_context: u64,
         pub lifetime: Arc<FrameLease>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FrameColorSpace {
+        DisplayP3,
     }
 
     pub struct FrameLease {
@@ -428,6 +440,7 @@ keybind = alt+right=esc:f
 
     struct PendingFrame {
         iosurface: usize,
+        color_space: FrameColorSpace,
         width_px: u32,
         height_px: u32,
         host_context: u64,
@@ -762,8 +775,16 @@ keybind = alt+right=esc:f
             return ffi::ghostty_metal_external_frame_disposition_e_GHOSTTY_METAL_EXTERNAL_FRAME_DROP;
         }
 
+        let color_space = match frame.color_space {
+            ffi::ghostty_metal_external_color_space_e_GHOSTTY_METAL_EXTERNAL_COLOR_SPACE_DISPLAY_P3 => {
+                FrameColorSpace::DisplayP3
+            }
+            _ => return ffi::ghostty_metal_external_frame_disposition_e_GHOSTTY_METAL_EXTERNAL_FRAME_DROP,
+        };
+
         let pending = PendingFrame {
             iosurface: frame.iosurface as usize,
+            color_space,
             width_px: frame.width_px,
             height_px: frame.height_px,
             host_context: frame.host_context,
@@ -982,6 +1003,7 @@ keybind = alt+right=esc:f
                 .map_err(TerminalError::FrameConversion)?;
             Ok(RenderedFrame {
                 pixel_buffer,
+                color_space: newest.color_space,
                 width_px: newest.width_px,
                 height_px: newest.height_px,
                 host_context: newest.host_context,

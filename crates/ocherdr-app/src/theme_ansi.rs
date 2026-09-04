@@ -29,6 +29,10 @@ pub struct ThemeAnsi {
 pub struct ThemeAnsiPalette {
     #[serde(default)]
     pub ansi: Option<[ThemeColor; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_text: Option<ThemeColor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_foreground: Option<ThemeColor>,
 }
 
 impl ThemeAnsi {
@@ -81,6 +85,22 @@ pub fn serialize_theme_file(family: &ThemeFamily, ansi: &ThemeAnsi) -> Result<St
 pub fn inject_theme_ansi(document: &mut Value, ansi: &ThemeAnsi) -> Result<()> {
     merge_variant(document, "light", ansi.light.ansi)?;
     merge_variant(document, "dark", ansi.dark.ansi)?;
+    for (name, variant) in [("light", ansi.light), ("dark", ansi.dark)] {
+        let object = document
+            .get_mut(name)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow::anyhow!("theme variant {name} is missing"))?;
+        for (key, color) in [
+            ("cursorText", variant.cursor_text),
+            ("selectionForeground", variant.selection_foreground),
+        ] {
+            if let Some(color) = color {
+                object.insert(key.to_owned(), serde_json::to_value(color)?);
+            } else {
+                object.remove(key);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -205,9 +225,11 @@ pub fn ochub_overlay() -> ThemeAnsi {
     ThemeAnsi {
         light: ThemeAnsiPalette {
             ansi: Some(rgb_palette(OCHUB_LIGHT_ANSI)),
+            ..Default::default()
         },
         dark: ThemeAnsiPalette {
             ansi: Some(rgb_palette(OCHUB_DARK_ANSI)),
+            ..Default::default()
         },
     }
 }
@@ -216,9 +238,11 @@ pub fn ember_overlay() -> ThemeAnsi {
     ThemeAnsi {
         light: ThemeAnsiPalette {
             ansi: Some(rgb_palette(EMBER_LIGHT_ANSI)),
+            ..Default::default()
         },
         dark: ThemeAnsiPalette {
             ansi: Some(rgb_palette(EMBER_DARK_ANSI)),
+            ..Default::default()
         },
     }
 }
