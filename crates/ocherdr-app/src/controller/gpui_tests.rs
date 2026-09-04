@@ -136,7 +136,7 @@ enum TestClientMessage {
         modifiers: u8,
     },
     InputEvents {
-        events: Vec<()>,
+        events: Vec<TestClientInputEvent>,
     },
     ObserveTerminal {
         target: String,
@@ -161,6 +161,44 @@ enum TestClientMessage {
         transfer_id: u64,
         image_id: u32,
     },
+}
+
+// The settings handshake sends one structured F12 key. Other test input is
+// raw terminal bytes; only the key/source variants used here are mirrored.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+enum TestClientInputEvent {
+    Key {
+        code: TestClientKeyCode,
+        modifiers: u8,
+        kind: u32,
+        repeat_count: u16,
+        generated_text: Option<String>,
+        source: u32,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+enum TestClientKeyCode {
+    Backspace,
+    Enter,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Tab,
+    BackTab,
+    Delete,
+    Insert,
+    Esc,
+    Char(char),
+    F(u8),
+    Null,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -553,7 +591,7 @@ fn handle_private_terminal(
         cols,
         rows,
         requested_encoding: TestRenderEncoding::TerminalAnsi,
-        launch_mode: TestClientLaunchMode::TerminalAttach,
+        launch_mode,
         ..
     }) = read_test_wire_message(&mut stream)
     else {
@@ -575,8 +613,19 @@ fn handle_private_terminal(
         return;
     }
 
+    let settings = matches!(launch_mode, TestClientLaunchMode::App);
     let (target, controlled) = loop {
         match read_test_wire_message::<TestClientMessage>(&mut stream) {
+            Ok(TestClientMessage::InputEvents { events }) if settings => {
+                assert!(matches!(
+                    events.as_slice(),
+                    [TestClientInputEvent::Key {
+                        code: TestClientKeyCode::F(12),
+                        ..
+                    }]
+                ));
+                break ("__settings".into(), false);
+            }
             Ok(TestClientMessage::ObserveTerminal { target }) => break (target, false),
             Ok(TestClientMessage::ControlTerminal { target, .. }) => break (target, true),
             Err(error)

@@ -1,4 +1,5 @@
 use super::*;
+use gpui::Focusable;
 
 #[gpui::test]
 fn command_comma_opens_ocherdr_settings_in_place(cx: &mut TestAppContext) {
@@ -20,6 +21,104 @@ fn command_comma_opens_ocherdr_settings_in_place(cx: &mut TestAppContext) {
 
     view.read_with(cx, |this, _| {
         assert!(matches!(this.overlay, crate::Overlay::Appearance));
+    });
+}
+
+#[gpui::test]
+#[cfg(target_os = "macos")]
+fn settings_toolbar_opens_embedded_client_and_close_restores_pane_input(cx: &mut TestAppContext) {
+    let (fake, view, cx) = connect_two_pane_view(cx);
+    let before = view.read_with(cx, |this, _| this.selection.clone());
+    let gear = cx
+        .debug_bounds("open-herdr-settings")
+        .expect("settings toolbar button");
+    cx.simulate_click(gear.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(matches!(this.overlay, crate::Overlay::HerdrSettings));
+        assert!(this.herdr_settings.is_some());
+        assert!(!crate::key_goes_to_terminal(&this.overlay));
+    });
+    assert!(cx.debug_bounds("herdr-settings-surface").is_some());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.terminal_attach_count("__settings") == 0 {
+        assert!(Instant::now() < deadline, "settings never connected");
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Explicitly drive a key through GPUI, which must only reach the settings
+    // connection, even though the selected pane is still mounted behind it.
+    let pane_inputs = fake.terminal_inputs(before.pane_id.as_deref().unwrap());
+    cx.simulate_keystrokes("down");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.terminal_inputs("__settings").is_empty() {
+        assert!(Instant::now() < deadline, "settings never received the key");
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Ghostty can encode the press using its initial extended keyboard mode
+    // or legacy mode after the first full frame resets the surface.
+    let settings_inputs = fake.terminal_inputs("__settings");
+    assert!(
+        settings_inputs == vec![b"\x1b[B".to_vec()]
+            || settings_inputs == vec![b"\x1b[1;1:1B".to_vec()],
+        "unexpected settings key: {settings_inputs:?}"
+    );
+    assert_eq!(
+        fake.terminal_inputs(before.pane_id.as_deref().unwrap()),
+        pane_inputs
+    );
+    let close = cx
+        .debug_bounds("close-herdr-settings")
+        .expect("settings close button");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.terminal_detach_count("__settings") == 0 {
+        assert!(Instant::now() < deadline, "settings never detached");
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+    view.update_in(cx, |this, window, cx| {
+        assert!(matches!(this.overlay, crate::Overlay::None));
+        assert!(this.herdr_settings.is_none());
+        assert!(this.focus.is_focused(window));
+        assert_eq!(this.selection.pane_id, before.pane_id);
+        assert_eq!(this.selection.tab_id, before.tab_id);
+        // Reopening uses a fresh entity/connection and remains in the window.
+        this.open_herdr_settings(cx);
+        assert!(matches!(this.overlay, crate::Overlay::HerdrSettings));
+        this.close_herdr_settings(window, cx);
+    });
+}
+
+#[gpui::test]
+#[cfg(target_os = "macos")]
+fn command_backspace_edits_the_focused_gpui_field_before_terminal_input(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    view.update_in(cx, |this, window, cx| {
+        this.agent_prompt_input.update(cx, |input, cx| {
+            input.set_content("first line\nsecond line", cx);
+        });
+        this.agent_prompt_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        let event = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: app_primary_modifiers(),
+                key: "backspace".into(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert!(this.handle_text_input_macos_editing(&event, window, cx));
+    });
+    view.read_with(cx, |this, cx| {
+        assert_eq!(
+            this.agent_prompt_input.read(cx).content().as_ref(),
+            "first line\n"
+        );
     });
 }
 
@@ -67,6 +166,69 @@ fn overflowing_tab_bar_scrolls_horizontally_with_the_wheel(cx: &mut TestAppConte
         tab_scroll.offset().x < gpui::px(0.),
         "selecting a hidden tab by number must scroll it into view"
     );
+}
+
+#[gpui::test]
+#[cfg(target_os = "macos")]
+fn command_backspace_dispatch_preserves_suffix_and_is_undoable(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    view.update_in(cx, |this, window, cx| {
+        this.open_rename(
+            crate::HierarchyTarget::Tab {
+                id: "test".into(),
+                label: "test".into(),
+            },
+            window,
+            cx,
+        );
+        this.rename_input
+            .update(cx, |input, cx| input.set_content("中文😀tail", cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("left left left left cmd-backspace");
+    view.read_with(cx, |this, cx| {
+        assert_eq!(this.rename_input.read(cx).content().as_ref(), "tail")
+    });
+    cx.simulate_keystrokes("cmd-z");
+    view.read_with(cx, |this, cx| {
+        assert_eq!(this.rename_input.read(cx).content().as_ref(), "中文😀tail")
+    });
+    cx.simulate_keystrokes("cmd-a cmd-backspace");
+    view.read_with(cx, |this, cx| {
+        assert_eq!(this.rename_input.read(cx).content().as_ref(), "")
+    });
+}
+
+#[gpui::test]
+#[cfg(target_os = "macos")]
+fn command_backspace_handles_dynamically_created_fields_and_preserves_composition(
+    cx: &mut TestAppContext,
+) {
+    use gpui::EntityInputHandler;
+    let (view, cx) = open_view(cx);
+    // Deliberately not one of the fields stored on OcHerdrView or HostCenter.
+    let input = cx.update(|_, cx| cx.new(|cx| crate::TextInput::new(cx, "dynamic")));
+    cx.run_until_parked();
+    let event = gpui::KeyDownEvent {
+        keystroke: gpui::Keystroke {
+            key: "backspace".into(),
+            modifiers: app_primary_modifiers(),
+            key_char: None,
+        },
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update_in(cx, |this, window, cx| {
+        input.update(cx, |input, cx| input.set_content("first\n中文😀", cx));
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        assert!(this.handle_text_input_macos_editing(&event, window, cx));
+        assert_eq!(input.read(cx).content().as_ref(), "first\n");
+        input.update(cx, |input, cx| {
+            input.replace_and_mark_text_in_range(None, "候选", None, window, cx)
+        });
+        assert!(this.handle_text_input_macos_editing(&event, window, cx));
+        assert_eq!(input.read(cx).content().as_ref(), "first\n候选");
+    });
 }
 
 /// Tabs start flush with the content area's left edge. Everything between `+`

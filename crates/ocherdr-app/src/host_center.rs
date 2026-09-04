@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
+use crate::text_input::{TextInput, TextInputEvent};
 use ocherdr_core::ConnectionProfile;
 use ocherdr_herdr::{
     HostHealthCheck, check_host, open_system_terminal, ssh_host_aliases, ssh_login_command,
@@ -9,7 +10,6 @@ use ochub_ui::gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Render,
     ScrollHandle, SharedString, Task, Window, prelude::*, px,
 };
-use ochub_ui::text_input::{TextInput, TextInputEvent};
 
 use super::*;
 use crate::notify::FailureKind;

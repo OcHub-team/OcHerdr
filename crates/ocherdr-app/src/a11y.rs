@@ -910,10 +910,7 @@ mod tests {
         assert_eq!(chrome.toolbar.zoom.name, "Zoom pane");
         assert_eq!(chrome.toolbar.close_pane.name, "Close pane");
         assert_eq!(chrome.toolbar.appearance.name, "Appearance");
-        assert_eq!(
-            chrome.toolbar.herdr_settings.name,
-            "Open Herdr settings in Terminal"
-        );
+        assert_eq!(chrome.toolbar.herdr_settings.name, "Open Herdr settings");
         assert_eq!(chrome.toolbar.remote.name, "Hosts");
         assert_eq!(chrome.toolbar.remote.selected, Some(true));
         assert_eq!(chrome.toolbar.remote.toggled, Some(true));

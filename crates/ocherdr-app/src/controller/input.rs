@@ -3,6 +3,15 @@ use std::fs;
 use std::io::Read as _;
 use std::path::Path;
 
+// Observe component creation rather than enumerating form fields. This also
+// includes TextInput's lazily-created Find field and future UI inputs, without
+// retaining closed dialogs or changing the pinned UI dependency.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct TextInputRegistry(Vec<WeakEntity<TextInput>>);
+#[cfg(target_os = "macos")]
+impl ochub_ui::gpui::Global for TextInputRegistry {}
+
 #[derive(Debug, PartialEq, Eq)]
 enum CommandPaste {
     PassThrough,
@@ -223,6 +232,43 @@ fn image_bytes_match_signature(extension: &str, bytes: &[u8]) -> bool {
 }
 
 impl OcHerdrView {
+    #[cfg(target_os = "macos")]
+    pub(super) fn install_text_input_editing(cx: &mut App) {
+        if cx.has_global::<TextInputRegistry>() {
+            return;
+        }
+        cx.set_global(TextInputRegistry::default());
+        cx.observe_new::<TextInput>(|_, _, cx| {
+            let entity = cx.entity().downgrade();
+            cx.global_mut::<TextInputRegistry>().0.push(entity);
+        })
+        .detach();
+    }
+    /// Route native editing only to the focused field, never to its pane.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn handle_text_input_macos_editing(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !TextInput::is_macos_editing_key(event) {
+            return false;
+        }
+        let registry = cx.global_mut::<TextInputRegistry>();
+        registry.0.retain(|input| input.is_upgradable());
+        let inputs: Vec<_> = registry.0.iter().filter_map(WeakEntity::upgrade).collect();
+        for input in inputs {
+            if !input.read(cx).focus_handle(cx).is_focused(window) {
+                continue;
+            }
+            return input.update(cx, |input, cx| {
+                input.handle_macos_editing_key(event, window, cx)
+            });
+        }
+        false
+    }
+
     pub(crate) fn create_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(workspace_id) = self.selection.workspace_id.clone() {
             self.invoke_with_response(
@@ -301,7 +347,7 @@ impl OcHerdrView {
         let shift = event.keystroke.modifiers.shift;
         match (key, shift) {
             ("escape", _) => {}
-            ("s", false) => self.open_native_tui(cx),
+            ("s", false) => self.open_herdr_settings(cx),
             ("c", false) => self.create_tab(cx),
             ("n", true) => self.create_workspace(cx),
             ("n", false) => self.cycle_tab(1, cx),
@@ -356,6 +402,9 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.handle_file_panel_hidden_key(event, cx) {
+            return true;
+        }
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         if modifiers.control && !modifiers.platform && !modifiers.alt && key == "b" {

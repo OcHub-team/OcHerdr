@@ -32,7 +32,7 @@ The repository targets macOS, Linux, Windows, and Herdr `0.8.1+`. The first mile
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
 - runtime internationalization with system-language detection, English, and Simplified Chinese;
 - OcHerdr-owned agent completion and attention alerts through the host notification center;
-- an Open TUI handoff for Herdr settings through the toolbar;
+- an embedded Herdr TUI settings panel through the toolbar, using the connected host/session;
 - stopped-session guidance through the system Terminal.
 
 OcHerdr does not link or modify Herdr. It implements protocol 20 of Herdr's private
@@ -138,7 +138,30 @@ alive, so the client-scoped staged image remains valid until the host is explici
 The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 `Shift+N` for a workspace, `N/P` to cycle tabs, `Shift+T/W/P` to rename,
 `Shift+X/D` to close, `H/J/K/L` to focus panes, `1…9` to switch tabs, or `S`
-to open Herdr settings in Terminal.
+to open Herdr settings inside OcHerdr. The gear opens the same panel; the palette
+and `Cmd+,` continue to open OcHerdr's own appearance settings. Herdr owns the TUI
+settings and saves them on the connected host. The panel uses a separate full-app
+client with connection-local bindings (`F12` opens settings), so custom server
+prefixes do not prevent entry and no config keys are overwritten. Existing Herdr
+dialogs, including onboarding, are preserved. Closing the panel detaches only
+that client and restores focus to OcHerdr's panes.
+
+On macOS, text fields (including dynamically created Find fields) support:
+
+- `Cmd+Left/Right`: line start/end; `Cmd+Up/Down`: document start/end.
+- `Option+Left/Right`: move by Unicode word; add `Shift` to extend the selection.
+- `Shift+Up/Down` and `Cmd+Shift+arrows`: extend the selection by line/document.
+- `Cmd+Backspace/Delete`: delete to line start/end; `Option+Backspace/Delete`:
+  delete by word. Existing selections take precedence.
+- `Ctrl+A/E/B/F/P/N`: line/character/vertical movement; `Ctrl+H/D`: backward/forward
+  deletion; `Ctrl+K`: delete to line end (or the newline); `Ctrl+T`: transpose characters.
+- `Cmd+A/C/X/V`, `Cmd+Shift+V` (plain text), `Cmd+Z`, `Cmd+Shift+Z`: selection,
+  clipboard, undo and redo. Composed Unicode characters and IME preedit are preserved.
+
+The file panel's **Show hidden files** button reveals dotfiles and directories
+such as `.env` and `.git`, locally and over SFTP. Toggle it with `Cmd+Shift+.` on
+macOS (`Ctrl+H` elsewhere) while the file panel is open. The preference is saved;
+changing it refreshes expanded directories and invalidates collapsed-directory caches.
 
 OcHerdr listens to the same per-pane agent status stream that keeps its UI current and
 posts a native notification when an agent moves from working to done or blocked. This

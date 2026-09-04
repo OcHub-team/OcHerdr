@@ -79,6 +79,9 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        crate::text_input::init(cx);
+        #[cfg(target_os = "macos")]
+        Self::install_text_input_editing(cx);
         let i18n = I18n::new(loaded.language);
         let appearance = loaded.appearance;
         let persistence = loaded.persistence;
@@ -177,6 +180,7 @@ impl OcHerdrView {
             pane_viewports: HashMap::new(),
             pane_mount_scheduled: false,
             overlay: Overlay::None,
+            herdr_settings: None,
             open_select: None,
             appearance_scroll: ScrollHandle::new(),
             appearance_ui: Default::default(),
@@ -506,6 +510,10 @@ impl OcHerdrView {
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
         self.abandon_worktree_list();
+        if matches!(self.overlay, Overlay::HerdrSettings) {
+            self.set_overlay(Overlay::None, cx);
+            self.pending_focus = Some(PendingFocus::Surface);
+        }
         if matches!(self.overlay, Overlay::AgentPanel { .. }) {
             self.overlay = Overlay::None;
             self.reset_agent_panel_state();
@@ -909,6 +917,11 @@ impl OcHerdrView {
     }
 
     fn set_overlay(&mut self, overlay: Overlay, cx: &mut Context<Self>) {
+        if !matches!(overlay, Overlay::HerdrSettings) {
+            // Dropping the settings entity cancels its frame task and detaches
+            // only its full-app client. Existing pane streams stay connected.
+            self.herdr_settings = None;
+        }
         if !matches!(overlay, Overlay::WorktreeOpen(_)) {
             self.worktree_list_task = None;
         }

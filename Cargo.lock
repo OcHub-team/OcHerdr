@@ -4006,7 +4006,7 @@ dependencies = [
 
 [[package]]
 name = "ocherdr"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "base64",
@@ -4031,12 +4031,13 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "toml 1.1.4+spec-1.1.0",
+ "unicode-segmentation",
  "url",
 ]
 
 [[package]]
 name = "ocherdr-core"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -4044,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "ocherdr-files"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "futures",
  "ocherdr-core",
@@ -4058,7 +4059,7 @@ dependencies = [
 
 [[package]]
 name = "ocherdr-herdr"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "bincode",
  "dirs",
@@ -4069,11 +4070,12 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "uds_windows",
+ "vt100",
 ]
 
 [[package]]
 name = "ocherdr-terminal"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "bindgen 0.72.1",
  "core-foundation 0.10.1",

@@ -6,10 +6,12 @@ This project is available under the MIT License or Apache License 2.0, at your o
 Third-party components
 ----------------------
 
-ochub-ui 0.6.0
+ochub-ui 0.6.2
 Copyright OcHub contributors
 MIT OR Apache-2.0
 https://github.com/OcHub-team/ochub-ui
+The local text input in crates/ocherdr-app/src/text_input.rs is adapted from
+ochub-ui commit ee186c95951f8cfcfd7b34e37aeced3f7bab6782, with native editing extensions.
 
 GhosttyKit (manaflow-ai/ghostty commit 3da10da73ae848c0310e3e0f0cb29e509c2f6963)
 Copyright Ghostty contributors

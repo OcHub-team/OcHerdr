@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::text_input::TextInput;
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
@@ -21,7 +22,7 @@ use ocherdr_files::{
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, MAX_CLIPBOARD_IMAGE_BYTES, SessionConnection,
     TerminalCommand, TerminalMode, TerminalNotificationKind, TerminalScrollDirection,
-    TerminalSession, attach_command, discover_sessions, open_system_terminal, request_socket,
+    TerminalSession, discover_sessions, request_socket,
 };
 use ocherdr_terminal::{
     KeyAction, KeyModifiers, RenderedFrame, SurfaceMouseButton, Terminal, TerminalPalette,
@@ -51,7 +52,6 @@ use ochub_ui::gpui::{
 use ochub_ui::gpui::{ObjectFit, surface};
 use ochub_ui::icons::{IconName, icon};
 use ochub_ui::notifications::NotificationHost;
-use ochub_ui::text_input::TextInput;
 use ochub_ui::{assets, theme};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,6 +62,7 @@ mod controller;
 use controller::HerdrCapabilities;
 mod file_panel;
 mod fonts;
+mod herdr_settings;
 mod host_center;
 mod host_model;
 mod i18n;
@@ -71,6 +72,9 @@ mod pane_model;
 mod pane_tab_drop;
 mod pane_templates;
 mod reorder_model;
+// Retain the upstream component API alongside OcHerdr's native editing layer.
+#[allow(dead_code)]
+mod text_input;
 mod theme_ansi;
 mod ui;
 mod update;
@@ -1032,6 +1036,7 @@ struct OcHerdrView {
     pane_viewports: HashMap<String, MeasuredPaneViewport>,
     pane_mount_scheduled: bool,
     overlay: Overlay,
+    herdr_settings: Option<Entity<herdr_settings::HerdrSettings>>,
     open_select: Option<SharedString>,
     appearance_scroll: ScrollHandle,
     appearance_ui: ui::AppearanceUi,
@@ -1177,6 +1182,7 @@ enum Overlay {
     NodeManager,
     RemoteForm(RemoteForm),
     Appearance,
+    HerdrSettings,
     HostSwitcher,
     ContextMenu(HierarchyContextMenu),
     FileContextMenu(FileContextMenu),

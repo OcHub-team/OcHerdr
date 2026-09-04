@@ -58,6 +58,7 @@ pub(crate) struct TerminalConnect<'a> {
     pub(crate) protocol: u32,
     pub(crate) target: &'a str,
     pub(crate) mode: crate::TerminalMode,
+    pub(crate) settings: bool,
     pub(crate) cols: u16,
     pub(crate) rows: u16,
     pub(crate) cell_width_px: u32,
@@ -81,6 +82,7 @@ pub(crate) fn connect(
             request.rows,
             request.cell_width_px,
             request.cell_height_px,
+            request.settings,
         )?,
     }
 
@@ -100,6 +102,7 @@ pub(crate) fn connect(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_v20(
     stream: &mut UnixStream,
     target: &str,
@@ -108,6 +111,7 @@ fn connect_v20(
     rows: u16,
     cell_width_px: u32,
     cell_height_px: u32,
+    settings: bool,
 ) -> Result<()> {
     v20::write_message(
         stream,
@@ -118,8 +122,19 @@ fn connect_v20(
             cell_width_px,
             cell_height_px,
             requested_encoding: v20::RenderEncoding::TerminalAnsi,
-            keybindings: v20::ClientKeybindings::Server,
-            launch_mode: v20::ClientLaunchMode::TerminalAttach,
+            keybindings: if settings {
+                // Connection-local bindings, never persisted to the user's config.
+                v20::ClientKeybindings::Local {
+                    keys_toml: "[keys]\nprefix = \"ctrl+b\"\nsettings = \"f12\"\n".into(),
+                }
+            } else {
+                v20::ClientKeybindings::Server
+            },
+            launch_mode: if settings {
+                v20::ClientLaunchMode::App
+            } else {
+                v20::ClientLaunchMode::TerminalAttach
+            },
         },
     )
     .map_err(protocol_error)?;
@@ -152,6 +167,12 @@ fn connect_v20(
         }
     }
 
+    if settings {
+        // A structured key avoids terminal escape parsing delays and never
+        // types a command into a pane. Existing modals retain their own input
+        // handling; we must not dismiss onboarding or unsaved dialogs blindly.
+        return v20::write_message(stream, &settings_key()).map_err(protocol_error);
+    }
     let attach = match mode {
         crate::TerminalMode::Observe => v20::ClientMessage::ObserveTerminal {
             target: target.to_owned(),
@@ -166,11 +187,31 @@ fn connect_v20(
     v20::write_message(stream, &attach).map_err(protocol_error)
 }
 
+fn settings_key() -> v20::ClientMessage {
+    v20::ClientMessage::InputEvents {
+        events: vec![v20::ClientInputEvent::Key {
+            code: v20::ClientKeyCode::F(12),
+            modifiers: 0,
+            kind: v20::ClientKeyKind::Press,
+            repeat_count: 1,
+            generated_text: None,
+            source: v20::ClientKeySource::Synthesized,
+        }],
+    }
+}
+
 impl TerminalWireWriter {
     pub(crate) fn send(&mut self, command: TerminalCommand) -> Result<()> {
-        match self.codec {
+        let release = command == TerminalCommand::Release;
+        let result = match self.codec {
             ProtocolCodec::V20 => self.send_v20(command),
+        };
+        if release || result.is_err() {
+            // Herdr removes the client on Detach, but its socket reader can
+            // still be waiting for our EOF. Wake both reader threads now.
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
         }
+        result
     }
 
     fn send_v20(&mut self, command: TerminalCommand) -> Result<()> {
@@ -425,6 +466,7 @@ mod tests {
             protocol: 20,
             target: "pane-7",
             mode: crate::TerminalMode::ControlTakeover,
+            settings: false,
             cols: 120,
             rows: 40,
             cell_width_px: 0,

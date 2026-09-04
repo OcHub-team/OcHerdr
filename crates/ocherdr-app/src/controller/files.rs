@@ -160,6 +160,15 @@ impl OcHerdrView {
             },
         );
         self.persist_settings(FailureKind::FileOperation, cx);
+        // Cancel lists captured with the previous visibility. Otherwise a
+        // toggle during a slow SFTP listing is silently lost by the in-flight
+        // task guard, and collapsed directories retain stale cached entries.
+        self.file_panel.directory_tasks.clear();
+        self.file_panel.loading.clear();
+        self.file_panel.children.clear();
+        if !self.file_panel.show_hidden {
+            self.file_panel.selected = None;
+        }
         let directories = self.file_panel.expanded.iter().cloned().collect::<Vec<_>>();
         for directory in directories {
             self.load_file_panel_directory(directory, true, cx);
@@ -316,13 +325,16 @@ impl OcHerdrView {
                         this.file_panel.children.clear();
                         this.file_panel.children.insert(root.clone(), entries);
                         this.file_panel.expanded.clear();
-                        this.file_panel.expanded.insert(root);
+                        this.file_panel.expanded.insert(root.clone());
                         this.file_panel.loading.clear();
                         this.file_panel.selected = None;
                         this.file_panel.error = None;
                         this.file_panel.address_editing = false;
                         this.file_panel.address_error = None;
                         this.pending_focus = Some(PendingFocus::Surface);
+                        if show_hidden != this.file_panel.show_hidden {
+                            this.load_file_panel_directory(root, true, cx);
+                        }
                     }
                     Err(error) => {
                         this.file_panel.address_error = Some(error.to_string());
@@ -355,7 +367,9 @@ impl OcHerdrView {
         let task = cx.spawn(async move |this, cx| {
             let result = service.list_dir(task_path.clone(), show_hidden).await;
             this.update(cx, |this, cx| {
-                if this.file_panel.generation != generation {
+                if this.file_panel.generation != generation
+                    || this.file_panel.show_hidden != show_hidden
+                {
                     return;
                 }
                 this.file_panel.directory_tasks.remove(&task_path);
@@ -1318,6 +1332,9 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.handle_file_panel_hidden_key(event, cx) {
+            return true;
+        }
         let modifiers = event.keystroke.modifiers;
         if self.file_panel.open
             && event.keystroke.key == "l"
@@ -1335,6 +1352,25 @@ impl OcHerdrView {
             && !matches!(self.file_panel.prompt, FilePanelPrompt::None)
         {
             self.cancel_file_prompt(window, cx);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn handle_file_panel_hidden_key(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let m = event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        if self.file_panel.open
+            && matches!(self.overlay, Overlay::None | Overlay::FileContextMenu(_))
+            && only_primary_modifier(m)
+            && ((cfg!(target_os = "macos") && m.shift && matches!(key, "." | ">"))
+                || (!cfg!(target_os = "macos") && !m.shift && key == "h"))
+        {
+            self.toggle_file_panel_hidden(cx);
             return true;
         }
         false

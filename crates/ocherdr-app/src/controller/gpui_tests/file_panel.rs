@@ -4,6 +4,131 @@ use ocherdr_core::WorkspaceWorktreeInfo;
 use ocherdr_files::{BackendKind, BackendSpec, EntryKind, FileEntry, FileService};
 
 #[gpui::test]
+fn hidden_files_toggle_refreshes_inflight_and_cached_directories(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let nested = root.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join(".env"), b"example=true").unwrap();
+    std::fs::write(nested.join(".config"), b"example").unwrap();
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, cx| {
+        let mut snapshot = three_tab_snapshot();
+        snapshot.workspaces[0].worktree = Some(WorkspaceWorktreeInfo {
+            repo_key: "fixture".into(),
+            repo_name: "fixture".into(),
+            repo_root: root.to_string_lossy().into_owned(),
+            checkout_path: root.to_string_lossy().into_owned(),
+            is_linked_worktree: false,
+        });
+        this.snapshot = Some(snapshot);
+        this.selection = Selection {
+            connection_id: "local".into(),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-a".into()),
+            ..Default::default()
+        };
+        this.file_panel.open = true;
+        this.file_panel.show_hidden = false;
+        this.file_panel.source = Some(crate::FilePanelSource {
+            profile_id: "local".into(),
+            suggested_root: root.clone(),
+        });
+        this.file_panel.service = Some(FileService::new(BackendSpec::Local).unwrap());
+        this.file_panel.root = Some(root.clone());
+        this.file_panel
+            .expanded
+            .extend([root.clone(), nested.clone()]);
+        // A pending old listing must not block the visibility refresh.
+        this.file_panel.directory_tasks.insert(
+            root.clone(),
+            cx.spawn(async |_, _| {
+                futures::future::pending::<()>().await;
+            }),
+        );
+        this.file_panel
+            .children
+            .insert(root.join("collapsed"), vec![]);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let button = cx
+        .debug_bounds("file-hidden")
+        .expect("visible hidden-files toggle");
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        if view.read_with(cx, |this, _| {
+            this.file_panel
+                .children
+                .get(&root)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.name == ".env"))
+                && this
+                    .file_panel
+                    .children
+                    .get(&nested)
+                    .is_some_and(|entries| entries.iter().any(|entry| entry.name == ".config"))
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "hidden entries never loaded");
+        thread::sleep(Duration::from_millis(10));
+    }
+    view.read_with(cx, |this, _| {
+        assert!(this.file_panel.show_hidden);
+        assert!(
+            this.file_panel.children[&root]
+                .iter()
+                .any(|entry| entry.name == ".git")
+        );
+        assert!(
+            !this
+                .file_panel
+                .children
+                .contains_key(&root.join("collapsed"))
+        );
+    });
+    view.update_in(cx, |this, window, cx| this.focus.focus(window, cx));
+    let shortcut = if cfg!(target_os = "macos") {
+        "cmd-shift-."
+    } else {
+        "ctrl-h"
+    };
+    // Toggle repeatedly before allowing old directory requests to settle.
+    cx.simulate_keystrokes(shortcut);
+    cx.simulate_keystrokes(shortcut);
+    cx.simulate_keystrokes(shortcut);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        if view.read_with(cx, |this, _| {
+            this.file_panel.children.contains_key(&root)
+                && this.file_panel.children.contains_key(&nested)
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "visible-only entries never loaded"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    view.read_with(cx, |this, _| {
+        assert!(!this.file_panel.show_hidden);
+        assert!(
+            this.file_panel
+                .children
+                .values()
+                .flatten()
+                .all(|entry| !entry.hidden)
+        );
+    });
+}
+
+#[gpui::test]
 #[cfg(target_os = "macos")]
 fn focused_file_path_input_keeps_text_out_of_the_terminal(cx: &mut TestAppContext) {
     let fake = FakeHerdr::snapshot_with_live_events(three_tab_snapshot());
@@ -40,6 +165,19 @@ fn focused_file_path_input_keeps_text_out_of_the_terminal(cx: &mut TestAppContex
     assert!(
         fake.terminal_inputs("p-a").is_empty(),
         "typing in the file path input must never reach the terminal"
+    );
+    cx.simulate_keystrokes("cmd-left cmd-right cmd-up cmd-down alt-left alt-right ctrl-b ctrl-f cmd-shift-left cmd-c cmd-right");
+    cx.run_until_parked();
+    view.update(cx, |this, _| {
+        this.pump_terminal_input();
+        assert!(
+            !this.prefix_pending,
+            "Control+B in a field is cursor movement"
+        );
+    });
+    assert!(
+        fake.terminal_inputs("p-a").is_empty(),
+        "editing shortcuts leaked into the pane"
     );
 }
 

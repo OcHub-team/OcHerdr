@@ -70,6 +70,11 @@ impl Render for OcHerdrView {
                 if this.handle_overlay_key(event, window, cx) {
                     return;
                 }
+                #[cfg(target_os = "macos")]
+                if this.handle_text_input_macos_editing(event, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.handle_file_panel_key(event, window, cx) {
                     cx.stop_propagation();
                     return;
@@ -125,6 +130,11 @@ impl Render for OcHerdrView {
             }
             Overlay::Appearance => {
                 root = root.child(self.render_appearance(cx));
+            }
+            Overlay::HerdrSettings => {
+                if let Some(settings) = &self.herdr_settings {
+                    root = root.child(settings.clone());
+                }
             }
             Overlay::ContextMenu(menu) => {
                 root = root.child(self.render_context_menu(menu, cx));

@@ -5,6 +5,8 @@
 
 mod private_protocol;
 mod private_v20;
+#[cfg(all(test, unix))]
+mod settings_tests;
 
 use std::collections::HashMap;
 use std::fs;
@@ -1054,6 +1056,25 @@ pub type TerminalEventReceiver = Receiver<Result<TerminalEvent>>;
 const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4;
 
 impl TerminalSession {
+    /// Attach the full Herdr UI and request its settings using client-local
+    /// bindings. No terminal ownership or takeover request is sent.
+    pub fn spawn_settings(
+        endpoint: TerminalEndpoint,
+        protocol: u32,
+        cols: u16,
+        rows: u16,
+    ) -> (Self, TerminalEventReceiver) {
+        Self::spawn_inner(
+            endpoint,
+            protocol,
+            String::new(),
+            TerminalMode::Observe,
+            cols,
+            rows,
+            true,
+        )
+    }
+
     pub fn spawn(
         endpoint: TerminalEndpoint,
         protocol: u32,
@@ -1061,6 +1082,18 @@ impl TerminalSession {
         mode: TerminalMode,
         cols: u16,
         rows: u16,
+    ) -> (Self, TerminalEventReceiver) {
+        Self::spawn_inner(endpoint, protocol, target, mode, cols, rows, false)
+    }
+
+    fn spawn_inner(
+        endpoint: TerminalEndpoint,
+        protocol: u32,
+        target: String,
+        mode: TerminalMode,
+        cols: u16,
+        rows: u16,
+        settings: bool,
     ) -> (Self, TerminalEventReceiver) {
         let (command_tx, command_rx) = mpsc::channel::<TerminalCommand>();
         let (mut event_tx, event_rx) =
@@ -1073,6 +1106,7 @@ impl TerminalSession {
                 protocol,
                 target: &target,
                 mode,
+                settings,
                 cols,
                 rows,
                 cell_width_px: 0,

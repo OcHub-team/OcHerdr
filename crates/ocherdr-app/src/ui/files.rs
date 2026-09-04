@@ -201,17 +201,12 @@ impl OcHerdrView {
                         } else {
                             i18n.text(k::FILES_HIDDEN_SHOW)
                         },
-                        icon_only_button_tone(
+                        button(
                             "file-hidden",
                             if show_hidden {
                                 i18n.text(k::FILES_HIDDEN_HIDE)
                             } else {
                                 i18n.text(k::FILES_HIDDEN_SHOW)
-                            },
-                            if show_hidden {
-                                IconName::EyeOff
-                            } else {
-                                IconName::Eye
                             },
                             if show_hidden {
                                 ButtonTone::Primary
@@ -220,6 +215,7 @@ impl OcHerdrView {
                             },
                             ButtonSize::Sm,
                         )
+                        .debug_selector(|| "file-hidden".into())
                         .on_click(cx.listener(|this, _, _window, cx| {
                             this.toggle_file_panel_hidden(cx);
                         })),

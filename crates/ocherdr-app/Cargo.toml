@@ -29,6 +29,7 @@ serde_json.workspace = true
 sys-locale.workspace = true
 tempfile.workspace = true
 url.workspace = true
+unicode-segmentation.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

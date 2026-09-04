@@ -932,7 +932,7 @@ pub(super) fn apply_split_drag_pointer(
     drag
 }
 
-pub(super) fn gpui_key_modifiers(modifiers: ochub_ui::gpui::Modifiers) -> KeyModifiers {
+pub(crate) fn gpui_key_modifiers(modifiers: ochub_ui::gpui::Modifiers) -> KeyModifiers {
     KeyModifiers {
         control: modifiers.control,
         alt: modifiers.alt,

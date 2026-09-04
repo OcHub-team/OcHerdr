@@ -680,12 +680,17 @@ impl OcHerdrView {
                             "open-herdr-settings",
                             chrome.toolbar.herdr_settings.name.clone(),
                             IconName::Settings,
-                            ButtonTone::Ghost,
+                            if matches!(self.overlay, Overlay::HerdrSettings) {
+                                ButtonTone::Primary
+                            } else {
+                                ButtonTone::Ghost
+                            },
                             ButtonSize::Sm,
                         ),
                         &chrome.toolbar.herdr_settings,
                     )
-                    .on_click(cx.listener(|this, _, _window, cx| this.open_native_tui(cx))),
+                    .debug_selector(|| "open-herdr-settings".into())
+                    .on_click(cx.listener(|this, _, _window, cx| this.open_herdr_settings(cx))),
                 ),
             )
             .child(apply_control(

@@ -32,6 +32,12 @@ fn local_listing_sorts_directories_first_and_filters_hidden() {
         vec!["folder", "A.txt", "z.txt"]
     );
     assert_eq!(entries[0].kind, EntryKind::Directory);
+    let entries = list_local_dir(temp.path(), true).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == ".secret" && entry.hidden)
+    );
 }
 
 #[test]
