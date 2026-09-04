@@ -1,4 +1,6 @@
+use super::terminal::HERDR_NOTIFICATION_ID;
 use super::*;
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AgentSystemNotification {
@@ -6,6 +8,8 @@ pub(super) struct AgentSystemNotification {
     agent: String,
     workspace: String,
     tab: String,
+    pane_id: String,
+    terminal_id: String,
 }
 
 pub(super) fn agent_system_notifications(
@@ -81,6 +85,8 @@ pub(super) fn agent_system_notifications(
             agent,
             workspace,
             tab,
+            pane_id: pane.pane_id.clone(),
+            terminal_id: pane.terminal_id.clone(),
         });
     }
     notices
@@ -295,6 +301,7 @@ impl OcHerdrView {
             // Requests already sent cannot be cancelled; the reconnect
             // snapshot is the authority for what actually happened.
             self.abort_pane_relocations_for_disconnect();
+            self.abort_tab_transfer_for_disconnect(cx);
         }
         self.reconcile_split_drag(cx);
         self.reconcile_split_commit(cx);
@@ -395,7 +402,7 @@ impl OcHerdrView {
         }
         if effects.apply_local {
             for notice in notices {
-                self.post_agent_system_notification(&profile_label, notice, cx);
+                self.post_agent_system_notification(owner, &profile_label, notice, cx);
             }
         }
         effects.reschedule
@@ -483,8 +490,10 @@ impl OcHerdrView {
         }
         if effects.apply_local {
             let host = self.current_profile().label().to_owned();
-            for notice in notices {
-                self.post_agent_system_notification(&host, notice, cx);
+            if let Some(owner) = self.current_session_key() {
+                for notice in notices {
+                    self.post_agent_system_notification(&owner, &host, notice, cx);
+                }
             }
         }
         self.reconcile_open_agent_panel(panel_refresh, cx);
@@ -608,7 +617,8 @@ impl OcHerdrView {
     }
 
     fn post_agent_system_notification(
-        &self,
+        &mut self,
+        owner: &SessionKey,
         host: &str,
         notice: AgentSystemNotification,
         cx: &mut Context<Self>,
@@ -629,7 +639,66 @@ impl OcHerdrView {
             workspace = notice.workspace,
             tab = notice.tab
         );
-        self.post_system_notification(title, body, cx);
+        let id = HERDR_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed);
+        let tag = format!("ocherdr-agent-{id}");
+        self.remember_agent_notification_target(
+            tag.clone(),
+            AgentNotificationTarget {
+                profile_id: owner.profile_id.clone(),
+                session_name: owner.session_name.clone(),
+                pane_id: notice.pane_id,
+                terminal_id: notice.terminal_id,
+            },
+        );
+        cx.show_system_notification(SystemNotification {
+            tag: tag.into(),
+            title: title.into(),
+            body: body.into(),
+            actions: Vec::new(),
+        });
+    }
+
+    pub(crate) fn handle_system_notification_response(
+        &mut self,
+        response: SystemNotificationResponse,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self
+            .agent_notification_targets
+            .remove(response.tag.as_ref())
+        else {
+            return;
+        };
+        let Some(profile_index) = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id() == target.profile_id)
+        else {
+            return;
+        };
+        if profile_index != self.profile_index {
+            self.select_profile(profile_index, cx);
+        }
+        if self.current_session().map(|session| session.name.as_str())
+            != Some(target.session_name.as_str())
+        {
+            return;
+        }
+        let pane_id = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.terminal_id == target.terminal_id)
+                .or_else(|| snapshot.pane(&target.pane_id))
+                .map(|pane| pane.pane_id.clone())
+        });
+        let Some(pane_id) = pane_id else {
+            return;
+        };
+        self.set_overlay(Overlay::None, cx);
+        self.select_pane(pane_id.clone(), window, cx);
+        self.invoke("pane.focus", json!({ "pane_id": pane_id }), cx);
     }
 
     pub(crate) fn resync_snapshot(&mut self, epoch: u64, cx: &mut Context<Self>) {

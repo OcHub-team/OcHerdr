@@ -32,6 +32,7 @@ mod pane_templates;
 mod reorder;
 mod runtime;
 mod support;
+mod tab_transfer;
 mod terminal;
 mod worktree;
 
@@ -64,6 +65,9 @@ impl OcHerdrView {
                 appearance: AppearanceSettings::default(),
                 language: Language::default(),
                 document: crate::config::ConfigDocument::new(),
+                ui_state: crate::config::UiState::default(),
+                persistence: crate::config::ConfigStore::temporary(),
+                storage_notices: Vec::new(),
             },
             window,
             cx,
@@ -77,6 +81,9 @@ impl OcHerdrView {
     ) -> Self {
         let i18n = I18n::new(loaded.language);
         let appearance = loaded.appearance;
+        let persistence = loaded.persistence;
+        let storage_notices = loaded.storage_notices;
+        let selected_connection_id = loaded.ui_state.selected_connection_id;
         let settings = loaded.settings;
         let (app_config, _) = crate::config::values::AppConfig::from_document(&loaded.document);
         let agent_notifications = app_config.agent_notifications;
@@ -91,6 +98,12 @@ impl OcHerdrView {
         let dialog_focus = cx.focus_handle();
         let host_center = cx.new(|cx| HostCenter::new(settings, i18n, focus.clone(), cx));
         let profiles = host_center.read(cx).profiles().to_vec();
+        let profile_index = selected_connection_id
+            .as_deref()
+            .and_then(|id| profile_index_by_id(&profiles, id))
+            .unwrap_or(0);
+        let selected_profile_id = profiles[profile_index].id().to_owned();
+        host_center.update(cx, |center, _| center.set_profile_index(profile_index));
         cx.subscribe(&host_center, |this, _center, event, cx| {
             this.handle_host_center_event(event.clone(), cx);
         })
@@ -122,7 +135,7 @@ impl OcHerdrView {
         .detach();
         let mut view = Self {
             profiles,
-            profile_index: 0,
+            profile_index,
             sessions: Vec::new(),
             session_index: None,
             connection: None,
@@ -139,13 +152,14 @@ impl OcHerdrView {
             agent_status_handoff: None,
             snapshot: None,
             selection: Selection {
-                connection_id: "local".into(),
+                connection_id: selected_profile_id,
                 ..Default::default()
             },
             operation: None,
             notifications: cx.new(|_| NotificationHost::new()),
             window_active: window.is_window_active(),
             agent_notifications,
+            agent_notification_targets: HashMap::new(),
             update_info: None,
             update_state: crate::update::load_state(),
             update_checking: false,
@@ -192,6 +206,8 @@ impl OcHerdrView {
             #[cfg(test)]
             headless_terminals: false,
             pending_reorder: None,
+            pending_tab_transfer: None,
+            tab_transfer_serial: 0,
             reorder_metrics: ReorderMetrics::default(),
             terminal_surface_bounds: None,
             ime_marked: None,
@@ -224,6 +240,7 @@ impl OcHerdrView {
             config: loaded.document,
             i18n,
             host_center,
+            persistence,
             pending_persist: None,
             persist_task: None,
         };
@@ -251,6 +268,9 @@ impl OcHerdrView {
         view.reload(None, cx);
         if let Some(notice) = missing_theme_notice(&view.appearance.theme_family, view.i18n) {
             view.post_notice(notice, cx);
+        }
+        for detail in storage_notices {
+            view.notify_failure(FailureKind::LoadConfiguration, detail, cx);
         }
         #[cfg(not(test))]
         view.spawn_auto_update_check(cx);
@@ -377,6 +397,9 @@ impl OcHerdrView {
         self.cancel_split_drag();
         self.split_commit = None;
         self.cancel_reorder_drag();
+        // A late callback from the old host must never continue the pane
+        // sequence through the newly selected host's socket.
+        self.pending_tab_transfer = None;
         self.cancel_pane_drag();
         self.cancel_keyboard_pane_move();
         self.abandon_worktree_list();
@@ -446,6 +469,15 @@ impl OcHerdrView {
         });
     }
 
+    fn remember_agent_notification_target(&mut self, tag: String, target: AgentNotificationTarget) {
+        if self.agent_notification_targets.len() >= 256
+            && let Some(stale) = self.agent_notification_targets.keys().next().cloned()
+        {
+            self.agent_notification_targets.remove(&stale);
+        }
+        self.agent_notification_targets.insert(tag, target);
+    }
+
     pub(super) fn reload(&mut self, preferred_session: Option<String>, cx: &mut Context<Self>) {
         self.failed_hosts.remove(self.current_profile().id());
         self.load_epoch = self.load_epoch.wrapping_add(1);
@@ -460,6 +492,7 @@ impl OcHerdrView {
         self.agent_status_handoff = None;
         self.pending_created_tab = None;
         self.surface_drag = SurfaceDrag::Idle;
+        self.pending_tab_transfer = None;
         self.split_commit = None;
         self.pane_resize_frozen_tabs.clear();
         self.pane_resize_serial = self.pane_resize_serial.wrapping_add(1);
@@ -612,15 +645,31 @@ impl OcHerdrView {
             let id = profile.id().to_owned();
             self.host_center
                 .update(cx, |center, cx| center.remember_host(&id, cx));
+            self.queue_settings_persist(
+                SettingsPersist {
+                    config_error: None,
+                    host: None,
+                    rollback: None,
+                    domains: PersistDomains {
+                        ui_state: true,
+                        ..Default::default()
+                    },
+                },
+                cx,
+            );
         }
     }
 
     fn persist_settings(&mut self, kind: FailureKind, cx: &mut Context<Self>) {
         self.queue_settings_persist(
             SettingsPersist {
-                error: Some(kind),
+                config_error: Some(kind),
                 host: None,
                 rollback: None,
+                domains: PersistDomains {
+                    config: true,
+                    ..Default::default()
+                },
             },
             cx,
         );
@@ -637,16 +686,27 @@ impl OcHerdrView {
     }
 
     fn spawn_settings_persist(&mut self, request: SettingsPersist, cx: &mut Context<Self>) {
-        let settings =
-            crate::host_center::assemble_settings(&self.host_center.read(cx).persist_state());
-        let document = self.config.clone();
+        let settings = request.domains.connections.then(|| {
+            crate::host_center::assemble_settings(&self.host_center.read(cx).persist_state())
+        });
+        let document = request.domains.config.then(|| self.config.clone());
+        let ui_state = request.domains.ui_state.then(|| crate::config::UiState {
+            selected_connection_id: self
+                .profiles
+                .get(self.profile_index)
+                .map(|profile| profile.id().to_owned()),
+            ..Default::default()
+        });
+        let persistence = self.persistence.clone();
         self.persist_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    crate::host_center::write_settings(&settings)?;
-                    let paths = crate::config::AppPaths::user()
-                        .ok_or_else(|| "Application Support directory is unavailable".to_owned())?;
-                    crate::config::write_config(&paths, &document)
+                    PersistResults {
+                        connections: settings
+                            .map(|settings| persistence.write_connections(&settings)),
+                        config: document.map(|document| persistence.write_config(&document)),
+                        ui_state: ui_state.map(|state| persistence.write_ui_state(&state)),
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -663,15 +723,16 @@ impl OcHerdrView {
     fn apply_settings_persist_result(
         &mut self,
         request: SettingsPersist,
-        result: std::result::Result<(), String>,
+        result: PersistResults,
         cx: &mut Context<Self>,
     ) {
         let SettingsPersist {
-            error,
+            config_error,
             host,
             rollback,
+            ..
         } = request;
-        match (result, host) {
+        match (result.connections.unwrap_or(Ok(())), host) {
             (Ok(()), None) => {}
             (Ok(()), Some(HostPersistFollowUp::Revertible { .. })) => {
                 let profiles = self.host_center.read(cx).profiles().to_vec();
@@ -706,21 +767,24 @@ impl OcHerdrView {
                     self.host_center
                         .update(cx, |center, _| center.apply_rollback(snapshot));
                 }
-                if continuing {
-                    return;
-                }
-                let kind = match host {
-                    Some(HostPersistFollowUp::Revertible { error }) => error,
-                    Some(HostPersistFollowUp::Saved { .. }) => FailureKind::SaveHost,
-                    None => {
-                        let Some(kind) = error else {
-                            return;
-                        };
-                        kind
+                if !continuing
+                    && let Some(kind) = match host {
+                        Some(HostPersistFollowUp::Revertible { error }) => Some(error),
+                        Some(HostPersistFollowUp::Saved { .. }) => Some(FailureKind::SaveHost),
+                        None => None,
                     }
-                };
-                self.notify_failure(kind, detail, cx);
+                {
+                    self.notify_failure(kind, detail, cx);
+                }
             }
+        }
+        if let Some(Err(detail)) = result.config
+            && let Some(kind) = config_error
+        {
+            self.notify_failure(kind, detail, cx);
+        }
+        if let Some(Err(detail)) = result.ui_state {
+            self.notify_failure(FailureKind::LoadConfiguration, detail, cx);
         }
     }
 
@@ -729,9 +793,13 @@ impl OcHerdrView {
             HostCenterEvent::PersistBestEffort => {
                 self.queue_settings_persist(
                     SettingsPersist {
-                        error: None,
+                        config_error: None,
                         host: None,
                         rollback: None,
+                        domains: PersistDomains {
+                            connections: true,
+                            ..Default::default()
+                        },
                     },
                     cx,
                 );
@@ -739,9 +807,13 @@ impl OcHerdrView {
             HostCenterEvent::PersistRevertible { rollback, error } => {
                 self.queue_settings_persist(
                     SettingsPersist {
-                        error: Some(error),
+                        config_error: None,
                         host: Some(HostPersistFollowUp::Revertible { error }),
                         rollback: Some(rollback),
+                        domains: PersistDomains {
+                            connections: true,
+                            ..Default::default()
+                        },
                     },
                     cx,
                 );
@@ -753,9 +825,13 @@ impl OcHerdrView {
             } => {
                 self.queue_settings_persist(
                     SettingsPersist {
-                        error: Some(FailureKind::SaveHost),
+                        config_error: None,
                         host: Some(HostPersistFollowUp::Saved { index, then }),
                         rollback: Some(rollback),
+                        domains: PersistDomains {
+                            connections: true,
+                            ..Default::default()
+                        },
                     },
                     cx,
                 );

@@ -789,6 +789,109 @@ impl OcHerdrView {
         cx.notify();
     }
 
+    /// Match Ghostty's secondary/middle-button behavior: offer the event to
+    /// the terminal first and let the native OcHerdr action run only when the
+    /// terminal application did not request mouse reporting.
+    pub(crate) fn pane_aux_mouse_down(
+        &mut self,
+        pane_id: String,
+        button: SurfaceMouseButton,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !matches!(self.surface_drag, SurfaceDrag::Idle) {
+            return false;
+        }
+        self.select_pane(pane_id.clone(), window, cx);
+        self.take_terminal_control(pane_id.clone(), cx);
+        let Some(runtime) = self.pane_mut(&pane_id) else {
+            return false;
+        };
+        let Some(surface) = map_mouse_to_surface(
+            mouse_point(event.position),
+            runtime.body_bounds,
+            runtime.pixel_size,
+            window.scale_factor(),
+        ) else {
+            return false;
+        };
+        let modifiers = gpui_key_modifiers(event.modifiers);
+        runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
+        let captured = runtime.terminal.mouse_captured() && !modifiers.shift;
+        let _ = runtime.terminal.mouse_button(true, button, modifiers);
+        flush_pane_surface(runtime);
+        if captured {
+            cx.stop_propagation();
+            cx.notify();
+        }
+        captured
+    }
+
+    pub(crate) fn pane_aux_mouse_up(
+        &mut self,
+        pane_id: &str,
+        button: SurfaceMouseButton,
+        event: &MouseUpEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let modifiers = gpui_key_modifiers(event.modifiers);
+        let was_captured = runtime.terminal.mouse_captured() && !modifiers.shift;
+        if let Some(surface) = map_mouse_to_surface(
+            mouse_point(event.position),
+            runtime.body_bounds,
+            runtime.pixel_size,
+            window.scale_factor(),
+        ) {
+            runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
+        }
+        let captured = runtime.terminal.mouse_button(false, button, modifiers);
+        flush_pane_surface(runtime);
+        if was_captured || captured {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    /// Ghostty reports hover motion even when no button is held if the TUI
+    /// requested any-motion mode. Text, split, reorder, and pane drags retain
+    /// their existing gesture-specific paths.
+    pub(crate) fn pane_surface_mouse_move(
+        &mut self,
+        pane_id: &str,
+        event: &MouseMoveEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pane_mouse_move(event, window, cx);
+        if !matches!(self.surface_drag, SurfaceDrag::Idle) {
+            return;
+        }
+        let Some(runtime) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let Some(surface) = map_mouse_to_surface(
+            mouse_point(event.position),
+            runtime.body_bounds,
+            runtime.pixel_size,
+            window.scale_factor(),
+        ) else {
+            return;
+        };
+        let modifiers = gpui_key_modifiers(event.modifiers);
+        let captured = runtime.terminal.mouse_captured() && !modifiers.shift;
+        runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
+        flush_pane_surface(runtime);
+        if captured {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
     pub(crate) fn pane_mouse_move(
         &mut self,
         event: &MouseMoveEvent,

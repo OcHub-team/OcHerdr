@@ -130,6 +130,7 @@ struct State {
     selection: Option<(GridPoint, GridPoint)>,
     selection_anchor: Option<GridPoint>,
     mouse: GridPoint,
+    pressed_mouse_button: Option<SurfaceMouseButton>,
     kitty_report_all: bool,
     preedit: Option<String>,
 }
@@ -164,6 +165,7 @@ impl Terminal {
                 selection: None,
                 selection_anchor: None,
                 mouse: GridPoint { row: 0, column: 0 },
+                pressed_mouse_button: None,
                 kitty_report_all: false,
                 preedit: None,
             }),
@@ -340,8 +342,18 @@ impl Terminal {
         })
     }
 
-    pub fn mouse_pos(&self, x: f64, y: f64, _modifiers: KeyModifiers) {
-        self.with_state(|state| state.mouse = point_from_pixels(state, x, y));
+    pub fn mouse_pos(&self, x: f64, y: f64, modifiers: KeyModifiers) {
+        let report = self.with_state(|state| {
+            let previous = state.mouse;
+            state.mouse = point_from_pixels(state, x, y);
+            if state.mouse == previous || modifiers.shift {
+                return None;
+            }
+            encode_mouse_motion(state, modifiers)
+        });
+        if let Some(bytes) = report {
+            self.queue_input(bytes);
+        }
     }
 
     pub fn mouse_button(
@@ -352,12 +364,19 @@ impl Terminal {
     ) -> bool {
         let report = self.with_state(|state| {
             use vt100::MouseProtocolMode;
-            (!matches!(
-                state.parser.screen().mouse_protocol_mode(),
-                MouseProtocolMode::None
-            ))
-            .then(|| encode_mouse(state, pressed, button, modifiers))
-            .flatten()
+            if pressed {
+                state.pressed_mouse_button = Some(button);
+            } else if state.pressed_mouse_button == Some(button) {
+                state.pressed_mouse_button = None;
+            }
+            let mode = state.parser.screen().mouse_protocol_mode();
+            if modifiers.shift
+                || matches!(mode, MouseProtocolMode::None)
+                || (!pressed && matches!(mode, MouseProtocolMode::Press))
+            {
+                return None;
+            }
+            encode_mouse(state, pressed, button, modifiers)
         });
         if let Some(bytes) = report {
             self.queue_input(bytes);
@@ -365,6 +384,15 @@ impl Terminal {
         } else {
             false
         }
+    }
+
+    pub fn mouse_captured(&self) -> bool {
+        self.with_state(|state| {
+            !matches!(
+                state.parser.screen().mouse_protocol_mode(),
+                vt100::MouseProtocolMode::None
+            )
+        })
     }
 
     pub fn set_mouse_capture(&self, enabled: bool, sgr_pixels: bool) {
@@ -414,7 +442,9 @@ impl Terminal {
 
     pub fn begin_text_selection(&self, x: f64, y: f64, modifiers: KeyModifiers) -> bool {
         self.mouse_pos(x, y, modifiers);
-        if self.mouse_button(true, SurfaceMouseButton::Left, modifiers) {
+        let captured = self.mouse_captured() && !modifiers.shift;
+        let _ = self.mouse_button(true, SurfaceMouseButton::Left, modifiers);
+        if captured {
             return true;
         }
         self.with_state(|state| {
@@ -439,7 +469,9 @@ impl Terminal {
         if let Some((x, y)) = point {
             self.update_text_selection(x, y, modifiers);
         }
-        if !self.mouse_button(false, SurfaceMouseButton::Left, modifiers) {
+        let captured = self.mouse_captured() && !modifiers.shift;
+        let _ = self.mouse_button(false, SurfaceMouseButton::Left, modifiers);
+        if !captured {
             self.with_state(|state| state.selection_anchor = None);
         }
         self.refresh();
@@ -802,6 +834,50 @@ fn encode_mouse(
     }
 }
 
+fn encode_mouse_motion(state: &State, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    use vt100::MouseProtocolMode;
+    let button = match state.parser.screen().mouse_protocol_mode() {
+        MouseProtocolMode::AnyMotion => state.pressed_mouse_button,
+        MouseProtocolMode::ButtonMotion => Some(state.pressed_mouse_button?),
+        MouseProtocolMode::None | MouseProtocolMode::Press | MouseProtocolMode::PressRelease => {
+            return None;
+        }
+    };
+    let mut code = match button {
+        Some(SurfaceMouseButton::Left) => 0,
+        Some(SurfaceMouseButton::Middle) => 1,
+        Some(SurfaceMouseButton::Right) => 2,
+        None => 3,
+    } + 32;
+    code += u8::from(modifiers.alt) * 8;
+    code += u8::from(modifiers.control) * 16;
+    encode_mouse_code(state, code, true)
+}
+
+fn encode_mouse_code(state: &State, code: u8, pressed: bool) -> Option<Vec<u8>> {
+    use vt100::MouseProtocolEncoding;
+    let column = u32::from(state.mouse.column) + 1;
+    let row = u32::from(state.mouse.row) + 1;
+    match state.parser.screen().mouse_protocol_encoding() {
+        MouseProtocolEncoding::Sgr => Some(
+            format!(
+                "\x1b[<{code};{column};{row}{}",
+                if pressed { 'M' } else { 'm' }
+            )
+            .into_bytes(),
+        ),
+        MouseProtocolEncoding::Default => Some(vec![
+            0x1b,
+            b'[',
+            b'M',
+            32 + code,
+            (32 + column.min(223)) as u8,
+            (32 + row.min(223)) as u8,
+        ]),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,5 +911,33 @@ mod tests {
         assert!(frame.lines[0].text.starts_with("hello"));
         assert!(terminal.send_key(KeyAction::Press, "up", None, KeyModifiers::default()));
         assert_eq!(terminal.try_input().unwrap(), b"\x1b[A");
+    }
+
+    #[test]
+    fn mouse_reporting_is_tui_first_and_shift_remains_selection() {
+        let terminal = Terminal::new(20, 10, 100, &palette()).unwrap();
+        assert!(!terminal.mouse_captured());
+
+        terminal.set_mouse_capture(true, false);
+        assert!(terminal.mouse_captured());
+        terminal.mouse_pos(16., 16., KeyModifiers::default());
+        let motion = terminal.try_input().expect("any-motion report");
+        assert!(motion.starts_with(b"\x1b[<35;"));
+        assert!(motion.ends_with(b"M"));
+
+        assert!(terminal.mouse_button(true, SurfaceMouseButton::Right, KeyModifiers::default(),));
+        let press = terminal.try_input().expect("secondary-button press");
+        assert!(press.starts_with(b"\x1b[<2;"));
+        assert!(press.ends_with(b"M"));
+
+        let shift = KeyModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert!(!terminal.mouse_button(true, SurfaceMouseButton::Left, shift));
+        assert!(terminal.try_input().is_none());
+
+        terminal.set_mouse_capture(false, false);
+        assert!(!terminal.mouse_captured());
     }
 }

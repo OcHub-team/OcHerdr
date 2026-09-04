@@ -36,12 +36,155 @@ pub(crate) struct ReorderDrag {
     /// Slot rect at press. Ghost size stays on this even if the live canvas
     /// span is rewritten by the squeeze animation.
     pub(crate) source_rect: (f32, f32, f32, f32),
+    /// A workspace row currently under a dragged tab. Keeping this semantic
+    /// target on the drag avoids deriving a cross-workspace drop from the tab
+    /// strip's horizontal reorder coordinate.
+    pub(crate) workspace_drop: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReorderList {
     Workspaces,
     Tabs { workspace_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TabTransferStep {
+    pub(crate) pane_id: String,
+    pub(crate) anchor_pane_id: String,
+    pub(crate) split: SplitDirection,
+    pub(crate) ratio: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TabTransferPlan {
+    pub(crate) first_pane_id: String,
+    pub(crate) steps: Vec<TabTransferStep>,
+}
+
+/// Turn a split tree into the `pane.move` sequence needed to recreate it in a
+/// fresh tab. Herdr always inserts the moved pane as the second child, so each
+/// split is created before either child subtree is expanded.
+pub(crate) fn tab_transfer_plan(root: &LayoutNode) -> TabTransferPlan {
+    fn first_pane(node: &LayoutNode) -> &str {
+        match node {
+            LayoutNode::Pane(id) => id,
+            LayoutNode::Split { first, .. } => first_pane(first),
+        }
+    }
+
+    fn append(node: &LayoutNode, steps: &mut Vec<TabTransferStep>) {
+        let LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return;
+        };
+        steps.push(TabTransferStep {
+            pane_id: first_pane(second).to_owned(),
+            anchor_pane_id: first_pane(first).to_owned(),
+            split: *direction,
+            ratio: *ratio,
+        });
+        append(first, steps);
+        append(second, steps);
+    }
+
+    let first_pane_id = first_pane(root).to_owned();
+    let mut steps = Vec::new();
+    append(root, &mut steps);
+    TabTransferPlan {
+        first_pane_id,
+        steps,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabTransferPhase {
+    Moving,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingTabTransfer {
+    pub(crate) operation_id: u64,
+    pub(crate) source_tab_id: String,
+    pub(crate) target_workspace_id: String,
+    pub(crate) tab_label: String,
+    pub(crate) focused_pane_id: String,
+    pub(crate) plan: TabTransferPlan,
+    pub(crate) target_tab_id: Option<String>,
+    /// Herdr can re-alias a pane when it crosses a workspace boundary.
+    pub(crate) pane_aliases: HashMap<String, String>,
+    /// Stable runtime identity used to recover an applied move whose socket
+    /// response was lost before OcHerdr learned the new public pane id.
+    pub(crate) pane_terminal_ids: HashMap<String, String>,
+    pub(crate) next_step: usize,
+    pub(crate) request_in_flight: bool,
+    pub(crate) phase: TabTransferPhase,
+}
+
+#[cfg(test)]
+mod tab_transfer_tests {
+    use super::*;
+
+    fn pane(id: &str) -> Box<LayoutNode> {
+        Box::new(LayoutNode::Pane(id.to_owned()))
+    }
+
+    fn split(
+        direction: SplitDirection,
+        ratio: f32,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    ) -> Box<LayoutNode> {
+        Box::new(LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        })
+    }
+
+    #[test]
+    fn one_pane_tab_needs_only_the_initial_cross_workspace_move() {
+        let plan = tab_transfer_plan(&LayoutNode::Pane("only".into()));
+        assert_eq!(plan.first_pane_id, "only");
+        assert!(plan.steps.is_empty());
+    }
+
+    #[test]
+    fn preorder_moves_rebuild_an_arbitrary_binary_layout_exactly() {
+        let original = *split(
+            SplitDirection::Right,
+            0.62,
+            split(
+                SplitDirection::Down,
+                0.35,
+                pane("a"),
+                split(SplitDirection::Right, 0.4, pane("b"), pane("c")),
+            ),
+            split(SplitDirection::Down, 0.7, pane("d"), pane("e")),
+        );
+        let plan = tab_transfer_plan(&original);
+        assert_eq!(plan.first_pane_id, "a");
+        assert_eq!(plan.steps.len(), 4);
+
+        let mut rebuilt = LayoutNode::Pane(plan.first_pane_id);
+        for step in plan.steps {
+            rebuilt = ocherdr_core::split_at(
+                rebuilt,
+                &step.anchor_pane_id,
+                step.split,
+                &step.pane_id,
+                step.ratio,
+            );
+        }
+        assert_eq!(rebuilt, original);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -146,9 +289,8 @@ pub(crate) fn reorder_list_bounds(rects: &[(f32, f32, f32, f32)]) -> (f32, f32, 
 /// Ghost origin so the dragged row stays on its list axis.
 ///
 /// Tabs lock `top` to the strip and clamp `left`; workspaces lock `left` to
-/// the sidebar and clamp `top`. Drop targeting still uses the pointer's
-/// coordinate along that same axis, including when the pointer has left the
-/// strip — there is no tear-out in this round.
+/// the sidebar and clamp `top`. A tab with a semantic workspace target uses
+/// its free pointer origin in `reorder_ghost`, outside this same-list helper.
 pub(crate) fn reorder_ghost_origin(
     pointer: (f32, f32),
     grab_offset: (f32, f32),
@@ -234,7 +376,7 @@ pub(crate) fn reorder_projection(
     pending: Option<&PendingListReorder>,
 ) -> Option<ReorderProjection> {
     let dragging = drag.and_then(|drag| {
-        if drag.list != *list || !reorder_past_slop(drag) {
+        if drag.list != *list || !reorder_past_slop(drag) || drag.workspace_drop.is_some() {
             return None;
         }
         Some((

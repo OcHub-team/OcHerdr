@@ -12,6 +12,7 @@ anyhow.workspace = true
 base64.workspace = true
 dirs.workspace = true
 futures.workspace = true
+fs2.workspace = true
 gpui.workspace = true
 gpui-platform.workspace = true
 ochub-ui.workspace = true

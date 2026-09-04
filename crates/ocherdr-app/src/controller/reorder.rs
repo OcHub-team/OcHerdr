@@ -41,6 +41,10 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
+        if self.tab_relocation_locked(&tab_id) || self.pending_tab_transfer.is_some() {
+            self.select_tab(tab_id, cx);
+            return;
+        }
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -59,7 +63,8 @@ impl OcHerdrView {
         let Some(source_index) = order.iter().position(|id| id == &tab_id) else {
             return;
         };
-        if order.len() < 2 {
+        let can_transfer = self.pane_move_supported() && snapshot.workspaces.len() >= 2;
+        if order.len() < 2 && !can_transfer {
             self.select_tab(tab_id, cx);
             return;
         }
@@ -112,6 +117,7 @@ impl OcHerdrView {
             pointer,
             grab_offset,
             source_rect: rect,
+            workspace_drop: None,
         });
         cx.stop_propagation();
         cx.notify();
@@ -231,6 +237,12 @@ impl OcHerdrView {
             return false;
         };
         drag.pointer = mouse;
+        drag.workspace_drop = self.workspace_drop_at(&drag);
+        if drag.workspace_drop.is_some() {
+            self.surface_drag = SurfaceDrag::Reorder(drag);
+            cx.notify();
+            return true;
+        }
         // Rows left the layout mid-drag. Keeping the last hover would aim the
         // drop at a position that is no longer on screen.
         let Some(hover) = self.reorder_hover_for(&drag) else {
@@ -257,6 +269,24 @@ impl OcHerdrView {
         drag.pointer = mouse;
         let source_id = drag.order[drag.source_index].clone();
         let list = drag.list.clone();
+        drag.workspace_drop = self.workspace_drop_at(&drag);
+        if reorder_past_slop(&drag)
+            && let (ReorderList::Tabs { workspace_id }, Some(target_workspace_id)) =
+                (&list, drag.workspace_drop.clone())
+        {
+            if target_workspace_id != *workspace_id
+                && self.start_tab_transfer(
+                    source_id.clone(),
+                    workspace_id.clone(),
+                    target_workspace_id,
+                    cx,
+                )
+            {
+                return true;
+            }
+            self.select_reorder_source(&list, source_id, cx);
+            return true;
+        }
         let Some(hover) = self.reorder_hover_for(&drag) else {
             self.select_reorder_source(&list, source_id, cx);
             return true;
@@ -299,6 +329,20 @@ impl OcHerdrView {
             ReorderList::Tabs { .. } => drag.pointer.0,
         };
         Some(reorder_hover_along_axis(&spans, pointer))
+    }
+
+    fn workspace_drop_at(&self, drag: &ReorderDrag) -> Option<String> {
+        if !matches!(drag.list, ReorderList::Tabs { .. })
+            || !reorder_past_slop(drag)
+            || !self.pane_move_supported()
+        {
+            return None;
+        }
+        self.reorder_metrics
+            .workspaces
+            .iter()
+            .find(|span| point_in_rect(drag.pointer, span.rect))
+            .map(|span| span.id.clone())
     }
 
     pub(super) fn pending_display_for(&self, drag: &ReorderDrag) -> Option<PendingListReorder> {

@@ -23,7 +23,9 @@ use ocherdr_herdr::{
     TerminalCommand, TerminalMode, TerminalNotificationKind, TerminalScrollDirection,
     TerminalSession, attach_command, discover_sessions, open_system_terminal, request_socket,
 };
-use ocherdr_terminal::{KeyAction, KeyModifiers, RenderedFrame, Terminal, TerminalPalette};
+use ocherdr_terminal::{
+    KeyAction, KeyModifiers, RenderedFrame, SurfaceMouseButton, Terminal, TerminalPalette,
+};
 use ochub_ui::anim::Transition;
 use ochub_ui::components::{
     ButtonSize, ButtonTone, busy_button, button, context_menu, context_menu_item, disabled_button,
@@ -36,10 +38,10 @@ use ochub_ui::gpui::{
     EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding,
     KeyDownEvent, Keystroke, Menu, MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, SystemNotification, Task, TextOverflow, TextRun,
-    TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds,
-    WindowOptions, anchored, canvas, deferred, div, ease_out_quint, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, size,
+    ScrollWheelEvent, SharedString, SystemNotification, SystemNotificationResponse, Task,
+    TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
+    WindowBounds, WindowOptions, anchored, canvas, deferred, div, ease_out_quint,
+    linear_color_stop, linear_gradient, point, prelude::*, px, relative, size,
 };
 #[cfg(not(target_os = "macos"))]
 use ochub_ui::gpui::{
@@ -452,6 +454,14 @@ struct SessionKey {
     session_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentNotificationTarget {
+    profile_id: String,
+    session_name: String,
+    pane_id: String,
+    terminal_id: String,
+}
+
 struct SessionPanes {
     /// Dropping a mismatched owner drops every pane runtime and its listen task.
     owner: SessionKey,
@@ -536,6 +546,11 @@ struct PaneRuntime {
     listen: Option<Task<()>>,
     /// The Herdr stream ended; keep the last frame until the snapshot drops this pane.
     exit_seen: bool,
+    /// Whether Herdr has supplied the authoritative terminal mouse-reporting
+    /// state for this private stream. Older Herdr builds omit the event for
+    /// direct terminal attachments, so agent panes use a TUI-first fallback
+    /// until an explicit state arrives.
+    mouse_capture: Option<(bool, bool)>,
     /// Leftover pixel delta from trackpad wheel events, in the pane's Y axis.
     scroll_px: f32,
     /// Terminal body in window coordinates: `(x, y, width, height)`.
@@ -814,8 +829,16 @@ impl CellHeightChoice {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+const SETTINGS_SCHEMA_VERSION: u32 = 1;
+
+const fn settings_schema_version() -> u32 {
+    SETTINGS_SCHEMA_VERSION
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Settings {
+    #[serde(default = "settings_schema_version")]
+    schema_version: u32,
     #[serde(default)]
     connections: Vec<ConnectionProfile>,
     #[serde(default)]
@@ -826,6 +849,19 @@ struct Settings {
     host_groups: Vec<String>,
     #[serde(default)]
     host_health: HashMap<String, CachedHostHealth>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            connections: Vec::new(),
+            recent_connection_ids: Vec::new(),
+            host_metadata: HashMap::new(),
+            host_groups: Vec::new(),
+            host_health: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -929,6 +965,9 @@ struct OcHerdrView {
     /// OcHerdr-owned native agent notifications. Unlike Herdr `SystemToast`,
     /// these are driven by the pane status subscription available to this UI.
     agent_notifications: bool,
+    /// Routing metadata stays in-process; notification tags remain opaque and
+    /// do not expose host, session, or pane identifiers to the OS.
+    agent_notification_targets: HashMap<String, AgentNotificationTarget>,
     update_info: Option<update::UpdateInfo>,
     update_state: update::UpdateState,
     update_checking: bool,
@@ -987,6 +1026,10 @@ struct OcHerdrView {
     /// frame. Dropped once no drag, return flight, or plan needs it.
     pane_drag_snapshot: Option<RenderedFrame>,
     pending_reorder: Option<PendingReorder>,
+    /// Client-side whole-tab transfer built from the existing cross-workspace
+    /// `pane.move` API.
+    pending_tab_transfer: Option<PendingTabTransfer>,
+    tab_transfer_serial: u64,
     /// Optimistic pane relocations keyed by tab. While one is set the tab is
     /// locked: no split drag, no pane drag, no pane close, frozen resizes.
     pane_relocations: HashMap<String, PendingPaneRelocation>,
@@ -1050,18 +1093,34 @@ struct OcHerdrView {
     config: config::ConfigDocument,
     i18n: I18n,
     host_center: Entity<HostCenter>,
+    persistence: config::ConfigStore,
     pending_persist: Option<SettingsPersist>,
     /// Waiting for the current settings write to finish so the next can start.
     persist_task: Option<Task<()>>,
 }
 
-/// One waiting settings write. Payload is assembled from live state when the
-/// write actually starts; rollback is the last known-good host catalog.
+/// One waiting settings write. Only the dirty domains are assembled from live
+/// state; rollback is the last known-good host catalog.
 #[derive(Clone, Debug)]
 struct SettingsPersist {
-    error: Option<FailureKind>,
+    config_error: Option<FailureKind>,
     host: Option<HostPersistFollowUp>,
     rollback: Option<HostRollback>,
+    domains: PersistDomains,
+}
+
+#[derive(Default)]
+struct PersistResults {
+    connections: Option<std::result::Result<(), String>>,
+    config: Option<std::result::Result<(), String>>,
+    ui_state: Option<std::result::Result<(), String>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PersistDomains {
+    connections: bool,
+    config: bool,
+    ui_state: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1241,6 +1300,12 @@ fn load_settings() -> config::LoadedApp {
             appearance: AppearanceSettings::default(),
             language: Language::default(),
             document: config::ConfigDocument::new(),
+            ui_state: config::UiState::default(),
+            persistence: config::ConfigStore::disabled(),
+            storage_notices: vec![
+                "The operating system did not provide an Application Support directory. Configuration writes are disabled for this run."
+                    .to_owned(),
+            ],
         },
     }
 }
@@ -1312,7 +1377,6 @@ fn main() {
         .with_assets(OcHerdrAssets)
         .run(|cx: &mut App| {
             cx.set_app_identity("io.github.ochub-team.ocherdr", "OcHerdr");
-            cx.on_system_notification_response(|_, cx| cx.activate(true));
             let loaded = load_settings();
             let menu_i18n = I18n::new(loaded.language);
             I18n::install(loaded.language);
@@ -1358,6 +1422,7 @@ fn main() {
                 move |window, cx| {
                     window.set_window_title("OcHerdr");
                     let view = cx.new(|cx| OcHerdrView::new_with(loaded, window, cx));
+                    install_system_notification_handler(&view, cx);
                     let focus = view.read(cx).focus.clone();
                     focus.focus(window, cx);
                     view
@@ -1366,6 +1431,18 @@ fn main() {
             .expect("open OcHerdr window");
             cx.activate(true);
         });
+}
+
+fn install_system_notification_handler(view: &Entity<OcHerdrView>, cx: &mut App) {
+    let view = view.downgrade();
+    cx.on_system_notification_response(move |response, cx| {
+        cx.activate(true);
+        view.update_in(cx, |this, window, cx| {
+            window.activate_window();
+            this.handle_system_notification_response(response, window, cx);
+        })
+        .ok();
+    });
 }
 
 #[cfg(test)]

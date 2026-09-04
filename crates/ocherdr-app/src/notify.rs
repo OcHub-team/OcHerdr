@@ -8,6 +8,7 @@ use crate::i18n::{I18n, Key, k};
 /// different failures remain distinguishable even when their details look similar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FailureKind {
+    LoadConfiguration,
     DiscoverSessions,
     RefreshSnapshot,
     ApplyLiveUpdate,
@@ -60,7 +61,8 @@ impl FailureKind {
             | Self::TerminalControlBusy
             | Self::TerminalControlTakenOver
             | Self::PaneMisordered => NotificationLevel::Warning,
-            Self::DiscoverSessions
+            Self::LoadConfiguration
+            | Self::DiscoverSessions
             | Self::RefreshSnapshot
             | Self::ApplyLiveUpdate
             | Self::UpdateFavorites
@@ -86,6 +88,7 @@ impl FailureKind {
 
     fn title_key(self) -> Key {
         match self {
+            Self::LoadConfiguration => k::NOTIFY_LOAD_CONFIGURATION,
             Self::DiscoverSessions => k::NOTIFY_DISCOVER_SESSIONS,
             Self::RefreshSnapshot => k::NOTIFY_REFRESH_SESSION,
             Self::ApplyLiveUpdate => k::NOTIFY_APPLY_LIVE_UPDATE,

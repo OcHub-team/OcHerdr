@@ -126,13 +126,21 @@ pub(super) fn reorder_ghost(
                 .map(|span| span.rect)
         })
         .collect::<Option<Vec<_>>>()?;
-    let (left, top) = reorder_ghost_origin(
-        drag.pointer,
-        drag.grab_offset,
-        reorder_list_bounds(&rects),
-        (drag.source_rect.2, drag.source_rect.3),
-        reorder_axis(&drag.list),
-    );
+    let (left, top) =
+        if matches!(drag.list, ReorderList::Tabs { .. }) && drag.workspace_drop.is_some() {
+            (
+                drag.pointer.0 - drag.grab_offset.0,
+                drag.pointer.1 - drag.grab_offset.1,
+            )
+        } else {
+            reorder_ghost_origin(
+                drag.pointer,
+                drag.grab_offset,
+                reorder_list_bounds(&rects),
+                (drag.source_rect.2, drag.source_rect.3),
+                reorder_axis(&drag.list),
+            )
+        };
     let left = px(left);
     let top = px(top);
     Some(match &drag.list {

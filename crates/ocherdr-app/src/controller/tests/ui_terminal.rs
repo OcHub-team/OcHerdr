@@ -813,6 +813,7 @@ fn workspace_reorder_on(snapshot: &HierarchySnapshot, source: usize) -> ReorderD
         pointer: (0., 0.),
         grab_offset: (0., 0.),
         source_rect: (0., 0., 0., 0.),
+        workspace_drop: None,
     }
 }
 

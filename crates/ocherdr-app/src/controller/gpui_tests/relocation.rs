@@ -1,6 +1,8 @@
 use super::*;
+use crate::Overlay;
 use ocherdr_core::HerdrEvent;
 use ocherdr_herdr::{TerminalEvent, TerminalNotificationKind};
+use ocherdr_terminal::SurfaceMouseButton;
 
 pub(super) fn temp_tab() -> TabInfo {
     TabInfo {
@@ -658,6 +660,191 @@ fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestCo
 }
 
 #[gpui::test]
+#[cfg(target_os = "macos")]
+fn agent_panes_follow_ghostty_mouse_reporting_with_shift_selection_fallback(
+    cx: &mut TestAppContext,
+) {
+    let mut snapshot = two_pane_snapshot();
+    let agent = snapshot
+        .panes
+        .iter_mut()
+        .find(|pane| pane.pane_id == "p-left")
+        .expect("left pane");
+    agent.agent = Some("codex".into());
+    agent.display_agent = Some("Codex".into());
+    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    measure_two_terminal_bodies(&view, cx);
+
+    view.read_with(cx, |this, _| {
+        let runtime = this.pane("p-left").expect("agent terminal");
+        assert!(runtime.mouse_capture.is_none());
+        assert!(
+            runtime.terminal.mouse_captured(),
+            "an old Herdr without MouseCapture events gets the agent-pane fallback"
+        );
+    });
+
+    let point = gpui::point(gpui::px(100.), gpui::px(100.));
+    let left_down = gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: point,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    };
+    let left_up = gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: point,
+        modifiers: Default::default(),
+        click_count: 1,
+    };
+    view.update_in(cx, |this, window, cx| {
+        this.pane_mouse_down("p-left".into(), &left_down, window, cx);
+        assert!(matches!(
+            this.surface_drag,
+            crate::SurfaceDrag::Text { captured: true, .. }
+        ));
+        this.pane_mouse_up(&left_up, window, cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fake
+        .terminal_inputs("p-left")
+        .iter()
+        .any(|bytes| bytes.starts_with(b"\x1b[<0;") && bytes.ends_with(b"m"))
+    {
+        assert!(Instant::now() < deadline, "Ghostty never wrote the click");
+        view.update(cx, |this, _| this.pump_terminal_input());
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mouse_inputs = fake.terminal_inputs("p-left");
+    assert!(
+        mouse_inputs
+            .iter()
+            .any(|bytes| bytes.starts_with(b"\x1b[<0;") && bytes.ends_with(b"M")),
+        "missing mouse press: {mouse_inputs:?}"
+    );
+    assert!(
+        mouse_inputs
+            .iter()
+            .any(|bytes| bytes.starts_with(b"\x1b[<0;") && bytes.ends_with(b"m")),
+        "missing mouse release: {mouse_inputs:?}"
+    );
+    assert!(
+        mouse_inputs
+            .iter()
+            .any(|bytes| bytes.starts_with(b"\x1b[<35;") && bytes.ends_with(b"M")),
+        "moving onto a mouse-aware TUI should report hover motion: {mouse_inputs:?}"
+    );
+    measure_two_terminal_bodies(&view, cx);
+
+    let right_down = gpui::MouseDownEvent {
+        button: gpui::MouseButton::Right,
+        ..left_down
+    };
+    let right_up = gpui::MouseUpEvent {
+        button: gpui::MouseButton::Right,
+        ..left_up
+    };
+    view.update_in(cx, |this, window, cx| {
+        assert!(this.pane_aux_mouse_down(
+            "p-left".into(),
+            SurfaceMouseButton::Right,
+            &right_down,
+            window,
+            cx,
+        ));
+        assert!(matches!(this.overlay, Overlay::None));
+        this.pane_aux_mouse_up("p-left", SurfaceMouseButton::Right, &right_up, window, cx);
+        this.pump_terminal_input();
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fake
+        .terminal_inputs("p-left")
+        .iter()
+        .any(|bytes| bytes.starts_with(b"\x1b[<2;") && bytes.ends_with(b"m"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "Ghostty never wrote the secondary click"
+        );
+        view.update(cx, |this, _| this.pump_terminal_input());
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(20));
+    }
+    measure_two_terminal_bodies(&view, cx);
+
+    let before_shift = fake.terminal_inputs("p-left").len();
+    let shift_down = gpui::MouseDownEvent {
+        modifiers: gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+        ..left_down
+    };
+    let shift_up = gpui::MouseUpEvent {
+        modifiers: gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+        ..left_up
+    };
+    view.update_in(cx, |this, window, cx| {
+        assert!(
+            matches!(this.surface_drag, crate::SurfaceDrag::Idle),
+            "previous click did not finish: {:?}",
+            this.surface_drag
+        );
+        this.pane_mouse_down("p-left".into(), &shift_down, window, cx);
+        assert!(
+            matches!(
+                this.surface_drag,
+                crate::SurfaceDrag::Text {
+                    captured: false,
+                    ..
+                }
+            ),
+            "Shift click did not start selection: {:?}",
+            this.surface_drag
+        );
+        this.pane_mouse_up(&shift_up, window, cx);
+        this.pump_terminal_input();
+    });
+    assert_eq!(
+        fake.terminal_inputs("p-left").len(),
+        before_shift,
+        "Shift bypasses mouse capture and remains local text selection"
+    );
+
+    view.update_in(cx, |this, window, cx| {
+        let owner = this.current_session_key().expect("connected session");
+        assert!(this.apply_herdr_frames(
+            &owner,
+            "p-left",
+            Some(vec![Ok(TerminalEvent::MouseCapture {
+                enabled: false,
+                sgr_pixels: false,
+            })]),
+            cx,
+        ));
+        assert_eq!(
+            this.pane("p-left").unwrap().mouse_capture,
+            Some((false, false))
+        );
+        assert!(!this.pane_aux_mouse_down(
+            "p-left".into(),
+            SurfaceMouseButton::Right,
+            &right_down,
+            window,
+            cx,
+        ));
+    });
+}
+
+#[gpui::test]
 fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppContext) {
     let mut snapshot = pane_move_capable_snapshot();
     snapshot.version = "0.8.2".into();
@@ -1112,7 +1299,7 @@ fn herdr_system_toast_reaches_the_os_notification_center(cx: &mut TestAppContext
         let owner = this.current_session_key().expect("connected session");
         assert!(this.apply_herdr_frames(
             &owner,
-            "p-left",
+            "p-right",
             Some(vec![Ok(TerminalEvent::Notify {
                 kind: TerminalNotificationKind::SystemToast,
                 message: "Codex finished".into(),
@@ -1128,6 +1315,14 @@ fn herdr_system_toast_reaches_the_os_notification_center(cx: &mut TestAppContext
     assert_eq!(shown[0].title, "Codex finished");
     assert_eq!(shown[0].body, "workspace 1");
     assert!(shown[0].actions.is_empty());
+    cx.simulate_system_notification_response(gpui::SystemNotificationResponse {
+        tag: shown[0].tag.clone(),
+        action_id: None,
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.selection.pane_id.as_deref(), Some("p-right"));
+    });
 }
 
 #[gpui::test]
@@ -1194,6 +1389,182 @@ fn background_agent_completion_reaches_the_os_notification_center(cx: &mut TestA
         1,
         "a repeated done event must not notify twice"
     );
+}
+
+#[gpui::test]
+fn clicking_an_agent_notification_jumps_to_its_pane(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+
+    view.update(cx, |this, cx| {
+        let pane = this
+            .snapshot
+            .as_mut()
+            .and_then(|snapshot| {
+                snapshot
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == "p-right")
+            })
+            .expect("background pane");
+        pane.tab_id = "t-b".into();
+        pane.agent = Some("codex".into());
+        pane.display_agent = Some("Codex".into());
+        pane.agent_status = AgentStatus::Working;
+        assert!(this.apply_agent_status_batch(
+            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p-right".into(),
+                workspace_id: "w".into(),
+                agent_status: AgentStatus::Done,
+                agent: Some("codex".into()),
+                title: None,
+                display_agent: Some("Codex".into()),
+                state_labels: HashMap::new(),
+            })]),
+            cx,
+        ));
+    });
+    let notification = cx
+        .shown_system_notifications()
+        .into_iter()
+        .next()
+        .expect("agent notification");
+    assert!(notification.tag.starts_with("ocherdr-agent-"));
+    view.update(cx, |this, _| {
+        this.snapshot
+            .as_mut()
+            .and_then(|snapshot| {
+                snapshot
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == "p-right")
+            })
+            .expect("notified pane still exists")
+            .pane_id = "p-right-realiased".into();
+    });
+
+    cx.simulate_system_notification_response(gpui::SystemNotificationResponse {
+        tag: notification.tag,
+        action_id: None,
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.selection.workspace_id.as_deref(), Some("w"));
+        assert_eq!(this.selection.tab_id.as_deref(), Some("t-b"));
+        assert_eq!(this.selection.pane_id.as_deref(), Some("p-right-realiased"));
+    });
+    let focus = fake.requests_for("pane.focus");
+    assert_eq!(focus.len(), 1);
+    assert_eq!(focus[0]["params"]["pane_id"], json!("p-right-realiased"));
+}
+
+#[gpui::test]
+fn clicking_a_parked_hosts_agent_notification_switches_host_and_pane(cx: &mut TestAppContext) {
+    let fake_a = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake_b = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake_a, cx);
+
+    view.update(cx, |this, cx| {
+        let local_owner = this.current_session_key().expect("local session owner");
+        let pane = this
+            .snapshot
+            .as_mut()
+            .and_then(|snapshot| {
+                snapshot
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == "p-right")
+            })
+            .expect("local background pane");
+        pane.agent = Some("codex".into());
+        pane.display_agent = Some("Codex".into());
+        pane.agent_status = AgentStatus::Working;
+
+        let profile_b = ConnectionProfile::Ssh {
+            id: "remote-click-test".into(),
+            label: "Remote click test".into(),
+            destination: "unused".into(),
+            port: None,
+            identity_file: None,
+            herdr_path: "herdr".into(),
+        };
+        let session_b = SessionSummary {
+            name: "beta".into(),
+            running: true,
+            socket_path: fake_b.socket_path(),
+            session_dir: fake_b._dir.path().join("beta"),
+            default: false,
+        };
+        let connection_b = SessionConnection::connect(&ConnectionProfile::default(), &session_b)
+            .expect("connect host B fake");
+        let snapshot_b = two_pane_snapshot();
+        let profile_b_index = this.profiles.len();
+        this.profiles.push(profile_b);
+        this.parked_hosts.insert(
+            "remote-click-test".into(),
+            crate::ParkedHostRuntime {
+                sessions: vec![session_b],
+                session_index: Some(0),
+                connection: connection_b,
+                herdr_capabilities: crate::controller::HerdrCapabilities::from_snapshot(
+                    &snapshot_b,
+                ),
+                event_stream: EventStreamState::Idle,
+                event_listen: None,
+                agent_status_listen: None,
+                agent_status_panes: std::collections::HashSet::new(),
+                agent_status_handoff: None,
+                snapshot: Some(snapshot_b),
+                selection: Selection {
+                    connection_id: "remote-click-test".into(),
+                    session_name: Some("beta".into()),
+                    workspace_id: Some("w".into()),
+                    tab_id: Some("t-a".into()),
+                    pane_id: Some("p-left".into()),
+                },
+                session_panes: None,
+                pane_viewports: HashMap::new(),
+            },
+        );
+        this.select_profile(profile_b_index, cx);
+        assert!(this.apply_agent_status_batch_for(
+            &local_owner,
+            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p-right".into(),
+                workspace_id: "w".into(),
+                agent_status: AgentStatus::Done,
+                agent: Some("codex".into()),
+                title: None,
+                display_agent: Some("Codex".into()),
+                state_labels: HashMap::new(),
+            })]),
+            cx,
+        ));
+    });
+    let notification = cx
+        .shown_system_notifications()
+        .into_iter()
+        .next()
+        .expect("parked host notification");
+
+    cx.simulate_system_notification_response(gpui::SystemNotificationResponse {
+        tag: notification.tag,
+        action_id: None,
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.current_profile().id(), "local");
+        assert_eq!(this.selection.pane_id.as_deref(), Some("p-right"));
+    });
+    let focus = fake_a.requests_for("pane.focus");
+    assert_eq!(focus.len(), 1);
+    assert_eq!(focus[0]["params"]["pane_id"], json!("p-right"));
 }
 
 #[gpui::test]

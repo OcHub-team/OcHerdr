@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static HERDR_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
+pub(super) static HERDR_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 
 impl OcHerdrView {
     pub(crate) fn ensure_session_terminals(&mut self, cx: &mut Context<Self>) {
@@ -32,6 +32,12 @@ impl OcHerdrView {
             .iter()
             .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
             .collect::<HashMap<_, _>>();
+        let agent_pane_ids = snapshot
+            .panes
+            .iter()
+            .filter(|pane| pane.agent.is_some())
+            .map(|pane| pane.pane_id.clone())
+            .collect::<HashSet<_>>();
         let incoming = SessionKey {
             profile_id,
             session_name: session_name.clone(),
@@ -120,6 +126,11 @@ impl OcHerdrView {
                     | VisiblePanePlan::DemoteToObserve => {
                         if let Some(runtime) = panes.get_mut(pane_id) {
                             runtime.last_visible_serial = access_serial;
+                            if runtime.mouse_capture.is_none() {
+                                runtime
+                                    .terminal
+                                    .set_mouse_capture(agent_pane_ids.contains(pane_id), false);
+                            }
                             if runtime.palette_signature != palette.signature() {
                                 if let Err(error) = runtime.terminal.apply_palette(&palette) {
                                     palette_error = Some(error);
@@ -155,6 +166,13 @@ impl OcHerdrView {
                         let rows = 24;
                         match Terminal::new(cols, rows, 10_000, &palette) {
                             Ok(terminal) => {
+                                if agent_pane_ids.contains(pane_id) {
+                                    // Herdr before the terminal-session mouse-capture fix does
+                                    // not publish the application's current mode. Coding-agent
+                                    // panes are TUI-first until the server supplies authority;
+                                    // Ghostty still reserves Shift for text selection.
+                                    terminal.set_mouse_capture(true, false);
+                                }
                                 let frame_context = 1;
                                 let resolved = terminal.resize_pixels(
                                     viewport.pixels.0,
@@ -191,6 +209,7 @@ impl OcHerdrView {
                                         palette_signature: palette.signature(),
                                         listen: None,
                                         exit_seen: false,
+                                        mouse_capture: None,
                                         scroll_px: 0.,
                                         body_bounds: viewport.body_bounds,
                                         pending_resize: None,
@@ -406,6 +425,18 @@ impl OcHerdrView {
         } else {
             HashSet::new()
         };
+        let tui_mouse_fallback = if active {
+            self.snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pane(pane_id))
+                .is_some_and(|pane| pane.agent.is_some())
+        } else {
+            self.parked_hosts
+                .get(&owner.profile_id)
+                .and_then(|host| host.snapshot.as_ref())
+                .and_then(|snapshot| snapshot.pane(pane_id))
+                .is_some_and(|pane| pane.agent.is_some())
+        };
         let mut error = None;
         let mut hierarchy_changed = false;
         let mut control_loss = None;
@@ -441,6 +472,18 @@ impl OcHerdrView {
                                     continue;
                                 }
                                 runtime.terminal.apply_frame(&frame.bytes, frame.full);
+                                if frame.full {
+                                    // A full Ghostty replay resets terminal modes. Herdr's ANSI
+                                    // blit contains cells and cursor state, not the originating
+                                    // application's DEC mouse modes, so restore the side-channel
+                                    // authority (or the old-server fallback) after the reset.
+                                    let (mouse_enabled, sgr_pixels) = runtime
+                                        .mouse_capture
+                                        .unwrap_or((tui_mouse_fallback, false));
+                                    runtime
+                                        .terminal
+                                        .set_mouse_capture(mouse_enabled, sgr_pixels);
+                                }
                                 if selected_pane.as_deref() == Some(pane_id)
                                     && let Some(preedit) = composing.as_deref()
                                 {
@@ -455,7 +498,10 @@ impl OcHerdrView {
                             Ok(TerminalEvent::MouseCapture {
                                 enabled,
                                 sgr_pixels,
-                            }) => runtime.terminal.set_mouse_capture(enabled, sgr_pixels),
+                            }) => {
+                                runtime.mouse_capture = Some((enabled, sgr_pixels));
+                                runtime.terminal.set_mouse_capture(enabled, sgr_pixels);
+                            }
                             Ok(TerminalEvent::KittyKeyboardReportAll { enabled }) => {
                                 runtime.terminal.set_kitty_keyboard_report_all(enabled)
                             }
@@ -508,7 +554,7 @@ impl OcHerdrView {
             }
         };
         for (kind, message, body) in notifications {
-            self.post_herdr_notification(kind, message, body, cx);
+            self.post_herdr_notification(owner, pane_id, kind, message, body, cx);
         }
         if !active {
             if !keep || error.is_some() {
@@ -543,6 +589,8 @@ impl OcHerdrView {
 
     fn post_herdr_notification(
         &mut self,
+        owner: &SessionKey,
+        pane_id: &str,
         kind: TerminalNotificationKind,
         message: String,
         body: Option<String>,
@@ -564,20 +612,45 @@ impl OcHerdrView {
                     .update(cx, |host, cx| host.notify(request, cx));
             }
             TerminalNotificationKind::SystemToast => {
-                self.post_system_notification(message, body.unwrap_or_default(), cx);
+                self.post_system_notification(
+                    owner,
+                    pane_id,
+                    message,
+                    body.unwrap_or_default(),
+                    cx,
+                );
             }
         }
     }
 
     pub(super) fn post_system_notification(
-        &self,
+        &mut self,
+        owner: &SessionKey,
+        pane_id: &str,
         title: String,
         body: String,
         cx: &mut Context<Self>,
     ) {
         let id = HERDR_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed);
+        let tag = format!("ocherdr-herdr-{id}");
+        let snapshot = if self.is_active_session(owner) {
+            self.snapshot.as_ref()
+        } else {
+            self.parked_hosts
+                .get(&owner.profile_id)
+                .and_then(|runtime| runtime.snapshot.as_ref())
+        };
+        if let Some(pane) = snapshot.and_then(|snapshot| snapshot.pane(pane_id)) {
+            let target = AgentNotificationTarget {
+                profile_id: owner.profile_id.clone(),
+                session_name: owner.session_name.clone(),
+                pane_id: pane.pane_id.clone(),
+                terminal_id: pane.terminal_id.clone(),
+            };
+            self.remember_agent_notification_target(tag.clone(), target);
+        }
         cx.show_system_notification(SystemNotification {
-            tag: format!("ocherdr-herdr-{id}").into(),
+            tag: tag.into(),
             title: title.into(),
             body: body.into(),
             actions: Vec::new(),

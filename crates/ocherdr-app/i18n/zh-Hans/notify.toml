@@ -39,6 +39,7 @@
 "notify.herdr_command" = "无法执行 Herdr 命令"
 "notify.invalid_ssh_destination" = "SSH 目标地址无效"
 "notify.invalid_ssh_port" = "SSH 端口无效"
+"notify.load_configuration" = "配置已进入保护状态"
 "notify.missing_theme" = "找不到主题"
 "notify.open_terminal" = "打开终端失败"
 "notify.pane_close" = "无法关闭窗格"

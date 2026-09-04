@@ -70,6 +70,7 @@ fn open_view(cx: &mut TestAppContext) -> (Entity<OcHerdrView>, &mut VisualTestCo
         view.operation = None;
         view
     });
+    cx.update(|_window, cx| crate::install_system_notification_handler(&view, cx));
     (view, cx)
 }
 
@@ -1069,6 +1070,16 @@ fn serve_snapshot_with_live_events(
                             },
                         }),
                     ),
+                    Some("pane.focus") => write_fake_response(
+                        stream,
+                        json!({
+                            "id": id,
+                            "result": {
+                                "type": "pane_info",
+                                "pane": { "pane_id": request["params"]["pane_id"] },
+                            },
+                        }),
+                    ),
                     // The fixture plays an old Herdr when asked to move into
                     // `unsupported`: the request enum fails to deserialize.
                     Some("pane.move")
@@ -1567,6 +1578,7 @@ fn session_name(view: &OcHerdrView) -> Option<&str> {
 }
 
 mod shell;
+mod tab_transfer;
 fn pane_move_capable_snapshot() -> HierarchySnapshot {
     HierarchySnapshot {
         version: "0.7.0".into(),

@@ -32,17 +32,25 @@ fn fresh_connections_prefer_default_without_a_session_picker() {
 
 fn persist_notice(kind: FailureKind) -> SettingsPersist {
     SettingsPersist {
-        error: Some(kind),
+        config_error: Some(kind),
         host: None,
         rollback: None,
+        domains: PersistDomains {
+            config: true,
+            ..Default::default()
+        },
     }
 }
 
 fn revertible_persist(kind: FailureKind, tag: &str) -> SettingsPersist {
     SettingsPersist {
-        error: Some(kind),
+        config_error: None,
         host: Some(HostPersistFollowUp::Revertible { error: kind }),
         rollback: Some(HostRollback::tagged(tag)),
+        domains: PersistDomains {
+            connections: true,
+            ..Default::default()
+        },
     }
 }
 
@@ -88,7 +96,7 @@ fn settings_persist_keeps_only_the_latest_unwritten_value() {
         persist_notice(FailureKind::SaveAppearance),
     );
     assert_eq!(
-        started.and_then(|request| request.error),
+        started.and_then(|request| request.config_error),
         Some(FailureKind::SaveAppearance)
     );
     assert!(pending.is_none());
@@ -110,7 +118,7 @@ fn settings_persist_keeps_only_the_latest_unwritten_value() {
         .is_none()
     );
     assert_eq!(
-        pending.and_then(|request| request.error),
+        pending.and_then(|request| request.config_error),
         Some(FailureKind::SaveAppearance)
     );
 }
@@ -122,13 +130,17 @@ fn settings_persist_keeps_a_host_follow_up_when_appearance_replaces_the_waiting_
     };
     let merged = merge_settings_persist(
         SettingsPersist {
-            error: Some(FailureKind::SaveHost),
+            config_error: None,
             host: Some(host),
             rollback: Some(HostRollback::tagged("before-host")),
+            domains: PersistDomains {
+                connections: true,
+                ..Default::default()
+            },
         },
         persist_notice(FailureKind::SaveAppearance),
     );
-    assert_eq!(merged.error, Some(FailureKind::SaveAppearance));
+    assert_eq!(merged.config_error, Some(FailureKind::SaveAppearance));
     assert!(matches!(
         merged.host,
         Some(HostPersistFollowUp::Revertible {
@@ -140,6 +152,8 @@ fn settings_persist_keeps_a_host_follow_up_when_appearance_replaces_the_waiting_
         merged.rollback.as_ref().and_then(HostRollback::tag),
         Some("before-host")
     );
+    assert!(merged.domains.connections);
+    assert!(merged.domains.config);
 }
 
 #[test]

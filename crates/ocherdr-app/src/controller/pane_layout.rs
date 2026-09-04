@@ -234,6 +234,10 @@ impl OcHerdrView {
                 .as_ref()
                 .is_some_and(|commit| commit.tab_id == tab_id)
             || self.pane_template_commits.contains_key(tab_id)
+            || self.pending_tab_transfer.as_ref().is_some_and(|transfer| {
+                transfer.source_tab_id == tab_id
+                    || transfer.target_tab_id.as_deref() == Some(tab_id)
+            })
     }
 
     /// Whether the four edge zones accept drops on this connection: the

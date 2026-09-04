@@ -19,6 +19,14 @@ impl OcHerdrView {
             SurfaceDrag::Reorder(drag) => Some(drag),
             _ => None,
         };
+        let tab_workspace_drop = drag.and_then(|drag| match &drag.list {
+            ReorderList::Tabs { workspace_id }
+                if drag.workspace_drop.as_deref() != Some(workspace_id.as_str()) =>
+            {
+                drag.workspace_drop.as_deref()
+            }
+            _ => None,
+        });
         let pending = self
             .pending_reorder
             .as_ref()
@@ -66,12 +74,15 @@ impl OcHerdrView {
                 let workspace_id = row.a11y.id.clone();
                 let press_id = workspace_id.clone();
                 let measure_id = workspace_id.clone();
+                let drop_debug_id = workspace_id.clone();
                 let measure_view = view.clone();
                 let workspace_target = HierarchyTarget::Workspace {
                     id: row.a11y.id.clone(),
                     label: row.a11y.name.clone(),
                 };
                 let selected = row.a11y.selected == Some(true);
+                let tab_drop_targeted = tab_workspace_drop == Some(workspace_id.as_str());
+                let tab_drop_label = i18n.drop_move_tab_to_workspace(&row.a11y.name);
                 let linked = row
                     .worktree
                     .as_ref()
@@ -104,6 +115,11 @@ impl OcHerdrView {
                     status_color(row.agent_status),
                     affiliation.as_deref(),
                 )
+                .debug_selector({
+                    let workspace_id = workspace_id.clone();
+                    move || format!("workspace-{workspace_id}")
+                })
+                .when(tab_drop_targeted, |row| row.aria_label(tab_drop_label))
                 .when(workspace_count >= 2, |row| row.cursor_grab())
                 .relative()
                 .opacity(if hidden { 0. } else { 1. });
@@ -136,6 +152,13 @@ impl OcHerdrView {
                 div()
                     .id(("workspace-slot", row.number))
                     .relative()
+                    .rounded(px(CORNER_COMPACT))
+                    .when(tab_drop_targeted, |slot| {
+                        slot.bg(theme::accent().alpha(0.14))
+                            .border_1()
+                            .border_color(theme::accent())
+                            .debug_selector(move || format!("tab-workspace-drop-{drop_debug_id}"))
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event, _window, cx| {

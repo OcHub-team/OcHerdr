@@ -39,6 +39,7 @@
 "notify.herdr_command" = "Could not run the Herdr command"
 "notify.invalid_ssh_destination" = "Invalid SSH destination"
 "notify.invalid_ssh_port" = "Invalid SSH port"
+"notify.load_configuration" = "Configuration was protected"
 "notify.missing_theme" = "Theme not found"
 "notify.open_terminal" = "Could not open Terminal"
 "notify.pane_close" = "Could not close the pane"

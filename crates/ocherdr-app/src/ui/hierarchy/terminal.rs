@@ -279,7 +279,14 @@ impl OcHerdrView {
                 handle,
             };
             let scroll_pane_id = pane_id.clone();
-            let mouse_pane_id = pane_id.clone();
+            let left_mouse_pane_id = pane_id.clone();
+            let move_mouse_pane_id = pane_id.clone();
+            let right_mouse_down_pane_id = pane_id.clone();
+            let right_mouse_up_pane_id = pane_id.clone();
+            let right_mouse_up_out_pane_id = pane_id.clone();
+            let middle_mouse_down_pane_id = pane_id.clone();
+            let middle_mouse_up_pane_id = pane_id.clone();
+            let middle_mouse_up_out_pane_id = pane_id.clone();
             elements.push(
                 render_pane(
                     PaneRenderInput {
@@ -294,7 +301,7 @@ impl OcHerdrView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event, window, cx| {
-                        this.pane_mouse_down(mouse_pane_id.clone(), event, window, cx);
+                        this.pane_mouse_down(left_mouse_pane_id.clone(), event, window, cx);
                     }),
                 )
                 .on_mouse_up(
@@ -310,7 +317,7 @@ impl OcHerdrView {
                     }),
                 )
                 .on_mouse_move(cx.listener(move |this, event, window, cx| {
-                    this.pane_mouse_move(event, window, cx);
+                    this.pane_surface_mouse_move(&move_mouse_pane_id, event, window, cx);
                 }))
                 .on_scroll_wheel(
                     cx.listener(move |this, event: &ScrollWheelEvent, _window, cx| {
@@ -320,7 +327,75 @@ impl OcHerdrView {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event, window, cx| {
-                        this.open_context_menu(pane_target.clone(), event, window, cx)
+                        if !this.pane_aux_mouse_down(
+                            right_mouse_down_pane_id.clone(),
+                            SurfaceMouseButton::Right,
+                            event,
+                            window,
+                            cx,
+                        ) {
+                            this.open_context_menu(pane_target.clone(), event, window, cx);
+                        }
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Right,
+                    cx.listener(move |this, event, window, cx| {
+                        this.pane_aux_mouse_up(
+                            &right_mouse_up_pane_id,
+                            SurfaceMouseButton::Right,
+                            event,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Right,
+                    cx.listener(move |this, event, window, cx| {
+                        this.pane_aux_mouse_up(
+                            &right_mouse_up_out_pane_id,
+                            SurfaceMouseButton::Right,
+                            event,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, event, window, cx| {
+                        this.pane_aux_mouse_down(
+                            middle_mouse_down_pane_id.clone(),
+                            SurfaceMouseButton::Middle,
+                            event,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(move |this, event, window, cx| {
+                        this.pane_aux_mouse_up(
+                            &middle_mouse_up_pane_id,
+                            SurfaceMouseButton::Middle,
+                            event,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Middle,
+                    cx.listener(move |this, event, window, cx| {
+                        this.pane_aux_mouse_up(
+                            &middle_mouse_up_out_pane_id,
+                            SurfaceMouseButton::Middle,
+                            event,
+                            window,
+                            cx,
+                        );
                     }),
                 )
                 .into_any_element(),
@@ -378,6 +453,10 @@ impl OcHerdrView {
         let parked_notice = self
             .parked_relocation(tab_id)
             .map(|pending| render_parked_notice(tab_id, &pending.plan, i18n, cx));
+        let tab_transfer_notice = self.pending_tab_transfer.as_ref().and_then(|transfer| {
+            (transfer.phase == TabTransferPhase::Failed)
+                .then(|| render_tab_transfer_notice(transfer.target_tab_id.is_some(), i18n, cx))
+        });
         let origin = self.surface_origin();
         let pane_return = self
             .pane_drag_return
@@ -463,6 +542,7 @@ impl OcHerdrView {
             .children(keyboard_move_overlay)
             .children(pane_return)
             .children(parked_notice)
+            .children(tab_transfer_notice)
             .into_any_element()
     }
 

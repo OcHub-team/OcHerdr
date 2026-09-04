@@ -10,6 +10,11 @@ impl OcHerdrView {
         let i18n = self.i18n;
         let view = cx.entity();
         let tab_count = chrome.tabs.items.len();
+        let tabs_can_transfer = self.pane_move_supported()
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.workspaces.len() >= 2);
         let authoritative_order = chrome
             .tabs
             .items
@@ -223,8 +228,10 @@ impl OcHerdrView {
                             theme::surface_hover()
                         })
                     })
-                    .when(tab_count >= 2, |tab| tab.cursor_grab())
-                    .when(tab_count < 2, |tab| tab.cursor_pointer())
+                    .when(tab_count >= 2 || tabs_can_transfer, |tab| tab.cursor_grab())
+                    .when(tab_count < 2 && !tabs_can_transfer, |tab| {
+                        tab.cursor_pointer()
+                    })
                     .group(tab_hover_group.clone())
                     .opacity(if hidden { 0. } else { 1. })
                     .debug_selector(move || format!("tab-{debug_tab_id}"))

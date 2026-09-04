@@ -1226,9 +1226,14 @@ pub(super) fn merge_settings_persist(
     next: SettingsPersist,
 ) -> SettingsPersist {
     SettingsPersist {
-        error: next.error.or(previous.error),
+        config_error: next.config_error.or(previous.config_error),
         host: merge_host_follow_up(previous.host, next.host),
         rollback: previous.rollback.or(next.rollback),
+        domains: PersistDomains {
+            connections: previous.domains.connections || next.domains.connections,
+            config: previous.domains.config || next.domains.config,
+            ui_state: previous.domains.ui_state || next.domains.ui_state,
+        },
     }
 }
 

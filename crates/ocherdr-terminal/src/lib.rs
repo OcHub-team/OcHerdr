@@ -60,6 +60,7 @@ mod macos {
     /// bytes as Ghostty.app.
     const BASE_CONFIG: &str = "\
 macos-option-as-alt = true
+mouse-shift-capture = never
 keybind = clear
 keybind = super+left=text:\\x01
 keybind = super+right=text:\\x05
@@ -1120,6 +1121,11 @@ keybind = alt+right=esc:f
             }
         }
 
+        pub fn mouse_captured(&self) -> bool {
+            // SAFETY: the surface is live and queried on GPUI's application thread.
+            unsafe { ffi::ghostty_surface_mouse_captured(self.raw()) }
+        }
+
         pub fn set_mouse_capture(&self, enabled: bool, sgr_pixels: bool) {
             self.apply_frame(&mouse_capture_sequence(enabled, sgr_pixels), false);
         }
@@ -1168,7 +1174,8 @@ keybind = alt+right=esc:f
 
         pub fn begin_text_selection(&self, x: f64, y: f64, modifiers: KeyModifiers) -> bool {
             self.mouse_pos(x, y, modifiers);
-            let captured = self.mouse_button(true, SurfaceMouseButton::Left, modifiers);
+            let captured = self.mouse_captured() && !modifiers.shift;
+            let _ = self.mouse_button(true, SurfaceMouseButton::Left, modifiers);
             self.refresh();
             captured
         }

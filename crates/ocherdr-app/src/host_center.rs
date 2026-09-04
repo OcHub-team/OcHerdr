@@ -26,6 +26,7 @@ pub(crate) struct HostPersistState {
 
 pub(crate) fn assemble_settings(host: &HostPersistState) -> Settings {
     Settings {
+        schema_version: crate::SETTINGS_SCHEMA_VERSION,
         connections: host
             .profiles
             .iter()
@@ -44,12 +45,6 @@ pub(crate) fn assemble_settings(host: &HostPersistState) -> Settings {
             })
             .collect(),
     }
-}
-
-pub(crate) fn write_settings(settings: &Settings) -> std::result::Result<(), String> {
-    let paths = crate::config::AppPaths::user()
-        .ok_or_else(|| "Application Support directory is unavailable".to_owned())?;
-    crate::config::write_connections(&paths, settings)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

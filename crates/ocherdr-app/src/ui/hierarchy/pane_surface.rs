@@ -550,7 +550,9 @@ pub(super) fn render_parked_notice(
         .absolute()
         .top(px(12.))
         .left(px(12.))
+        .right(px(12.))
         .flex()
+        .flex_wrap()
         .items_center()
         .gap_3()
         .px_3()
@@ -590,6 +592,65 @@ pub(super) fn render_parked_notice(
                 this.go_to_parked_tab(&go_tab, cx);
             })),
         )
+        .into_any_element()
+}
+
+/// A whole-tab move is a short sequence of existing `pane.move` calls. If a
+/// call fails, keep the completed moves in place and offer a resumable action
+/// instead of starting terminals again or pretending the operation was atomic.
+pub(super) fn render_tab_transfer_notice(
+    has_target_tab: bool,
+    i18n: I18n,
+    cx: &mut Context<OcHerdrView>,
+) -> ochub_ui::gpui::AnyElement {
+    div()
+        .id("tab-transfer-paused")
+        .debug_selector(|| "tab-transfer-paused".to_owned())
+        .role(ochub_ui::gpui::Role::Status)
+        .aria_label(i18n.text(k::TERMINAL_TAB_TRANSFER_FAILED))
+        .absolute()
+        .top(px(12.))
+        .left(px(12.))
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .rounded(px(CORNER_CONTROL))
+        .bg(theme::panel())
+        .border_1()
+        .border_color(theme::yellow())
+        .shadow_md()
+        .text_sm()
+        .text_color(theme::text())
+        .child(status_dot(theme::yellow()))
+        .child(i18n.text(k::TERMINAL_TAB_TRANSFER_FAILED))
+        .child(
+            button(
+                "tab-transfer-retry",
+                i18n.text(k::TERMINAL_TAB_TRANSFER_RETRY),
+                ButtonTone::Primary,
+                ButtonSize::Sm,
+            )
+            .debug_selector(|| "tab-transfer-retry".to_owned())
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.retry_tab_transfer(cx);
+            })),
+        )
+        .when(has_target_tab, |notice| {
+            notice.child(
+                button(
+                    "tab-transfer-go-to-target",
+                    i18n.text(k::TERMINAL_TAB_TRANSFER_GO_TO_TARGET),
+                    ButtonTone::Neutral,
+                    ButtonSize::Sm,
+                )
+                .debug_selector(|| "tab-transfer-go-to-target".to_owned())
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.go_to_tab_transfer_target(cx);
+                })),
+            )
+        })
         .into_any_element()
 }
 

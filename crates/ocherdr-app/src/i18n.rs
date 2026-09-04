@@ -183,6 +183,10 @@ impl I18n {
         tf!(self, k::TERMINAL_DROP_MOVE_TO_TAB, name = name)
     }
 
+    pub(crate) fn drop_move_tab_to_workspace(self, name: &str) -> String {
+        tf!(self, k::TERMINAL_DROP_MOVE_TAB_TO_WORKSPACE, name = name)
+    }
+
     pub(crate) fn move_pane_mode(self, name: &str) -> String {
         tf!(self, k::TERMINAL_MOVE_PANE_MODE, name = name)
     }
