@@ -112,7 +112,7 @@ impl OcHerdrView {
                         IconName::Folder
                     },
                     selected,
-                    status_color(row.agent_status),
+                    (row.agent_status, self.status_indicators),
                     affiliation.as_deref(),
                 )
                 .debug_selector({
@@ -266,7 +266,7 @@ impl OcHerdrView {
                         this.open_agent_context_menu(menu_pane_id.clone(), event, window, cx)
                     }),
                 )
-                .child(agent_state_dot(status))
+                .child(status_indicator(status, self.status_indicators))
                 .child(
                     div()
                         .flex_1()

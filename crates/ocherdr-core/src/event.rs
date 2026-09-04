@@ -263,6 +263,15 @@ pub fn agent_status_handoff_take<T>(pending: &mut VecDeque<T>) -> Vec<T> {
 
 impl HierarchySnapshot {
     pub fn apply(&mut self, event: &HerdrEvent) -> SnapshotUpdate {
+        let refresh_agent_aggregates = matches!(
+            event,
+            HerdrEvent::PaneCreated { .. }
+                | HerdrEvent::PaneUpdated { .. }
+                | HerdrEvent::PaneClosed { .. }
+                | HerdrEvent::PaneExited { .. }
+                | HerdrEvent::PaneAgentDetected { .. }
+                | HerdrEvent::PaneAgentStatusChanged { .. }
+        );
         match event {
             HerdrEvent::WorkspaceCreated { workspace } => {
                 upsert_by_id(
@@ -529,7 +538,7 @@ impl HierarchySnapshot {
                 closed_workspace_id,
                 closed_tab_id,
             } => {
-                return self.apply_pane_moved(PaneMovedEvent {
+                let update = self.apply_pane_moved(PaneMovedEvent {
                     pane,
                     previous_pane_id,
                     previous_workspace_id,
@@ -539,10 +548,40 @@ impl HierarchySnapshot {
                     closed_workspace_id: closed_workspace_id.as_deref(),
                     closed_tab_id: closed_tab_id.as_deref(),
                 });
+                if update == SnapshotUpdate::Applied {
+                    self.refresh_agent_aggregates();
+                }
+                return update;
             }
             HerdrEvent::Unknown => return SnapshotUpdate::Resync,
         }
+        if refresh_agent_aggregates {
+            self.refresh_agent_aggregates();
+        }
         SnapshotUpdate::Applied
+    }
+
+    /// Keep the snapshot's tab/workspace summaries in lockstep with the live
+    /// pane status stream. Herdr computes the same priority from terminal
+    /// state; OcHerdr repeats it locally because pane status events do not
+    /// include refreshed parent records.
+    fn refresh_agent_aggregates(&mut self) {
+        for tab in &mut self.tabs {
+            tab.agent_status = aggregate_agent_status(
+                self.panes
+                    .iter()
+                    .filter(|pane| pane.tab_id == tab.tab_id)
+                    .map(|pane| pane.agent_status),
+            );
+        }
+        for workspace in &mut self.workspaces {
+            workspace.agent_status = aggregate_agent_status(
+                self.panes
+                    .iter()
+                    .filter(|pane| pane.workspace_id == workspace.workspace_id)
+                    .map(|pane| pane.agent_status),
+            );
+        }
     }
 
     /// Incremental `pane.moved` (design §6.1). Records only: the pane moves
@@ -782,6 +821,18 @@ impl HierarchySnapshot {
     fn tab_close_needs_resync(&self, workspace_id: &str, tab_was_focused: bool) -> bool {
         tab_was_focused || !self.tabs.iter().any(|tab| tab.workspace_id == workspace_id)
     }
+}
+
+fn aggregate_agent_status(statuses: impl Iterator<Item = AgentStatus>) -> AgentStatus {
+    statuses
+        .max_by_key(|status| match status {
+            AgentStatus::Blocked => 4,
+            AgentStatus::Done => 3,
+            AgentStatus::Working => 2,
+            AgentStatus::Idle => 1,
+            AgentStatus::Unknown => 0,
+        })
+        .unwrap_or(AgentStatus::Unknown)
 }
 
 fn replace_by_id<T>(

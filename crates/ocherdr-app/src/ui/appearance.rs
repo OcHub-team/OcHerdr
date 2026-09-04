@@ -154,6 +154,7 @@ impl OcHerdrView {
             .child(group(vec![
                 self.language_row(cx).into_any_element(),
                 self.agent_notifications_row(cx).into_any_element(),
+                self.status_indicators_row(cx).into_any_element(),
             ]))
             .child(section_header(
                 self.i18n.text(k::APPEARANCE_THEME_LABEL),
@@ -243,6 +244,27 @@ impl OcHerdrView {
             self.agent_notifications,
             false,
             move |window, cx| listener(&(), window, cx),
+        )
+    }
+
+    fn status_indicators_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
+        select_row(
+            "status-indicators",
+            i18n.text(k::APPEARANCE_STATUS_INDICATORS_LABEL),
+            Some(
+                i18n.text(k::APPEARANCE_STATUS_INDICATORS_DESCRIPTION)
+                    .into(),
+            ),
+            &[
+                i18n.text(k::APPEARANCE_STATUS_INDICATORS_DOTS),
+                i18n.text(k::APPEARANCE_STATUS_INDICATORS_SYMBOLS),
+            ],
+            self.status_indicators.index(),
+            self.select_row_state("status-indicators"),
+            appearance_select(cx, "status-indicators", |this, index, _window, cx| {
+                this.set_status_indicators(StatusIndicatorStyle::from_index(index), cx);
+            }),
         )
     }
 
@@ -1245,6 +1267,7 @@ impl OcHerdrView {
         let (config, _) = crate::config::values::AppConfig::from_document(&self.config);
         self.appearance = crate::config::values::appearance_from_config(&config);
         self.agent_notifications = config.agent_notifications;
+        self.status_indicators = config.status_indicators;
         self.pane_edge_relocation = config.pane_edge_relocation;
         if self.i18n.preference() != config.language {
             self.i18n.set_preference(config.language);

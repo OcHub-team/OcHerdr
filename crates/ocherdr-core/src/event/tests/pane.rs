@@ -405,6 +405,30 @@ fn pane_agent_status_changed_moves_working_to_done_and_updates_presentation() {
 }
 
 #[test]
+fn pane_agent_status_changed_refreshes_tab_and_workspace_attention_priority() {
+    let mut snapshot = cascade_snapshot();
+    snapshot.panes[0].agent = Some("grok".into());
+    snapshot.panes[0].agent_status = AgentStatus::Working;
+    snapshot.panes[1].agent_status = AgentStatus::Done;
+    snapshot.panes[2].agent_status = AgentStatus::Idle;
+
+    assert_eq!(
+        snapshot.apply(&status_event("grok", AgentStatus::Working)),
+        SnapshotUpdate::Applied
+    );
+    assert_eq!(snapshot.tabs[0].agent_status, AgentStatus::Done);
+    assert_eq!(snapshot.tabs[1].agent_status, AgentStatus::Idle);
+    assert_eq!(snapshot.workspaces[0].agent_status, AgentStatus::Done);
+
+    assert_eq!(
+        snapshot.apply(&status_event("grok", AgentStatus::Blocked)),
+        SnapshotUpdate::Applied
+    );
+    assert_eq!(snapshot.tabs[0].agent_status, AgentStatus::Blocked);
+    assert_eq!(snapshot.workspaces[0].agent_status, AgentStatus::Blocked);
+}
+
+#[test]
 fn pane_agent_status_changed_resyncs_when_the_pane_is_missing() {
     let mut snapshot = HierarchySnapshot::default();
     assert_eq!(

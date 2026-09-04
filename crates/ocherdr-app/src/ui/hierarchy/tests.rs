@@ -1,13 +1,40 @@
-use super::{TabStripPress, agent_dot_filled, pane_fractions, tab_key_equivalent, tab_strip_press};
+use super::{
+    StatusIndicatorKind, TabStripPress, pane_fractions, status_indicator_kind,
+    status_indicator_symbol, tab_key_equivalent, tab_strip_press,
+};
 use ocherdr_core::{AgentStatus, LayoutPane, LayoutRect, PaneLayout};
 
 #[test]
-fn agent_dot_is_hollow_when_idle_or_done_and_filled_otherwise() {
-    assert!(!agent_dot_filled(AgentStatus::Idle));
-    assert!(!agent_dot_filled(AgentStatus::Done));
-    assert!(agent_dot_filled(AgentStatus::Working));
-    assert!(agent_dot_filled(AgentStatus::Blocked));
-    assert!(agent_dot_filled(AgentStatus::Unknown));
+fn agent_dots_match_herdrs_five_state_shapes() {
+    assert_eq!(
+        status_indicator_kind(AgentStatus::Blocked),
+        StatusIndicatorKind::Filled
+    );
+    assert_eq!(
+        status_indicator_kind(AgentStatus::Working),
+        StatusIndicatorKind::Filled
+    );
+    assert_eq!(
+        status_indicator_kind(AgentStatus::Done),
+        StatusIndicatorKind::Filled
+    );
+    assert_eq!(
+        status_indicator_kind(AgentStatus::Idle),
+        StatusIndicatorKind::Ring
+    );
+    assert_eq!(
+        status_indicator_kind(AgentStatus::Unknown),
+        StatusIndicatorKind::Point
+    );
+}
+
+#[test]
+fn distinct_agent_symbols_match_herdrs_five_states() {
+    assert_eq!(status_indicator_symbol(AgentStatus::Blocked), "×");
+    assert_eq!(status_indicator_symbol(AgentStatus::Working), "◐");
+    assert_eq!(status_indicator_symbol(AgentStatus::Done), "✓");
+    assert_eq!(status_indicator_symbol(AgentStatus::Idle), "○");
+    assert_eq!(status_indicator_symbol(AgentStatus::Unknown), "·");
 }
 
 #[test]

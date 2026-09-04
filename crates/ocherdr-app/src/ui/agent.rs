@@ -1,5 +1,5 @@
 use super::super::*;
-use super::hierarchy::status_color;
+use super::hierarchy::status_indicator;
 use crate::a11y::apply_dialog;
 use ochub_ui::gpui::{AnyElement, Div};
 use ochub_ui::layout::section_header;
@@ -182,7 +182,7 @@ impl OcHerdrView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(status_dot(status_color(status)))
+                            .child(status_indicator(status, self.status_indicators))
                             .child(i18n.agent_status(status))
                             .into_any_element()
                     }),

@@ -699,6 +699,45 @@ impl BackdropMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StatusIndicatorStyle {
+    #[default]
+    Dots,
+    Symbols,
+}
+
+impl StatusIndicatorStyle {
+    const fn index(self) -> usize {
+        match self {
+            Self::Dots => 0,
+            Self::Symbols => 1,
+        }
+    }
+
+    const fn from_index(index: usize) -> Self {
+        if index == 1 {
+            Self::Symbols
+        } else {
+            Self::Dots
+        }
+    }
+
+    const fn as_config(self) -> &'static str {
+        match self {
+            Self::Dots => "dots",
+            Self::Symbols => "symbols",
+        }
+    }
+
+    fn from_config(value: &str) -> Option<Self> {
+        match value.trim() {
+            "dots" => Some(Self::Dots),
+            "symbols" => Some(Self::Symbols),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AppearanceSettings {
     theme_family: String,
@@ -965,6 +1004,9 @@ struct OcHerdrView {
     /// OcHerdr-owned native agent notifications. Unlike Herdr `SystemToast`,
     /// these are driven by the pane status subscription available to this UI.
     agent_notifications: bool,
+    /// Herdr-compatible five-state status presentation used consistently by
+    /// workspace, pane, and agent surfaces.
+    status_indicators: StatusIndicatorStyle,
     /// Routing metadata stays in-process; notification tags remain opaque and
     /// do not expose host, session, or pane identifiers to the OS.
     agent_notification_targets: HashMap<String, AgentNotificationTarget>,

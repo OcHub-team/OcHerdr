@@ -169,6 +169,17 @@ impl OcHerdrView {
         cx.notify();
     }
 
+    pub(crate) fn set_status_indicators(
+        &mut self,
+        style: StatusIndicatorStyle,
+        cx: &mut Context<Self>,
+    ) {
+        self.config.set("status-indicators", style.as_config());
+        self.status_indicators = style;
+        self.persist_settings(FailureKind::SaveAppearance, cx);
+        cx.notify();
+    }
+
     pub(crate) fn set_terminal_theme(
         &mut self,
         theme: Option<String>,

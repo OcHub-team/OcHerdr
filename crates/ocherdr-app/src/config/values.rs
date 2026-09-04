@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use crate::i18n::Language;
-use crate::{AppearanceMode, AppearanceSettings, BackdropMode, TerminalFontSettings};
+use crate::{
+    AppearanceMode, AppearanceSettings, BackdropMode, StatusIndicatorStyle, TerminalFontSettings,
+};
 
 use super::document::{ConfigDocument, ParseWarning};
 
@@ -34,6 +36,7 @@ pub fn is_known_key(key: &str) -> bool {
             | "window-backdrop"
             | "language"
             | "agent-notifications"
+            | "status-indicators"
             | "pane-edge-relocation"
             | "file-panel-open"
             | "file-panel-width"
@@ -48,6 +51,7 @@ pub fn is_preserved_app_key(key: &str) -> bool {
     matches!(
         key,
         "agent-notifications"
+            | "status-indicators"
             | "pane-edge-relocation"
             | "file-panel-open"
             | "file-panel-width"
@@ -199,6 +203,8 @@ pub struct AppConfig {
     /// stream. This is owned by OcHerdr and does not require Herdr toast
     /// delivery to target a terminal-attach client.
     pub agent_notifications: bool,
+    /// Herdr-compatible state glyphs: colored dots or distinct symbols.
+    pub status_indicators: StatusIndicatorStyle,
     /// Design §13 step 3: four-edge pane relocation via the two-step
     /// `pane.move` orchestration. Off until it graduates (step 4).
     pub pane_edge_relocation: bool,
@@ -236,6 +242,7 @@ impl Default for AppConfig {
             window_backdrop: BackdropMode::Blurred,
             language: Language::System,
             agent_notifications: true,
+            status_indicators: StatusIndicatorStyle::Dots,
             pane_edge_relocation: false,
             file_panel_open: false,
             file_panel_width: crate::FILE_PANEL_DEFAULT_WIDTH,
@@ -287,6 +294,10 @@ fn apply_assignment(
         },
         "agent-notifications" => match parse_bool(value) {
             Some(flag) => config.agent_notifications = flag,
+            None => invalid(warnings, line, key, value),
+        },
+        "status-indicators" => match StatusIndicatorStyle::from_config(value) {
+            Some(style) => config.status_indicators = style,
             None => invalid(warnings, line, key, value),
         },
         "pane-edge-relocation" => match parse_bool(value) {
@@ -404,6 +415,7 @@ fn reset_key(config: &mut AppConfig, key: &str) {
         "window-backdrop" => config.window_backdrop = default.window_backdrop,
         "language" => config.language = default.language,
         "agent-notifications" => config.agent_notifications = default.agent_notifications,
+        "status-indicators" => config.status_indicators = default.status_indicators,
         "pane-edge-relocation" => config.pane_edge_relocation = default.pane_edge_relocation,
         "file-panel-open" => config.file_panel_open = default.file_panel_open,
         "file-panel-width" => config.file_panel_width = default.file_panel_width,
@@ -744,6 +756,28 @@ language = en
         strip_known_keys(&mut document);
         let written = document.serialize();
         assert!(written.contains("agent-notifications = false"));
+        assert!(!written.contains("font-size"));
+    }
+
+    #[test]
+    fn status_indicators_parse_validate_and_survive_appearance_reset() {
+        let (config, warnings) = AppConfig::from_document(&ConfigDocument::parse(""));
+        assert_eq!(config.status_indicators, StatusIndicatorStyle::Dots);
+        assert!(warnings.is_empty());
+
+        let (config, warnings) =
+            AppConfig::from_document(&ConfigDocument::parse("status-indicators = symbols\n"));
+        assert_eq!(config.status_indicators, StatusIndicatorStyle::Symbols);
+        assert!(warnings.is_empty());
+
+        let (_, warnings) =
+            AppConfig::from_document(&ConfigDocument::parse("status-indicators = shapes\n"));
+        assert_eq!(warnings.len(), 1);
+
+        let mut document = ConfigDocument::parse("status-indicators = symbols\nfont-size = 12\n");
+        strip_known_keys(&mut document);
+        let written = document.serialize();
+        assert!(written.contains("status-indicators = symbols"));
         assert!(!written.contains("font-size"));
     }
 

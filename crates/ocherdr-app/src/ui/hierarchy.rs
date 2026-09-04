@@ -17,7 +17,7 @@ use pane_templates::*;
 use support::*;
 use terminal::{TabStripPress, tab_strip_press};
 
-pub(crate) use pane_surface::status_color;
+pub(crate) use pane_surface::status_indicator;
 
 #[cfg(test)]
 mod tests;

@@ -87,6 +87,7 @@ impl OcHerdrView {
         let settings = loaded.settings;
         let (app_config, _) = crate::config::values::AppConfig::from_document(&loaded.document);
         let agent_notifications = app_config.agent_notifications;
+        let status_indicators = app_config.status_indicators;
         let pane_edge_relocation = app_config.pane_edge_relocation;
         let file_panel = FilePanelState::new(
             app_config.file_panel_open,
@@ -159,6 +160,7 @@ impl OcHerdrView {
             notifications: cx.new(|_| NotificationHost::new()),
             window_active: window.is_window_active(),
             agent_notifications,
+            status_indicators,
             agent_notification_targets: HashMap::new(),
             update_info: None,
             update_state: crate::update::load_state(),

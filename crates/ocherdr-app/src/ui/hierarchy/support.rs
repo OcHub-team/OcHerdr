@@ -56,7 +56,7 @@ pub(super) fn tree_row(
     indent: f32,
     icon_name: IconName,
     selected: bool,
-    color: ochub_ui::gpui::Rgba,
+    status: (AgentStatus, StatusIndicatorStyle),
     affiliation: Option<&str>,
 ) -> ochub_ui::gpui::Stateful<ochub_ui::gpui::Div> {
     apply_control(div().id(id), control)
@@ -103,7 +103,7 @@ pub(super) fn tree_row(
                     .child(text.to_owned()),
             )
         })
-        .child(status_dot(color))
+        .child(status_indicator(status.0, status.1))
 }
 
 pub(super) fn reorder_ghost(

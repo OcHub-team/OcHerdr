@@ -657,28 +657,76 @@ pub(super) fn render_tab_transfer_notice(
 /// Sidebar agent rows are two lines tall (workspace, then pane label).
 pub(super) const AGENT_ROW_HEIGHT: f32 = 44.;
 
-/// The TUI's `●`/`○` rule: a hollow ring once the agent is idle or done, a
-/// filled dot while it is working, blocked, or in an unknown state.
-pub(super) fn agent_dot_filled(status: AgentStatus) -> bool {
-    !matches!(status, AgentStatus::Idle | AgentStatus::Done)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StatusIndicatorKind {
+    Filled,
+    Ring,
+    Point,
 }
 
-pub(super) fn agent_state_dot(status: AgentStatus) -> ochub_ui::gpui::Div {
+pub(super) fn status_indicator_kind(status: AgentStatus) -> StatusIndicatorKind {
+    match status {
+        AgentStatus::Blocked | AgentStatus::Working | AgentStatus::Done => {
+            StatusIndicatorKind::Filled
+        }
+        AgentStatus::Idle => StatusIndicatorKind::Ring,
+        AgentStatus::Unknown => StatusIndicatorKind::Point,
+    }
+}
+
+pub(super) fn status_indicator_symbol(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Blocked => "×",
+        AgentStatus::Working => "◐",
+        AgentStatus::Done => "✓",
+        AgentStatus::Idle => "○",
+        AgentStatus::Unknown => "·",
+    }
+}
+
+pub(crate) fn status_indicator(
+    status: AgentStatus,
+    style: StatusIndicatorStyle,
+) -> ochub_ui::gpui::Div {
     let color = status_color(status);
-    let dot = div().w(px(8.)).h(px(8.)).flex_none().rounded_full();
-    if agent_dot_filled(status) {
-        dot.bg(color)
-    } else {
-        dot.border_1().border_color(color)
+    let container = div()
+        .w(px(12.))
+        .h(px(14.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(color);
+    match style {
+        StatusIndicatorStyle::Symbols => container
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(status_indicator_symbol(status)),
+        StatusIndicatorStyle::Dots => match status_indicator_kind(status) {
+            StatusIndicatorKind::Filled => {
+                container.child(div().w(px(8.)).h(px(8.)).rounded_full().bg(color))
+            }
+            StatusIndicatorKind::Ring => container.child(
+                div()
+                    .w(px(8.))
+                    .h(px(8.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(color),
+            ),
+            StatusIndicatorKind::Point => {
+                container.child(div().w(px(3.)).h(px(3.)).rounded_full().bg(color))
+            }
+        },
     }
 }
 
 pub(crate) fn status_color(status: AgentStatus) -> ochub_ui::gpui::Rgba {
     match status {
-        AgentStatus::Working => theme::teal(),
-        AgentStatus::Blocked => theme::yellow(),
-        AgentStatus::Done => theme::green(),
-        AgentStatus::Idle => theme::muted(),
-        AgentStatus::Unknown => theme::border_strong(),
+        AgentStatus::Blocked => theme::red(),
+        AgentStatus::Working => theme::yellow(),
+        AgentStatus::Done => theme::teal(),
+        AgentStatus::Idle => theme::green(),
+        AgentStatus::Unknown => theme::muted(),
     }
 }
