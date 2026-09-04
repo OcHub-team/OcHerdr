@@ -1,4 +1,5 @@
 use super::*;
+use ocherdr_core::HerdrEvent;
 use ocherdr_herdr::{TerminalEvent, TerminalNotificationKind};
 
 pub(super) fn temp_tab() -> TabInfo {
@@ -773,6 +774,20 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
     }
 
     view.update(cx, |this, cx| {
+        let local_owner = this.current_session_key().expect("local session owner");
+        let local_background_pane = this
+            .snapshot
+            .as_mut()
+            .and_then(|snapshot| {
+                snapshot
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == "p-right")
+            })
+            .expect("local background pane");
+        local_background_pane.agent = Some("codex".into());
+        local_background_pane.display_agent = Some("Codex".into());
+        local_background_pane.agent_status = AgentStatus::Working;
         let profile_b = ConnectionProfile::Ssh {
             id: "remote-test".into(),
             label: "Remote test".into(),
@@ -804,6 +819,9 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
                 ),
                 event_stream: EventStreamState::Idle,
                 event_listen: None,
+                agent_status_listen: None,
+                agent_status_panes: std::collections::HashSet::new(),
+                agent_status_handoff: None,
                 snapshot: Some(snapshot_b),
                 selection: Selection {
                     connection_id: "remote-test".into(),
@@ -819,7 +837,24 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
 
         this.select_profile(profile_b_index, cx);
         assert!(this.parked_hosts.contains_key("local"));
+        assert!(
+            this.parked_hosts["local"].agent_status_listen.is_some(),
+            "switching machines must retain the established status stream"
+        );
         assert_eq!(fake_a.terminal_detach_count("p-left"), 0);
+        assert!(this.apply_agent_status_batch_for(
+            &local_owner,
+            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p-right".into(),
+                workspace_id: "w".into(),
+                agent_status: AgentStatus::Done,
+                agent: Some("codex".into()),
+                title: None,
+                display_agent: Some("Codex".into()),
+                state_labels: HashMap::new(),
+            })]),
+            cx,
+        ));
 
         this.select_profile(0, cx);
         assert_eq!(this.current_profile().id(), "local");
@@ -828,6 +863,11 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
 
         this.disconnect_host("local", cx);
     });
+    assert_eq!(
+        cx.shown_system_notifications().len(),
+        1,
+        "an agent on the parked machine still notifies locally"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while fake_a.terminal_detach_count("p-left") == 0 {
@@ -1088,6 +1128,72 @@ fn herdr_system_toast_reaches_the_os_notification_center(cx: &mut TestAppContext
     assert_eq!(shown[0].title, "Codex finished");
     assert_eq!(shown[0].body, "workspace 1");
     assert!(shown[0].actions.is_empty());
+}
+
+#[gpui::test]
+#[cfg(target_os = "macos")]
+fn background_agent_completion_reaches_the_os_notification_center(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+
+    view.update(cx, |this, cx| {
+        this.i18n = I18n::new(Language::English);
+        let workspace_id = {
+            let pane = this
+                .snapshot
+                .as_mut()
+                .and_then(|snapshot| {
+                    snapshot
+                        .panes
+                        .iter_mut()
+                        .find(|pane| pane.pane_id == "p-right")
+                })
+                .expect("background pane");
+            pane.agent = Some("codex".into());
+            pane.display_agent = Some("Codex".into());
+            pane.agent_status = AgentStatus::Working;
+            pane.workspace_id.clone()
+        };
+        assert!(this.apply_agent_status_batch(
+            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p-right".into(),
+                workspace_id,
+                agent_status: AgentStatus::Done,
+                agent: Some("codex".into()),
+                title: None,
+                display_agent: Some("Codex".into()),
+                state_labels: HashMap::new(),
+            })]),
+            cx,
+        ));
+    });
+
+    let shown = cx.shown_system_notifications();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].title, "Codex finished");
+    assert!(shown[0].body.starts_with("Local · "));
+
+    view.update(cx, |this, cx| {
+        assert!(this.apply_agent_status_batch(
+            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p-right".into(),
+                workspace_id: "w".into(),
+                agent_status: AgentStatus::Done,
+                agent: Some("codex".into()),
+                title: None,
+                display_agent: Some("Codex".into()),
+                state_labels: HashMap::new(),
+            })]),
+            cx,
+        ));
+    });
+    assert_eq!(
+        cx.shown_system_notifications().len(),
+        1,
+        "a repeated done event must not notify twice"
+    );
 }
 
 #[gpui::test]

@@ -31,7 +31,7 @@ The repository targets macOS, Linux, Windows, and Herdr `0.8.1+`. The first mile
   and safe external-editor synchronization;
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
 - runtime internationalization with system-language detection, English, and Simplified Chinese;
-- Herdr system toasts delivered through the host notification center, including macOS Notification Center;
+- OcHerdr-owned agent completion and attention alerts through the host notification center;
 - an Open TUI handoff for Herdr settings through the toolbar;
 - stopped-session guidance through the system Terminal.
 
@@ -140,13 +140,16 @@ The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 `Shift+X/D` to close, `H/J/K/L` to focus panes, `1…9` to switch tabs, or `S`
 to open Herdr settings in Terminal.
 
-When Herdr's toast delivery is configured as `system`, OcHerdr forwards its
-`SystemToast` messages to the local operating system. It uses Notification Center on
-macOS, native Toast notifications on Windows, and the XDG notification service on
-Linux. On macOS, the packaged app asks for notification permission on the first
-message and posts even while OcHerdr is frontmost. Clicking a notification activates
-OcHerdr. Remote Herdr sessions use the computer running OcHerdr as the notification
-destination.
+OcHerdr listens to the same per-pane agent status stream that keeps its UI current and
+posts a native notification when an agent moves from working to done or blocked. This
+does not depend on Herdr's `toast.delivery` setting or on Herdr treating OcHerdr's
+terminal-attach sockets as its foreground app client. Startup snapshots, reconnect
+replay, repeated terminal states, and the pane currently visible in the frontmost
+OcHerdr window do not produce duplicate alerts. Agent notifications can be disabled
+under General settings. They use Notification Center on macOS, native Toast
+notifications on Windows, and the XDG notification service on Linux; remote Herdr
+sessions notify on the computer running OcHerdr. Clicking a notification activates
+OcHerdr.
 
 ## Architecture
 

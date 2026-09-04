@@ -159,6 +159,16 @@ impl OcHerdrView {
         self.apply_appearance(window, cx);
     }
 
+    pub(crate) fn set_agent_notifications(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.config.set(
+            "agent-notifications",
+            if enabled { "true" } else { "false" },
+        );
+        self.agent_notifications = enabled;
+        self.persist_settings(FailureKind::SaveAppearance, cx);
+        cx.notify();
+    }
+
     pub(crate) fn set_terminal_theme(
         &mut self,
         theme: Option<String>,

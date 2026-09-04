@@ -62,6 +62,8 @@
 "appearance.mode.description" = "Follow macOS or pin a variant."
 "appearance.mode.label" = "Mode"
 "appearance.mode.light" = "Light"
+"appearance.notifications.description" = "Show a system notification when an agent finishes or needs attention."
+"appearance.notifications.label" = "Agent notifications"
 "appearance.opacity.description" = "0 to 1, applied to terminal and shell surfaces when transparency is enabled. Values from Ghostty are kept as-is."
 "appearance.opacity.label" = "Background opacity"
 "appearance.palette.black" = "Black"

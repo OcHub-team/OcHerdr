@@ -564,15 +564,24 @@ impl OcHerdrView {
                     .update(cx, |host, cx| host.notify(request, cx));
             }
             TerminalNotificationKind::SystemToast => {
-                let id = HERDR_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed);
-                cx.show_system_notification(SystemNotification {
-                    tag: format!("ocherdr-herdr-{id}").into(),
-                    title: message.into(),
-                    body: body.unwrap_or_default().into(),
-                    actions: Vec::new(),
-                });
+                self.post_system_notification(message, body.unwrap_or_default(), cx);
             }
         }
+    }
+
+    pub(super) fn post_system_notification(
+        &self,
+        title: String,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        let id = HERDR_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed);
+        cx.show_system_notification(SystemNotification {
+            tag: format!("ocherdr-herdr-{id}").into(),
+            title: title.into(),
+            body: body.into(),
+            actions: Vec::new(),
+        });
     }
 
     pub(super) fn apply_ghostty_frame(

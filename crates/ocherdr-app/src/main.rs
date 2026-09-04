@@ -480,6 +480,9 @@ struct ParkedHostRuntime {
     herdr_capabilities: HerdrCapabilities,
     event_stream: EventStreamState,
     event_listen: Option<Task<()>>,
+    agent_status_listen: Option<Task<()>>,
+    agent_status_panes: HashSet<String>,
+    agent_status_handoff: Option<AgentStatusHandoff<HerdrEvent>>,
     snapshot: Option<HierarchySnapshot>,
     selection: Selection,
     session_panes: Option<SessionPanes>,
@@ -920,6 +923,12 @@ struct OcHerdrView {
     selection: Selection,
     operation: Option<SharedString>,
     notifications: Entity<NotificationHost>,
+    /// Whether this window is frontmost. A selected pane only suppresses an
+    /// agent completion notification while the user can actually see it.
+    window_active: bool,
+    /// OcHerdr-owned native agent notifications. Unlike Herdr `SystemToast`,
+    /// these are driven by the pane status subscription available to this UI.
+    agent_notifications: bool,
     update_info: Option<update::UpdateInfo>,
     update_state: update::UpdateState,
     update_checking: bool,

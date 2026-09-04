@@ -1,5 +1,91 @@
 use super::*;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AgentSystemNotification {
+    status: AgentStatus,
+    agent: String,
+    workspace: String,
+    tab: String,
+}
+
+pub(super) fn agent_system_notifications(
+    snapshot: &HierarchySnapshot,
+    items: &[std::result::Result<HerdrEvent, HerdrError>],
+    suppressed_pane: Option<&str>,
+) -> Vec<AgentSystemNotification> {
+    let mut statuses = snapshot
+        .panes
+        .iter()
+        .map(|pane| (pane.pane_id.clone(), pane.agent_status))
+        .collect::<HashMap<_, _>>();
+    let mut notices = Vec::new();
+    for item in items {
+        let event = match item {
+            Ok(event) => event,
+            Err(error) if error.is_event_payload_error() => continue,
+            Err(_) => break,
+        };
+        let HerdrEvent::PaneAgentStatusChanged {
+            pane_id,
+            agent_status,
+            agent,
+            display_agent,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(pane) = snapshot.panes.iter().find(|pane| pane.pane_id == *pane_id) else {
+            continue;
+        };
+        // Match HierarchySnapshot::apply: a status from a previous agent on
+        // the same pane is stale and must never trigger a notification.
+        if agent.as_deref() != pane.agent.as_deref() {
+            continue;
+        }
+        let previous = statuses.insert(pane_id.clone(), *agent_status);
+        if previous != Some(AgentStatus::Working)
+            || !matches!(agent_status, AgentStatus::Done | AgentStatus::Blocked)
+            || suppressed_pane == Some(pane_id.as_str())
+        {
+            continue;
+        }
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == pane.workspace_id)
+            .map(|workspace| workspace.label.as_str())
+            .filter(|label| !label.is_empty())
+            .unwrap_or(&pane.workspace_id)
+            .to_owned();
+        let tab = snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == pane.tab_id)
+            .map(|tab| tab.label.as_str())
+            .filter(|label| !label.is_empty())
+            .unwrap_or(&pane.tab_id)
+            .to_owned();
+        let agent = display_agent
+            .as_deref()
+            .filter(|label| !label.is_empty())
+            .or_else(|| {
+                let label = pane.display_name();
+                (!label.is_empty()).then_some(label)
+            })
+            .or(agent.as_deref())
+            .unwrap_or(&pane.pane_id)
+            .to_owned();
+        notices.push(AgentSystemNotification {
+            status: *agent_status,
+            agent,
+            workspace,
+            tab,
+        });
+    }
+    notices
+}
+
 impl OcHerdrView {
     pub(super) fn listen_events(
         owner: SessionKey,
@@ -226,6 +312,7 @@ impl OcHerdrView {
     }
 
     pub(super) fn listen_agent_status(
+        owner: SessionKey,
         mut events: EventSubscription,
         cx: &mut Context<Self>,
     ) -> Task<()> {
@@ -233,7 +320,9 @@ impl OcHerdrView {
             loop {
                 let batch = events.next_batch().await;
                 let keep = this
-                    .update(cx, |this, cx| this.apply_agent_status_batch(batch, cx))
+                    .update(cx, |this, cx| {
+                        this.apply_agent_status_batch_for(&owner, batch, cx)
+                    })
                     .unwrap_or(false);
                 if !keep {
                     break;
@@ -242,12 +331,95 @@ impl OcHerdrView {
         })
     }
 
+    pub(super) fn apply_agent_status_batch_for(
+        &mut self,
+        owner: &SessionKey,
+        batch: Option<Vec<std::result::Result<HerdrEvent, HerdrError>>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.is_active_session(owner) {
+            return self.apply_agent_status_batch(batch, cx);
+        }
+        let enabled = self.agent_notifications;
+        let profile_label = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id() == owner.profile_id)
+            .map(ConnectionProfile::label)
+            .unwrap_or(&owner.profile_id)
+            .to_owned();
+        let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) else {
+            return false;
+        };
+        let Some(items) = batch else {
+            runtime.agent_status_panes = agent_status_panes_after_stream_closed();
+            return false;
+        };
+        if let Some(handoff) = runtime.agent_status_handoff.as_mut() {
+            let mut events = Vec::new();
+            for item in items {
+                match item {
+                    Ok(event) => events.push(event),
+                    Err(error) if error.is_event_payload_error() => handoff.note_payload_error(),
+                    Err(_) => {
+                        runtime.agent_status_panes = agent_status_panes_after_stream_closed();
+                        return false;
+                    }
+                }
+            }
+            handoff.push(events, AGENT_STATUS_HANDOFF_LIMIT);
+            return true;
+        }
+        let notices = if enabled {
+            runtime
+                .snapshot
+                .as_ref()
+                .map(|snapshot| agent_system_notifications(snapshot, &items, None))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let Some(snapshot) = runtime.snapshot.as_mut() else {
+            return false;
+        };
+        let mut items = items.into_iter();
+        let action = apply_event_stream(snapshot, &mut runtime.selection, || match items.next() {
+            Some(Ok(event)) => Ok(Some(event)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        });
+        let effects = effects_for(&action);
+        if matches!(action, EventPollAction::Disconnect(_)) || effects.resync {
+            runtime.agent_status_panes = agent_status_panes_after_stream_closed();
+            return false;
+        }
+        if effects.apply_local {
+            for notice in notices {
+                self.post_agent_system_notification(&profile_label, notice, cx);
+            }
+        }
+        effects.reschedule
+    }
+
     pub(super) fn apply_agent_status_batch(
         &mut self,
         batch: Option<Vec<std::result::Result<HerdrEvent, HerdrError>>>,
         cx: &mut Context<Self>,
     ) -> bool {
         let panel_refresh = agent_panel_refresh_from_batch(&self.overlay, batch.as_deref());
+        let notices = if self.agent_notifications && self.agent_status_handoff.is_none() {
+            let suppressed = self
+                .window_active
+                .then_some(self.selection.pane_id.as_deref())
+                .flatten();
+            self.snapshot
+                .as_ref()
+                .zip(batch.as_deref())
+                .map(|(snapshot, items)| agent_system_notifications(snapshot, items, suppressed))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let action = match batch {
             None => {
                 self.agent_status_panes = agent_status_panes_after_stream_closed();
@@ -308,6 +480,12 @@ impl OcHerdrView {
         }
         if effects.notify {
             cx.notify();
+        }
+        if effects.apply_local {
+            let host = self.current_profile().label().to_owned();
+            for notice in notices {
+                self.post_agent_system_notification(&host, notice, cx);
+            }
         }
         self.reconcile_open_agent_panel(panel_refresh, cx);
         effects.reschedule
@@ -383,6 +561,10 @@ impl OcHerdrView {
             self.agent_status_panes = previous;
             return;
         };
+        let Some(owner) = self.current_session_key() else {
+            self.agent_status_panes = previous;
+            return;
+        };
         let socket = connection.socket_path().to_owned();
         let epoch = self.event_epoch;
         let pane_list: Vec<String> = panes.iter().cloned().collect();
@@ -403,7 +585,7 @@ impl OcHerdrView {
                             this.agent_status_handoff = Some(AgentStatusHandoff::new());
                         }
                         this.agent_status_listen =
-                            Some(Self::listen_agent_status(subscription, cx));
+                            Some(Self::listen_agent_status(owner, subscription, cx));
                         this.resync_snapshot(epoch, cx);
                     }
                     Err(error) => match agent_status_subscribe_failure_action(&error) {
@@ -423,6 +605,31 @@ impl OcHerdrView {
             })
             .ok();
         }));
+    }
+
+    fn post_agent_system_notification(
+        &self,
+        host: &str,
+        notice: AgentSystemNotification,
+        cx: &mut Context<Self>,
+    ) {
+        let title = match notice.status {
+            AgentStatus::Done => tf!(self.i18n, k::AGENT_NOTIFICATION_DONE, agent = notice.agent),
+            AgentStatus::Blocked => tf!(
+                self.i18n,
+                k::AGENT_NOTIFICATION_BLOCKED,
+                agent = notice.agent
+            ),
+            _ => return,
+        };
+        let body = tf!(
+            self.i18n,
+            k::AGENT_NOTIFICATION_LOCATION,
+            host = host,
+            workspace = notice.workspace,
+            tab = notice.tab
+        );
+        self.post_system_notification(title, body, cx);
     }
 
     pub(crate) fn resync_snapshot(&mut self, epoch: u64, cx: &mut Context<Self>) {

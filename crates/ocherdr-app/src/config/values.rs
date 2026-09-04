@@ -33,6 +33,7 @@ pub fn is_known_key(key: &str) -> bool {
             | "appearance-mode"
             | "window-backdrop"
             | "language"
+            | "agent-notifications"
             | "pane-edge-relocation"
             | "file-panel-open"
             | "file-panel-width"
@@ -41,13 +42,13 @@ pub fn is_known_key(key: &str) -> bool {
     )
 }
 
-/// Experimental switches are read like any other key but survive
-/// `strip_known_keys` (restore-appearance-defaults must not silently turn
-/// them off).
-pub fn is_experimental_key(key: &str) -> bool {
+/// App behavior outside the appearance theme survives `strip_known_keys` so
+/// restoring appearance defaults does not silently change unrelated features.
+pub fn is_preserved_app_key(key: &str) -> bool {
     matches!(
         key,
-        "pane-edge-relocation"
+        "agent-notifications"
+            | "pane-edge-relocation"
             | "file-panel-open"
             | "file-panel-width"
             | "file-panel-show-hidden"
@@ -194,6 +195,10 @@ pub struct AppConfig {
     pub appearance_mode: AppearanceMode,
     pub window_backdrop: BackdropMode,
     pub language: Language,
+    /// Native notifications synthesized from Herdr's pane agent-status
+    /// stream. This is owned by OcHerdr and does not require Herdr toast
+    /// delivery to target a terminal-attach client.
+    pub agent_notifications: bool,
     /// Design §13 step 3: four-edge pane relocation via the two-step
     /// `pane.move` orchestration. Off until it graduates (step 4).
     pub pane_edge_relocation: bool,
@@ -230,6 +235,7 @@ impl Default for AppConfig {
             appearance_mode: AppearanceMode::Dark,
             window_backdrop: BackdropMode::Blurred,
             language: Language::System,
+            agent_notifications: true,
             pane_edge_relocation: false,
             file_panel_open: false,
             file_panel_width: crate::FILE_PANEL_DEFAULT_WIDTH,
@@ -277,6 +283,10 @@ fn apply_assignment(
         },
         "font-thicken" => match parse_bool(value) {
             Some(flag) => config.font_thicken = flag,
+            None => invalid(warnings, line, key, value),
+        },
+        "agent-notifications" => match parse_bool(value) {
+            Some(flag) => config.agent_notifications = flag,
             None => invalid(warnings, line, key, value),
         },
         "pane-edge-relocation" => match parse_bool(value) {
@@ -393,6 +403,7 @@ fn reset_key(config: &mut AppConfig, key: &str) {
         "appearance-mode" => config.appearance_mode = default.appearance_mode,
         "window-backdrop" => config.window_backdrop = default.window_backdrop,
         "language" => config.language = default.language,
+        "agent-notifications" => config.agent_notifications = default.agent_notifications,
         "pane-edge-relocation" => config.pane_edge_relocation = default.pane_edge_relocation,
         "file-panel-open" => config.file_panel_open = default.file_panel_open,
         "file-panel-width" => config.file_panel_width = default.file_panel_width,
@@ -503,7 +514,7 @@ pub fn appearance_from_config(config: &AppConfig) -> AppearanceSettings {
 pub fn strip_known_keys(document: &mut super::document::ConfigDocument) {
     let keys: Vec<String> = document
         .assignments()
-        .filter(|(_, key, _)| is_known_key(key) && !is_experimental_key(key))
+        .filter(|(_, key, _)| is_known_key(key) && !is_preserved_app_key(key))
         .map(|(_, key, _)| key.to_owned())
         .collect();
     for key in keys {
@@ -715,6 +726,24 @@ language = en
         strip_known_keys(&mut document);
         let written = document.serialize();
         assert!(written.contains("pane-edge-relocation = true"));
+        assert!(!written.contains("font-size"));
+    }
+
+    #[test]
+    fn agent_notifications_default_on_parse_bools_and_survive_appearance_reset() {
+        let (config, warnings) = AppConfig::from_document(&ConfigDocument::parse(""));
+        assert!(config.agent_notifications);
+        assert!(warnings.is_empty());
+
+        let (config, warnings) =
+            AppConfig::from_document(&ConfigDocument::parse("agent-notifications = false\n"));
+        assert!(!config.agent_notifications);
+        assert!(warnings.is_empty());
+
+        let mut document = ConfigDocument::parse("agent-notifications = false\nfont-size = 12\n");
+        strip_known_keys(&mut document);
+        let written = document.serialize();
+        assert!(written.contains("agent-notifications = false"));
         assert!(!written.contains("font-size"));
     }
 

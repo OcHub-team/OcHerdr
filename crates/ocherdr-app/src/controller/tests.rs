@@ -274,6 +274,66 @@ fn two_tab_snapshot() -> HierarchySnapshot {
     }
 }
 
+fn status_event(pane_id: &str, status: AgentStatus, agent: &str) -> HerdrEvent {
+    HerdrEvent::PaneAgentStatusChanged {
+        pane_id: pane_id.into(),
+        workspace_id: "w".into(),
+        agent_status: status,
+        agent: Some(agent.into()),
+        title: None,
+        display_agent: Some("Codex".into()),
+        state_labels: HashMap::new(),
+    }
+}
+
+#[test]
+fn agent_notifications_require_a_real_working_to_terminal_transition() {
+    let mut snapshot = two_tab_snapshot();
+    snapshot.panes[0].agent = Some("codex".into());
+    snapshot.panes[0].display_agent = Some("Codex".into());
+    snapshot.panes[0].agent_status = AgentStatus::Working;
+
+    let notices = events::agent_system_notifications(
+        &snapshot,
+        &[
+            Ok(status_event("p-a", AgentStatus::Done, "codex")),
+            Ok(status_event("p-a", AgentStatus::Done, "codex")),
+            Ok(status_event("p-a", AgentStatus::Working, "codex")),
+            Ok(status_event("p-a", AgentStatus::Blocked, "codex")),
+        ],
+        None,
+    );
+    assert_eq!(notices.len(), 2, "repeated terminal states must not notify");
+
+    snapshot.panes[0].agent_status = AgentStatus::Idle;
+    assert!(
+        events::agent_system_notifications(
+            &snapshot,
+            &[Ok(status_event("p-a", AgentStatus::Done, "codex"))],
+            None,
+        )
+        .is_empty(),
+        "an initial idle/done snapshot replay is not a completed work transition"
+    );
+}
+
+#[test]
+fn agent_notifications_ignore_visible_and_stale_agent_events() {
+    let mut snapshot = two_tab_snapshot();
+    snapshot.panes[0].agent = Some("codex".into());
+    snapshot.panes[0].agent_status = AgentStatus::Working;
+    let event = status_event("p-a", AgentStatus::Done, "codex");
+    assert!(events::agent_system_notifications(&snapshot, &[Ok(event)], Some("p-a")).is_empty());
+    assert!(
+        events::agent_system_notifications(
+            &snapshot,
+            &[Ok(status_event("p-a", AgentStatus::Done, "claude"))],
+            None,
+        )
+        .is_empty()
+    );
+}
+
 #[test]
 fn cmd_w_closes_the_selected_split_pane() {
     let mut snapshot = two_tab_snapshot();

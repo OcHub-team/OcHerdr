@@ -713,6 +713,8 @@ fn stale_pane_agent_status_subscribe_resyncs_without_notifying(cx: &mut TestAppC
             SessionConnection::connect(&this.profiles[0], &session)
                 .expect("connect stale pane session"),
         );
+        this.sessions = vec![session];
+        this.session_index = Some(0);
         this.snapshot = Some(agent_snapshot());
         this.ensure_agent_status_stream(cx);
     });

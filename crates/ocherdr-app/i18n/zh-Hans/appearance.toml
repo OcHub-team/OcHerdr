@@ -62,6 +62,8 @@
 "appearance.mode.description" = "跟随 macOS，或固定使用一种外观。"
 "appearance.mode.label" = "模式"
 "appearance.mode.light" = "浅色"
+"appearance.notifications.description" = "智能体完成工作或需要处理时显示系统通知。"
+"appearance.notifications.label" = "智能体通知"
 "appearance.opacity.description" = "0 到 1，启用透明背景时应用于终端及应用表面。会原样保留 Ghostty 配置里的值。"
 "appearance.opacity.label" = "背景不透明度"
 "appearance.palette.black" = "黑"

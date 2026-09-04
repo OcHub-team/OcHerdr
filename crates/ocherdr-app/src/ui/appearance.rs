@@ -151,7 +151,10 @@ impl OcHerdrView {
                 self.i18n.text(k::APPEARANCE_GENERAL_LABEL),
                 None,
             ))
-            .child(group(vec![self.language_row(cx).into_any_element()]))
+            .child(group(vec![
+                self.language_row(cx).into_any_element(),
+                self.agent_notifications_row(cx).into_any_element(),
+            ]))
             .child(section_header(
                 self.i18n.text(k::APPEARANCE_THEME_LABEL),
                 Some(self.i18n.text(k::APPEARANCE_THEME_DESCRIPTION).into()),
@@ -225,6 +228,21 @@ impl OcHerdrView {
             appearance_select(cx, "language", |this, index, _window, cx| {
                 this.set_language(Language::from_index(index), cx);
             }),
+        )
+    }
+
+    fn agent_notifications_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
+        let listener = cx.listener(|this, _: &(), _window, cx| {
+            this.set_agent_notifications(!this.agent_notifications, cx);
+        });
+        switch_row(
+            "agent-notifications",
+            i18n.text(k::APPEARANCE_NOTIFICATIONS_LABEL),
+            Some(i18n.text(k::APPEARANCE_NOTIFICATIONS_DESCRIPTION).into()),
+            self.agent_notifications,
+            false,
+            move |window, cx| listener(&(), window, cx),
         )
     }
 
@@ -1226,6 +1244,7 @@ impl OcHerdrView {
     fn sync_appearance_from_document(&mut self) {
         let (config, _) = crate::config::values::AppConfig::from_document(&self.config);
         self.appearance = crate::config::values::appearance_from_config(&config);
+        self.agent_notifications = config.agent_notifications;
         self.pane_edge_relocation = config.pane_edge_relocation;
         if self.i18n.preference() != config.language {
             self.i18n.set_preference(config.language);

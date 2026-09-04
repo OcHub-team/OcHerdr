@@ -133,15 +133,17 @@ import it. `private_protocol.rs` owns the explicit version registry, handshake, 
 and mapping between wire values and the stable `TerminalCommand` / `TerminalEvent`
 facade.
 
-`Notify` messages are also part of the stable facade. Herdr `Toast` messages use
-OcHerdr's in-app notification host, while `SystemToast` messages are posted through
-GPUI's platform notification API. On macOS that API uses `UNUserNotificationCenter`,
-requests alert permission lazily, retains notifications in Notification Center, and
-opts into foreground banner/list presentation. The packaged app's bundle identifier
-provides its notification identity; source binaries run outside an app bundle safely
-leave system delivery disabled. Windows uses native Toast notifications with the
-OcHerdr AppUserModelID, while Linux uses the XDG notification D-Bus service through
-`notify-rust`.
+`Notify` messages are part of the stable terminal facade and are rendered if Herdr
+delivers one to that terminal client. They are not the source of agent-completion
+alerts: Herdr's generic notifications target its foreground app client, while
+OcHerdr's pane sockets use terminal-attach mode. Instead, OcHerdr detects genuine
+`working -> done` and `working -> blocked` transitions on its parameterized
+`pane.agent_status_changed` subscriptions and posts those through GPUI's platform
+notification API. The subscription handoff keeps startup and reconnect replay quiet,
+and inactive hosts retain their established status listener when the user switches
+machines. On macOS the platform API uses `UNUserNotificationCenter`; Windows uses
+native Toast notifications with the OcHerdr AppUserModelID; Linux uses the XDG
+notification D-Bus service through `notify-rust`.
 
 For a future v21, add a new `private_v21.rs`, copy the released Herdr schema exactly,
 add independent golden fixtures, register one new codec variant, and implement only

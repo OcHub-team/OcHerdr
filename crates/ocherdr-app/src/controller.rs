@@ -79,6 +79,7 @@ impl OcHerdrView {
         let appearance = loaded.appearance;
         let settings = loaded.settings;
         let (app_config, _) = crate::config::values::AppConfig::from_document(&loaded.document);
+        let agent_notifications = app_config.agent_notifications;
         let pane_edge_relocation = app_config.pane_edge_relocation;
         let file_panel = FilePanelState::new(
             app_config.file_panel_open,
@@ -97,6 +98,7 @@ impl OcHerdrView {
         // Command released in another app never reaches this window as a
         // modifiers change, so losing key status drops the hints.
         cx.observe_window_activation(window, |this, window, cx| {
+            this.window_active = window.is_window_active();
             if !window.is_window_active() {
                 this.set_command_held(false, cx);
             }
@@ -142,6 +144,8 @@ impl OcHerdrView {
             },
             operation: None,
             notifications: cx.new(|_| NotificationHost::new()),
+            window_active: window.is_window_active(),
+            agent_notifications,
             update_info: None,
             update_state: crate::update::load_state(),
             update_checking: false,
@@ -307,6 +311,9 @@ impl OcHerdrView {
             herdr_capabilities: std::mem::take(&mut self.herdr_capabilities),
             event_stream: std::mem::replace(&mut self.event_stream, EventStreamState::Idle),
             event_listen: self.event_listen.take(),
+            agent_status_listen: self.agent_status_listen.take(),
+            agent_status_panes: std::mem::take(&mut self.agent_status_panes),
+            agent_status_handoff: self.agent_status_handoff.take(),
             snapshot: self.snapshot.take(),
             selection: std::mem::take(&mut self.selection),
             session_panes: self.session_panes.take(),
@@ -325,6 +332,9 @@ impl OcHerdrView {
         self.herdr_capabilities = runtime.herdr_capabilities;
         self.event_stream = runtime.event_stream;
         self.event_listen = runtime.event_listen;
+        self.agent_status_listen = runtime.agent_status_listen;
+        self.agent_status_panes = runtime.agent_status_panes;
+        self.agent_status_handoff = runtime.agent_status_handoff;
         self.snapshot = runtime.snapshot;
         self.selection = runtime.selection;
         self.session_panes = runtime.session_panes;
@@ -377,6 +387,7 @@ impl OcHerdrView {
         if self.current_profile().id() != profile_id {
             if let Some(mut runtime) = self.parked_hosts.remove(profile_id) {
                 runtime.event_listen = None;
+                runtime.agent_status_listen = None;
                 runtime.session_panes = None;
             }
             cx.notify();
@@ -567,8 +578,10 @@ impl OcHerdrView {
         if index == self.profile_index {
             return;
         }
-        self.reset_for_host_transition();
         self.park_current_host();
+        // Invalidate only work that was not transferred into the parked
+        // runtime. The live event/status listeners continue to own that host.
+        self.reset_for_host_transition();
         self.profile_index = index;
         self.host_center
             .update(cx, |center, _| center.set_profile_index(index));
