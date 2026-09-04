@@ -985,6 +985,7 @@ struct HostListRevision {
 }
 
 struct OcHerdrView {
+    render_cache: ui::RenderCache,
     profiles: Vec<ConnectionProfile>,
     profile_index: usize,
     sessions: Vec<SessionSummary>,

@@ -5,6 +5,7 @@
 
 mod private_protocol;
 mod private_v20;
+mod scroll_queue;
 #[cfg(all(test, unix))]
 mod settings_tests;
 
@@ -17,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(windows)]
@@ -1045,7 +1045,7 @@ pub enum TerminalScrollDirection {
 }
 
 pub struct TerminalSession {
-    commands: Sender<TerminalCommand>,
+    commands: scroll_queue::CommandSender,
     alive: Arc<AtomicBool>,
 }
 
@@ -1095,7 +1095,7 @@ impl TerminalSession {
         rows: u16,
         settings: bool,
     ) -> (Self, TerminalEventReceiver) {
-        let (command_tx, command_rx) = mpsc::channel::<TerminalCommand>();
+        let (command_tx, command_rx) = scroll_queue::channel();
         let (mut event_tx, event_rx) =
             futures_mpsc::channel::<Result<TerminalEvent>>(TERMINAL_EVENT_QUEUE_CAPACITY);
         let alive = Arc::new(AtomicBool::new(true));
@@ -1121,7 +1121,7 @@ impl TerminalSession {
                 }
             };
             let _writer = thread::spawn(move || {
-                while let Ok(command) = command_rx.recv() {
+                while let Some(command) = command_rx.recv() {
                     let release = command == TerminalCommand::Release;
                     if writer.send(command).is_err() || release {
                         break;

@@ -50,11 +50,9 @@ impl OcHerdrView {
         let Some(runtime) = self.pane_mut(pane_id) else {
             return;
         };
-        let line_height = if runtime.size.1 == 0 {
-            16.
-        } else {
-            (runtime.pixel_size.1 as f32 / f32::from(runtime.size.1)).max(1.)
-        };
+        // GPUI wheel pixels and measured body bounds are both logical pixels.
+        // pixel_size is physical: using it halves scrolling on a Retina display.
+        let line_height = logical_scroll_line_height(runtime.body_bounds.3, runtime.size.1);
         let lines = wheel_scroll_lines(event.delta, line_height, &mut runtime.scroll_px);
         if lines == 0 {
             cx.stop_propagation();
@@ -67,7 +65,7 @@ impl OcHerdrView {
         };
         let _ = runtime.session.send(TerminalCommand::Scroll {
             direction,
-            lines: lines.unsigned_abs() as u16,
+            lines: lines.unsigned_abs().min(u32::from(u16::MAX)) as u16,
         });
         cx.stop_propagation();
     }

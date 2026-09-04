@@ -1276,3 +1276,45 @@ fn wheel_delta_accumulates_into_terminal_scroll_lines() {
 }
 
 mod ui_terminal;
+
+#[test]
+fn wheel_pixels_use_logical_viewport_at_any_display_scale() {
+    for scale in [1., 1.5, 2., 3.] {
+        let physical_height = 480. * scale;
+        let logical_height = physical_height / scale;
+        let line_height = logical_scroll_line_height(logical_height, 30);
+        let mut remainder = 0.;
+        assert_eq!(
+            wheel_scroll_lines(
+                ScrollDelta::Pixels(point(px(0.), px(32.))),
+                line_height,
+                &mut remainder,
+            ),
+            2
+        );
+        assert_eq!(remainder, 0.);
+    }
+    assert_eq!(logical_scroll_line_height(0., 0), 16.);
+    assert_eq!(logical_scroll_line_height(f32::NAN, 24), 16.);
+}
+
+#[test]
+fn malformed_wheel_events_do_not_poison_future_scrolling() {
+    let mut remainder = 8.;
+    assert_eq!(
+        wheel_scroll_lines(
+            ScrollDelta::Pixels(point(px(0.), px(f32::NAN))),
+            16.,
+            &mut remainder,
+        ),
+        0
+    );
+    assert_eq!(
+        wheel_scroll_lines(
+            ScrollDelta::Pixels(point(px(0.), px(16.))),
+            16.,
+            &mut remainder,
+        ),
+        1
+    );
+}

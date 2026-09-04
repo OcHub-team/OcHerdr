@@ -1036,6 +1036,14 @@ pub(super) fn flush_pane_surface(runtime: &mut PaneRuntime) {
     }
 }
 
+pub(super) fn logical_scroll_line_height(body_height: f32, rows: u16) -> f32 {
+    if rows == 0 || !body_height.is_finite() || body_height <= 0. {
+        16.
+    } else {
+        (body_height / f32::from(rows)).max(1.)
+    }
+}
+
 pub(super) fn wheel_scroll_lines(delta: ScrollDelta, line_height: f32, leftover: &mut f32) -> i32 {
     match delta {
         ScrollDelta::Lines(delta) => {
@@ -1043,8 +1051,12 @@ pub(super) fn wheel_scroll_lines(delta: ScrollDelta, line_height: f32, leftover:
             delta.y.round() as i32
         }
         ScrollDelta::Pixels(delta) => {
-            if line_height <= 0. {
+            if !line_height.is_finite() || line_height <= 0. || !f32::from(delta.y).is_finite() {
+                *leftover = 0.;
                 return 0;
+            }
+            if !leftover.is_finite() {
+                *leftover = 0.;
             }
             *leftover += f32::from(delta.y);
             let lines = (*leftover / line_height).trunc() as i32;

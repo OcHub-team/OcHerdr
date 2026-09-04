@@ -1,6 +1,7 @@
 use super::*;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
+use std::sync::mpsc;
 #[cfg(windows)]
 use uds_windows::UnixListener;
 

@@ -6,9 +6,11 @@ mod files;
 mod hierarchy;
 mod overlays;
 mod remote;
+mod render_cache;
 mod update;
 
 pub(crate) use appearance::AppearanceUi;
+pub(crate) use render_cache::RenderCache;
 
 impl Render for OcHerdrView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -17,10 +19,10 @@ impl Render for OcHerdrView {
         let chrome = self.chrome_a11y();
         let file_panel_overlay =
             f32::from(window.viewport_size().width) < FILE_PANEL_OVERLAY_BREAKPOINT;
-        let file_panel = self
-            .file_panel
-            .open
-            .then(|| self.render_file_panel(file_panel_overlay, cx));
+        let file_panel = self.file_panel.open.then(|| {
+            self.render_cache
+                .files(self.file_panel.width, file_panel_overlay)
+        });
         let content = div()
             .relative()
             .flex()
@@ -37,7 +39,7 @@ impl Render for OcHerdrView {
             .min_w_0()
             .h_full()
             .bg(theme::surface().alpha(0.))
-            .child(self.render_tab_bar(&chrome, window, cx))
+            .child(self.render_cache.tabs())
             .child(content);
         let workspace_body = div()
             .relative()
@@ -46,7 +48,7 @@ impl Render for OcHerdrView {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .child(self.render_sidebar(&chrome, cx))
+            .child(self.render_cache.sidebar())
             .child(main)
             .into_any_element();
         let body = if self.overlay.host_center() {
@@ -55,6 +57,7 @@ impl Render for OcHerdrView {
             workspace_body
         };
         let mut root = div()
+            .child(self.render_cache.terminal_signal.clone())
             .relative()
             .flex()
             .flex_col()

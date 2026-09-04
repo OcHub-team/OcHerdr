@@ -197,6 +197,10 @@ terminal theme and font settings without replacing the OcHerdr UI theme. Previou
 imported themes should be imported again to restore background, foreground, cursor,
 and selection colors that older versions omitted. See [color rendering](docs/color-rendering.md).
 
+Trackpad scrolling uses logical display units, coalesces high-frequency wheel input,
+and reuses cached application chrome during terminal-only updates. See
+[scroll performance and regression measurements](docs/scroll-performance.md).
+
 ## License
 
 OcHerdr source is dual-licensed under MIT or Apache-2.0. See `NOTICE` for third-party

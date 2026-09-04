@@ -1908,3 +1908,4 @@ mod file_panel;
 mod pane;
 mod pane_tab_drop;
 mod relocation;
+mod rendering;

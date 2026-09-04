@@ -554,7 +554,7 @@ impl OcHerdrView {
             self.resync_snapshot(self.event_epoch, cx);
         }
         if changed {
-            cx.notify();
+            self.render_cache.notify_terminal(cx);
         }
         keep
     }
@@ -690,7 +690,7 @@ impl OcHerdrView {
             self.resync_snapshot(self.event_epoch, cx);
         }
         if changed {
-            cx.notify();
+            self.render_cache.notify_terminal(cx);
         }
         keep
     }

@@ -480,6 +480,7 @@ impl OcHerdrView {
             .debug_selector(|| "tab-bar".to_owned())
             .flex()
             .items_center()
+            .w_full()
             .h(px(HEADER_HEIGHT))
             .pr_2()
             .gap_1()

@@ -138,6 +138,7 @@ impl OcHerdrView {
         })
         .detach();
         let mut view = Self {
+            render_cache: ui::RenderCache::new(cx),
             profiles,
             profile_index,
             sessions: Vec::new(),

@@ -4,6 +4,7 @@ use crate::{
     private_v20 as wire,
 };
 use std::os::unix::net::UnixListener;
+use std::sync::mpsc;
 
 #[test]
 fn settings_client_uses_local_binding_and_detaches_without_taking_a_pane() {
