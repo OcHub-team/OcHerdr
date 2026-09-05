@@ -691,7 +691,13 @@ impl OcHerdrView {
                         &chrome.toolbar.herdr_settings,
                     )
                     .debug_selector(|| "open-herdr-settings".into())
-                    .on_click(cx.listener(|this, _, _window, cx| this.open_herdr_settings(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if matches!(this.overlay, Overlay::HerdrSettings) {
+                            this.close_herdr_settings(window, cx);
+                        } else {
+                            this.open_herdr_settings(cx);
+                        }
+                    })),
                 ),
             )
             .child(apply_control(

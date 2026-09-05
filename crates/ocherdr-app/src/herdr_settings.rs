@@ -8,6 +8,12 @@ use futures::{
 use ocherdr_herdr::{TerminalEndpoint, TerminalEvent, TerminalEventReceiver, next_batch};
 use std::{ops::Range, task::Poll};
 
+/// What woke the settings listener on the Ghostty side.
+enum SurfaceWake {
+    Frame(Option<Result<RenderedFrame, ocherdr_terminal::TerminalError>>),
+    Input(Option<Vec<u8>>),
+}
+
 pub(crate) struct HerdrSettings {
     endpoint: TerminalEndpoint,
     protocol: u32,
@@ -108,14 +114,28 @@ impl HerdrSettings {
                 let server = next_batch(&mut events);
                 let surface = poll_fn(|task_cx| {
                     this.update(cx, |this, _| {
-                        this.terminal
-                            .as_mut()
-                            .map_or(Poll::Ready(None), |terminal| terminal.poll_frame(task_cx))
+                        let Some(terminal) = this.terminal.as_mut() else {
+                            return Poll::Ready(SurfaceWake::Frame(None));
+                        };
+                        if let Poll::Ready(frame) = terminal.poll_frame(task_cx) {
+                            return Poll::Ready(SurfaceWake::Frame(frame));
+                        }
+                        terminal.poll_input(task_cx).map(SurfaceWake::Input)
                     })
-                    .unwrap_or(Poll::Ready(None))
+                    .unwrap_or(Poll::Ready(SurfaceWake::Frame(None)))
                 });
                 pin_mut!(server, surface);
                 let keep = match future::select(server, surface).await {
+                    Either::Right((SurfaceWake::Input(bytes), _)) => this
+                        .update(cx, |this, cx| {
+                            let Some(bytes) = bytes else {
+                                return false;
+                            };
+                            this.send(TerminalCommand::Input(bytes));
+                            this.flush(cx);
+                            true
+                        })
+                        .unwrap_or(false),
                     Either::Left((batch, _)) => this
                         .update(cx, |this, cx| {
                             let Some(batch) = batch else {
@@ -172,7 +192,7 @@ impl HerdrSettings {
                             true
                         })
                         .unwrap_or(false),
-                    Either::Right((frame, _)) => this
+                    Either::Right((SurfaceWake::Frame(frame), _)) => this
                         .update(cx, |this, cx| match frame {
                             Some(Ok(frame)) => {
                                 this.frame = Some(frame);
@@ -199,6 +219,15 @@ impl HerdrSettings {
         })
     }
 
+    pub(crate) fn apply_palette(&mut self, palette: &TerminalPalette, cx: &mut Context<Self>) {
+        if let Some(terminal) = &self.terminal
+            && let Err(error) = terminal.apply_palette(palette)
+        {
+            self.error = Some(error.to_string());
+        }
+        cx.notify();
+    }
+
     fn disconnected(&mut self, cx: &mut Context<Self>) {
         self.error = Some(self.i18n.text(k::HERDR_SETTINGS_DISCONNECTED).to_string());
         self.session = None;
@@ -223,7 +252,13 @@ impl HerdrSettings {
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
-        if key.modifiers.platform && key.key == "w" {
+        let escape = key.key == "escape" && !key.modifiers.modified();
+        if (key.modifiers.platform && key.key == "w")
+            || (escape && (self.session.is_none() || self.error.is_some()))
+        {
+            // Esc normally belongs to Herdr (it closes Herdr's own modal).
+            // Once the stream is gone there is nothing left to receive it, so
+            // it closes this panel instead of appearing to do nothing.
             self.close(window, cx);
         } else if self.marked.is_none() {
             if let Some(terminal) = &self.terminal {
@@ -267,14 +302,16 @@ impl HerdrSettings {
         &self,
         position: ochub_ui::gpui::Point<ochub_ui::gpui::Pixels>,
         modifiers: ochub_ui::gpui::Modifiers,
-        window: &Window,
+        _window: &Window,
     ) {
         if let (Some(bounds), Some(terminal)) = (self.bounds, &self.terminal) {
+            // Ghostty takes view points and applies the content scale itself;
+            // pre-multiplying by the scale factor landed every Retina click
+            // two cells away from the pointer.
             let point = position - bounds.origin;
-            let scale = f64::from(window.scale_factor());
             terminal.mouse_pos(
-                f64::from(f32::from(point.x)) * scale,
-                f64::from(f32::from(point.y)) * scale,
+                f64::from(f32::from(point.x)),
+                f64::from(f32::from(point.y)),
                 controller::gpui_key_modifiers(modifiers),
             );
         }
@@ -320,8 +357,7 @@ impl Render for HerdrSettings {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .pl(px(78.))
-                    .pr_4()
+                    .px_4()
                     .py_3()
                     .child(
                         div()

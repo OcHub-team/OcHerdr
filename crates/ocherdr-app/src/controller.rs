@@ -118,6 +118,7 @@ impl OcHerdrView {
             this.window_active = window.is_window_active();
             if !window.is_window_active() {
                 this.set_command_held(false, cx);
+                this.end_text_drag();
             }
         })
         .detach();
@@ -134,7 +135,11 @@ impl OcHerdrView {
             }
             install_appearance(&this.appearance, window.appearance());
             theme::apply_window_background(window);
+            // The chrome follows the system through the theme registry; the
+            // embedded Ghostty surfaces only follow when told.
+            this.apply_terminal_palette(cx);
             cx.refresh_windows();
+            cx.notify();
         })
         .detach();
         let mut view = Self {
@@ -198,6 +203,7 @@ impl OcHerdrView {
             prefix_pending: false,
             suppress_key_release: false,
             surface_drag: SurfaceDrag::Idle,
+            aux_mouse_drag: None,
             split_commit: None,
             pane_drag_snapshot: None,
             pane_relocations: HashMap::new(),

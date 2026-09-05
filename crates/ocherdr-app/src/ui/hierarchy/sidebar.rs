@@ -313,7 +313,11 @@ impl OcHerdrView {
                     .flex()
                     .items_center()
                     .h(px(HEADER_HEIGHT))
-                    .pl(px(78.))
+                    // With the traffic lights at x = 18 the green control ends
+                    // near x = 77 in this transparent titlebar. Leave a
+                    // readable gap instead of starting the workspace label on
+                    // top of it.
+                    .pl(px(100.))
                     .pr_4()
                     .gap_2()
                     .on_mouse_down(

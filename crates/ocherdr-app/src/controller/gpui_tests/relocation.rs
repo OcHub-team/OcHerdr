@@ -662,6 +662,74 @@ fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestCo
     cx.run_until_parked();
 }
 
+/// Ghostty encodes mouse reports on its IO thread. The pane listener must
+/// forward them as soon as they exist; relying on the next pointer or key
+/// event to flush left a click's release (and a quick click entirely)
+/// stranded until something unrelated happened in the pane.
+#[gpui::test]
+#[cfg(target_os = "macos")]
+fn mouse_click_is_forwarded_without_a_follow_up_ui_event(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    measure_two_terminal_bodies(&view, cx);
+    view.update_in(cx, |this, _window, cx| {
+        let owner = this.current_session_key().expect("connected session");
+        assert!(this.apply_herdr_frames(
+            &owner,
+            "p-left",
+            Some(vec![Ok(TerminalEvent::MouseCapture {
+                enabled: true,
+                sgr_pixels: false,
+            })]),
+            cx,
+        ));
+        assert!(
+            this.pane("p-left")
+                .expect("agent terminal")
+                .terminal
+                .mouse_captured()
+        );
+    });
+
+    let point = gpui::point(gpui::px(100.), gpui::px(100.));
+    let left_down = gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: point,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    };
+    let left_up = gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: point,
+        modifiers: Default::default(),
+        click_count: 1,
+    };
+    view.update_in(cx, |this, window, cx| {
+        this.pane_mouse_down("p-left".into(), &left_down, window, cx);
+        this.pane_mouse_up(&left_up, window, cx);
+    });
+
+    // Deliberately no `pump_terminal_input`: only the listener may forward.
+    let has_report = |suffix: u8| {
+        fake.terminal_inputs("p-left")
+            .iter()
+            .any(|bytes| bytes.starts_with(b"\x1b[<0;") && bytes.ends_with(&[suffix]))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(has_report(b'M') && has_report(b'm')) {
+        assert!(
+            Instant::now() < deadline,
+            "listener never forwarded the click: {:?}",
+            fake.terminal_inputs("p-left")
+        );
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[gpui::test]
 #[cfg(target_os = "macos")]
 fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut TestAppContext) {
@@ -804,6 +872,14 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
             cx,
         ));
         assert!(matches!(this.overlay, Overlay::None));
+        // GPUI can deliver the out-of-pane release through the pane below the
+        // pointer first. That pane must not consume a right click which began
+        // on p-left.
+        this.pane_aux_mouse_up("p-right", SurfaceMouseButton::Right, &right_up, window, cx);
+        assert!(matches!(
+            this.aux_mouse_drag.as_ref(),
+            Some(crate::AuxMouseDrag { pane_id, .. }) if pane_id == "p-left"
+        ));
         this.pane_aux_mouse_up("p-left", SurfaceMouseButton::Right, &right_up, window, cx);
         this.pump_terminal_input();
     });
@@ -831,13 +907,7 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
         },
         ..left_down
     };
-    let shift_up = gpui::MouseUpEvent {
-        modifiers: gpui::Modifiers {
-            shift: true,
-            ..Default::default()
-        },
-        ..left_up
-    };
+    let shift_up = gpui::MouseUpEvent { ..left_up };
     view.update_in(cx, |this, window, cx| {
         assert!(
             matches!(this.surface_drag, crate::SurfaceDrag::Idle),
@@ -856,6 +926,9 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
             "Shift click did not start selection: {:?}",
             this.surface_drag
         );
+        // Shift may be released before the mouse button. Ghostty keeps this
+        // press as local selection; it must not turn the release into a TUI
+        // mouse report.
         this.pane_mouse_up(&shift_up, window, cx);
         this.pump_terminal_input();
     });

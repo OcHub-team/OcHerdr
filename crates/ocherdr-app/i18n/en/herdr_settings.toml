@@ -1,3 +1,3 @@
 "herdr_settings.title" = "Herdr settings"
-"herdr_settings.hint" = "Apply changes in Herdr to save them on this host. Esc returns to the workspace; F12 opens settings. Closing this panel keeps your tasks running."
+"herdr_settings.hint" = "Apply changes in Herdr to save them on this host. Esc closes Herdr's own dialogs; to leave this panel click Close, click the settings button again, or press ⌘W. Your tasks keep running."
 "herdr_settings.disconnected" = "The Herdr settings connection closed. Close this panel and open settings again to reconnect."

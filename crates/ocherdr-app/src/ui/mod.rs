@@ -31,7 +31,13 @@ impl Render for OcHerdrView {
             .min_h_0()
             .min_w_0()
             .child(self.render_terminal(window, cx))
-            .when_some(file_panel, |content, panel| content.child(panel));
+            .when_some(file_panel, |content, panel| content.child(panel))
+            // Herdr's own UI replaces the pane area only. The tab bar, its
+            // settings toggle, the sidebar, and the status bar stay usable, so
+            // leaving the embedded Herdr never depends on Herdr's key handling.
+            .when(matches!(self.overlay, Overlay::HerdrSettings), |content| {
+                content.children(self.herdr_settings.clone())
+            });
         let main = crate::a11y::apply_region(div().id(chrome.main.id), &chrome.main)
             .flex()
             .flex_col()
@@ -134,11 +140,7 @@ impl Render for OcHerdrView {
             Overlay::Appearance => {
                 root = root.child(self.render_appearance(cx));
             }
-            Overlay::HerdrSettings => {
-                if let Some(settings) = &self.herdr_settings {
-                    root = root.child(settings.clone());
-                }
-            }
+            Overlay::HerdrSettings => {}
             Overlay::ContextMenu(menu) => {
                 root = root.child(self.render_context_menu(menu, cx));
             }

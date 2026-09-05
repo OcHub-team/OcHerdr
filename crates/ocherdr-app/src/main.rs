@@ -34,15 +34,15 @@ use ochub_ui::components::{
     modal_card, modal_footer, modal_header, modal_overlay, spinner, status_dot,
 };
 use ochub_ui::gpui::{
-    Anchor, Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClickEvent,
-    ClipboardEntry, ClipboardItem, Context, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding,
-    KeyDownEvent, Keystroke, Menu, MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, SystemNotification, SystemNotificationResponse, Task,
-    TextOverflow, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance,
-    WindowBounds, WindowOptions, anchored, canvas, deferred, div, ease_out_quint,
-    linear_color_stop, linear_gradient, point, prelude::*, px, relative, size,
+    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClickEvent, ClipboardEntry,
+    ClipboardItem, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent,
+    Keystroke, Menu, MenuItem, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathPromptOptions, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, SystemNotification, SystemNotificationResponse, Task, TextOverflow, TextRun,
+    TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowAppearance, WindowBounds,
+    WindowOptions, canvas, div, ease_out_quint, linear_color_stop, linear_gradient, point,
+    prelude::*, px, relative, size,
 };
 #[cfg(not(target_os = "macos"))]
 use ochub_ui::gpui::{
@@ -1079,6 +1079,7 @@ struct OcHerdrView {
     /// The last key-down was an OcHerdr shortcut; swallow its key-up.
     suppress_key_release: bool,
     surface_drag: SurfaceDrag,
+    aux_mouse_drag: Option<AuxMouseDrag>,
     /// A released divider drag whose `layout.set_split_ratio` batch is still
     /// landing: the squeeze preview stays on and the tab stays locked until
     /// the authoritative layout carries every ratio of the batch.
@@ -1391,6 +1392,11 @@ fn bind_enter_submit<T: 'static>(
 /// keeps the tooltip above terminal textures and other later siblings. The
 /// label stays pointer-transparent so an invisible tooltip cannot mask nearby
 /// controls before it is shown.
+/// Hover label for an icon-only control. Uses GPUI's native tooltip: it is
+/// shown after the platform hover delay and positioned by the window. The
+/// previous `group_hover` popup lived inside a `deferred` element, which is
+/// painted after its group's hitbox has been popped, so it never became
+/// visible.
 fn icon_action_tooltip(
     group: &'static str,
     label: impl Into<SharedString>,
@@ -1398,38 +1404,38 @@ fn icon_action_tooltip(
 ) -> impl IntoElement {
     let label = label.into();
     div()
+        .id(group)
         .relative()
         .flex_none()
-        .group(group)
         .child(action)
-        .child(
-            deferred(
-                anchored()
-                    .anchor(Anchor::TopCenter)
-                    .offset(point(px(0.), px(7.)))
-                    .snap_to_window_with_margin(px(8.))
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("{group}-popup").into()))
-                            .role(ochub_ui::gpui::Role::Tooltip)
-                            .invisible()
-                            .group_hover(group, |style| style.visible())
-                            .max_w(px(260.))
-                            .px_2()
-                            .py_1()
-                            .rounded(px(CORNER_COMPACT))
-                            .border_1()
-                            .border_color(theme::border())
-                            .bg(theme::overlay())
-                            .shadow(theme::shadow_popover())
-                            .text_xs()
-                            .text_color(theme::text())
-                            .whitespace_normal()
-                            .child(label),
-                    ),
-            )
-            .priority(40),
-        )
+        .tooltip(move |_window, cx| {
+            let label = label.clone();
+            cx.new(|_| ActionTooltip { label }).into()
+        })
+}
+
+struct ActionTooltip {
+    label: SharedString,
+}
+
+impl Render for ActionTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("action-tooltip")
+            .role(ochub_ui::gpui::Role::Tooltip)
+            .max_w(px(260.))
+            .px_2()
+            .py_1()
+            .rounded(px(CORNER_COMPACT))
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::overlay())
+            .shadow(theme::shadow_popover())
+            .text_xs()
+            .text_color(theme::text())
+            .whitespace_normal()
+            .child(self.label.clone())
+    }
 }
 
 fn quit_app(_: &Quit, cx: &mut App) {

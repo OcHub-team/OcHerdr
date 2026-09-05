@@ -18,12 +18,11 @@ mod macos {
     use std::pin::Pin;
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-    use std::sync::mpsc::{self, Receiver as StdReceiver};
     use std::sync::{Arc, Mutex, OnceLock, Weak};
     use std::task::{Context, Poll};
 
     use futures::Stream;
-    use futures::channel::mpsc::{Receiver, Sender};
+    use futures::channel::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
     use core_foundation::array::CFArray;
     use core_foundation::base::{CFRelease, TCFType as _};
@@ -450,7 +449,11 @@ keybind = alt+right=esc:f
     struct CallbackState {
         surface: Weak<SurfaceCore>,
         frames: Mutex<Sender<PendingFrame>>,
-        input: mpsc::Sender<Vec<u8>>,
+        /// Bytes Ghostty encoded for the pty. Unbounded and waker-backed so
+        /// the application thread is woken as soon as the IO thread writes;
+        /// polling only at the next pointer or key event left a click's
+        /// release stranded until something else happened to flush it.
+        input: UnboundedSender<Vec<u8>>,
     }
 
     struct SurfaceCore {
@@ -820,13 +823,13 @@ keybind = alt+right=esc:f
         // SAFETY: the callback state and byte slice are valid for this callback.
         let callback = unsafe { &*(userdata.cast::<CallbackState>()) };
         let bytes = unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), len) };
-        let _ = callback.input.send(bytes.to_vec());
+        let _ = callback.input.unbounded_send(bytes.to_vec());
     }
 
     pub struct Terminal {
         surface: Arc<SurfaceCore>,
         frames: Receiver<PendingFrame>,
-        input: StdReceiver<Vec<u8>>,
+        input: Mutex<UnboundedReceiver<Vec<u8>>>,
     }
 
     impl Terminal {
@@ -843,7 +846,7 @@ keybind = alt+right=esc:f
             // when GPUI is behind, Ghostty drops newer callbacks and releases
             // their tokens immediately instead of growing an unbounded queue.
             let (frame_sender, frames) = futures::channel::mpsc::channel(1);
-            let (input_sender, input) = mpsc::channel();
+            let (input_sender, input) = futures::channel::mpsc::unbounded();
             let surface = Arc::new(SurfaceCore {
                 raw: AtomicPtr::new(std::ptr::null_mut()),
                 callback_state: AtomicPtr::new(std::ptr::null_mut()),
@@ -890,7 +893,7 @@ keybind = alt+right=esc:f
             let terminal = Self {
                 surface,
                 frames,
-                input,
+                input: Mutex::new(input),
             };
             terminal.set_grid_size(cols, rows)?;
             terminal.apply_surface_palette(palette)?;
@@ -1012,7 +1015,23 @@ keybind = alt+right=esc:f
         }
 
         pub fn try_input(&self) -> Option<Vec<u8>> {
-            self.input.try_recv().ok()
+            self.input
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .try_next()
+                .ok()
+                .flatten()
+        }
+
+        /// Wait for Ghostty's IO thread to encode the next pty write. Key and
+        /// mouse encoding is asynchronous; a listener must poll this rather
+        /// than rely on the next UI event to call [`Terminal::try_input`].
+        pub fn poll_input(&self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+            let mut input = self
+                .input
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Pin::new(&mut *input).poll_next(cx)
         }
 
         /// Send a key event to the surface. `key` is GPUI's key name and `text`

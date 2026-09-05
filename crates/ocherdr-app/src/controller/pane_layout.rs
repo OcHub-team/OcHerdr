@@ -34,28 +34,34 @@ impl OcHerdrView {
     }
 
     pub(super) fn end_text_drag_unless_pane(&mut self, pane_id: &str) {
-        let Some((previous, captured)) = self.take_text_drag() else {
+        let Some((previous, captured, shift)) = self.take_text_drag() else {
             return;
         };
         if previous == pane_id {
             self.surface_drag = SurfaceDrag::Text {
                 pane_id: previous,
                 captured,
+                shift,
             };
             return;
         }
-        self.finish_text_drag_on(&previous);
+        self.finish_text_drag_on(&previous, shift);
     }
 
     pub(super) fn end_text_drag(&mut self) {
-        if let Some((previous, _)) = self.take_text_drag() {
-            self.finish_text_drag_on(&previous);
+        if let Some((previous, _, shift)) = self.take_text_drag() {
+            self.finish_text_drag_on(&previous, shift);
         }
+        self.end_aux_mouse_drag();
     }
 
-    pub(super) fn take_text_drag(&mut self) -> Option<(String, bool)> {
+    pub(super) fn take_text_drag(&mut self) -> Option<(String, bool, bool)> {
         match std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle) {
-            SurfaceDrag::Text { pane_id, captured } => Some((pane_id, captured)),
+            SurfaceDrag::Text {
+                pane_id,
+                captured,
+                shift,
+            } => Some((pane_id, captured, shift)),
             other => {
                 self.surface_drag = other;
                 None
@@ -63,11 +69,16 @@ impl OcHerdrView {
         }
     }
 
-    pub(super) fn finish_text_drag_on(&mut self, pane_id: &str) {
+    pub(super) fn finish_text_drag_on(&mut self, pane_id: &str, shift: bool) {
         if let Some(runtime) = self.pane_mut(pane_id) {
-            runtime
-                .terminal
-                .end_text_selection(None, KeyModifiers::default());
+            runtime.terminal.end_text_selection(
+                None,
+                KeyModifiers {
+                    shift,
+                    ..Default::default()
+                },
+            );
+            flush_pane_surface(runtime);
         }
     }
 

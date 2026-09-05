@@ -1,4 +1,10 @@
 use super::*;
+
+/// What woke a pane listener on the Ghostty side.
+pub(super) enum GhosttyWake {
+    Frame(Option<std::result::Result<RenderedFrame, ocherdr_terminal::TerminalError>>),
+    Input(Option<Vec<u8>>),
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) static HERDR_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -356,37 +362,42 @@ impl OcHerdrView {
         cx.spawn(async move |this, cx| {
             loop {
                 let herdr = next_batch(&mut frames);
+                // Ghostty renders frames and encodes key/mouse input on its
+                // own threads. Wake on either so a click's press and release
+                // reach Herdr immediately instead of at the next UI event that
+                // happens to flush the pane.
                 let ghostty = poll_fn(|task_cx| {
                     this.update(cx, |this, _| {
                         let Some(runtime) = this.pane_for_owner_mut(&owner, &pane_id) else {
-                            return Poll::Ready(None);
+                            return Poll::Ready(GhosttyWake::Frame(None));
                         };
-                        runtime.terminal.poll_frame(task_cx)
+                        if let Poll::Ready(frame) = runtime.terminal.poll_frame(task_cx) {
+                            return Poll::Ready(GhosttyWake::Frame(frame));
+                        }
+                        runtime.terminal.poll_input(task_cx).map(GhosttyWake::Input)
                     })
-                    .unwrap_or(Poll::Ready(None))
+                    .unwrap_or(Poll::Ready(GhosttyWake::Frame(None)))
                 });
                 pin_mut!(herdr, ghostty);
-                match future::select(herdr, ghostty).await {
-                    Either::Left((batch, _)) => {
-                        let keep = this
-                            .update(cx, |this, cx| {
-                                this.apply_herdr_frames(&owner, &pane_id, batch, cx)
-                            })
-                            .unwrap_or(false);
-                        if !keep {
-                            break;
-                        }
-                    }
-                    Either::Right((frame, _)) => {
-                        let keep = this
-                            .update(cx, |this, cx| {
-                                this.apply_ghostty_frame(&owner, &pane_id, frame, cx)
-                            })
-                            .unwrap_or(false);
-                        if !keep {
-                            break;
-                        }
-                    }
+                let keep = match future::select(herdr, ghostty).await {
+                    Either::Left((batch, _)) => this
+                        .update(cx, |this, cx| {
+                            this.apply_herdr_frames(&owner, &pane_id, batch, cx)
+                        })
+                        .unwrap_or(false),
+                    Either::Right((GhosttyWake::Frame(frame), _)) => this
+                        .update(cx, |this, cx| {
+                            this.apply_ghostty_frame(&owner, &pane_id, frame, cx)
+                        })
+                        .unwrap_or(false),
+                    Either::Right((GhosttyWake::Input(bytes), _)) => this
+                        .update(cx, |this, cx| {
+                            this.apply_ghostty_input(&owner, &pane_id, bytes, cx)
+                        })
+                        .unwrap_or(false),
+                };
+                if !keep {
+                    break;
                 }
             }
         })
@@ -691,6 +702,53 @@ impl OcHerdrView {
         }
         if changed {
             self.render_cache.notify_terminal(cx);
+        }
+        keep
+    }
+
+    /// Forward a pty write Ghostty just encoded, plus anything queued behind
+    /// it. `None` means the surface is gone and the listener should stop.
+    pub(super) fn apply_ghostty_input(
+        &mut self,
+        owner: &SessionKey,
+        pane_id: &str,
+        bytes: Option<Vec<u8>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let active = self.is_active_session(owner);
+        let Some(bytes) = bytes else {
+            return false;
+        };
+        let keep = {
+            let Some(runtime) = self.pane_for_owner_mut(owner, pane_id) else {
+                return false;
+            };
+            let sent = if runtime.mode.is_controlled() {
+                runtime
+                    .session
+                    .send(TerminalCommand::Input(bytes))
+                    .map_err(|_| ())
+            } else {
+                Ok(())
+            };
+            if sent.is_err() || forward_terminal_input(runtime).is_err() {
+                runtime.exit_seen = true;
+                false
+            } else {
+                true
+            }
+        };
+        if !keep {
+            if active {
+                self.resync_snapshot(self.event_epoch, cx);
+            } else if let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) {
+                runtime.event_stream = EventStreamState::Lost(
+                    HerdrError::TerminalClosed("terminal stream closed".into())
+                        .to_string()
+                        .into(),
+                );
+                cx.notify();
+            }
         }
         keep
     }

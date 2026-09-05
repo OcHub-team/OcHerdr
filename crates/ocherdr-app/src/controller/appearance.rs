@@ -88,6 +88,18 @@ impl OcHerdrView {
         // temporarily absent theme can come back on the next launch.
         install_appearance(&self.appearance, window.appearance());
         theme::apply_window_background(window);
+        self.apply_terminal_palette(cx);
+        self.persist_settings(FailureKind::SaveAppearance, cx);
+        cx.refresh_windows();
+        cx.notify();
+    }
+
+    /// Push the palette for the current effective light/dark theme into every
+    /// mounted Ghostty surface. Called for explicit appearance edits and for
+    /// system appearance changes while the mode is `System`; without the
+    /// latter the chrome switched but the terminals kept the old colors until
+    /// a snapshot change happened to remount them.
+    pub(crate) fn apply_terminal_palette(&mut self, cx: &mut Context<Self>) {
         let palette = current_terminal_palette(&self.appearance);
         let mut palette_error = None;
         for runtime in self
@@ -101,12 +113,13 @@ impl OcHerdrView {
             runtime.color_scheme_dark = palette.dark;
             runtime.palette_signature = palette.signature();
         }
+        if let Some(settings) = &self.herdr_settings {
+            let palette = palette.clone();
+            settings.update(cx, |settings, cx| settings.apply_palette(&palette, cx));
+        }
         if let Some(error) = palette_error {
             self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }
-        self.persist_settings(FailureKind::SaveAppearance, cx);
-        cx.refresh_windows();
-        cx.notify();
     }
 
     pub(crate) fn set_theme_family(

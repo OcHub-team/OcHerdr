@@ -4,10 +4,31 @@ use super::*;
 #[allow(clippy::large_enum_variant)] // PaneDrag carries hover + tab-bar drop state.
 pub(crate) enum SurfaceDrag {
     Idle,
-    Text { pane_id: String, captured: bool },
+    Text {
+        pane_id: String,
+        captured: bool,
+        /// Ghostty decides whether Shift bypasses terminal mouse reporting on
+        /// press. Preserve that decision until the matching release.
+        shift: bool,
+    },
     Split(SplitDrag),
     Reorder(ReorderDrag),
     Pane(PaneDrag),
+}
+
+/// A non-primary mouse gesture which the terminal application captured.
+///
+/// GPUI dispatches `mouse_up_out` to the pane under the pointer at release.
+/// Keep the press owner separately so a release after crossing panes is sent
+/// back to the terminal that received the press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuxMouseDrag {
+    pub(crate) pane_id: String,
+    pub(crate) button: SurfaceMouseButton,
+    /// Ghostty's shift-capture decision is made at press time. Retain it for
+    /// the matching motion and release so changing Shift mid-gesture cannot
+    /// synthesize a mismatched terminal mouse sequence.
+    pub(crate) shift: bool,
 }
 
 /// A pane grabbed by its title-bar handle (design §5).

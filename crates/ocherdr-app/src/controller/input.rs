@@ -802,6 +802,7 @@ impl OcHerdrView {
         ) {
             return;
         }
+        self.end_aux_mouse_drag();
         self.end_text_drag_unless_pane(&pane_id);
         self.select_pane(pane_id.clone(), window, cx);
         self.take_terminal_control(pane_id.clone(), cx);
@@ -833,6 +834,7 @@ impl OcHerdrView {
         self.surface_drag = SurfaceDrag::Text {
             pane_id: pane_id.clone(),
             captured,
+            shift: modifiers.shift,
         };
         cx.stop_propagation();
         cx.notify();
@@ -849,7 +851,7 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !matches!(self.surface_drag, SurfaceDrag::Idle) {
+        if !matches!(self.surface_drag, SurfaceDrag::Idle) || self.aux_mouse_drag.is_some() {
             return false;
         }
         self.select_pane(pane_id.clone(), window, cx);
@@ -867,10 +869,14 @@ impl OcHerdrView {
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
         runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
-        let captured = runtime.terminal.mouse_captured() && !modifiers.shift;
-        let _ = runtime.terminal.mouse_button(true, button, modifiers);
+        let captured = runtime.terminal.mouse_button(true, button, modifiers);
         flush_pane_surface(runtime);
         if captured {
+            self.aux_mouse_drag = Some(AuxMouseDrag {
+                pane_id,
+                button,
+                shift: modifiers.shift,
+            });
             cx.stop_propagation();
             cx.notify();
         }
@@ -885,11 +891,21 @@ impl OcHerdrView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(drag) = self.aux_mouse_drag.as_ref() else {
+            return;
+        };
+        if drag.pane_id != pane_id || drag.button != button {
+            return;
+        }
+        let drag = self
+            .aux_mouse_drag
+            .take()
+            .expect("auxiliary mouse drag was checked above");
         let Some(runtime) = self.pane_mut(pane_id) else {
             return;
         };
-        let modifiers = gpui_key_modifiers(event.modifiers);
-        let was_captured = runtime.terminal.mouse_captured() && !modifiers.shift;
+        let mut modifiers = gpui_key_modifiers(event.modifiers);
+        modifiers.shift = drag.shift;
         if let Some(surface) = map_mouse_to_surface(
             mouse_point(event.position),
             runtime.body_bounds,
@@ -898,12 +914,10 @@ impl OcHerdrView {
         ) {
             runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
         }
-        let captured = runtime.terminal.mouse_button(false, button, modifiers);
+        let _ = runtime.terminal.mouse_button(false, button, modifiers);
         flush_pane_surface(runtime);
-        if was_captured || captured {
-            cx.stop_propagation();
-            cx.notify();
-        }
+        cx.stop_propagation();
+        cx.notify();
     }
 
     /// Ghostty reports hover motion even when no button is held if the TUI
@@ -959,10 +973,32 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
-        let SurfaceDrag::Text { pane_id, .. } = &self.surface_drag else {
+        if let Some(drag) = self.aux_mouse_drag.clone() {
+            if let Some(runtime) = self.pane(&drag.pane_id) {
+                let surface = map_mouse_to_surface(
+                    mouse_point(event.position),
+                    runtime.body_bounds,
+                    runtime.pixel_size,
+                    window.scale_factor(),
+                );
+                if let Some(surface) = surface {
+                    let mut modifiers = gpui_key_modifiers(event.modifiers);
+                    modifiers.shift = drag.shift;
+                    if let Some(runtime) = self.pane_mut(&drag.pane_id) {
+                        runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
+                        flush_pane_surface(runtime);
+                    }
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let SurfaceDrag::Text { pane_id, shift, .. } = &self.surface_drag else {
             return;
         };
         let pane_id = pane_id.clone();
+        let shift = *shift;
         let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
@@ -974,7 +1010,8 @@ impl OcHerdrView {
         ) else {
             return;
         };
-        let modifiers = gpui_key_modifiers(event.modifiers);
+        let mut modifiers = gpui_key_modifiers(event.modifiers);
+        modifiers.shift = shift;
         if let Some(runtime) = self.pane_mut(&pane_id) {
             runtime
                 .terminal
@@ -1003,12 +1040,16 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
-        let SurfaceDrag::Text { pane_id, captured } =
-            std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle)
+        let SurfaceDrag::Text {
+            pane_id,
+            captured,
+            shift,
+        } = std::mem::replace(&mut self.surface_drag, SurfaceDrag::Idle)
         else {
             return;
         };
-        let modifiers = gpui_key_modifiers(event.modifiers);
+        let mut modifiers = gpui_key_modifiers(event.modifiers);
+        modifiers.shift = shift;
         if let Some(runtime) = self.pane_mut(&pane_id) {
             let point = map_mouse_to_surface(
                 mouse_point(event.position),
@@ -1024,6 +1065,27 @@ impl OcHerdrView {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// Cancel a captured secondary or middle click when another gesture or a
+    /// window transition takes ownership. A terminal must see the matching
+    /// release even when the operating system stops routing mouse-up events
+    /// to this window.
+    pub(super) fn end_aux_mouse_drag(&mut self) {
+        let Some(drag) = self.aux_mouse_drag.take() else {
+            return;
+        };
+        if let Some(runtime) = self.pane_mut(&drag.pane_id) {
+            runtime.terminal.mouse_button(
+                false,
+                drag.button,
+                KeyModifiers {
+                    shift: drag.shift,
+                    ..Default::default()
+                },
+            );
+            flush_pane_surface(runtime);
+        }
     }
 }
 

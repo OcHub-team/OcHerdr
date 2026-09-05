@@ -4,12 +4,11 @@
 //! input, and exposes styled viewport rows for GPUI to paint.
 
 use std::pin::Pin;
-use std::sync::mpsc::{self, Receiver as StdReceiver, Sender as StdSender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures::Stream;
-use futures::channel::mpsc::{Receiver, Sender};
+use futures::channel::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use thiserror::Error;
 
 const MOUSE_REPORTING_RESET: &[u8] =
@@ -141,8 +140,8 @@ pub struct Terminal {
     state: Mutex<State>,
     frames_tx: Mutex<Sender<()>>,
     frames: Receiver<()>,
-    input_tx: StdSender<Vec<u8>>,
-    input: StdReceiver<Vec<u8>>,
+    input_tx: UnboundedSender<Vec<u8>>,
+    input: Mutex<UnboundedReceiver<Vec<u8>>>,
 }
 
 impl Terminal {
@@ -156,7 +155,7 @@ impl Terminal {
             return Err(TerminalError::InvalidGrid);
         }
         let (frames_tx, frames) = futures::channel::mpsc::channel(1);
-        let (input_tx, input) = mpsc::channel();
+        let (input_tx, input) = futures::channel::mpsc::unbounded();
         let size = initial_size(cols, rows, palette);
         let terminal = Self {
             state: Mutex::new(State {
@@ -174,7 +173,7 @@ impl Terminal {
             frames_tx: Mutex::new(frames_tx),
             frames,
             input_tx,
-            input,
+            input: Mutex::new(input),
         };
         terminal.refresh();
         Ok(terminal)
@@ -279,7 +278,22 @@ impl Terminal {
     }
 
     pub fn try_input(&self) -> Option<Vec<u8>> {
-        self.input.try_recv().ok()
+        self.input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .try_next()
+            .ok()
+            .flatten()
+    }
+
+    /// Wait for the next encoded pty write. Mirrors the macOS surface so the
+    /// pane listener forwards input as soon as it exists.
+    pub fn poll_input(&self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        let mut input = self
+            .input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Pin::new(&mut *input).poll_next(cx)
     }
 
     pub fn send_key(
@@ -506,7 +520,7 @@ impl Terminal {
 
     fn queue_input(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
-            let _ = self.input_tx.send(bytes);
+            let _ = self.input_tx.unbounded_send(bytes);
         }
     }
 
