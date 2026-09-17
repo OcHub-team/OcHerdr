@@ -643,11 +643,11 @@ impl EndpointHandle {
             "ocherdr-ep-{}",
             self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let command = self.requests.lock().unwrap().submit(
-            request_id.clone(),
-            method.to_owned(),
-            params,
-        );
+        let command =
+            self.requests
+                .lock()
+                .unwrap()
+                .submit(request_id.clone(), method.to_owned(), params);
         if let Some(command) = command {
             self.send(command)?;
         }
@@ -719,10 +719,8 @@ impl EndpointSession {
             // connect() already consumed the initial snapshot to capture its
             // boot_id; re-emit it so the stream keeps its documented shape.
             if let Some(snapshot) = snapshot
-                && futures::executor::block_on(
-                    event_tx.send(Ok(EndpointEvent::Snapshot(snapshot))),
-                )
-                .is_err()
+                && futures::executor::block_on(event_tx.send(Ok(EndpointEvent::Snapshot(snapshot))))
+                    .is_err()
             {
                 return;
             }
@@ -785,11 +783,11 @@ impl EndpointSession {
             "ocherdr-ep-{}",
             self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let command = self.requests.lock().unwrap().submit(
-            request_id.clone(),
-            method.to_owned(),
-            params,
-        );
+        let command =
+            self.requests
+                .lock()
+                .unwrap()
+                .submit(request_id.clone(), method.to_owned(), params);
         if let Some(command) = command {
             self.send(command)?;
         }
@@ -826,14 +824,8 @@ mod tests {
             lane.submit("r1".into(), "a".into(), Value::Null),
             Some(EndpointCommand::Request { .. })
         ));
-        assert!(
-            lane.submit("r2".into(), "b".into(), Value::Null)
-                .is_none()
-        );
-        assert!(
-            lane.submit("r3".into(), "c".into(), Value::Null)
-                .is_none()
-        );
+        assert!(lane.submit("r2".into(), "b".into(), Value::Null).is_none());
+        assert!(lane.submit("r3".into(), "c".into(), Value::Null).is_none());
         assert_eq!(lane.queued.len(), 2);
 
         // Unrelated responses must not release the lane.
