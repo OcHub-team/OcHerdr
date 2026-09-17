@@ -483,3 +483,213 @@ fn request_socket_returns_the_result_when_the_server_replies() {
     .unwrap();
     assert_eq!(result, json!({ "ok": true }));
 }
+
+#[test]
+fn endpoint_handshake_against_live_server() {
+    // OCHERDR_TEST_CLIENT_SOCKET overrides the default session socket so the
+    // handshake can be exercised against a disposable named session.
+    let socket = std::env::var_os("OCHERDR_TEST_CLIENT_SOCKET")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| Path::new(&home).join(".config/herdr/herdr-client.sock"))
+        });
+    let Some(socket) = socket else {
+        return;
+    };
+    if !socket.exists() {
+        eprintln!("skipping live endpoint handshake: {socket:?} absent");
+        return;
+    }
+    let endpoint = crate::TerminalEndpoint::new(socket);
+    let (session, mut events) = crate::endpoint::EndpointSession::spawn(endpoint, 80, 24, 8, 17);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut welcome = None;
+    let mut snapshot = None;
+    while std::time::Instant::now() < deadline && (welcome.is_none() || snapshot.is_none()) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match futures::executor::block_on(futures::StreamExt::next(&mut events)) {
+            Some(Ok(crate::endpoint::EndpointEvent::Welcome(w))) => welcome = Some(w),
+            Some(Ok(crate::endpoint::EndpointEvent::Snapshot(s))) => snapshot = Some(s),
+            Some(Ok(_)) => {}
+            Some(Err(error)) => panic!("endpoint handshake failed: {error}"),
+            None => panic!("endpoint stream closed before snapshot"),
+        }
+        let _ = remaining;
+    }
+    let welcome = welcome.expect("endpoint welcome never arrived");
+    let snapshot = snapshot.expect("endpoint snapshot never arrived");
+    eprintln!(
+        "endpoint handshake OK: server {} ({} methods, {} capabilities), \
+         boot_id {} ({} workspaces)",
+        welcome.server_version,
+        welcome.methods.len(),
+        welcome.capabilities.len(),
+        snapshot.boot_id,
+        snapshot.workspaces.len()
+    );
+
+    session
+        .send(crate::endpoint::EndpointCommand::Focus(true))
+        .unwrap();
+    session.set_surface_active(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut frames = 0u32;
+    let mut last_frame: Option<Box<crate::endpoint_v1::PaneSurfaceFrame>> = None;
+    while std::time::Instant::now() < deadline && frames == 0 {
+        match futures::executor::block_on(futures::StreamExt::next(&mut events)) {
+            Some(Ok(crate::endpoint::EndpointEvent::Surface(frame))) => {
+                frames += 1;
+                last_frame = Some(frame.clone());
+                eprintln!(
+                    "surface frame: {}x{} cells, {} panes, {} splits, {} cells",
+                    frame.frame.width,
+                    frame.frame.height,
+                    frame.panes.len(),
+                    frame.splits.len(),
+                    frame.frame.cells.len()
+                );
+            }
+            Some(Ok(_)) => {}
+            Some(Err(error)) => panic!("surface stream failed: {error}"),
+            None => panic!("endpoint stream closed before surface"),
+        }
+    }
+    assert!(frames > 0, "no surface frame after surface.set active");
+
+    let frame = last_frame.expect("expected the captured frame");
+    let mut decoder = crate::surface_ansi::SurfaceDecoder::new();
+    let updates = decoder.frame(*frame.clone(), false);
+    assert!(!updates.is_empty(), "decoder produced no pane updates");
+    let mut screens: HashMap<String, vt100::Parser> = HashMap::new();
+    for update in &updates {
+        let mut screen = vt100::Parser::new(
+            update.inner_rect.height.max(1),
+            update.inner_rect.width.max(1),
+            0,
+        );
+        screen.process(&update.ansi);
+        let text = screen.screen().contents();
+        eprintln!(
+            "pane {} ({}x{}): {:?}",
+            update.pane_id,
+            update.inner_rect.width,
+            update.inner_rect.height,
+            text.chars().take(120).collect::<String>()
+        );
+        screens.insert(update.pane_id.clone(), screen);
+    }
+
+    // Deep phase, only against a disposable session socket: semantic input
+    // round-trip, endpoint-tunneled pane.split, multi-pane frames, patches.
+    if std::env::var_os("OCHERDR_TEST_CLIENT_SOCKET").is_none() {
+        return;
+    }
+    let marker = "EP-OK-7f3a";
+    let first_pane = updates[0].pane_id.clone();
+    let handle = session.handle();
+    handle
+        .pane_input(
+            &first_pane,
+            vec![
+                crate::endpoint_v1::ClientPaneInputEvent::TextCommit(format!("echo {marker}")),
+                crate::endpoint_v1::ClientPaneInputEvent::Key {
+                    code: crate::endpoint_v1::ClientKeyCode::Enter,
+                    modifiers: 0,
+                    kind: crate::endpoint_v1::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    shifted_codepoint: None,
+                    generated_text: None,
+                    tracks_release: true,
+                    physical_key_id: None,
+                    windows_record: None,
+                },
+                crate::endpoint_v1::ClientPaneInputEvent::Key {
+                    code: crate::endpoint_v1::ClientKeyCode::Enter,
+                    modifiers: 0,
+                    kind: crate::endpoint_v1::ClientKeyKind::Release,
+                    repeat_count: 1,
+                    shifted_codepoint: None,
+                    generated_text: None,
+                    tracks_release: false,
+                    physical_key_id: None,
+                    windows_record: None,
+                },
+            ],
+        )
+        .unwrap();
+    // Endpoint-scoped API tunnel: split the pane and expect a 2-pane frame.
+    let split_request = session
+        .request(
+            "pane.split",
+            json!({
+                "target_pane_id": first_pane,
+                "direction": "right",
+                "focus": false,
+            }),
+        )
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut saw_marker = false;
+    let mut saw_response = false;
+    let mut saw_patch = false;
+    let mut saw_two_panes = false;
+    while std::time::Instant::now() < deadline && !(saw_marker && saw_response && saw_two_panes) {
+        match futures::executor::block_on(futures::StreamExt::next(&mut events)) {
+            Some(Ok(crate::endpoint::EndpointEvent::Surface(frame))) => {
+                if frame.panes.len() >= 2 {
+                    saw_two_panes = true;
+                }
+                for update in decoder.frame(*frame, false) {
+                    let screen = screens.entry(update.pane_id.clone()).or_insert_with(|| {
+                        vt100::Parser::new(
+                            update.inner_rect.height.max(1),
+                            update.inner_rect.width.max(1),
+                            0,
+                        )
+                    });
+                    screen.process(&update.ansi);
+                    if screen.screen().contents().contains(marker) {
+                        saw_marker = true;
+                    }
+                }
+            }
+            Some(Ok(crate::endpoint::EndpointEvent::SurfacePatch(patch))) => {
+                saw_patch = true;
+                if let Some(updates) = decoder.patch(&patch) {
+                    for update in updates {
+                        if let Some(screen) = screens.get_mut(&update.pane_id) {
+                            screen.process(&update.ansi);
+                            if screen.screen().contents().contains(marker) {
+                                saw_marker = true;
+                            }
+                        }
+                    }
+                }
+            }
+            Some(Ok(crate::endpoint::EndpointEvent::Response { request_id, data }))
+                if request_id == split_request =>
+            {
+                saw_response = true;
+                eprintln!(
+                    "pane.split response: {}",
+                    String::from_utf8_lossy(&data)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                );
+            }
+            Some(Ok(_)) => {}
+            Some(Err(error)) => panic!("endpoint stream failed mid-test: {error}"),
+            None => panic!("endpoint stream closed mid-test"),
+        }
+    }
+    assert!(saw_response, "pane.split response never arrived");
+    assert!(saw_two_panes, "composited surface never grew to 2 panes");
+    assert!(
+        saw_marker,
+        "semantic input never echoed back through the surface"
+    );
+    eprintln!("deep phase: split ok, 2 panes, input echoed, patch seen = {saw_patch}");
+}

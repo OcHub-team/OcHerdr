@@ -3,11 +3,14 @@
 //! Session state uses Herdr's public NDJSON API. Terminal rendering and input use
 //! a versioned private-protocol facade over the companion client socket.
 
+pub mod endpoint;
+pub mod endpoint_v1;
 mod private_protocol;
 mod private_v20;
 mod scroll_queue;
 #[cfg(all(test, unix))]
 mod settings_tests;
+pub mod surface_ansi;
 
 use std::collections::HashMap;
 use std::fs;

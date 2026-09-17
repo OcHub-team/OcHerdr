@@ -67,6 +67,92 @@ impl OcHerdrView {
         });
     }
 
+    pub(crate) fn toggle_sidebar_mode(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_mode = match self.sidebar_mode {
+            SidebarMode::Single => SidebarMode::Aggregate,
+            SidebarMode::Aggregate => SidebarMode::Single,
+        };
+        if self.sidebar_mode == SidebarMode::Aggregate {
+            self.refresh_all_parked_snapshots(cx);
+        }
+        cx.notify();
+    }
+
+    /// Aggregate-sidebar click: switch to the row's host when needed, then
+    /// apply the workspace/pane part once that host's snapshot is local.
+    pub(crate) fn select_aggregate_target(
+        &mut self,
+        index: usize,
+        workspace_id: Option<String>,
+        pane_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
+        if index == self.profile_index {
+            self.apply_pending_host_target_parts(workspace_id, pane_id, window, cx);
+            return;
+        }
+        self.pending_host_target = Some(PendingHostTarget {
+            profile_id: profile.id().to_owned(),
+            workspace_id,
+            pane_id,
+        });
+        self.select_profile(index, cx);
+    }
+
+    /// Applies the deferred aggregate-row target. Runs from render because
+    /// pane selection needs the window for terminal focus, and because a
+    /// freshly connected host only gains a snapshot asynchronously.
+    pub(crate) fn apply_pending_host_target(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_host_target.clone() else {
+            return;
+        };
+        if pending.profile_id != self.current_profile().id()
+            || self.failed_hosts.contains(&pending.profile_id)
+        {
+            self.pending_host_target = None;
+            return;
+        }
+        if self.snapshot.is_none() {
+            return;
+        }
+        self.pending_host_target = None;
+        self.apply_pending_host_target_parts(pending.workspace_id, pending.pane_id, window, cx);
+    }
+
+    fn apply_pending_host_target_parts(
+        &mut self,
+        workspace_id: Option<String>,
+        pane_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if let Some(pane_id) = pane_id
+            && snapshot.pane(&pane_id).is_some()
+        {
+            self.jump_to_agent_pane(pane_id, window, cx);
+            return;
+        }
+        if let Some(workspace_id) = workspace_id
+            && snapshot
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.workspace_id == workspace_id)
+        {
+            self.select_workspace(workspace_id, cx);
+        }
+    }
+
     pub(crate) fn handle_overlay_key(
         &mut self,
         event: &KeyDownEvent,
@@ -377,6 +463,7 @@ impl OcHerdrView {
                 .or_else(|| snapshot.panes_for(tab_id).next())
                 .map(|pane| pane.pane_id.clone())
         });
+        self.endpoint_selection_changed();
         self.ensure_session_terminals(cx);
         cx.notify();
     }
@@ -407,6 +494,7 @@ impl OcHerdrView {
         if let Some(tab_index) = tab_index {
             self.tab_scroll.scroll_to_item(tab_index);
         }
+        self.endpoint_selection_changed();
         self.ensure_session_terminals(cx);
         cx.notify();
     }
@@ -541,6 +629,7 @@ impl OcHerdrView {
             self.selection.tab_id = Some(tab_id);
         }
         self.selection.pane_id = Some(pane_id);
+        self.endpoint_selection_changed();
         if changed {
             self.ensure_session_terminals(cx);
         }

@@ -961,11 +961,23 @@ impl OcHerdrView {
             return;
         };
         self.take_terminal_control(pane_id.clone(), cx);
+        let quoted = shell_quote_path(&path);
+        let endpoint = self
+            .pane(&pane_id)
+            .is_some_and(|runtime| matches!(runtime.session, PaneChannel::Endpoint { .. }));
+        if endpoint {
+            // Endpoint panes take semantic paste; the server applies the
+            // pane's bracketed-paste mode.
+            self.endpoint_pane_input(&pane_id, vec![ClientPaneInputEvent::Paste(quoted)]);
+            self.focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
         let stream_closed = {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
             };
-            runtime.terminal.paste(&shell_quote_path(&path));
+            runtime.terminal.paste(&quoted);
             drain_terminal_input(runtime)
         };
         if stream_closed {

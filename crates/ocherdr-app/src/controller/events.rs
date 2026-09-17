@@ -142,8 +142,67 @@ impl OcHerdrView {
                     cx.notify();
                     return false;
                 }
+                // Aggregate mode lists parked hosts' rows: keep their
+                // snapshots fresh from the event stream that is already
+                // running for the parked connection.
+                if self.sidebar_mode == SidebarMode::Aggregate {
+                    self.refresh_parked_snapshot(&owner.profile_id, cx);
+                }
                 true
             }
+        }
+    }
+
+    /// Pull a fresh `session.snapshot` for a parked host into
+    /// `ParkedHostRuntime::snapshot`. Single-flight per host, with one queued
+    /// re-request when events keep arriving during an in-flight refresh.
+    pub(super) fn refresh_parked_snapshot(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(runtime) = self.parked_hosts.get_mut(profile_id) else {
+            return;
+        };
+        if runtime.snapshot_refreshing {
+            runtime.snapshot_refresh_pending = true;
+            return;
+        }
+        runtime.snapshot_refreshing = true;
+        runtime.snapshot_refresh_pending = false;
+        let socket = runtime.connection.socket_path().to_owned();
+        let profile_id = profile_id.to_owned();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let result = request_socket(&socket, "session.snapshot", json!({}))?;
+                    let snapshot = result.get("snapshot").cloned().ok_or_else(|| {
+                        HerdrError::Protocol("snapshot result is missing `snapshot`".into())
+                    })?;
+                    Ok::<HierarchySnapshot, HerdrError>(serde_json::from_value(snapshot)?)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(runtime) = this.parked_hosts.get_mut(&profile_id) else {
+                    return;
+                };
+                runtime.snapshot_refreshing = false;
+                if let Ok(snapshot) = result {
+                    runtime.herdr_capabilities = HerdrCapabilities::from_snapshot(&snapshot);
+                    runtime.selection.reconcile(&snapshot);
+                    runtime.snapshot = Some(snapshot);
+                    cx.notify();
+                }
+                if runtime.snapshot_refresh_pending {
+                    this.refresh_parked_snapshot(&profile_id, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Snapshot pull for every parked host; used when the aggregate sidebar
+    /// turns on so rows from machines parked a while ago are not stale.
+    pub(super) fn refresh_all_parked_snapshots(&mut self, cx: &mut Context<Self>) {
+        for profile_id in self.parked_hosts.keys().cloned().collect::<Vec<_>>() {
+            self.refresh_parked_snapshot(&profile_id, cx);
         }
     }
 

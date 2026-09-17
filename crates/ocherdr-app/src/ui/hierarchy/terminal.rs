@@ -106,7 +106,37 @@ impl OcHerdrView {
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_host_switcher(cx)))
                     .child(icon(profile_icon, theme::muted(), 13.))
-                    .child(div().flex_1().min_w_0().truncate().child(profile_label)),
+                    .child(div().flex_1().min_w_0().truncate().child(profile_label))
+                    .child(icon_action_tooltip(
+                        "sidebar-mode-tooltip",
+                        i18n.text(match self.sidebar_mode {
+                            SidebarMode::Single => k::TERMINAL_VIEW_AGGREGATE,
+                            SidebarMode::Aggregate => k::TERMINAL_VIEW_SINGLE,
+                        }),
+                        icon_only_button_tone(
+                            "sidebar-mode",
+                            i18n.text(match self.sidebar_mode {
+                                SidebarMode::Single => k::TERMINAL_VIEW_AGGREGATE,
+                                SidebarMode::Aggregate => k::TERMINAL_VIEW_SINGLE,
+                            }),
+                            match self.sidebar_mode {
+                                SidebarMode::Single => IconName::Globe,
+                                SidebarMode::Aggregate => IconName::Desktop,
+                            },
+                            ButtonTone::Ghost,
+                            ButtonSize::Sm,
+                        )
+                        .size(px(20.))
+                        .rounded_full()
+                        .debug_selector(|| "sidebar-mode".into())
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            cx.stop_propagation();
+                            this.toggle_sidebar_mode(cx);
+                        })),
+                    )),
             )
             .child(
                 apply_control(div().id("status-message"), &chrome.status_message)
@@ -523,6 +553,8 @@ impl OcHerdrView {
                                 f32::from(bounds.size.width),
                                 f32::from(bounds.size.height),
                             ));
+                            // The shared endpoint surface follows the canvas.
+                            this.endpoint_send_resize();
                         });
                     },
                     move |bounds, _, window, cx| {

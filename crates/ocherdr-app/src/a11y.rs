@@ -358,7 +358,10 @@ pub fn apply_dialog(
     element.id(id).role(Role::Dialog).aria_label(title)
 }
 
-fn workspace_rows(workspaces: &[WorkspaceInfo], selected_id: Option<&str>) -> Vec<WorkspaceRow> {
+pub(crate) fn workspace_rows(
+    workspaces: &[WorkspaceInfo],
+    selected_id: Option<&str>,
+) -> Vec<WorkspaceRow> {
     workspaces
         .iter()
         .map(|workspace| WorkspaceRow {
@@ -380,7 +383,7 @@ fn workspace_rows(workspaces: &[WorkspaceInfo], selected_id: Option<&str>) -> Ve
 /// a detected/reported kind (`pane.agent`) or a custom agent name (an
 /// `agents` entry) — in workspace order, then tab order, then pane order.
 /// No dedupe: two `codex` panes are two rows.
-fn agent_rows(
+pub(crate) fn agent_rows(
     snapshot: &HierarchySnapshot,
     selected_pane_id: Option<&str>,
     i18n: I18n,

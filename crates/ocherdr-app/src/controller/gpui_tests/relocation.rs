@@ -1138,6 +1138,8 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
                 },
                 session_panes: None,
                 pane_viewports: HashMap::new(),
+                snapshot_refreshing: false,
+                snapshot_refresh_pending: false,
             },
         );
 
@@ -1648,6 +1650,8 @@ fn clicking_a_parked_hosts_agent_notification_switches_host_and_pane(cx: &mut Te
                 },
                 session_panes: None,
                 pane_viewports: HashMap::new(),
+                snapshot_refreshing: false,
+                snapshot_refresh_pending: false,
             },
         );
         this.select_profile(profile_b_index, cx);

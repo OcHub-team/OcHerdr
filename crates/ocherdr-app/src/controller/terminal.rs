@@ -30,14 +30,6 @@ impl OcHerdrView {
         };
         let visible_tab_id = self.selection.tab_id.clone();
         let selected_pane_id = self.selection.pane_id.clone();
-        let snapshot = self.snapshot.as_ref().expect("snapshot checked above");
-        let terminal_protocol = snapshot.protocol;
-        let live_pane_ids = snapshot_pane_ids(snapshot);
-        let pane_tabs = snapshot
-            .panes
-            .iter()
-            .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
-            .collect::<HashMap<_, _>>();
         let incoming = SessionKey {
             profile_id,
             session_name: session_name.clone(),
@@ -50,6 +42,17 @@ impl OcHerdrView {
             self.pane_resize_serial = self.pane_resize_serial.wrapping_add(1);
             self.session_panes = Some(SessionPanes::new(incoming));
         }
+        // Protocol 22+ sessions multiplex everything over one endpoint
+        // connection; it must exist before panes spawn so they can share it.
+        self.ensure_endpoint_session(cx);
+        let snapshot = self.snapshot.as_ref().expect("snapshot checked above");
+        let terminal_protocol = snapshot.protocol;
+        let live_pane_ids = snapshot_pane_ids(snapshot);
+        let pane_tabs = snapshot
+            .panes
+            .iter()
+            .map(|pane| (pane.pane_id.clone(), pane.tab_id.clone()))
+            .collect::<HashMap<_, _>>();
         let palette = current_terminal_palette(&self.appearance);
         let color_scheme_dark = palette.dark;
         let mut palette_error = None;
@@ -64,7 +67,7 @@ impl OcHerdrView {
         let mut mounted = 0usize;
         let mut mount_more = false;
         {
-            let (controls, access_serial) = {
+            let (controls, access_serial, endpoint_handle) = {
                 let session = self
                     .session_panes
                     .as_mut()
@@ -74,7 +77,14 @@ impl OcHerdrView {
                     .controls
                     .retain(|pane_id, _| live_pane_ids.contains(pane_id));
                 prime_automatic_terminal_control(session, &optimistic_visible, &live_pane_ids);
-                (session.controls.clone(), session.access_serial)
+                (
+                    session.controls.clone(),
+                    session.access_serial,
+                    session
+                        .endpoint
+                        .as_ref()
+                        .map(|endpoint| endpoint.session.handle()),
+                )
             };
             #[cfg_attr(not(test), allow(unused_mut))]
             let mut wanted = snapshot_runtime_targets(
@@ -141,7 +151,7 @@ impl OcHerdrView {
                                 terminal_protocol,
                                 pane_id.clone(),
                             ) {
-                                pending_listens.push((pane_id.clone(), frames));
+                                pending_listens.push((pane_id.clone(), Some(frames)));
                             }
                         }
                     }
@@ -172,14 +182,29 @@ impl OcHerdrView {
                                     too_small.push(pane_id.clone());
                                     continue;
                                 }
-                                let (session, frames) = TerminalSession::spawn(
-                                    terminal_endpoint.clone(),
-                                    terminal_protocol,
-                                    pane_id.clone(),
-                                    mode,
-                                    resolved.columns,
-                                    resolved.rows,
-                                );
+                                let (session, frames) = match &endpoint_handle {
+                                    // Endpoint sessions carry every pane on one
+                                    // connection; the runtime's mirror waits
+                                    // for the server-composited surface.
+                                    Some(handle) => (
+                                        PaneChannel::Endpoint {
+                                            handle: handle.clone(),
+                                            pane_id: pane_id.clone(),
+                                        },
+                                        None,
+                                    ),
+                                    None => {
+                                        let (session, frames) = TerminalSession::spawn(
+                                            terminal_endpoint.clone(),
+                                            terminal_protocol,
+                                            pane_id.clone(),
+                                            mode,
+                                            resolved.columns,
+                                            resolved.rows,
+                                        );
+                                        (PaneChannel::Private(session), Some(frames))
+                                    }
+                                };
                                 terminal.set_focus(target.focused);
                                 panes.insert(
                                     pane_id.clone(),
@@ -191,6 +216,7 @@ impl OcHerdrView {
                                         focused: target.focused,
                                         size: (resolved.columns, resolved.rows),
                                         pixel_size: viewport.pixels,
+                                        endpoint_pixels: (0, 0),
                                         viewport_ready: true,
                                         frame_context,
                                         color_scheme_dark,
@@ -262,7 +288,12 @@ impl OcHerdrView {
                 .expect("pane listener requires a live session")
                 .owner
                 .clone();
-            let task = Self::listen_pane(owner, pane_id.clone(), frames, cx);
+            let task = match frames {
+                Some(frames) => Self::listen_pane(owner, pane_id.clone(), frames, cx),
+                // Endpoint panes have no private stream; the listener only
+                // services the mirror's own frame queue.
+                None => Self::listen_pane_mirror(owner, pane_id.clone(), cx),
+            };
             if let Some(runtime) = self.pane_mut(&pane_id) {
                 runtime.listen = Some(task);
             }
@@ -396,6 +427,40 @@ impl OcHerdrView {
                         })
                         .unwrap_or(false),
                 };
+                if !keep {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Mirror-only listener for endpoint-mode panes: there is no per-pane
+    /// Herdr stream, so the task just services the Ghostty frame queue.
+    /// Terminal content arrives through the session-level endpoint listener.
+    pub(super) fn listen_pane_mirror(
+        owner: SessionKey,
+        pane_id: String,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let ghostty = poll_fn(|task_cx| {
+                    this.update(cx, |this, _| {
+                        let Some(runtime) = this.pane_for_owner_mut(&owner, &pane_id) else {
+                            return Poll::Ready(None);
+                        };
+                        runtime.terminal.poll_frame(task_cx)
+                    })
+                    .unwrap_or(Poll::Ready(None))
+                });
+                let Some(frame) = ghostty.await else {
+                    break;
+                };
+                let keep = this
+                    .update(cx, |this, cx| {
+                        this.apply_ghostty_frame(&owner, &pane_id, Some(frame), cx)
+                    })
+                    .unwrap_or(false);
                 if !keep {
                     break;
                 }
@@ -570,7 +635,7 @@ impl OcHerdrView {
         keep
     }
 
-    fn post_herdr_notification(
+    pub(super) fn post_herdr_notification(
         &mut self,
         owner: &SessionKey,
         pane_id: &str,
@@ -1008,8 +1073,20 @@ impl OcHerdrView {
             // changes the shared PTY, while an observer resize updates only
             // that observer's render viewport. The native protocol handles
             // both modes in place, so resizing never tears down the surface or
-            // its private stream.
-            runtime.size = size;
+            // its private stream. Endpoint panes keep `runtime.size`
+            // server-owned: the frame's `inner_rect` is the authoritative
+            // cell grid, local measurement only drives the framebuffer.
+            let endpoint = matches!(runtime.session, PaneChannel::Endpoint { .. });
+            if !endpoint {
+                runtime.size = size;
+            } else if runtime.size.0 > 0 {
+                // resize_pixels sized the framebuffer to local pixels but
+                // also resolved its own cell grid; endpoint frames arrive
+                // encoded for the server's inner_rect grid, so re-assert it.
+                let _ = runtime
+                    .terminal
+                    .set_grid_size(runtime.size.0.max(1), runtime.size.1.max(1));
+            }
             runtime.pixel_size = pending.pixels;
             runtime.viewport_ready = pending.pixels.0 > 0 && pending.pixels.1 > 0;
             if collapse {
@@ -1040,6 +1117,11 @@ impl OcHerdrView {
             }
             cx.notify();
             return;
+        }
+        // A settled pane measurement can move the shared endpoint surface:
+        // new cell metrics or a changed canvas mean the server should retile.
+        if self.endpoint_active() {
+            self.endpoint_send_resize();
         }
         cx.notify();
     }

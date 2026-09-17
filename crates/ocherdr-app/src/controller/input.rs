@@ -615,6 +615,7 @@ impl OcHerdrView {
         let mut paste_error = None;
         let mut remote_image = None;
         let mut suppress_key_release = false;
+        let mut endpoint_events = Vec::new();
         let stream_closed = {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
@@ -622,12 +623,22 @@ impl OcHerdrView {
             if !runtime.mode.is_controlled() {
                 return;
             }
+            let endpoint = matches!(runtime.session, PaneChannel::Endpoint { .. });
             match paste.unwrap_or(CommandPaste::PassThrough) {
                 CommandPaste::Text(text) => {
-                    runtime.terminal.paste(&text);
+                    if endpoint {
+                        // The server applies the pane's bracketed-paste mode.
+                        endpoint_events.push(ClientPaneInputEvent::Paste(text));
+                    } else {
+                        runtime.terminal.paste(&text);
+                    }
                     suppress_key_release = true;
                     cx.stop_propagation();
-                    drain_terminal_input(runtime)
+                    if endpoint {
+                        false
+                    } else {
+                        drain_terminal_input(runtime)
+                    }
                 }
                 CommandPaste::RemoteImage(image) => {
                     suppress_key_release = true;
@@ -650,19 +661,31 @@ impl OcHerdrView {
                     } else {
                         KeyAction::Press
                     };
-                    if !runtime.terminal.send_key(
-                        action,
-                        &key.key,
-                        key.key_char.as_deref(),
-                        gpui_key_modifiers(key.modifiers),
-                    ) {
-                        return;
+                    if endpoint {
+                        let Some(event) = endpoint_key_event(key, action) else {
+                            return;
+                        };
+                        endpoint_events.push(event);
+                        cx.stop_propagation();
+                        false
+                    } else {
+                        if !runtime.terminal.send_key(
+                            action,
+                            &key.key,
+                            key.key_char.as_deref(),
+                            gpui_key_modifiers(key.modifiers),
+                        ) {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        drain_terminal_input(runtime)
                     }
-                    cx.stop_propagation();
-                    drain_terminal_input(runtime)
                 }
             }
         };
+        if !endpoint_events.is_empty() {
+            self.endpoint_pane_input(&pane_id, endpoint_events);
+        }
         if suppress_key_release {
             self.suppress_key_release = true;
         }
@@ -759,20 +782,31 @@ impl OcHerdrView {
             return;
         };
         let key = &event.keystroke;
+        let mut endpoint_event = None;
         let stream_closed = {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
             };
-            if !runtime.terminal.send_key(
-                KeyAction::Release,
-                &key.key,
-                None,
-                gpui_key_modifiers(key.modifiers),
-            ) {
-                return;
+            if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+                // Report-all keyboard state lives on the server; it decides
+                // whether a release reaches the pane.
+                endpoint_event = endpoint_key_event(key, KeyAction::Release);
+                false
+            } else {
+                if !runtime.terminal.send_key(
+                    KeyAction::Release,
+                    &key.key,
+                    None,
+                    gpui_key_modifiers(key.modifiers),
+                ) {
+                    return;
+                }
+                drain_terminal_input(runtime)
             }
-            drain_terminal_input(runtime)
         };
+        if let Some(event) = endpoint_event {
+            self.endpoint_pane_input(&pane_id, vec![event]);
+        }
         if stream_closed {
             self.resync_snapshot(self.event_epoch, cx);
         }
@@ -824,13 +858,30 @@ impl OcHerdrView {
             return;
         };
         let modifiers = gpui_key_modifiers(event.modifiers);
-        let Some(runtime) = self.pane_mut(&pane_id) else {
-            return;
+        let mut endpoint_event = None;
+        let captured = {
+            let Some(runtime) = self.pane_mut(&pane_id) else {
+                return;
+            };
+            let captured = runtime
+                .terminal
+                .begin_text_selection(surface.0, surface.1, modifiers);
+            if captured && matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+                endpoint_event = Some(endpoint_mouse_event(
+                    ClientMouseKind::Down(ClientMouseButton::Left),
+                    mouse,
+                    runtime,
+                    endpoint_modifiers(event.modifiers),
+                    0,
+                    f64::from(window.scale_factor()),
+                ));
+            }
+            flush_pane_surface(runtime);
+            captured
         };
-        let captured = runtime
-            .terminal
-            .begin_text_selection(surface.0, surface.1, modifiers);
-        flush_pane_surface(runtime);
+        if let Some(event) = endpoint_event {
+            self.endpoint_pane_input(&pane_id, vec![event]);
+        }
         self.surface_drag = SurfaceDrag::Text {
             pane_id: pane_id.clone(),
             captured,
@@ -870,7 +921,21 @@ impl OcHerdrView {
         let modifiers = gpui_key_modifiers(event.modifiers);
         runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
         let captured = runtime.terminal.mouse_button(true, button, modifiers);
+        let endpoint_event = (captured && matches!(runtime.session, PaneChannel::Endpoint { .. }))
+            .then(|| {
+                endpoint_mouse_event(
+                    ClientMouseKind::Down(endpoint_mouse_button(button)),
+                    mouse_point(event.position),
+                    runtime,
+                    endpoint_modifiers(event.modifiers),
+                    0,
+                    f64::from(window.scale_factor()),
+                )
+            });
         flush_pane_surface(runtime);
+        if let Some(event) = endpoint_event {
+            self.endpoint_pane_input(&pane_id, vec![event]);
+        }
         if captured {
             self.aux_mouse_drag = Some(AuxMouseDrag {
                 pane_id,
@@ -915,7 +980,20 @@ impl OcHerdrView {
             runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
         }
         let _ = runtime.terminal.mouse_button(false, button, modifiers);
+        let endpoint_event = matches!(runtime.session, PaneChannel::Endpoint { .. }).then(|| {
+            endpoint_mouse_event(
+                ClientMouseKind::Up(endpoint_mouse_button(button)),
+                mouse_point(event.position),
+                runtime,
+                endpoint_modifiers(event.modifiers),
+                0,
+                f64::from(window.scale_factor()),
+            )
+        });
         flush_pane_surface(runtime);
+        if let Some(event) = endpoint_event {
+            self.endpoint_pane_input(pane_id, vec![event]);
+        }
         cx.stop_propagation();
         cx.notify();
     }
@@ -948,7 +1026,21 @@ impl OcHerdrView {
         let modifiers = gpui_key_modifiers(event.modifiers);
         let captured = runtime.terminal.mouse_captured() && !modifiers.shift;
         runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
+        let endpoint_event = (captured && matches!(runtime.session, PaneChannel::Endpoint { .. }))
+            .then(|| {
+                endpoint_mouse_event(
+                    ClientMouseKind::Moved,
+                    mouse_point(event.position),
+                    runtime,
+                    endpoint_modifiers(event.modifiers),
+                    0,
+                    f64::from(window.scale_factor()),
+                )
+            });
         flush_pane_surface(runtime);
+        if let Some(event) = endpoint_event {
+            self.endpoint_pane_input(pane_id, vec![event]);
+        }
         if captured {
             cx.stop_propagation();
             cx.notify();
@@ -974,6 +1066,7 @@ impl OcHerdrView {
             return;
         }
         if let Some(drag) = self.aux_mouse_drag.clone() {
+            let mut endpoint_event = None;
             if let Some(runtime) = self.pane(&drag.pane_id) {
                 let surface = map_mouse_to_surface(
                     mouse_point(event.position),
@@ -986,19 +1079,38 @@ impl OcHerdrView {
                     modifiers.shift = drag.shift;
                     if let Some(runtime) = self.pane_mut(&drag.pane_id) {
                         runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
+                        if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+                            endpoint_event = Some(endpoint_mouse_event(
+                                ClientMouseKind::Drag(endpoint_mouse_button(drag.button)),
+                                mouse_point(event.position),
+                                runtime,
+                                endpoint_modifiers(event.modifiers),
+                                0,
+                                f64::from(window.scale_factor()),
+                            ));
+                        }
                         flush_pane_surface(runtime);
                     }
                 }
+            }
+            if let Some(event) = endpoint_event {
+                self.endpoint_pane_input(&drag.pane_id, vec![event]);
             }
             cx.stop_propagation();
             cx.notify();
             return;
         }
-        let SurfaceDrag::Text { pane_id, shift, .. } = &self.surface_drag else {
+        let SurfaceDrag::Text {
+            pane_id,
+            captured,
+            shift,
+        } = &self.surface_drag
+        else {
             return;
         };
         let pane_id = pane_id.clone();
         let shift = *shift;
+        let captured = *captured;
         let Some(runtime) = self.pane(&pane_id) else {
             return;
         };
@@ -1012,11 +1124,25 @@ impl OcHerdrView {
         };
         let mut modifiers = gpui_key_modifiers(event.modifiers);
         modifiers.shift = shift;
+        let mut endpoint_event = None;
         if let Some(runtime) = self.pane_mut(&pane_id) {
             runtime
                 .terminal
                 .update_text_selection(surface.0, surface.1, modifiers);
+            if captured && matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+                endpoint_event = Some(endpoint_mouse_event(
+                    ClientMouseKind::Drag(ClientMouseButton::Left),
+                    mouse_point(event.position),
+                    runtime,
+                    endpoint_modifiers(event.modifiers),
+                    0,
+                    f64::from(window.scale_factor()),
+                ));
+            }
             flush_pane_surface(runtime);
+        }
+        if let Some(event) = endpoint_event {
+            self.endpoint_pane_input(&pane_id, vec![event]);
         }
         cx.stop_propagation();
         cx.notify();
@@ -1050,6 +1176,7 @@ impl OcHerdrView {
         };
         let mut modifiers = gpui_key_modifiers(event.modifiers);
         modifiers.shift = shift;
+        let mut endpoint_event = None;
         if let Some(runtime) = self.pane_mut(&pane_id) {
             let point = map_mouse_to_surface(
                 mouse_point(event.position),
@@ -1058,10 +1185,23 @@ impl OcHerdrView {
                 window.scale_factor(),
             );
             runtime.terminal.end_text_selection(point, modifiers);
+            if captured && matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+                endpoint_event = Some(endpoint_mouse_event(
+                    ClientMouseKind::Up(ClientMouseButton::Left),
+                    mouse_point(event.position),
+                    runtime,
+                    endpoint_modifiers(event.modifiers),
+                    0,
+                    f64::from(window.scale_factor()),
+                ));
+            }
             flush_pane_surface(runtime);
             if !captured {
                 copy_terminal_selection(runtime, cx);
             }
+        }
+        if let Some(event) = endpoint_event {
+            self.endpoint_pane_input(&pane_id, vec![event]);
         }
         cx.stop_propagation();
         cx.notify();
@@ -1075,6 +1215,7 @@ impl OcHerdrView {
         let Some(drag) = self.aux_mouse_drag.take() else {
             return;
         };
+        let mut endpoint_event = None;
         if let Some(runtime) = self.pane_mut(&drag.pane_id) {
             runtime.terminal.mouse_button(
                 false,
@@ -1084,7 +1225,22 @@ impl OcHerdrView {
                     ..Default::default()
                 },
             );
+            if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+                endpoint_event = Some(endpoint_mouse_event(
+                    ClientMouseKind::Up(endpoint_mouse_button(drag.button)),
+                    // The release lands wherever the press started; the
+                    // server only needs the button transition.
+                    (runtime.body_bounds.0, runtime.body_bounds.1),
+                    runtime,
+                    u8::from(drag.shift),
+                    0,
+                    1.0,
+                ));
+            }
             flush_pane_surface(runtime);
+        }
+        if let Some(event) = endpoint_event {
+            self.endpoint_pane_input(&drag.pane_id, vec![event]);
         }
     }
 }

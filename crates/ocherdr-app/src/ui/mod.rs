@@ -15,6 +15,7 @@ pub(crate) use render_cache::RenderCache;
 impl Render for OcHerdrView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_pending_focus(window, cx);
+        self.apply_pending_host_target(window, cx);
         self.sync_file_panel_source(cx);
         let chrome = self.chrome_a11y();
         let file_panel_overlay =

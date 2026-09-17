@@ -120,6 +120,9 @@ impl OcHerdrView {
         if let Some(error) = palette_error {
             self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }
+        // The endpoint server draws its own chrome (pane borders, status)
+        // from the host theme the client publishes.
+        self.endpoint_send_host_theme();
     }
 
     pub(crate) fn set_theme_family(

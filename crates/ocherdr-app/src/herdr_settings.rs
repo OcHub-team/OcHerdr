@@ -49,6 +49,13 @@ impl HerdrSettings {
             Ok(terminal) => (Some(terminal), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        // The settings embed rides the numbered private protocol, which
+        // endpoint-generation servers (0.9.x, private protocol 22+) no longer
+        // accept. Show the explanation instead of a doomed connect.
+        let error = error.or_else(|| {
+            (protocol >= controller::endpoint::ENDPOINT_MIN_PROTOCOL)
+                .then(|| i18n.text(k::HERDR_SETTINGS_UNSUPPORTED).to_string())
+        });
         Self {
             endpoint,
             protocol,

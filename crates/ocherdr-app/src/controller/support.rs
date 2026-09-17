@@ -1200,6 +1200,12 @@ pub(super) fn sync_pane_session(
         runtime.terminal.set_focus(focused);
         runtime.focused = focused;
     }
+    if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+        // Endpoint panes share the session connection; mode flips are
+        // bookkeeping only — the server already streams every visible pane.
+        runtime.mode = wanted;
+        return None;
+    }
     if runtime.mode == wanted {
         return None;
     }
@@ -1213,7 +1219,7 @@ pub(super) fn sync_pane_session(
         cols.max(1),
         rows.max(1),
     );
-    runtime.session = session;
+    runtime.session = PaneChannel::Private(session);
     runtime.mode = wanted;
     if wanted.is_controlled() {
         send_session_resize(runtime);

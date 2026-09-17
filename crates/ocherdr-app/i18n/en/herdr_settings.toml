@@ -1,3 +1,4 @@
 "herdr_settings.title" = "Herdr settings"
 "herdr_settings.hint" = "Apply changes in Herdr to save them on this host. Esc closes Herdr's own dialogs; to leave this panel click Close, click the settings button again, or press ⌘W. Your tasks keep running."
 "herdr_settings.disconnected" = "The Herdr settings connection closed. Close this panel and open settings again to reconnect."
+"herdr_settings.unsupported" = "This Herdr server no longer offers the embedded settings editor (Herdr 0.9+ uses the client-owned endpoint protocol). Edit config.toml on the host or open settings inside `herdr` itself."

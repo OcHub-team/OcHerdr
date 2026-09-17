@@ -1,3 +1,4 @@
 "herdr_settings.title" = "Herdr 设置"
 "herdr_settings.hint" = "在 Herdr 中应用更改以保存到当前主机。Esc 只关闭 Herdr 内部的弹窗；要离开此面板，请点“关闭”、再次点击设置按钮或按 ⌘W。现有任务不会停止。"
 "herdr_settings.disconnected" = "Herdr 设置连接已关闭。请关闭此面板，重新打开设置以连接。"
+"herdr_settings.unsupported" = "此 Herdr 服务端不再提供内嵌设置编辑器（Herdr 0.9+ 改用客户端自持的 endpoint 协议）。请直接编辑该主机上的 config.toml，或在 `herdr` 内打开设置。"

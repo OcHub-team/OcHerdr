@@ -21,6 +21,7 @@ use crate::notify::{FailureKind, FailureNotice, command_notification, notificati
 mod agent;
 mod app_update;
 mod appearance;
+pub(crate) mod endpoint;
 mod events;
 mod files;
 mod hierarchy;
@@ -36,6 +37,7 @@ mod tab_transfer;
 mod terminal;
 mod worktree;
 
+pub(super) use endpoint::*;
 pub(crate) use support::split_layout_fingerprint;
 pub(super) use support::*;
 
@@ -116,6 +118,7 @@ impl OcHerdrView {
         // modifiers change, so losing key status drops the hints.
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
+            this.endpoint_set_focused(this.window_active);
             if !window.is_window_active() {
                 this.set_command_held(false, cx);
                 this.end_text_drag();
@@ -150,6 +153,9 @@ impl OcHerdrView {
             session_index: None,
             connection: None,
             parked_hosts: HashMap::new(),
+            sidebar_mode: SidebarMode::Single,
+            pending_host_target: None,
+            collapsed_aggregate_hosts: HashSet::new(),
             failed_hosts: HashSet::new(),
             herdr_capabilities: HerdrCapabilities::default(),
             event_stream: EventStreamState::Idle,
@@ -336,6 +342,9 @@ impl OcHerdrView {
         let Some(connection) = self.connection.take() else {
             return;
         };
+        // A parked host must not keep compositing surfaces it cannot show;
+        // the endpoint stays connected but stops pulling frames.
+        self.endpoint_set_surface_active(false);
         let profile_id = self.current_profile().id().to_owned();
         let runtime = ParkedHostRuntime {
             sessions: std::mem::take(&mut self.sessions),
@@ -351,6 +360,8 @@ impl OcHerdrView {
             selection: std::mem::take(&mut self.selection),
             session_panes: self.session_panes.take(),
             pane_viewports: std::mem::take(&mut self.pane_viewports),
+            snapshot_refreshing: false,
+            snapshot_refresh_pending: false,
         };
         self.parked_hosts.insert(profile_id, runtime);
     }
@@ -391,6 +402,9 @@ impl OcHerdrView {
         }
         self.resync_snapshot(self.event_epoch, cx);
         self.ensure_agent_status_stream(cx);
+        // The endpoint connection survived parking with surfaces suspended;
+        // re-activate so it resumes compositing the restored view.
+        self.endpoint_activate(cx);
         true
     }
 
@@ -968,6 +982,18 @@ impl OcHerdrView {
 
     fn pane_mut(&mut self, pane_id: &str) -> Option<&mut PaneRuntime> {
         self.session_panes.as_mut()?.panes.get_mut(pane_id)
+    }
+
+    /// The session's pane state for `owner`, whether it is the visible session
+    /// or parked on another host.
+    fn session_for_owner_mut(&mut self, owner: &SessionKey) -> Option<&mut SessionPanes> {
+        if self.is_active_session(owner) {
+            let session = self.session_panes.as_mut()?;
+            return (session.owner == *owner).then_some(session);
+        }
+        let runtime = self.parked_hosts.get_mut(&owner.profile_id)?;
+        let session = runtime.session_panes.as_mut()?;
+        (session.owner == *owner).then_some(session)
     }
 
     fn pane_for_owner_mut(

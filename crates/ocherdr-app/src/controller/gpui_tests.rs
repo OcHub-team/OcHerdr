@@ -1903,6 +1903,7 @@ fn swapped_layout_event() -> Value {
     })
 }
 
+mod aggregate;
 mod creation;
 mod file_panel;
 mod pane;

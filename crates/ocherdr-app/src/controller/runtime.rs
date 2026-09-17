@@ -47,6 +47,11 @@ impl OcHerdrView {
         // promote only the pane under the pointer and keep any other pane
         // controls intact.
         self.take_terminal_control(pane_id.to_owned(), cx);
+        let scale_factor = self
+            .pane_viewports
+            .get(pane_id)
+            .map(|viewport| viewport.scale_factor)
+            .unwrap_or(1.0);
         let Some(runtime) = self.pane_mut(pane_id) else {
             return;
         };
@@ -63,9 +68,30 @@ impl OcHerdrView {
         } else {
             TerminalScrollDirection::Down
         };
+        let count = lines.unsigned_abs().min(u32::from(u16::MAX)) as u16;
+        if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+            // The server owns scrollback: wheel scroll becomes a semantic
+            // scroll event, which Herdr routes to mouse-reporting apps or to
+            // its own scrollback view.
+            let kind = match direction {
+                TerminalScrollDirection::Up => ClientMouseKind::ScrollUp,
+                TerminalScrollDirection::Down => ClientMouseKind::ScrollDown,
+            };
+            let event = endpoint_mouse_event(
+                kind,
+                (f32::from(event.position.x), f32::from(event.position.y)),
+                runtime,
+                endpoint_modifiers(event.modifiers),
+                count,
+                scale_factor,
+            );
+            self.endpoint_pane_input(pane_id, vec![event]);
+            cx.stop_propagation();
+            return;
+        }
         let _ = runtime.session.send(TerminalCommand::Scroll {
             direction,
-            lines: lines.unsigned_abs().min(u32::from(u16::MAX)) as u16,
+            lines: count,
         });
         cx.stop_propagation();
     }
@@ -199,14 +225,22 @@ impl OcHerdrView {
             if !runtime.mode.is_controlled() {
                 return;
             }
-            let closed = runtime
-                .session
-                .send(TerminalCommand::Input(text.as_bytes().to_vec()))
-                .is_err();
-            if closed {
-                runtime.exit_seen = true;
+            if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+                self.endpoint_pane_input(
+                    &pane_id,
+                    vec![ClientPaneInputEvent::TextCommit(text.to_owned())],
+                );
+                false
+            } else {
+                let closed = runtime
+                    .session
+                    .send(TerminalCommand::Input(text.as_bytes().to_vec()))
+                    .is_err();
+                if closed {
+                    runtime.exit_seen = true;
+                }
+                closed
             }
-            closed
         };
         window.invalidate_character_coordinates();
         cx.notify();

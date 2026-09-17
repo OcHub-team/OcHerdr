@@ -22,7 +22,7 @@ use ocherdr_files::{
 use ocherdr_herdr::{
     EventSubscription, HerdrError, HostHealthStatus, MAX_CLIPBOARD_IMAGE_BYTES, SessionConnection,
     TerminalCommand, TerminalMode, TerminalNotificationKind, TerminalScrollDirection,
-    TerminalSession, discover_sessions, request_socket,
+    TerminalSession, discover_sessions, endpoint::EndpointHandle, request_socket,
 };
 use ocherdr_terminal::{
     KeyAction, KeyModifiers, RenderedFrame, SurfaceMouseButton, Terminal, TerminalPalette,
@@ -472,6 +472,10 @@ struct AgentNotificationTarget {
 struct SessionPanes {
     /// Dropping a mismatched owner drops every pane runtime and its listen task.
     owner: SessionKey,
+    /// One client-owned shell connection per session on endpoint-capable
+    /// servers (private protocol 22+, Herdr 0.9.x). `None` keeps the legacy
+    /// per-pane private streams.
+    endpoint: Option<crate::controller::endpoint::EndpointRuntime>,
     panes: HashMap<String, PaneRuntime>,
     /// Panes this OcHerdr instance currently controls. A first visible pane
     /// starts with non-takeover control so its PTY adopts the measured local
@@ -504,6 +508,28 @@ struct ParkedHostRuntime {
     selection: Selection,
     session_panes: Option<SessionPanes>,
     pane_viewports: HashMap<String, MeasuredPaneViewport>,
+    /// The aggregate sidebar keeps parked hosts' snapshots fresh from their
+    /// event streams; refresh is single-flight with one queued re-request.
+    snapshot_refreshing: bool,
+    snapshot_refresh_pending: bool,
+}
+
+/// Sidebar navigation scope: the active host only, or every live host
+/// grouped by machine (Herdr's federated multi-endpoint view).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SidebarMode {
+    #[default]
+    Single,
+    Aggregate,
+}
+
+/// A sidebar row clicked under a host that is not active yet. Applied once
+/// that host is selected and its snapshot carries the target.
+#[derive(Clone, Debug)]
+struct PendingHostTarget {
+    profile_id: String,
+    workspace_id: Option<String>,
+    pane_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -520,10 +546,50 @@ impl SessionPanes {
     fn new(owner: SessionKey) -> Self {
         Self {
             owner,
+            endpoint: None,
             panes: HashMap::new(),
             controls: HashMap::new(),
             automatic_control_attempts: HashSet::new(),
             access_serial: 0,
+        }
+    }
+}
+
+/// How a pane talks to Herdr. Endpoint-capable servers multiplex all panes
+/// over one session connection; older servers keep a private stream per pane.
+enum PaneChannel {
+    Private(TerminalSession),
+    Endpoint {
+        handle: EndpointHandle,
+        pane_id: String,
+    },
+}
+
+impl PaneChannel {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Private(session) => session.is_closed(),
+            Self::Endpoint { handle, .. } => handle.is_closed(),
+        }
+    }
+
+    /// Compatibility send for commands that map onto the endpoint channel.
+    /// Raw byte input has no endpoint representation — input paths branch to
+    /// semantic events before reaching this.
+    fn send(&self, command: TerminalCommand) -> Result<(), HerdrError> {
+        match (self, command) {
+            (Self::Private(session), command) => session.send(command),
+            (
+                Self::Endpoint { handle, pane_id },
+                TerminalCommand::ClipboardImage { extension, bytes },
+            ) => handle.send(ocherdr_herdr::endpoint::EndpointCommand::ClipboardImage {
+                target: ocherdr_herdr::endpoint::EndpointClipboardTarget::Pane(pane_id.clone()),
+                extension,
+                bytes,
+            }),
+            // Resize/scroll/release are session-surface or pane-scroll concerns
+            // handled by the endpoint paths that know the pane's scroll offset.
+            (Self::Endpoint { .. }, _) => Ok(()),
         }
     }
 }
@@ -533,7 +599,7 @@ struct PaneRuntime {
     /// sized before it paints. Untouched panes observe; panes already controlled
     /// by this OcHerdr keep their stream across tab switches. Explicit
     /// interaction can promote an observer with takeover.
-    session: TerminalSession,
+    session: PaneChannel,
     terminal: Terminal,
     frame: Option<RenderedFrame>,
     mode: TerminalMode,
@@ -542,7 +608,14 @@ struct PaneRuntime {
     /// observing, so a direct interaction can promote it to control.
     focused: bool,
     size: (u16, u16),
+    /// Local framebuffer pixels, owned by viewport measurements. Endpoint
+    /// panes additionally carry `endpoint_pixels` from the server's
+    /// `inner_rect`; the two differ by sub-cell rounding and stay separate
+    /// so selection/IME math and pixel-mouse geometry each use the right one.
     pixel_size: (u32, u32),
+    /// Server-reported `inner_rect` pixels on the endpoint path; (0, 0)
+    /// before the first frame or on the private stream.
+    endpoint_pixels: (u32, u32),
     /// True after this pane's body has supplied an actual local viewport.
     /// Bootstrap frames use 80×24 and must not reach the Metal surface first.
     viewport_ready: bool,
@@ -994,6 +1067,13 @@ struct OcHerdrView {
     /// Live hosts other than `profile_index`. Removing an entry is the
     /// explicit disconnect operation and releases its Herdr clients/tunnel.
     parked_hosts: HashMap<String, ParkedHostRuntime>,
+    /// Sidebar scope: single machine or the federated all-machines view.
+    sidebar_mode: SidebarMode,
+    /// Row clicked under another host in aggregate mode; applied after that
+    /// host activates and its snapshot arrives.
+    pending_host_target: Option<PendingHostTarget>,
+    /// Machines collapsed in the aggregate sidebar.
+    collapsed_aggregate_hosts: HashSet<String>,
     /// Hosts whose most recent explicit connection attempt failed. This is UI
     /// state only; it never causes an automatic reconnect.
     failed_hosts: HashSet<String>,

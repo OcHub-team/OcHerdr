@@ -4070,6 +4070,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "uds_windows",
+ "unicode-width",
  "vt100",
 ]
 

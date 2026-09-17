@@ -1,4 +1,5 @@
 use super::*;
+use crate::a11y::{AgentRow, WorkspaceRow, agent_rows, workspace_rows};
 
 impl OcHerdrView {
     pub(crate) fn render_sidebar(
@@ -6,6 +7,9 @@ impl OcHerdrView {
         chrome: &ChromeA11y,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        if self.sidebar_mode == SidebarMode::Aggregate {
+            return self.render_aggregate_sidebar(chrome, cx).into_any_element();
+        }
         let i18n = self.i18n;
         let view = cx.entity();
         let workspace_count = chrome.workspaces.items.len();
@@ -446,6 +450,343 @@ impl OcHerdrView {
                             .children(agent_rows),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// Federated navigation: every live host gets a machine group with its
+    /// own workspaces and agent rows. Selecting a row on another host parks
+    /// the current one and focuses that row's target there — the same
+    /// endpoint model Herdr's own client uses. Pane runtimes stay on their
+    /// machine; only the sidebar view federates.
+    fn render_aggregate_sidebar(
+        &mut self,
+        chrome: &ChromeA11y,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let i18n = self.i18n;
+        struct MachineGroup {
+            index: usize,
+            profile_id: String,
+            label: String,
+            is_local: bool,
+            active: bool,
+            state: HostConnectionState,
+            collapsed: bool,
+            workspaces: Vec<WorkspaceRow>,
+            agents: Vec<AgentRow>,
+        }
+        let groups = {
+            let center = self.host_center.read(cx);
+            (0..self.profiles.len())
+                .filter_map(|index| {
+                    let profile = center.profiles().get(index)?.clone();
+                    let profile_id = profile.id().to_owned();
+                    let active = index == self.profile_index;
+                    let (snapshot, selection) = if active {
+                        (self.snapshot.as_ref(), Some(&self.selection))
+                    } else {
+                        self.parked_hosts
+                            .get(&profile_id)
+                            .map(|runtime| (runtime.snapshot.as_ref(), Some(&runtime.selection)))
+                            .unwrap_or((None, None))
+                    };
+                    let (workspaces, agents) = match (snapshot, selection) {
+                        (Some(snapshot), Some(selection)) => (
+                            workspace_rows(&snapshot.workspaces, selection.workspace_id.as_deref()),
+                            agent_rows(snapshot, selection.pane_id.as_deref(), i18n),
+                        ),
+                        _ => (Vec::new(), Vec::new()),
+                    };
+                    Some(MachineGroup {
+                        index,
+                        profile_id: profile_id.clone(),
+                        label: center.display_label(index),
+                        is_local: matches!(profile, ConnectionProfile::Local { .. }),
+                        active,
+                        state: self.host_connection_state(&profile_id),
+                        collapsed: self.collapsed_aggregate_hosts.contains(&profile_id),
+                        workspaces,
+                        agents,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut sections = Vec::new();
+        for group in groups {
+            let header_label = format!(
+                "{}, {}",
+                group.label,
+                i18n.host_connection_status(group.state)
+            );
+            let dot_color = match group.state {
+                HostConnectionState::Disconnected => theme::muted(),
+                HostConnectionState::Connecting => theme::yellow(),
+                HostConnectionState::Connected => theme::green(),
+                HostConnectionState::Degraded => theme::red(),
+            };
+            let collapse_id = group.profile_id.clone();
+            let chevron = if group.collapsed {
+                IconName::ChevronRight
+            } else {
+                IconName::ChevronDown
+            };
+            let mut section_children = Vec::new();
+            if !group.collapsed {
+                for row in &group.workspaces {
+                    let workspace_id = row.a11y.id.clone();
+                    let linked = row
+                        .worktree
+                        .as_ref()
+                        .is_some_and(|info| info.is_linked_worktree);
+                    let affiliation = row.worktree.as_ref().map(|info| info.affiliation_label());
+                    let index = group.index;
+                    let selected = row.a11y.selected == Some(true);
+                    section_children.push(
+                        tree_row(
+                            ochub_ui::gpui::ElementId::Name(
+                                format!("agg-ws-{}-{}", group.profile_id, workspace_id).into(),
+                            ),
+                            &row.a11y,
+                            26.,
+                            if linked {
+                                IconName::Layers
+                            } else {
+                                IconName::Folder
+                            },
+                            selected,
+                            (row.agent_status, self.status_indicators),
+                            affiliation.as_deref(),
+                        )
+                        .debug_selector({
+                            let selector =
+                                format!("agg-workspace-{}-{}", group.profile_id, workspace_id);
+                            move || selector.clone()
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_aggregate_target(
+                                index,
+                                Some(workspace_id.clone()),
+                                None,
+                                window,
+                                cx,
+                            )
+                        }))
+                        .into_any_element(),
+                    );
+                }
+                for row in &group.agents {
+                    let pane_id = row.pane_id.clone();
+                    let debug_id = format!("agg-agent-{}-{}", group.profile_id, pane_id);
+                    let status = row.agent_status;
+                    let selected = row.a11y.selected == Some(true);
+                    let workspace_line = row.workspace_line.clone();
+                    let pane_line = row.pane_line.clone();
+                    let kind = row.kind.clone();
+                    let index = group.index;
+                    section_children.push(
+                        apply_control(
+                            div().id(ochub_ui::gpui::ElementId::Name(
+                                format!("agg-agent-{}-{}", group.profile_id, pane_id).into(),
+                            )),
+                            &row.a11y,
+                        )
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(AGENT_ROW_HEIGHT))
+                        .flex_none()
+                        .pl(px(26.))
+                        .pr_3()
+                        .rounded(px(CORNER_COMPACT))
+                        .bg(if selected {
+                            theme::sidebar_selected()
+                        } else {
+                            theme::surface().alpha(0.)
+                        })
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .cursor_pointer()
+                        .debug_selector(move || debug_id.clone())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_aggregate_target(
+                                index,
+                                None,
+                                Some(pane_id.clone()),
+                                window,
+                                cx,
+                            )
+                        }))
+                        .child(status_indicator(status, self.status_indicators))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::sidebar_text())
+                                        .child(workspace_line),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_baseline()
+                                        .gap_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(div().truncate().child(pane_line))
+                                        .children(kind.map(|kind| div().flex_none().child(kind))),
+                                ),
+                        )
+                        .into_any_element(),
+                    );
+                }
+            }
+            let index = group.index;
+            let active = group.active;
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id(("agg-host", index))
+                            .role(ochub_ui::gpui::Role::Button)
+                            .tab_stop(false)
+                            .aria_label(header_label)
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(32.))
+                            .pl_2()
+                            .pr_2()
+                            .rounded(px(CORNER_COMPACT))
+                            .bg(if active {
+                                theme::selection()
+                            } else {
+                                theme::surface().alpha(0.)
+                            })
+                            .hover(|style| style.bg(theme::surface_hover()))
+                            .cursor_pointer()
+                            .debug_selector({
+                                let profile_id = group.profile_id.clone();
+                                move || format!("agg-host-{profile_id}")
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_aggregate_target(index, None, None, window, cx)
+                            }))
+                            .child(status_dot(dot_color))
+                            .child(icon(
+                                if group.is_local {
+                                    IconName::Desktop
+                                } else {
+                                    IconName::Globe
+                                },
+                                if active {
+                                    theme::accent()
+                                } else {
+                                    theme::muted()
+                                },
+                                13.,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .child(group.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(("agg-host-collapse", index))
+                                    .role(ochub_ui::gpui::Role::Button)
+                                    .tab_stop(false)
+                                    .flex_none()
+                                    .size(px(20.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        cx.stop_propagation();
+                                        if !this.collapsed_aggregate_hosts.remove(&collapse_id) {
+                                            this.collapsed_aggregate_hosts
+                                                .insert(collapse_id.clone());
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(icon(chevron, theme::muted(), 12.)),
+                            ),
+                    )
+                    .children(section_children)
+                    .into_any_element(),
+            );
+        }
+        apply_region(div().id(chrome.sidebar.id), &chrome.sidebar)
+            .flex()
+            .flex_col()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .flex_none()
+            .bg(theme::sidebar_background())
+            .text_color(theme::sidebar_text())
+            .border_r_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(HEADER_HEIGHT))
+                    .pl(px(100.))
+                    .pr_4()
+                    .gap_2()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, window, _| window.start_window_move()),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-title")
+                            .role(ochub_ui::gpui::Role::Heading)
+                            .aria_level(1)
+                            .aria_label(chrome.sidebar.name.clone())
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(chrome.sidebar.name.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("sidebar-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .px_2()
+                    .pb_3()
+                    .child(section_label(
+                        "machines-heading",
+                        i18n.text(k::TERMINAL_MACHINES),
+                    ))
+                    .child(
+                        div()
+                            .id("aggregate-hosts")
+                            .role(ochub_ui::gpui::Role::List)
+                            .aria_label(i18n.text(k::TERMINAL_MACHINES))
+                            .flex()
+                            .flex_col()
+                            .children(sections),
+                    ),
+            )
+            .into_any_element()
     }
 
     pub(super) fn tab_preview_card(&self, tab_id: &str, title: String) -> TabPreviewCard {
