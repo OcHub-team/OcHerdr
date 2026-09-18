@@ -82,6 +82,7 @@ fn attach_command_keeps_session_name_quoted() {
         destination: "deploy@example.com".into(),
         port: None,
         identity_file: None,
+        proxy_jump: None,
         herdr_path: "/opt/herdr".into(),
     };
     assert_eq!(
@@ -98,6 +99,7 @@ fn interactive_ssh_command_preserves_profile_overrides() {
         destination: "deploy@example.com".into(),
         port: Some(2202),
         identity_file: Some("/Keys/work key".into()),
+        proxy_jump: None,
         herdr_path: "herdr".into(),
     };
     assert_eq!(
@@ -128,6 +130,7 @@ fn ssh_tunnel_forwards_public_and_private_sockets_in_one_process() {
         destination: "deploy@example.com".into(),
         port: Some(2202),
         identity_file: Some("/Keys/work key".into()),
+        proxy_jump: None,
         herdr_path: "herdr".into(),
     };
     let command = ssh_tunnel_command(
@@ -692,4 +695,70 @@ fn endpoint_handshake_against_live_server() {
         "semantic input never echoed back through the surface"
     );
     eprintln!("deep phase: split ok, 2 panes, input echoed, patch seen = {saw_patch}");
+}
+
+#[test]
+fn ssh_g_output_builds_user_host_destination() {
+    let resolved = parse_ssh_g_output(
+        "user deploy\nhostname 10.0.1.5\nport 2222\nidentityfile ~/.ssh/prod_key\nproxyjump none\nproxycommand none\n",
+    );
+    assert_eq!(resolved.destination, "deploy@10.0.1.5");
+    assert_eq!(resolved.port, Some(2222));
+    assert_eq!(
+        resolved.identity_file.as_deref(),
+        Some(Path::new("~/.ssh/prod_key"))
+    );
+    assert_eq!(resolved.proxy_jump, None);
+    assert!(!resolved.has_proxy_command);
+}
+
+#[test]
+fn ssh_g_output_omits_user_when_unset() {
+    let resolved = parse_ssh_g_output("hostname example.net\nport 22\n");
+    assert_eq!(resolved.destination, "example.net");
+}
+
+#[test]
+fn ssh_g_output_skips_implicit_default_identity_files() {
+    let resolved = parse_ssh_g_output(
+        "hostname h\nidentityfile /Users/me/.ssh/id_rsa\nidentityfile /Users/me/.ssh/id_ed25519\n",
+    );
+    assert_eq!(resolved.identity_file, None);
+    // A configured key after the defaults is the one that sticks.
+    let resolved = parse_ssh_g_output(
+        "hostname h\nidentityfile /Users/me/.ssh/id_rsa\nidentityfile ~/.ssh/deploy_key\n",
+    );
+    assert_eq!(
+        resolved.identity_file.as_deref(),
+        Some(Path::new("~/.ssh/deploy_key"))
+    );
+}
+
+#[test]
+fn ssh_g_output_captures_proxy_jump_and_flags_proxy_command() {
+    let resolved = parse_ssh_g_output("hostname h\nproxyjump bastion,2222\n");
+    assert_eq!(resolved.proxy_jump.as_deref(), Some("bastion,2222"));
+    let resolved = parse_ssh_g_output("hostname h\nproxycommand nc -X 5 -x proxy %h %p\n");
+    assert!(resolved.has_proxy_command);
+}
+
+#[test]
+fn ssh_commands_forward_proxy_jump() {
+    let profile = ConnectionProfile::Ssh {
+        id: "server".into(),
+        label: "Server".into(),
+        destination: "deploy@example.com".into(),
+        port: Some(2202),
+        identity_file: Some("/Keys/work".into()),
+        proxy_jump: Some("bastion".into()),
+        herdr_path: "/opt/herdr".into(),
+    };
+    assert_eq!(
+        ssh_login_command(&profile).as_deref(),
+        Some("ssh -p 2202 -i /Keys/work -J bastion deploy@example.com")
+    );
+    assert_eq!(
+        attach_command(&profile, "work"),
+        "ssh -t -p 2202 -i /Keys/work -J bastion deploy@example.com 'exec /opt/herdr session attach work'"
+    );
 }

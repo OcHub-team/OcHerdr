@@ -176,13 +176,20 @@ fn probe_ssh(profile: &ConnectionProfile) -> Result<()> {
         destination,
         port,
         identity_file,
+        proxy_jump,
         ..
     } = profile
     else {
         return Ok(());
     };
     let mut command = Command::new(system_ssh());
-    add_ssh_common(&mut command, destination, *port, identity_file.as_deref());
+    add_ssh_common(
+        &mut command,
+        destination,
+        *port,
+        identity_file.as_deref(),
+        proxy_jump.as_deref(),
+    );
     let output = command
         .arg("--")
         .arg("true")
@@ -295,11 +302,18 @@ fn command_for(profile: &ConnectionProfile, args: &[&str]) -> Result<Command> {
             destination,
             port,
             identity_file,
+            proxy_jump,
             herdr_path,
             ..
         } => {
             let mut command = Command::new(system_ssh());
-            add_ssh_common(&mut command, destination, *port, identity_file.as_deref());
+            add_ssh_common(
+                &mut command,
+                destination,
+                *port,
+                identity_file.as_deref(),
+                proxy_jump.as_deref(),
+            );
             let remote = remote_herdr_command(herdr_path, args);
             command.arg("--").arg(remote);
             Ok(command)
@@ -396,6 +410,7 @@ fn add_ssh_common(
     destination: &str,
     port: Option<u16>,
     identity_file: Option<&Path>,
+    proxy_jump: Option<&str>,
 ) {
     command
         .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
@@ -410,6 +425,9 @@ fn add_ssh_common(
     }
     if let Some(identity_file) = identity_file {
         command.arg("-i").arg(identity_file);
+    }
+    if let Some(proxy_jump) = proxy_jump {
+        command.arg("-J").arg(proxy_jump);
     }
     command.arg(destination);
 }
@@ -678,6 +696,7 @@ fn ssh_tunnel_command(
         destination,
         port,
         identity_file,
+        proxy_jump,
         ..
     } = profile
     else {
@@ -704,6 +723,9 @@ fn ssh_tunnel_command(
     }
     if let Some(identity_file) = identity_file {
         command.arg("-i").arg(identity_file);
+    }
+    if let Some(proxy_jump) = proxy_jump {
+        command.arg("-J").arg(proxy_jump);
     }
     command.arg(destination);
     Ok(command)
@@ -1184,6 +1206,92 @@ pub fn ssh_host_aliases() -> Vec<String> {
     hosts
 }
 
+/// The effective connection fields `ssh -G` resolves for one config alias.
+/// Imported machines persist these so they no longer depend on `~/.ssh/config`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedSshHost {
+    /// `user@hostname` ready for the ssh destination argument.
+    pub destination: String,
+    pub port: Option<u16>,
+    pub identity_file: Option<PathBuf>,
+    pub proxy_jump: Option<String>,
+    /// True when the alias relies on ProxyCommand, which profiles cannot
+    /// reproduce; the import flow warns instead of silently breaking.
+    pub has_proxy_command: bool,
+}
+
+/// Resolves an `~/.ssh/config` alias through `ssh -G` into self-contained
+/// connection fields.
+pub fn resolve_ssh_alias(alias: &str) -> Result<ResolvedSshHost> {
+    let output = Command::new(system_ssh())
+        .arg("-G")
+        .arg(alias)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        return Err(HerdrError::Ssh(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let resolved = parse_ssh_g_output(&String::from_utf8_lossy(&output.stdout));
+    if resolved.destination.is_empty() {
+        return Err(HerdrError::Ssh(format!(
+            "ssh -G {alias} produced no hostname"
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Identity files OpenSSH probes implicitly; `ssh -G` reports them even
+/// when the alias configures none.
+const SSH_DEFAULT_IDENTITY_FILES: &[&str] = &[
+    ".ssh/id_rsa",
+    ".ssh/id_ecdsa",
+    ".ssh/id_ecdsa_sk",
+    ".ssh/id_ed25519",
+    ".ssh/id_ed25519_sk",
+    ".ssh/id_dsa",
+    ".ssh/id_xmss",
+];
+
+fn parse_ssh_g_output(output: &str) -> ResolvedSshHost {
+    let mut user = String::new();
+    let mut hostname = String::new();
+    let mut resolved = ResolvedSshHost::default();
+    for line in output.lines() {
+        let mut fields = line.splitn(2, char::is_whitespace);
+        let (Some(key), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "user" => user = value.to_owned(),
+            "hostname" => hostname = value.to_owned(),
+            "port" => resolved.port = value.parse().ok(),
+            "identityfile" if resolved.identity_file.is_none() && value != "none" => {
+                // `ssh -G` lists implicit defaults alongside configured keys;
+                // persisting a default would pin noise into the profile.
+                let is_default = SSH_DEFAULT_IDENTITY_FILES
+                    .iter()
+                    .any(|default| value.ends_with(default));
+                if !is_default {
+                    resolved.identity_file = Some(PathBuf::from(value));
+                }
+            }
+            "proxyjump" if value != "none" => resolved.proxy_jump = Some(value.to_owned()),
+            "proxycommand" if value != "none" => resolved.has_proxy_command = true,
+            _ => {}
+        }
+    }
+    resolved.destination = if user.is_empty() {
+        hostname
+    } else {
+        format!("{user}@{hostname}")
+    };
+    resolved
+}
+
 fn collect_ssh_hosts(
     path: &Path,
     ssh_dir: &Path,
@@ -1313,15 +1421,29 @@ pub fn attach_command(profile: &ConnectionProfile, session_name: &str) -> String
         ),
         ConnectionProfile::Ssh {
             destination,
+            port,
+            identity_file,
+            proxy_jump,
             herdr_path,
             ..
         } => {
             let attach = remote_herdr_command(herdr_path, &["session", "attach", session_name]);
-            format!(
-                "ssh -t {} {}",
-                posix_quote(destination),
-                posix_quote(&attach)
-            )
+            let mut arguments = vec!["ssh".to_owned(), "-t".to_owned()];
+            if let Some(port) = port {
+                arguments.extend(["-p".into(), port.to_string()]);
+            }
+            if let Some(identity_file) = identity_file {
+                arguments.extend([
+                    "-i".into(),
+                    posix_quote(&identity_file.display().to_string()),
+                ]);
+            }
+            if let Some(proxy_jump) = proxy_jump {
+                arguments.extend(["-J".into(), posix_quote(proxy_jump)]);
+            }
+            arguments.push(posix_quote(destination));
+            arguments.push(posix_quote(&attach));
+            arguments.join(" ")
         }
     }
 }
@@ -1333,6 +1455,7 @@ pub fn ssh_login_command(profile: &ConnectionProfile) -> Option<String> {
         destination,
         port,
         identity_file,
+        proxy_jump,
         ..
     } = profile
     else {
@@ -1347,6 +1470,9 @@ pub fn ssh_login_command(profile: &ConnectionProfile) -> Option<String> {
             "-i".into(),
             posix_quote(&identity_file.display().to_string()),
         ]);
+    }
+    if let Some(proxy_jump) = proxy_jump {
+        arguments.extend(["-J".into(), posix_quote(proxy_jump)]);
     }
     arguments.push(posix_quote(destination));
     Some(arguments.join(" "))

@@ -1469,6 +1469,7 @@ fn saved_host_settings() -> Settings {
             destination: "alpha.example".into(),
             port: None,
             identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         }],
         ..Settings::default()

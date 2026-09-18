@@ -10,7 +10,6 @@ pub(crate) enum RemoteForm {
 pub(crate) enum ConnectionSource {
     ThisMac,
     Saved,
-    SshConfig,
 }
 
 impl ConnectionSource {
@@ -18,7 +17,6 @@ impl ConnectionSource {
         i18n.text(match self {
             Self::ThisMac => k::HOSTS_SOURCE_THIS_MAC,
             Self::Saved => k::HOSTS_SOURCE_SAVED_SHORT,
-            Self::SshConfig => k::HOSTS_SOURCE_SSH_CONFIG,
         })
     }
 
@@ -26,7 +24,6 @@ impl ConnectionSource {
         i18n.text(match self {
             Self::ThisMac => k::HOSTS_SOURCE_THIS_MAC_DESCRIPTION,
             Self::Saved => k::HOSTS_SOURCE_SAVED,
-            Self::SshConfig => k::HOSTS_SOURCE_SSH_CONFIG_READONLY,
         })
     }
 }
@@ -34,31 +31,13 @@ impl ConnectionSource {
 pub(crate) fn connection_source(profile: &ConnectionProfile) -> ConnectionSource {
     if matches!(profile, ConnectionProfile::Local { .. }) {
         ConnectionSource::ThisMac
-    } else if profile.id().starts_with("manual-") {
-        ConnectionSource::Saved
     } else {
-        ConnectionSource::SshConfig
+        ConnectionSource::Saved
     }
 }
 
 pub(crate) fn is_saved_profile(profile: &ConnectionProfile) -> bool {
     profile.id().starts_with("manual-")
-}
-
-pub(crate) fn ssh_destination(profile: &ConnectionProfile) -> Option<&str> {
-    match profile {
-        ConnectionProfile::Ssh { destination, .. } => Some(destination.as_str()),
-        ConnectionProfile::Local { .. } => None,
-    }
-}
-
-pub(crate) fn ssh_config_covered_by_saved(
-    profiles: &[ConnectionProfile],
-    destination: &str,
-) -> bool {
-    profiles
-        .iter()
-        .any(|profile| is_saved_profile(profile) && ssh_destination(profile) == Some(destination))
 }
 
 pub(crate) fn remember_recent(recents: &mut Vec<String>, id: &str) {
@@ -68,16 +47,10 @@ pub(crate) fn remember_recent(recents: &mut Vec<String>, id: &str) {
 }
 
 pub(crate) fn normalize_recent_host_id(id: &str, profiles: &[ConnectionProfile]) -> Option<String> {
-    if profiles.iter().any(|profile| profile.id() == id) {
-        return Some(id.to_owned());
-    }
-    let legacy_alias = id
-        .strip_prefix("ssh-")
-        .and_then(|rest| rest.split_once('-').map(|(_, alias)| alias))?;
     profiles
         .iter()
-        .find(|profile| ssh_destination(profile) == Some(legacy_alias))
-        .map(|profile| profile.id().to_owned())
+        .any(|profile| profile.id() == id)
+        .then(|| id.to_owned())
 }
 
 pub(crate) fn parse_host_tags(value: &str) -> Vec<String> {
@@ -165,15 +138,6 @@ pub(crate) fn profile_matches_search(profile: &ConnectionProfile, query: &str, i
             .contains(query)
 }
 
-pub(crate) fn ssh_config_entry_is_hidden(
-    profiles: &[ConnectionProfile],
-    profile: &ConnectionProfile,
-) -> bool {
-    connection_source(profile) == ConnectionSource::SshConfig
-        && ssh_destination(profile)
-            .is_some_and(|destination| ssh_config_covered_by_saved(profiles, destination))
-}
-
 pub(crate) fn host_display_label_for(
     profile: &ConnectionProfile,
     metadata: Option<&HostMetadata>,
@@ -189,22 +153,16 @@ pub(crate) fn host_fits_filter(
     filter: &HostFilter,
     metadata: Option<&HostMetadata>,
     recent_ids: &[String],
-    orphaned: &HashSet<String>,
     health: &HashMap<String, HostHealthView>,
 ) -> bool {
     match filter {
         HostFilter::All => true,
         HostFilter::Favorites => metadata.is_some_and(|value| value.favorite),
         HostFilter::Recent => recent_ids.iter().any(|id| id == profile.id()),
-        HostFilter::Attention => {
-            orphaned.contains(profile.id())
-                || health.get(profile.id()).is_some_and(|health| match health {
-                    HostHealthView::Checking { .. } => false,
-                    HostHealthView::Checked { cached, .. } => {
-                        cached.status != HostHealthStatus::Ready
-                    }
-                })
-        }
+        HostFilter::Attention => health.get(profile.id()).is_some_and(|health| match health {
+            HostHealthView::Checking { .. } => false,
+            HostHealthView::Checked { cached, .. } => cached.status != HostHealthStatus::Ready,
+        }),
         HostFilter::Source(source) => connection_source(profile) == *source,
         HostFilter::Group(group) => {
             metadata.and_then(|value| value.group.as_deref()) == Some(group.as_str())
@@ -219,7 +177,6 @@ pub(crate) struct HostCatalog<'a> {
     pub(crate) profiles: &'a [ConnectionProfile],
     pub(crate) metadata: &'a HashMap<String, HostMetadata>,
     pub(crate) recent_ids: &'a [String],
-    pub(crate) orphaned: &'a HashSet<String>,
     pub(crate) health: &'a HashMap<String, HostHealthView>,
 }
 
@@ -242,9 +199,6 @@ pub(crate) fn visible_host_indices(
         .iter()
         .enumerate()
         .filter(|(_, profile)| {
-            if ssh_config_entry_is_hidden(catalog.profiles, profile) {
-                return false;
-            }
             let meta = catalog.metadata.get(profile.id());
             let search_matches = profile_matches_search(profile, &query, i18n)
                 || meta.is_some_and(|metadata| {
@@ -262,14 +216,7 @@ pub(crate) fn visible_host_indices(
                             .any(|tag| tag.to_lowercase().contains(&query))
                 });
             search_matches
-                && host_fits_filter(
-                    profile,
-                    filter,
-                    meta,
-                    catalog.recent_ids,
-                    catalog.orphaned,
-                    catalog.health,
-                )
+                && host_fits_filter(profile, filter, meta, catalog.recent_ids, catalog.health)
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();

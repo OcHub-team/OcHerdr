@@ -62,22 +62,6 @@ pub(super) fn inspector_row(label: &'static str, value: String) -> ochub_ui::gpu
         .into_any_element()
 }
 
-pub(super) fn readonly_field_control(value: String) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .h(px(34.))
-        .w_full()
-        .px_3()
-        .rounded(px(CORNER_CONTROL))
-        .border_1()
-        .border_color(theme::border())
-        .bg(theme::inset())
-        .text_sm()
-        .text_color(theme::subtext())
-        .child(value)
-}
-
 pub(super) fn host_health_summary(
     health: Option<&HostHealthView>,
     i18n: I18n,

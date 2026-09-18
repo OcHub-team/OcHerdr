@@ -770,22 +770,24 @@ fn legacy_connection_settings_keep_host_fields_without_appearance() {
 }
 
 #[test]
-fn legacy_recent_ssh_ids_migrate_to_stable_alias_ids() {
+fn recent_host_ids_only_survive_when_the_profile_still_exists() {
     let profiles = vec![
         ConnectionProfile::default(),
         ConnectionProfile::Ssh {
-            id: "ssh-config:build-box".into(),
+            id: "manual-9".into(),
             label: "build-box".into(),
-            destination: "build-box".into(),
+            destination: "deploy@build.example".into(),
             port: None,
             identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         },
     ];
     assert_eq!(
-        normalize_recent_host_id("ssh-7-build-box", &profiles).as_deref(),
-        Some("ssh-config:build-box")
+        normalize_recent_host_id("manual-9", &profiles).as_deref(),
+        Some("manual-9")
     );
+    assert_eq!(normalize_recent_host_id("manual-8", &profiles), None);
 }
 
 #[test]
@@ -804,13 +806,14 @@ fn remote_search_matches_labels_endpoints_and_sources() {
         destination: "builder@example.net".into(),
         port: Some(2222),
         identity_file: None,
+        proxy_jump: None,
         herdr_path: "herdr".into(),
     };
 
     let i18n = I18n::new(Language::English);
     assert!(profile_matches_search(&profile, "build", i18n));
     assert!(profile_matches_search(&profile, "2222", i18n));
-    assert!(profile_matches_search(&profile, "ssh config", i18n));
+    assert!(profile_matches_search(&profile, "saved", i18n));
     assert!(!profile_matches_search(&profile, "production", i18n));
 }
 
@@ -833,6 +836,7 @@ fn ssh_host(id: &str, label: &str) -> ConnectionProfile {
         destination: label.into(),
         port: None,
         identity_file: None,
+        proxy_jump: None,
         herdr_path: "herdr".into(),
     }
 }
@@ -980,8 +984,8 @@ fn keys_go_to_the_terminal_only_when_no_overlay_is_open() {
 }
 
 #[test]
-fn saved_hosts_hide_the_matching_ssh_config_entry() {
-    let profiles = vec![
+fn connection_source_distinguishes_local_and_saved_profiles() {
+    let profiles = [
         ConnectionProfile::default(),
         ConnectionProfile::Ssh {
             id: "manual-1".into(),
@@ -989,22 +993,14 @@ fn saved_hosts_hide_the_matching_ssh_config_entry() {
             destination: "build".into(),
             port: None,
             identity_file: None,
-            herdr_path: "herdr".into(),
-        },
-        ConnectionProfile::Ssh {
-            id: "ssh-0-build".into(),
-            label: "build".into(),
-            destination: "build".into(),
-            port: None,
-            identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         },
     ];
-    assert!(ssh_config_covered_by_saved(&profiles, "build"));
-    assert!(!ssh_config_covered_by_saved(&profiles, "prod"));
     assert_eq!(connection_source(&profiles[0]), ConnectionSource::ThisMac);
     assert_eq!(connection_source(&profiles[1]), ConnectionSource::Saved);
-    assert_eq!(connection_source(&profiles[2]), ConnectionSource::SshConfig);
+    assert!(is_saved_profile(&profiles[1]));
+    assert!(!is_saved_profile(&profiles[0]));
 }
 
 fn sample_visible_hosts() -> (Vec<ConnectionProfile>, HashMap<String, HostMetadata>) {
@@ -1016,6 +1012,7 @@ fn sample_visible_hosts() -> (Vec<ConnectionProfile>, HashMap<String, HostMetada
             destination: "alpha.example".into(),
             port: None,
             identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         },
         ConnectionProfile::Ssh {
@@ -1024,6 +1021,7 @@ fn sample_visible_hosts() -> (Vec<ConnectionProfile>, HashMap<String, HostMetada
             destination: "beta.example".into(),
             port: None,
             identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         },
     ];
@@ -1041,14 +1039,12 @@ fn sample_visible_hosts() -> (Vec<ConnectionProfile>, HashMap<String, HostMetada
 fn indices_for(filter: HostFilter) -> (Vec<ConnectionProfile>, Vec<usize>) {
     let (profiles, metadata) = sample_visible_hosts();
     let recent_ids = Vec::<String>::new();
-    let orphaned = HashSet::new();
     let health = HashMap::new();
     let indexes = visible_host_indices(
         &HostCatalog {
             profiles: &profiles,
             metadata: &metadata,
             recent_ids: &recent_ids,
-            orphaned: &orphaned,
             health: &health,
         },
         &filter,

@@ -1005,12 +1005,10 @@ struct HostMetadata {
     group: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
+    /// The `~/.ssh/config` alias this machine was imported from. Used to hide
+    /// the alias from the import section and to badge the row's origin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    port_override: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    identity_file_override: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    herdr_path_override: Option<String>,
+    source_alias: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -867,9 +867,6 @@ impl OcHerdrView {
                     cx,
                 );
             }
-            HostCenterEvent::CatalogChanged(profiles) => {
-                self.adopt_profiles(profiles, cx);
-            }
             HostCenterEvent::ProfileSelected(index) => {
                 self.request_choose_node(index, cx);
             }

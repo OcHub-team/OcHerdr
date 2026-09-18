@@ -191,7 +191,8 @@ impl HostCenter {
                                         ),
                                         list_state,
                                     )),
-                            ),
+                            )
+                            .child(self.render_ssh_import_section(cx)),
                     )
                     .child(
                         div()
@@ -273,27 +274,14 @@ impl HostCenter {
         }
 
         items.push(host_nav_heading(i18n.text(k::HOSTS_NAV_SOURCES)));
-        for (id, label, source) in [
-            (
-                "host-filter-saved",
-                i18n.text(k::HOSTS_SOURCE_SAVED),
-                ConnectionSource::Saved,
-            ),
-            (
-                "host-filter-ssh-config",
-                i18n.text(k::HOSTS_SOURCE_SSH_CONFIG),
-                ConnectionSource::SshConfig,
-            ),
-        ] {
-            let filter = HostFilter::Source(source);
-            items.push(self.host_nav_item(
-                id,
-                label,
-                filter.clone(),
-                self.host_filter_count(&filter),
-                cx,
-            ));
-        }
+        let filter = HostFilter::Source(ConnectionSource::Saved);
+        items.push(self.host_nav_item(
+            "host-filter-saved",
+            i18n.text(k::HOSTS_SOURCE_SAVED),
+            filter.clone(),
+            self.host_filter_count(&filter),
+            cx,
+        ));
 
         let nav_scroll = self.host_nav_scroll.clone();
         div()
@@ -388,15 +376,13 @@ impl HostCenter {
         let Some(profile) = self.profiles.get(index) else {
             return false;
         };
-        !ssh_config_entry_is_hidden(&self.profiles, profile)
-            && host_fits_filter(
-                profile,
-                filter,
-                self.host_metadata.get(profile.id()),
-                &self.recent_connection_ids,
-                &self.orphaned_ssh_hosts,
-                &self.host_health,
-            )
+        host_fits_filter(
+            profile,
+            filter,
+            self.host_metadata.get(profile.id()),
+            &self.recent_connection_ids,
+            &self.host_health,
+        )
     }
 
     /// Rebuild the virtual list when the visible set or the inputs that produce
@@ -426,6 +412,150 @@ impl HostCenter {
             HostFilter::Source(source) => source.label(i18n).into(),
             HostFilter::Group(group) | HostFilter::Tag(group) => group.clone().into(),
         }
+    }
+
+    /// Collapsible discovery section at the bottom of the machine list. These
+    /// aliases come from `~/.ssh/config`; importing one resolves it with
+    /// `ssh -G` and stores a self-contained profile in our own catalog.
+    fn render_ssh_import_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
+        let open = self.ssh_section_open;
+        let candidates = self.ssh_candidates.clone();
+        let ssh_scroll = self.host_ssh_scroll.clone();
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .border_t_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .id("ssh-config-section-toggle")
+                    .role(ochub_ui::gpui::Role::Button)
+                    .tab_stop(false)
+                    .aria_label(i18n.text(k::HOSTS_SSH_SECTION_ARIA))
+                    .aria_expanded(open)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(38.))
+                    .px_4()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_ssh_section(cx)))
+                    .child(icon(
+                        if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        },
+                        theme::muted(),
+                        12.,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::subtext())
+                            .child(i18n.text(k::HOSTS_SSH_SECTION_TITLE)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(candidates.len().to_string()),
+                    ),
+            )
+            .when(open, |section| {
+                if candidates.is_empty() {
+                    return section.child(
+                        div()
+                            .px_4()
+                            .pb_3()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(i18n.text(k::HOSTS_SSH_SECTION_EMPTY)),
+                    );
+                }
+                section.child(
+                    div()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .max_h(px(196.))
+                        .min_h_0()
+                        .child(
+                            div()
+                                .id("ssh-config-candidates")
+                                .role(ochub_ui::gpui::Role::List)
+                                .aria_label(i18n.text(k::HOSTS_SSH_SECTION_ARIA))
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .track_scroll(&ssh_scroll)
+                                .on_scroll_wheel(contain_vertical_scroll(ssh_scroll.clone()))
+                                .px_2()
+                                .pb_2()
+                                .children(candidates.into_iter().map(|alias| {
+                                    self.ssh_candidate_row(alias, cx).into_any_element()
+                                })),
+                        )
+                        .child(VerticalScrollbar::new(
+                            ochub_ui::gpui::ElementId::Name(
+                                "ssh-config-candidates-scrollbar".into(),
+                            ),
+                            ssh_scroll,
+                        )),
+                )
+            })
+    }
+
+    fn ssh_candidate_row(&self, alias: String, cx: &mut Context<Self>) -> impl IntoElement {
+        let i18n = self.i18n;
+        let importing = self.ssh_candidate_importing(&alias);
+        let row_alias = alias.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(32.))
+            .px_2()
+            .rounded(px(CORNER_COMPACT))
+            .child(icon(IconName::Globe, theme::muted(), 13.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(theme::text())
+                    .child(alias),
+            )
+            .child(if importing {
+                busy_button(
+                    format!("ssh-import:{row_alias}"),
+                    i18n.text(k::HOSTS_SSH_IMPORTING),
+                    ButtonTone::Neutral,
+                    ButtonSize::Sm,
+                    false,
+                )
+            } else {
+                button(
+                    format!("ssh-import:{row_alias}"),
+                    i18n.text(k::HOSTS_SSH_IMPORT),
+                    ButtonTone::Neutral,
+                    ButtonSize::Sm,
+                )
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.import_ssh_candidate(row_alias.clone(), cx)
+                }))
+            })
     }
 
     fn managed_host_row(&self, index: usize, cx: &mut Context<Self>) -> ochub_ui::gpui::AnyElement {
@@ -912,10 +1042,6 @@ impl HostCenter {
             Some(RemoteForm::Edit(index)) => Some(index),
             _ => None,
         };
-        let source = index
-            .and_then(|index| self.profiles.get(index))
-            .map(connection_source)
-            .unwrap_or(ConnectionSource::Saved);
         let active = index == Some(self.profile_index);
         let form_scroll = self.host_form_scroll.clone();
         div()
@@ -945,13 +1071,12 @@ impl HostCenter {
                                     i18n.text(k::HOSTS_EDIT)
                                 },
                             ))
-                            .child(div().text_xs().text_color(theme::muted()).child(
-                                if source == ConnectionSource::SshConfig {
-                                    i18n.text(k::HOSTS_FORM_SSH_READONLY)
-                                } else {
-                                    i18n.text(k::HOSTS_FORM_CHANGES_NEXT_CONNECT)
-                                },
-                            )),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(i18n.text(k::HOSTS_FORM_CHANGES_NEXT_CONNECT)),
+                            ),
                     )
                     .child(
                         icon_only_button_tone(
@@ -993,28 +1118,12 @@ impl HostCenter {
                                 Some(i18n.text(k::HOSTS_FORM_NAME_DESCRIPTION).into()),
                                 self.remote_label.clone(),
                             ))
-                            .child(if source == ConnectionSource::SshConfig {
-                                field(
-                                    i18n.text(k::HOSTS_FORM_DESTINATION),
-                                    false,
-                                    Some(i18n.text(k::HOSTS_FORM_DESTINATION_SSH_MANAGED).into()),
-                                    readonly_field_control(
-                                        self.profiles
-                                            .get(index.unwrap_or_default())
-                                            .map(profile_endpoint)
-                                            .unwrap_or_default(),
-                                    ),
-                                )
-                                .into_any_element()
-                            } else {
-                                field(
-                                    i18n.text(k::HOSTS_FORM_DESTINATION),
-                                    true,
-                                    Some(i18n.text(k::HOSTS_FORM_DESTINATION_DESCRIPTION).into()),
-                                    self.remote_destination.clone(),
-                                )
-                                .into_any_element()
-                            })
+                            .child(field(
+                                i18n.text(k::HOSTS_FORM_DESTINATION),
+                                true,
+                                Some(i18n.text(k::HOSTS_FORM_DESTINATION_DESCRIPTION).into()),
+                                self.remote_destination.clone(),
+                            ))
                             .child(
                                 div()
                                     .flex()
@@ -1063,39 +1172,61 @@ impl HostCenter {
                                 form.child(
                                     div()
                                         .flex()
-                                        .items_start()
+                                        .flex_col()
                                         .gap_3()
-                                        .child(div().flex_1().min_w_0().child(field(
-                                            i18n.text(k::HOSTS_FORM_PORT),
-                                            false,
-                                            Some(i18n.text(k::HOSTS_FORM_PORT_DESCRIPTION).into()),
-                                            self.remote_port.clone(),
-                                        )))
                                         .child(
-                                            div().flex_1().min_w_0().child(field(
-                                                i18n.text(k::HOSTS_HERDR_COMMAND),
-                                                false,
-                                                Some(
-                                                    i18n.text(
-                                                        k::HOSTS_FORM_HERDR_COMMAND_DESCRIPTION,
-                                                    )
-                                                    .into(),
-                                                ),
-                                                self.remote_herdr_path.clone(),
-                                            )),
+                                            div()
+                                                .flex()
+                                                .items_start()
+                                                .gap_3()
+                                                .child(div().flex_1().min_w_0().child(field(
+                                                    i18n.text(k::HOSTS_FORM_PORT),
+                                                    false,
+                                                    Some(
+                                                        i18n.text(k::HOSTS_FORM_PORT_DESCRIPTION)
+                                                            .into(),
+                                                    ),
+                                                    self.remote_port.clone(),
+                                                )))
+                                                .child(div().flex_1().min_w_0().child(field(
+                                                    i18n.text(k::HOSTS_FORM_PROXY_JUMP),
+                                                    false,
+                                                    Some(
+                                                        i18n.text(
+                                                            k::HOSTS_FORM_PROXY_JUMP_DESCRIPTION,
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    self.remote_proxy_jump.clone(),
+                                                ))),
                                         )
                                         .child(
-                                            div().flex_1().min_w_0().child(field(
-                                                i18n.text(k::HOSTS_FORM_IDENTITY_FILE),
-                                                false,
-                                                Some(
-                                                    i18n.text(
-                                                        k::HOSTS_FORM_IDENTITY_FILE_DESCRIPTION,
-                                                    )
-                                                    .into(),
-                                                ),
-                                                self.remote_identity_file.clone(),
-                                            )),
+                                            div()
+                                                .flex()
+                                                .items_start()
+                                                .gap_3()
+                                                .child(div().flex_1().min_w_0().child(field(
+                                                    i18n.text(k::HOSTS_HERDR_COMMAND),
+                                                    false,
+                                                    Some(
+                                                        i18n.text(
+                                                            k::HOSTS_FORM_HERDR_COMMAND_DESCRIPTION,
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    self.remote_herdr_path.clone(),
+                                                )))
+                                                .child(div().flex_1().min_w_0().child(field(
+                                                    i18n.text(k::HOSTS_FORM_IDENTITY_FILE),
+                                                    false,
+                                                    Some(
+                                                        i18n.text(
+                                                            k::HOSTS_FORM_IDENTITY_FILE_DESCRIPTION,
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    self.remote_identity_file.clone(),
+                                                ))),
                                         ),
                                 )
                             }),

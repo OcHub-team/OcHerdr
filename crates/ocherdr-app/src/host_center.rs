@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use crate::text_input::{TextInput, TextInputEvent};
 use ocherdr_core::ConnectionProfile;
 use ocherdr_herdr::{
-    HostHealthCheck, check_host, open_system_terminal, ssh_host_aliases, ssh_login_command,
+    HostHealthCheck, check_host, open_system_terminal, resolve_ssh_alias, ssh_host_aliases,
+    ssh_login_command,
 };
 use ochub_ui::gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Render,
@@ -65,7 +66,6 @@ pub(crate) enum HostCenterEvent {
         index: usize,
         then: HostSaveThen,
     },
-    CatalogChanged(Vec<ConnectionProfile>),
     ProfileSelected(usize),
     OpenCreateForm,
     OpenEditForm(usize),
@@ -86,7 +86,7 @@ pub(crate) struct HostRollback {
     host_metadata: HashMap<String, HostMetadata>,
     host_groups: Vec<String>,
     host_health: HashMap<String, HostHealthView>,
-    orphaned_ssh_hosts: HashSet<String>,
+    ssh_candidates: Vec<String>,
     profile_index: usize,
     managed_profile_index: usize,
     host_bulk_selection: HashSet<String>,
@@ -101,7 +101,7 @@ impl HostRollback {
             host_metadata: HashMap::new(),
             host_groups: Vec::new(),
             host_health: HashMap::new(),
-            orphaned_ssh_hosts: HashSet::new(),
+            ssh_candidates: Vec::new(),
             profile_index: 0,
             managed_profile_index: 0,
             host_bulk_selection: HashSet::new(),
@@ -131,16 +131,23 @@ pub(crate) struct HostCenter {
     host_check_queue: VecDeque<(String, ConnectionProfile)>,
     pub(crate) host_bulk_mode: bool,
     pub(crate) host_bulk_selection: HashSet<String>,
-    pub(crate) orphaned_ssh_hosts: HashSet<String>,
+    /// `~/.ssh/config` aliases offered for import. Discovery-only: they never
+    /// appear in `profiles` until the user imports one explicitly.
+    pub(crate) ssh_candidates: Vec<String>,
+    pub(crate) ssh_section_open: bool,
+    /// Aliases with an in-flight `ssh -G` resolution.
+    ssh_importing: HashMap<String, Task<()>>,
     pub(crate) host_nav_scroll: ScrollHandle,
     pub(crate) host_inspector_scroll: ScrollHandle,
     pub(crate) host_form_scroll: ScrollHandle,
+    pub(crate) host_ssh_scroll: ScrollHandle,
     pub(crate) host_list_state: ListState,
     pub(crate) host_list_revision: HostListRevision,
     pub(crate) remote_label: Entity<TextInput>,
     pub(crate) remote_destination: Entity<TextInput>,
     pub(crate) remote_port: Entity<TextInput>,
     pub(crate) remote_identity_file: Entity<TextInput>,
+    pub(crate) remote_proxy_jump: Entity<TextInput>,
     pub(crate) remote_herdr_path: Entity<TextInput>,
     pub(crate) remote_group: Entity<TextInput>,
     pub(crate) remote_tags: Entity<TextInput>,
@@ -161,60 +168,7 @@ impl HostCenter {
         let host_metadata = settings.host_metadata;
         let mut profiles = vec![ConnectionProfile::default()];
         profiles.extend(settings.connections);
-        let saved_destinations = profiles
-            .iter()
-            .filter_map(|profile| match profile {
-                ConnectionProfile::Ssh { destination, .. } => Some(destination.clone()),
-                ConnectionProfile::Local { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        profiles.extend(
-            ssh_host_aliases()
-                .into_iter()
-                .filter(|host| !saved_destinations.contains(host))
-                .map(|host| {
-                    let id = format!("ssh-config:{host}");
-                    let metadata = host_metadata.get(&id).cloned().unwrap_or_default();
-                    ConnectionProfile::Ssh {
-                        id,
-                        label: metadata.display_name.unwrap_or_else(|| host.clone()),
-                        destination: host,
-                        port: metadata.port_override,
-                        identity_file: metadata.identity_file_override,
-                        herdr_path: metadata
-                            .herdr_path_override
-                            .unwrap_or_else(|| "herdr".into()),
-                    }
-                }),
-        );
-        let mut orphaned_ssh_hosts = HashSet::new();
-        for (id, metadata) in &host_metadata {
-            let Some(alias) = id.strip_prefix("ssh-config:") else {
-                continue;
-            };
-            if profiles.iter().any(|profile| profile.id() == id)
-                || saved_destinations
-                    .iter()
-                    .any(|destination| destination == alias)
-            {
-                continue;
-            }
-            profiles.push(ConnectionProfile::Ssh {
-                id: id.clone(),
-                label: metadata
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| alias.to_owned()),
-                destination: alias.to_owned(),
-                port: metadata.port_override,
-                identity_file: metadata.identity_file_override.clone(),
-                herdr_path: metadata
-                    .herdr_path_override
-                    .clone()
-                    .unwrap_or_else(|| "herdr".into()),
-            });
-            orphaned_ssh_hosts.insert(id.clone());
-        }
+        let ssh_candidates = unimported_ssh_aliases(ssh_host_aliases(), &host_metadata);
         let remote_search = cx.new(|cx| {
             TextInput::new(cx, i18n.text(k::HOSTS_SEARCH_PLACEHOLDER))
                 .search_field()
@@ -263,10 +217,13 @@ impl HostCenter {
             host_check_queue: VecDeque::new(),
             host_bulk_mode: false,
             host_bulk_selection: HashSet::new(),
-            orphaned_ssh_hosts,
+            ssh_candidates,
+            ssh_section_open: false,
+            ssh_importing: HashMap::new(),
             host_nav_scroll: ScrollHandle::new(),
             host_inspector_scroll: ScrollHandle::new(),
             host_form_scroll: ScrollHandle::new(),
+            host_ssh_scroll: ScrollHandle::new(),
             host_list_state: ListState::new(0, ListAlignment::Top, px(192.)),
             host_list_revision: HostListRevision::default(),
             remote_label: cx
@@ -276,6 +233,8 @@ impl HostCenter {
             remote_port: cx.new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_PORT))),
             remote_identity_file: cx
                 .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_IDENTITY))),
+            remote_proxy_jump: cx
+                .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_PROXY_JUMP))),
             remote_herdr_path: cx.new(|cx| TextInput::new(cx, "herdr").with_content("herdr")),
             remote_group: cx
                 .new(|cx| TextInput::new(cx, i18n.text(k::HOSTS_FORM_PLACEHOLDER_GROUP))),
@@ -290,6 +249,7 @@ impl HostCenter {
             &center.remote_destination,
             &center.remote_port,
             &center.remote_identity_file,
+            &center.remote_proxy_jump,
             &center.remote_herdr_path,
             &center.remote_group,
             &center.remote_tags,
@@ -414,6 +374,9 @@ impl HostCenter {
         self.remote_identity_file.update(cx, |input, cx| {
             input.set_placeholder(i18n.text(k::HOSTS_FORM_PLACEHOLDER_IDENTITY), cx)
         });
+        self.remote_proxy_jump.update(cx, |input, cx| {
+            input.set_placeholder(i18n.text(k::HOSTS_FORM_PLACEHOLDER_PROXY_JUMP), cx)
+        });
         self.remote_group.update(cx, |input, cx| {
             input.set_placeholder(i18n.text(k::HOSTS_FORM_PLACEHOLDER_GROUP), cx)
         });
@@ -428,7 +391,7 @@ impl HostCenter {
         self.host_metadata = snapshot.host_metadata;
         self.host_groups = snapshot.host_groups;
         self.host_health = snapshot.host_health;
-        self.orphaned_ssh_hosts = snapshot.orphaned_ssh_hosts;
+        self.ssh_candidates = snapshot.ssh_candidates;
         self.profile_index = snapshot.profile_index;
         self.managed_profile_index = snapshot.managed_profile_index;
         self.host_bulk_selection = snapshot.host_bulk_selection;
@@ -441,7 +404,7 @@ impl HostCenter {
             host_metadata: self.host_metadata.clone(),
             host_groups: self.host_groups.clone(),
             host_health: self.host_health.clone(),
-            orphaned_ssh_hosts: self.orphaned_ssh_hosts.clone(),
+            ssh_candidates: self.ssh_candidates.clone(),
             profile_index: self.profile_index,
             managed_profile_index: self.managed_profile_index,
             host_bulk_selection: self.host_bulk_selection.clone(),
@@ -691,46 +654,16 @@ impl HostCenter {
         let removed_ids = self
             .profiles
             .iter()
-            .filter(|profile| {
-                selected.contains(profile.id())
-                    && (is_saved_profile(profile) || self.orphaned_ssh_hosts.contains(profile.id()))
-            })
+            .filter(|profile| selected.contains(profile.id()) && is_saved_profile(profile))
             .map(|profile| profile.id().to_owned())
             .collect::<HashSet<_>>();
         self.profiles
             .retain(|profile| !removed_ids.contains(profile.id()));
-        for profile in &mut self.profiles {
-            if !selected.contains(profile.id())
-                || connection_source(profile) != ConnectionSource::SshConfig
-            {
-                continue;
-            }
-            let ConnectionProfile::Ssh {
-                id,
-                label,
-                destination,
-                port,
-                identity_file,
-                herdr_path,
-            } = profile
-            else {
-                continue;
-            };
-            let alias = id
-                .strip_prefix("ssh-config:")
-                .unwrap_or(destination)
-                .to_owned();
-            *label = alias.clone();
-            *destination = alias;
-            *port = None;
-            *identity_file = None;
-            *herdr_path = "herdr".into();
-        }
         for id in &selected {
             self.host_metadata.remove(id);
             self.host_health.remove(id);
         }
-        self.orphaned_ssh_hosts.retain(|id| !selected.contains(id));
+        self.refresh_ssh_candidates();
         self.recent_connection_ids
             .retain(|id| !removed_ids.contains(id));
         self.profile_index = self
@@ -754,7 +687,6 @@ impl HostCenter {
                 profiles: &self.profiles,
                 metadata: &self.host_metadata,
                 recent_ids: &self.recent_connection_ids,
-                orphaned: &self.orphaned_ssh_hosts,
                 health: &self.host_health,
             },
             &self.host_filter,
@@ -787,7 +719,7 @@ impl HostCenter {
     }
 
     pub(crate) fn refresh_common_host_health(&mut self, cx: &mut Context<Self>) {
-        self.reload_ssh_config_hosts(cx);
+        self.refresh_ssh_candidates();
         self.cancel_host_checks();
         let mut ids = Vec::new();
         if let Some(profile) = self.profiles.get(self.profile_index) {
@@ -824,76 +756,93 @@ impl HostCenter {
         cx.notify();
     }
 
-    fn reload_ssh_config_hosts(&mut self, cx: &mut Context<Self>) {
-        let current_id = self
-            .profiles
-            .get(self.profile_index)
-            .map(|profile| profile.id().to_owned())
-            .unwrap_or_else(|| "local".into());
-        let managed_id = self
-            .profiles
-            .get(self.managed_profile_index)
-            .map(|profile| profile.id().to_owned())
-            .unwrap_or_else(|| current_id.clone());
-        let old_config = self
-            .profiles
-            .iter()
-            .filter(|profile| connection_source(profile) == ConnectionSource::SshConfig)
-            .map(|profile| (profile.id().to_owned(), profile.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut profiles = self
-            .profiles
-            .iter()
-            .filter(|profile| connection_source(profile) != ConnectionSource::SshConfig)
-            .cloned()
-            .collect::<Vec<_>>();
-        let saved_destinations = profiles
-            .iter()
-            .filter_map(ssh_destination)
-            .map(str::to_owned)
-            .collect::<HashSet<_>>();
-        let aliases = ssh_host_aliases();
-        let mut discovered_ids = HashSet::new();
-        for alias in aliases {
-            if saved_destinations.contains(&alias) {
-                continue;
-            }
-            let id = format!("ssh-config:{alias}");
-            discovered_ids.insert(id.clone());
-            let metadata = self.host_metadata.get(&id).cloned().unwrap_or_default();
-            profiles.push(ConnectionProfile::Ssh {
-                id,
-                label: metadata.display_name.unwrap_or_else(|| alias.clone()),
-                destination: alias,
-                port: metadata.port_override,
-                identity_file: metadata.identity_file_override,
-                herdr_path: metadata
-                    .herdr_path_override
-                    .unwrap_or_else(|| "herdr".into()),
-            });
+    /// Recompute the importable alias list. Aliases disappear once imported
+    /// and reappear if the imported machine is deleted.
+    fn refresh_ssh_candidates(&mut self) {
+        self.ssh_candidates = unimported_ssh_aliases(ssh_host_aliases(), &self.host_metadata);
+    }
+
+    pub(crate) fn toggle_ssh_section(&mut self, cx: &mut Context<Self>) {
+        self.ssh_section_open = !self.ssh_section_open;
+        if self.ssh_section_open {
+            self.refresh_ssh_candidates();
         }
-        self.orphaned_ssh_hosts.clear();
-        for (id, profile) in old_config {
-            if discovered_ids.contains(&id) {
-                continue;
-            }
-            if self.host_metadata.contains_key(&id) || id == current_id {
-                self.orphaned_ssh_hosts.insert(id);
-                profiles.push(profile);
-            }
+        cx.notify();
+    }
+
+    pub(crate) fn ssh_candidate_importing(&self, alias: &str) -> bool {
+        self.ssh_importing.contains_key(alias)
+    }
+
+    /// Import one `~/.ssh/config` alias into the managed catalog. The alias is
+    /// resolved with `ssh -G` so the stored profile is self-contained and no
+    /// longer depends on the ssh config file.
+    pub(crate) fn import_ssh_candidate(&mut self, alias: String, cx: &mut Context<Self>) {
+        if self.ssh_importing.contains_key(&alias) || !self.ssh_candidates.contains(&alias) {
+            return;
         }
-        self.profiles = profiles;
-        self.profile_index = self
-            .profiles
-            .iter()
-            .position(|profile| profile.id() == current_id)
-            .unwrap_or(0);
-        self.managed_profile_index = self
-            .profiles
-            .iter()
-            .position(|profile| profile.id() == managed_id)
-            .unwrap_or(self.profile_index);
-        cx.emit(HostCenterEvent::CatalogChanged(self.profiles.clone()));
+        let probe = alias.clone();
+        let key = alias.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let resolved = cx
+                .background_spawn(async move { resolve_ssh_alias(&alias) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.ssh_importing.remove(&probe).is_none() {
+                    return;
+                }
+                match resolved {
+                    Ok(resolved) => this.finish_ssh_import(probe, resolved, cx),
+                    Err(error) => this.fail(FailureKind::ImportHost, error, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.ssh_importing.insert(key, task);
+        cx.notify();
+    }
+
+    pub(crate) fn finish_ssh_import(
+        &mut self,
+        alias: String,
+        resolved: ocherdr_herdr::ResolvedSshHost,
+        cx: &mut Context<Self>,
+    ) {
+        let rollback = self.begin_mutation();
+        let profile = ConnectionProfile::Ssh {
+            id: format!("manual-{}", next_manual_profile_id(&self.profiles)),
+            label: alias.clone(),
+            destination: resolved.destination,
+            port: resolved.port,
+            identity_file: resolved.identity_file,
+            proxy_jump: resolved.proxy_jump,
+            herdr_path: "herdr".into(),
+        };
+        self.profiles.push(profile);
+        let index = self.profiles.len() - 1;
+        let id = self.profiles[index].id().to_owned();
+        self.host_metadata.insert(
+            id,
+            HostMetadata {
+                source_alias: Some(alias.clone()),
+                ..HostMetadata::default()
+            },
+        );
+        self.ssh_candidates.retain(|candidate| candidate != &alias);
+        self.managed_profile_index = index;
+        cx.emit(HostCenterEvent::HostSaved {
+            rollback,
+            index,
+            then: HostSaveThen::ShowHostCenter,
+        });
+        if resolved.has_proxy_command {
+            self.fail(
+                FailureKind::ImportHostUnsupported,
+                self.i18n.text(k::NOTIFY_DETAIL_IMPORT_PROXY_COMMAND),
+                cx,
+            );
+        }
     }
 
     fn pump_host_checks(&mut self, cx: &mut Context<Self>) {
@@ -992,6 +941,7 @@ impl HostCenter {
         self.recent_connection_ids.retain(|id| id != removed.id());
         self.host_metadata.remove(&removed_id);
         self.host_health.remove(&removed_id);
+        self.refresh_ssh_candidates();
         if index == self.profile_index {
             self.profile_index = 0;
         } else if index < self.profile_index {
@@ -1029,12 +979,12 @@ impl HostCenter {
                 index
             }
             RemoteForm::Edit(index) if index < self.profiles.len() => {
-                let source = connection_source(&self.profiles[index]);
                 let ConnectionProfile::Ssh {
                     label: new_label,
                     destination: new_destination,
                     port: new_port,
                     identity_file: new_identity,
+                    proxy_jump: new_proxy_jump,
                     herdr_path: new_herdr,
                     ..
                 } = draft
@@ -1046,30 +996,21 @@ impl HostCenter {
                 let metadata = self.host_metadata.entry(id).or_default();
                 metadata.group = group.clone();
                 metadata.tags = tags.clone();
-                if source == ConnectionSource::SshConfig {
-                    metadata.display_name = Some(new_label.clone()).filter(|label| {
-                        label != ssh_destination(&self.profiles[index]).unwrap_or_default()
-                    });
-                    metadata.port_override = new_port;
-                    metadata.identity_file_override = new_identity.clone();
-                    metadata.herdr_path_override =
-                        (new_herdr != "herdr").then_some(new_herdr.clone());
-                }
                 match &mut self.profiles[index] {
                     ConnectionProfile::Ssh {
                         label,
                         destination,
                         port,
                         identity_file,
+                        proxy_jump,
                         herdr_path,
                         ..
                     } => {
                         *label = new_label;
-                        if source == ConnectionSource::Saved {
-                            *destination = new_destination;
-                        }
+                        *destination = new_destination;
                         *port = new_port;
                         *identity_file = new_identity;
+                        *proxy_jump = new_proxy_jump;
                         *herdr_path = new_herdr;
                     }
                     ConnectionProfile::Local { .. } => unreachable!(),
@@ -1122,6 +1063,7 @@ impl HostCenter {
             .content()
             .trim()
             .to_owned();
+        let proxy_jump = self.remote_proxy_jump.read(cx).content().trim().to_owned();
         let herdr_path = self.remote_herdr_path.read(cx).content().trim().to_owned();
         let port = if port_text.is_empty() {
             None
@@ -1157,6 +1099,7 @@ impl HostCenter {
             destination,
             port,
             identity_file: (!identity_file.is_empty()).then(|| PathBuf::from(identity_file)),
+            proxy_jump: (!proxy_jump.is_empty()).then_some(proxy_jump),
             herdr_path: if herdr_path.is_empty() {
                 "herdr".into()
             } else {
@@ -1173,6 +1116,8 @@ impl HostCenter {
         self.remote_port
             .update(cx, |input, cx| input.set_content("", cx));
         self.remote_identity_file
+            .update(cx, |input, cx| input.set_content("", cx));
+        self.remote_proxy_jump
             .update(cx, |input, cx| input.set_content("", cx));
         self.remote_herdr_path
             .update(cx, |input, cx| input.set_content("herdr", cx));
@@ -1214,6 +1159,7 @@ impl HostCenter {
                 destination,
                 port,
                 identity_file,
+                proxy_jump,
                 herdr_path,
                 ..
             } => {
@@ -1233,10 +1179,15 @@ impl HostCenter {
                         cx,
                     )
                 });
+                self.remote_proxy_jump.update(cx, |input, cx| {
+                    input.set_content(proxy_jump.clone().unwrap_or_default(), cx)
+                });
                 self.remote_herdr_path
                     .update(cx, |input, cx| input.set_content(herdr_path.clone(), cx));
-                self.remote_advanced_open =
-                    port.is_some() || identity_file.is_some() || herdr_path != "herdr";
+                self.remote_advanced_open = port.is_some()
+                    || identity_file.is_some()
+                    || proxy_jump.is_some()
+                    || herdr_path != "herdr";
             }
         }
     }
@@ -1244,6 +1195,22 @@ impl HostCenter {
     pub(crate) fn select_live_profile(&mut self, index: usize, cx: &mut Context<Self>) {
         cx.emit(HostCenterEvent::ProfileSelected(index));
     }
+}
+
+/// SSH config aliases that have not been imported yet. Imported machines keep
+/// their origin in `HostMetadata::source_alias`, which is the dedup key.
+fn unimported_ssh_aliases(
+    aliases: Vec<String>,
+    metadata: &HashMap<String, HostMetadata>,
+) -> Vec<String> {
+    let imported = metadata
+        .values()
+        .filter_map(|meta| meta.source_alias.as_deref())
+        .collect::<HashSet<_>>();
+    aliases
+        .into_iter()
+        .filter(|alias| !imported.contains(alias.as_str()))
+        .collect()
 }
 
 fn restore_cancelled_check(health: &mut HashMap<String, HostHealthView>, id: &str) {
@@ -1301,6 +1268,7 @@ mod tests {
             destination: destination.into(),
             port: None,
             identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         }
     }
@@ -1320,14 +1288,6 @@ mod tests {
             profiles: vec![
                 ConnectionProfile::default(),
                 manual_profile("manual-1", "alpha.example"),
-                ConnectionProfile::Ssh {
-                    id: "ssh-config:build".into(),
-                    label: "build".into(),
-                    destination: "build".into(),
-                    port: None,
-                    identity_file: None,
-                    herdr_path: "herdr".into(),
-                },
             ],
             recent_connection_ids: vec!["manual-1".into(), "local".into()],
             host_metadata,
@@ -1371,8 +1331,56 @@ mod tests {
             !settings
                 .connections
                 .iter()
-                .any(|profile| profile.id() == "local" || profile.id().starts_with("ssh-config:"))
+                .any(|profile| profile.id() == "local")
         );
+    }
+
+    #[test]
+    fn unimported_aliases_skip_already_imported_origins() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "manual-7".into(),
+            HostMetadata {
+                source_alias: Some("prod-box".into()),
+                ..HostMetadata::default()
+            },
+        );
+
+        let candidates =
+            unimported_ssh_aliases(vec!["prod-box".into(), "dev-vm".into()], &metadata);
+
+        assert_eq!(candidates, vec!["dev-vm".to_owned()]);
+    }
+
+    #[test]
+    fn imported_profile_survives_ssh_config_removal() {
+        // The resolved destination is stored verbatim; nothing in the profile
+        // references the alias after import.
+        let profile = ConnectionProfile::Ssh {
+            id: "manual-3".into(),
+            label: "prod-box".into(),
+            destination: "deploy@10.0.1.5".into(),
+            port: Some(2222),
+            identity_file: Some(PathBuf::from("~/.ssh/prod_key")),
+            proxy_jump: Some("bastion".into()),
+            herdr_path: "herdr".into(),
+        };
+        let json = serde_json::to_string(&profile).expect("serialize");
+        let parsed: ConnectionProfile = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(parsed, profile);
+        match parsed {
+            ConnectionProfile::Ssh {
+                destination,
+                port,
+                proxy_jump,
+                ..
+            } => {
+                assert_eq!(destination, "deploy@10.0.1.5");
+                assert_eq!(port, Some(2222));
+                assert_eq!(proxy_jump.as_deref(), Some("bastion"));
+            }
+            ConnectionProfile::Local { .. } => panic!("expected ssh profile"),
+        }
     }
 
     fn ready_health() -> HostHealthView {

@@ -1137,3 +1137,84 @@ fn saving_a_host_discards_its_probe_instead_of_restoring_it(cx: &mut TestAppCont
         );
     });
 }
+
+#[gpui::test]
+fn ssh_import_stores_a_self_contained_profile(cx: &mut TestAppContext) {
+    install_app(cx);
+    let center = cx.new(|cx| {
+        HostCenter::new(
+            saved_host_settings(),
+            I18n::new(Language::English),
+            cx.focus_handle(),
+            cx,
+        )
+    });
+
+    center.update(cx, |center, cx| {
+        center.ssh_candidates = vec!["prod-box".into(), "dev-vm".into()];
+        center.finish_ssh_import(
+            "prod-box".into(),
+            ocherdr_herdr::ResolvedSshHost {
+                destination: "deploy@10.0.1.5".into(),
+                port: Some(2222),
+                identity_file: Some(std::path::PathBuf::from("~/.ssh/prod_key")),
+                proxy_jump: Some("bastion".into()),
+                has_proxy_command: false,
+            },
+            cx,
+        );
+
+        let index = center
+            .profiles
+            .iter()
+            .position(|profile| profile.id() == "manual-2")
+            .expect("imported host lands in the managed catalog");
+        let ConnectionProfile::Ssh {
+            label,
+            destination,
+            port,
+            identity_file,
+            proxy_jump,
+            ..
+        } = &center.profiles[index]
+        else {
+            panic!("imported host must be an ssh profile");
+        };
+        assert_eq!(label, "prod-box");
+        assert_eq!(destination, "deploy@10.0.1.5");
+        assert_eq!(*port, Some(2222));
+        assert_eq!(
+            identity_file.as_deref(),
+            Some(std::path::Path::new("~/.ssh/prod_key"))
+        );
+        assert_eq!(proxy_jump.as_deref(), Some("bastion"));
+        assert_eq!(center.managed_profile_index, index);
+        assert_eq!(
+            center.host_metadata["manual-2"].source_alias.as_deref(),
+            Some("prod-box"),
+            "the origin alias is the dedup key for the import section"
+        );
+        assert_eq!(center.ssh_candidates, vec!["dev-vm".to_owned()]);
+    });
+}
+
+#[gpui::test]
+fn ssh_section_toggle_flips_collapsed_state(cx: &mut TestAppContext) {
+    install_app(cx);
+    let center = cx.new(|cx| {
+        HostCenter::new(
+            saved_host_settings(),
+            I18n::new(Language::English),
+            cx.focus_handle(),
+            cx,
+        )
+    });
+
+    center.update(cx, |center, cx| {
+        assert!(!center.ssh_section_open);
+        center.toggle_ssh_section(cx);
+        assert!(center.ssh_section_open);
+        center.toggle_ssh_section(cx);
+        assert!(!center.ssh_section_open);
+    });
+}

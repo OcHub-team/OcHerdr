@@ -1100,6 +1100,7 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
             destination: "unused".into(),
             port: None,
             identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         };
         let session_b = SessionSummary {
@@ -1354,6 +1355,7 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
             destination: "unused.example".into(),
             port: None,
             identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         };
         cx.write_to_clipboard(gpui::ClipboardItem {
@@ -1612,6 +1614,7 @@ fn clicking_a_parked_hosts_agent_notification_switches_host_and_pane(cx: &mut Te
             destination: "unused".into(),
             port: None,
             identity_file: None,
+            proxy_jump: None,
             herdr_path: "herdr".into(),
         };
         let session_b = SessionSummary {

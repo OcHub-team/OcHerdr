@@ -45,6 +45,9 @@ pub enum ConnectionProfile {
         port: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity_file: Option<PathBuf>,
+        /// Bastion/jump host captured at import time (`ssh -J`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy_jump: Option<String>,
         #[serde(default = "default_herdr_path")]
         herdr_path: String,
     },
