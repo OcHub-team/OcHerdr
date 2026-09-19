@@ -26,6 +26,15 @@ pub(crate) struct HostPersistState {
 }
 
 pub(crate) fn assemble_settings(host: &HostPersistState) -> Settings {
+    // Metadata for profiles that no longer exist is garbage-collected here so
+    // it can't accumulate. `ssh-config:*` entries are kept: they hold the
+    // user's organization for aliases that may be imported later, and
+    // `finish_ssh_import` migrates + removes them when that happens.
+    let known_ids = host
+        .profiles
+        .iter()
+        .map(|profile| profile.id().to_owned())
+        .collect::<HashSet<_>>();
     Settings {
         schema_version: crate::SETTINGS_SCHEMA_VERSION,
         connections: host
@@ -35,7 +44,12 @@ pub(crate) fn assemble_settings(host: &HostPersistState) -> Settings {
             .cloned()
             .collect(),
         recent_connection_ids: host.recent_connection_ids.clone(),
-        host_metadata: host.host_metadata.clone(),
+        host_metadata: host
+            .host_metadata
+            .iter()
+            .filter(|(id, _)| known_ids.contains(*id) || id.starts_with("ssh-config:"))
+            .map(|(id, metadata)| (id.clone(), metadata.clone()))
+            .collect(),
         host_groups: host.host_groups.clone(),
         host_health: host
             .host_health
@@ -52,6 +66,10 @@ pub(crate) fn assemble_settings(host: &HostPersistState) -> Settings {
 pub(crate) enum HostSaveThen {
     ShowHostCenter,
     Connect,
+    /// Persist and adopt the profile without touching the current overlay.
+    /// Background actions (SSH-config import) must not dismiss an open form
+    /// or resurrect a closed host center.
+    Stay,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +81,7 @@ pub(crate) enum HostCenterEvent {
     },
     HostSaved {
         rollback: HostRollback,
-        index: usize,
+        id: String,
         then: HostSaveThen,
     },
     ProfileSelected(usize),
@@ -459,19 +477,12 @@ impl HostCenter {
         self.host_health = restore_cancelled_checks(std::mem::take(&mut self.host_health));
     }
 
-    pub(crate) fn invalidate_probe_for_saved_host(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(id) = self
-            .profiles
-            .get(index)
-            .map(|profile| profile.id().to_owned())
-        else {
-            return;
-        };
+    pub(crate) fn invalidate_probe_for_saved_host(&mut self, id: &str, cx: &mut Context<Self>) {
         discard_probe_for_host(
             &mut self.host_check_inflight,
             &mut self.host_check_queue,
             &mut self.host_health,
-            &id,
+            id,
         );
         self.pump_host_checks(cx);
     }
@@ -822,19 +833,20 @@ impl HostCenter {
         self.profiles.push(profile);
         let index = self.profiles.len() - 1;
         let id = self.profiles[index].id().to_owned();
-        self.host_metadata.insert(
-            id,
-            HostMetadata {
-                source_alias: Some(alias.clone()),
-                ..HostMetadata::default()
-            },
-        );
+        // Carry forward any organization the user set on the old ssh-config
+        // entry so importing doesn't lose favorites, groups, or tags.
+        let mut metadata = self
+            .host_metadata
+            .remove(&format!("ssh-config:{alias}"))
+            .unwrap_or_default();
+        metadata.source_alias = Some(alias.clone());
+        self.host_metadata.insert(id.clone(), metadata);
         self.ssh_candidates.retain(|candidate| candidate != &alias);
         self.managed_profile_index = index;
         cx.emit(HostCenterEvent::HostSaved {
             rollback,
-            index,
-            then: HostSaveThen::ShowHostCenter,
+            id,
+            then: HostSaveThen::Stay,
         });
         if resolved.has_proxy_command {
             self.fail(
@@ -1032,9 +1044,10 @@ impl HostCenter {
             self.host_groups.sort_by_key(|group| group.to_lowercase());
         }
         self.managed_profile_index = index;
+        let id = self.profiles[index].id().to_owned();
         cx.emit(HostCenterEvent::HostSaved {
             rollback,
-            index,
+            id,
             then: if connect {
                 HostSaveThen::Connect
             } else {

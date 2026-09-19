@@ -769,22 +769,20 @@ impl OcHerdrView {
                 let profiles = self.host_center.read(cx).profiles().to_vec();
                 self.adopt_profiles(profiles, cx);
             }
-            (Ok(()), Some(HostPersistFollowUp::Saved { index, then })) => {
+            (Ok(()), Some(HostPersistFollowUp::Saved { id, then })) => {
                 self.host_center.update(cx, |center, cx| {
-                    center.invalidate_probe_for_saved_host(index, cx);
+                    center.invalidate_probe_for_saved_host(&id, cx);
                 });
                 let profiles = self.host_center.read(cx).profiles().to_vec();
                 self.adopt_profiles(profiles, cx);
-                self.set_overlay(Overlay::NodeManager, cx);
+                if !matches!(then, HostSaveThen::Stay) {
+                    self.set_overlay(Overlay::NodeManager, cx);
+                }
                 if then == HostSaveThen::Connect {
-                    if let Some(profile_id) = self
-                        .profiles
-                        .get(index)
-                        .map(|profile| profile.id().to_owned())
-                    {
-                        self.disconnect_host(&profile_id, cx);
+                    self.disconnect_host(&id, cx);
+                    if let Some(index) = profile_index_by_id(&self.profiles, &id) {
+                        self.request_choose_node(index, cx);
                     }
-                    self.request_choose_node(index, cx);
                 }
             }
             (Err(detail), host) => {
@@ -801,6 +799,10 @@ impl OcHerdrView {
                 if !continuing
                     && let Some(kind) = match host {
                         Some(HostPersistFollowUp::Revertible { error }) => Some(error),
+                        Some(HostPersistFollowUp::Saved {
+                            then: HostSaveThen::Stay,
+                            ..
+                        }) => Some(FailureKind::ImportHost),
                         Some(HostPersistFollowUp::Saved { .. }) => Some(FailureKind::SaveHost),
                         None => None,
                     }
@@ -849,15 +851,11 @@ impl OcHerdrView {
                     cx,
                 );
             }
-            HostCenterEvent::HostSaved {
-                rollback,
-                index,
-                then,
-            } => {
+            HostCenterEvent::HostSaved { rollback, id, then } => {
                 self.queue_settings_persist(
                     SettingsPersist {
                         config_error: None,
-                        host: Some(HostPersistFollowUp::Saved { index, then }),
+                        host: Some(HostPersistFollowUp::Saved { id, then }),
                         rollback: Some(rollback),
                         domains: PersistDomains {
                             connections: true,

@@ -1006,7 +1006,8 @@ struct HostMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
     /// The `~/.ssh/config` alias this machine was imported from. Used to hide
-    /// the alias from the import section and to badge the row's origin.
+    /// the alias from the import section (dedup) and to carry organization
+    /// forward when a legacy ssh-config entry is imported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_alias: Option<String>,
 }
@@ -1265,10 +1266,17 @@ struct PersistDomains {
     ui_state: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum HostPersistFollowUp {
-    Revertible { error: FailureKind },
-    Saved { index: usize, then: HostSaveThen },
+    Revertible {
+        error: FailureKind,
+    },
+    /// The saved host is identified by id, not index — queued writes resolve
+    /// the position at follow-up time so interleaved deletes can't mislead it.
+    Saved {
+        id: String,
+        then: HostSaveThen,
+    },
 }
 
 #[derive(Clone, Debug)]

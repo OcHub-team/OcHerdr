@@ -1223,12 +1223,15 @@ pub struct ResolvedSshHost {
 /// Resolves an `~/.ssh/config` alias through `ssh -G` into self-contained
 /// connection fields.
 pub fn resolve_ssh_alias(alias: &str) -> Result<ResolvedSshHost> {
-    let output = Command::new(system_ssh())
+    let mut command = Command::new(system_ssh());
+    command
         .arg("-G")
         .arg(alias)
         .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
+        .stderr(Stdio::piped());
+    // `ssh -G` only reads local config, but a wedged binary or a blocking
+    // Include target must not strand the import UI in "importing" forever.
+    let output = command_output_with_timeout(&mut command, Duration::from_secs(10))?;
     if !output.status.success() {
         return Err(HerdrError::Ssh(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -1241,6 +1244,30 @@ pub fn resolve_ssh_alias(alias: &str) -> Result<ResolvedSshHost> {
         )));
     }
     Ok(resolved)
+}
+
+/// Runs a command to completion with a wall-clock deadline, killing the
+/// child when the deadline passes so callers never wait forever.
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(_) => return Ok(child.wait_with_output()?),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HerdrError::Ssh(format!(
+                    "command timed out after {}s",
+                    timeout.as_secs()
+                )));
+            }
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 /// Identity files OpenSSH probes implicitly; `ssh -G` reports them even

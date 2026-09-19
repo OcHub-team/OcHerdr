@@ -176,6 +176,55 @@ fn merged_revertible_persists_keep_the_earliest_rollback() {
 }
 
 #[test]
+fn a_background_import_stay_follow_up_cannot_steal_a_queued_connect() {
+    let connect = HostPersistFollowUp::Saved {
+        id: "manual-1".into(),
+        then: HostSaveThen::Connect,
+    };
+    let merged = merge_host_follow_up(
+        Some(connect),
+        Some(HostPersistFollowUp::Saved {
+            id: "manual-2".into(),
+            then: HostSaveThen::Stay,
+        }),
+    );
+    assert!(
+        matches!(
+            merged,
+            Some(HostPersistFollowUp::Saved {
+                then: HostSaveThen::Connect,
+                ..
+            })
+        ),
+        "an SSH import completing must not replace a pending save & connect"
+    );
+}
+
+#[test]
+fn a_later_user_save_still_supersedes_a_background_import() {
+    let merged = merge_host_follow_up(
+        Some(HostPersistFollowUp::Saved {
+            id: "manual-2".into(),
+            then: HostSaveThen::Stay,
+        }),
+        Some(HostPersistFollowUp::Saved {
+            id: "manual-1".into(),
+            then: HostSaveThen::ShowHostCenter,
+        }),
+    );
+    assert!(
+        matches!(
+            merged,
+            Some(HostPersistFollowUp::Saved {
+                then: HostSaveThen::ShowHostCenter,
+                ..
+            })
+        ),
+        "the user's explicit save wins over a queued background import"
+    );
+}
+
+#[test]
 fn a_failed_host_write_keeps_a_queued_write_for_a_different_host() {
     let mut pending = Some(revertible_persist(
         FailureKind::UpdateFavorites,

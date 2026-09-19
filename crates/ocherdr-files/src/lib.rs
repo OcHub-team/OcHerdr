@@ -50,6 +50,7 @@ pub enum BackendSpec {
         destination: String,
         port: Option<u16>,
         identity_file: Option<PathBuf>,
+        proxy_jump: Option<String>,
     },
 }
 
@@ -61,11 +62,13 @@ impl BackendSpec {
                 destination,
                 port,
                 identity_file,
+                proxy_jump,
                 ..
             } => Self::Sftp {
                 destination: destination.clone(),
                 port: *port,
                 identity_file: identity_file.clone(),
+                proxy_jump: proxy_jump.clone(),
             },
         }
     }
@@ -525,10 +528,12 @@ impl Worker {
                 destination,
                 port,
                 identity_file,
+                proxy_jump,
             } => Self::Sftp(Box::new(RemoteWorker {
                 destination,
                 port,
                 identity_file,
+                proxy_jump,
                 session: None,
                 #[cfg(windows)]
                 ssh_child: None,
@@ -773,6 +778,7 @@ struct RemoteWorker {
     destination: String,
     port: Option<u16>,
     identity_file: Option<PathBuf>,
+    proxy_jump: Option<String>,
     session: Option<Sftp>,
     #[cfg(windows)]
     ssh_child: Option<tokio::process::Child>,
@@ -793,6 +799,9 @@ impl RemoteWorker {
                 }
                 if let Some(identity_file) = &self.identity_file {
                     builder.keyfile(identity_file);
+                }
+                if let Some(proxy_jump) = &self.proxy_jump {
+                    builder.jump_hosts([proxy_jump]);
                 }
                 let ssh = builder
                     .connect(&self.destination)
@@ -820,6 +829,9 @@ impl RemoteWorker {
                 }
                 if let Some(identity_file) = &self.identity_file {
                     command.arg("-i").arg(identity_file);
+                }
+                if let Some(proxy_jump) = &self.proxy_jump {
+                    command.arg("-J").arg(proxy_jump);
                 }
                 command
                     .arg("-s")

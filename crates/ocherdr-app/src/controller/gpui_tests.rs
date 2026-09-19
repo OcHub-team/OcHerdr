@@ -25,11 +25,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::split_drag_from_press;
-use crate::host_center::HostCenter;
+use crate::host_center::{HostCenter, HostCenterEvent, HostSaveThen};
 use crate::{
     AgentOutputState, AgentPromptPhase, AppearanceSettings, CachedHostHealth, EventStreamState,
-    HEADER_HEIGHT, HostHealthView, I18n, Language, OcHerdrView, PendingListReorder, ReorderList,
-    Settings, TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_GAP, TAB_PREVIEW_HEIGHT,
+    HEADER_HEIGHT, HostHealthView, HostMetadata, I18n, Language, OcHerdrView, PendingListReorder,
+    ReorderList, Settings, TAB_PILL_WIDTH, TAB_PREVIEW_DELAY, TAB_PREVIEW_GAP, TAB_PREVIEW_HEIGHT,
     TAB_PREVIEW_WIDTH, install_appearance, reorder_projection,
 };
 

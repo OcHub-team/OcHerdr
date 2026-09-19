@@ -1283,10 +1283,20 @@ pub(super) fn merge_host_follow_up(
     next: Option<HostPersistFollowUp>,
 ) -> Option<HostPersistFollowUp> {
     match (previous, next) {
+        // A queued save/connect already expresses the user's final intent for
+        // the write it belongs to — neither a later trivial write nor a
+        // background Stay follow-up (SSH import) may steal its slot.
         (
-            Some(saved @ HostPersistFollowUp::Saved { .. }),
+            Some(saved @ HostPersistFollowUp::Saved { then, .. }),
             Some(HostPersistFollowUp::Revertible { .. }),
-        ) => Some(saved),
+        )
+        | (
+            Some(saved @ HostPersistFollowUp::Saved { then, .. }),
+            Some(HostPersistFollowUp::Saved {
+                then: HostSaveThen::Stay,
+                ..
+            }),
+        ) if then != HostSaveThen::Stay => Some(saved),
         (previous, None) => previous,
         (_, Some(next)) => Some(next),
     }

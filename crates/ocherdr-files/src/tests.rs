@@ -198,3 +198,26 @@ fn editor_sync_refuses_stale_versions_and_replaces_atomically() {
     assert_eq!(monitor.snapshot().bytes_transferred, 15);
     assert!(monitor.is_finished());
 }
+
+#[test]
+fn backend_spec_from_ssh_profile_carries_proxy_jump() {
+    let profile = ConnectionProfile::Ssh {
+        id: "manual-1".into(),
+        label: "jumped".into(),
+        destination: "deploy@internal".into(),
+        port: Some(2222),
+        identity_file: Some(PathBuf::from("/keys/id_ed25519")),
+        proxy_jump: Some("bastion.example.com".into()),
+        herdr_path: "herdr".into(),
+    };
+
+    assert_eq!(
+        BackendSpec::from_profile(&profile),
+        BackendSpec::Sftp {
+            destination: "deploy@internal".into(),
+            port: Some(2222),
+            identity_file: Some(PathBuf::from("/keys/id_ed25519")),
+            proxy_jump: Some("bastion.example.com".into()),
+        }
+    );
+}

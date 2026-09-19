@@ -1119,18 +1119,13 @@ fn saving_a_host_discards_its_probe_instead_of_restoring_it(cx: &mut TestAppCont
     });
 
     center.update(cx, |center, cx| {
-        let index = center
-            .profiles
-            .iter()
-            .position(|profile| profile.id() == "manual-1")
-            .expect("saved host is in the catalog");
         center.host_health.insert(
             "manual-1".into(),
             HostHealthView::Checking {
                 previous: Some(Box::new(ready_health())),
             },
         );
-        center.invalidate_probe_for_saved_host(index, cx);
+        center.invalidate_probe_for_saved_host("manual-1", cx);
         assert!(
             !center.host_health.contains_key("manual-1"),
             "saving a host must discard the old probe, not restore the previous Cached result"
@@ -1216,5 +1211,96 @@ fn ssh_section_toggle_flips_collapsed_state(cx: &mut TestAppContext) {
         assert!(center.ssh_section_open);
         center.toggle_ssh_section(cx);
         assert!(!center.ssh_section_open);
+    });
+}
+
+#[gpui::test]
+fn ssh_import_persists_without_navigating_the_overlay(cx: &mut TestAppContext) {
+    install_app(cx);
+    let center = cx.new(|cx| {
+        HostCenter::new(
+            saved_host_settings(),
+            I18n::new(Language::English),
+            cx.focus_handle(),
+            cx,
+        )
+    });
+    let saved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = saved.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&center, move |_, event: &HostCenterEvent, _| {
+            if let HostCenterEvent::HostSaved { id, then, .. } = event {
+                captured.borrow_mut().push((id.clone(), *then));
+            }
+        })
+    });
+
+    center.update(cx, |center, cx| {
+        center.ssh_candidates = vec!["prod-box".into()];
+        center.finish_ssh_import(
+            "prod-box".into(),
+            ocherdr_herdr::ResolvedSshHost {
+                destination: "deploy@10.0.1.5".into(),
+                port: None,
+                identity_file: None,
+                proxy_jump: None,
+                has_proxy_command: false,
+            },
+            cx,
+        );
+    });
+
+    assert_eq!(
+        saved.borrow().as_slice(),
+        &[("manual-2".to_owned(), HostSaveThen::Stay)],
+        "a background import must persist without disturbing open forms or overlays"
+    );
+}
+
+#[gpui::test]
+fn ssh_import_migrates_legacy_ssh_config_organization(cx: &mut TestAppContext) {
+    install_app(cx);
+    let center = cx.new(|cx| {
+        let mut settings = saved_host_settings();
+        settings.host_metadata.insert(
+            "ssh-config:prod-box".into(),
+            HostMetadata {
+                favorite: true,
+                group: Some("prod".into()),
+                tags: vec!["critical".into()],
+                ..HostMetadata::default()
+            },
+        );
+        HostCenter::new(
+            settings,
+            I18n::new(Language::English),
+            cx.focus_handle(),
+            cx,
+        )
+    });
+
+    center.update(cx, |center, cx| {
+        center.ssh_candidates = vec!["prod-box".into()];
+        center.finish_ssh_import(
+            "prod-box".into(),
+            ocherdr_herdr::ResolvedSshHost {
+                destination: "deploy@10.0.1.5".into(),
+                port: None,
+                identity_file: None,
+                proxy_jump: None,
+                has_proxy_command: false,
+            },
+            cx,
+        );
+
+        let metadata = &center.host_metadata["manual-2"];
+        assert!(metadata.favorite);
+        assert_eq!(metadata.group.as_deref(), Some("prod"));
+        assert_eq!(metadata.tags, vec!["critical".to_owned()]);
+        assert_eq!(metadata.source_alias.as_deref(), Some("prod-box"));
+        assert!(
+            !center.host_metadata.contains_key("ssh-config:prod-box"),
+            "the legacy entry is consumed by the migration"
+        );
     });
 }
