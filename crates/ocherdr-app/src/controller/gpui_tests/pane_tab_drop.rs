@@ -16,7 +16,7 @@ fn connect_one_pane_view(
     snapshot.focused_pane_id = Some("p-left".into());
     snapshot.panes = vec![split_pane("p-left", true)];
     snapshot.layouts = vec![single_pane_layout("t-a", "p-left")];
-    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let fake = FakeHerdr::serving(snapshot);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -34,7 +34,7 @@ fn connect_two_pane_scripted(
     cx: &mut TestAppContext,
     script: PaneMoveScript,
 ) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
-    let fake = FakeHerdr::snapshot_with_live_events_and_script(two_pane_snapshot(), script);
+    let fake = FakeHerdr::serving_with_script(two_pane_snapshot(), script);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -118,53 +118,38 @@ fn focused_temp_tab() -> TabInfo {
     tab
 }
 
-fn pane_on_temp_tab(pane_id: &str, focused: bool) -> Value {
-    let mut pane = split_pane(pane_id, focused);
-    pane.tab_id = "t-tmp".into();
-    serde_json::to_value(pane).expect("pane json")
+/// What Herdr's hierarchy looks like after the new-tab drop from a two-pane
+/// tab: the temp tab exists and is focused, both tabs hold one pane each.
+fn new_tab_detach_state(snapshot: &mut HierarchySnapshot) {
+    snapshot.tabs.push(focused_temp_tab());
+    if let Some(pane) = snapshot
+        .panes
+        .iter_mut()
+        .find(|pane| pane.pane_id == "p-left")
+    {
+        pane.tab_id = "t-tmp".into();
+        pane.focused = true;
+    }
+    snapshot.layouts = vec![
+        single_pane_layout("t-a", "p-right"),
+        single_pane_layout("t-tmp", "p-left"),
+    ];
 }
 
-fn new_tab_detach_events() -> Vec<Value> {
-    let created = focused_temp_tab();
-    vec![
-        json!({ "event": "tab_created", "data": { "type": "tab_created", "tab": created.clone() } }),
-        json!({
-            "event": "pane_moved",
-            "data": {
-                "type": "pane_moved",
-                "pane": pane_on_temp_tab("p-left", true),
-                "previous_pane_id": "p-left",
-                "previous_workspace_id": "w",
-                "previous_tab_id": "t-a",
-                "created_tab": created,
-            }
-        }),
-        layout_event(single_pane_layout("t-a", "p-right")),
-        layout_event(single_pane_layout("t-tmp", "p-left")),
-    ]
-}
-
-fn last_pane_detach_events() -> Vec<Value> {
-    let created = focused_temp_tab();
-    vec![
-        json!({ "event": "tab_created", "data": { "type": "tab_created", "tab": created.clone() } }),
-        json!({
-            "event": "pane_moved",
-            "data": {
-                "type": "pane_moved",
-                "pane": pane_on_temp_tab("p-left", true),
-                "previous_pane_id": "p-left",
-                "previous_workspace_id": "w",
-                "previous_tab_id": "t-a",
-                "created_tab": created,
-            }
-        }),
-        json!({
-            "event": "tab_closed",
-            "data": { "type": "tab_closed", "tab_id": "t-a", "workspace_id": "w" }
-        }),
-        layout_event(single_pane_layout("t-tmp", "p-left")),
-    ]
+/// The dragged pane was the source tab's last: `t-a` is gone and only the
+/// temporary tab holds a layout.
+fn last_pane_detach_state(snapshot: &mut HierarchySnapshot) {
+    snapshot.tabs.retain(|tab| tab.tab_id != "t-a");
+    snapshot.tabs.push(focused_temp_tab());
+    if let Some(pane) = snapshot
+        .panes
+        .iter_mut()
+        .find(|pane| pane.pane_id == "p-left")
+    {
+        pane.tab_id = "t-tmp".into();
+        pane.focused = true;
+    }
+    snapshot.layouts = vec![single_pane_layout("t-tmp", "p-left")];
 }
 
 #[gpui::test]
@@ -350,16 +335,25 @@ fn zoomed_or_locked_or_unsupported_tabs_do_not_open_tab_bar_drops(cx: &mut TestA
             .zoomed = false;
     });
 
+    // No connection at all: pane moves are unsupported (the capability is
+    // the live connection itself), so the tab bar must stay inert even
+    // though the snapshot holds two droppable panes.
     let mut snapshot = three_tab_snapshot();
     snapshot.focused_pane_id = Some("p-left".into());
     snapshot.panes = vec![split_pane("p-left", true), split_pane("p-right", false)];
     snapshot.layouts = vec![two_pane_layout("p-left", "p-right")];
-    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
-    view.update(cx, |this, _| this.headless_terminals = true);
-    connect_view_to_fake_and_resync(&view, &fake, cx);
     view.update(cx, |this, cx| {
+        this.headless_terminals = true;
+        this.snapshot = Some(snapshot);
+        this.selection = Selection {
+            connection_id: "local".into(),
+            session_name: Some("alpha".into()),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-a".into()),
+            pane_id: Some("p-left".into()),
+        };
         this.terminal_surface_bounds = Some(SURFACE);
         assert!(!this.pane_move_supported());
         assert!(this.begin_pane_drag("p-left".into(), (SURFACE.0 + 12., SURFACE.1 + 12.)));
@@ -399,7 +393,17 @@ fn a_failed_or_disconnected_new_tab_drop_clears_the_lock(cx: &mut TestAppContext
     cx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
     view.update(cx, |this, cx| {
         assert!(!this.pane_detaches.is_empty());
-        this.apply_event_batch(None, cx);
+        let owner = this.current_session_key().expect("connected session key");
+        assert!(
+            !this.apply_endpoint_batch(
+                &owner,
+                vec![Err(ocherdr_herdr::HerdrError::TerminalClosed(
+                    "endpoint socket dropped".into()
+                ))],
+                cx
+            ),
+            "a dead endpoint stream stops the listener"
+        );
         assert!(this.pane_detaches.is_empty());
         assert!(!this.tab_relocation_locked("t-a"));
     });
@@ -409,52 +413,30 @@ fn a_failed_or_disconnected_new_tab_drop_clears_the_lock(cx: &mut TestAppContext
 
 #[gpui::test]
 fn new_tab_events_before_the_response_still_converge(cx: &mut TestAppContext) {
-    let script = PaneMoveScript {
-        events_before_park_response: Mutex::new(new_tab_detach_events()),
-        ..PaneMoveScript::default()
-    };
-    let (fake, view, cx) = connect_two_pane_scripted(cx, script);
+    let (fake, view, cx) = connect_two_pane_scripted(cx, PaneMoveScript::default());
     let point = hover_new_tab_drop(&view, cx);
     view.update_in(cx, |this, window, cx| {
         assert!(this.finish_pane_drag((f32::from(point.x), f32::from(point.y)), window, cx));
-        assert!(
-            this.pane_detaches.contains_key("t-a"),
-            "the detach is pending before any event or response"
-        );
+        assert!(this.pane_detaches.contains_key("t-a"));
         assert!(!this.pane_detaches.get("t-a").unwrap().responded);
     });
-
-    // The fake broadcasts live events, then waits 60ms before writing the
-    // pane.move response. Pump until those events are applied while the
-    // request is still unanswered.
-    let mut events_while_pending = false;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        let _ = cx.executor().tick();
-        view.read_with(cx, |this, _| {
-            let temp_tab_known = this
-                .snapshot
+    apply_snapshot_before_response(&fake, &view, new_tab_detach_state, cx);
+    view.read_with(cx, |this, _| {
+        let pending = this
+            .pane_detaches
+            .get("t-a")
+            .expect("a pushed snapshot must not discard the pending detach");
+        assert!(!pending.responded);
+        assert!(
+            this.snapshot
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp"));
-            if temp_tab_known {
-                let pending = this
-                    .pane_detaches
-                    .get("t-a")
-                    .expect("events must not drop the pending detach before the response");
-                assert!(!pending.responded, "events beat the response: {pending:?}");
-                assert!(!this.hidden_tab_ids().contains("t-tmp"));
-                events_while_pending = true;
-            }
-        });
-        if events_while_pending {
-            break;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert!(
-        events_while_pending,
-        "the race was exercised: events landed while the detach was still pending"
-    );
+                .unwrap()
+                .tabs
+                .iter()
+                .any(|tab| tab.tab_id == "t-tmp")
+        );
+        assert!(!this.hidden_tab_ids().contains("t-tmp"));
+    });
     cx.run_until_parked();
     view.read_with(cx, |this, _| {
         assert!(
@@ -486,11 +468,16 @@ fn new_tab_events_settle_without_hiding_the_created_tab(cx: &mut TestAppContext)
     let point = hover_new_tab_drop(&view, cx);
     cx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
-    send_events(&fake, new_tab_detach_events(), cx);
+    push_state(&fake, &view, cx, new_tab_detach_state, |snapshot| {
+        snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp")
+            && snapshot
+                .pane("p-left")
+                .is_some_and(|pane| pane.tab_id == "t-tmp")
+    });
     view.read_with(cx, |this, _| {
         assert!(
             this.pane_detaches.is_empty(),
-            "response + matching events settle"
+            "response + matching state settles"
         );
         let snapshot = this.snapshot.as_ref().expect("snapshot");
         assert!(snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp"));
@@ -520,7 +507,10 @@ fn moving_the_last_pane_does_not_send_tab_close(cx: &mut TestAppContext) {
     assert_eq!(fake.requests_for("pane.move").len(), 1);
     assert_new_tab_move(&fake.requests_for("pane.move")[0]);
     assert!(fake.requests_for("tab.close").is_empty());
-    send_events(&fake, last_pane_detach_events(), cx);
+    push_state(&fake, &view, cx, last_pane_detach_state, |snapshot| {
+        snapshot.tabs.iter().all(|tab| tab.tab_id != "t-a")
+            && snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp")
+    });
     view.read_with(cx, |this, _| {
         assert!(this.pane_detaches.is_empty());
         let snapshot = this.snapshot.as_ref().expect("snapshot");
@@ -581,7 +571,7 @@ fn connect_merge_view_scripted(
     cx: &mut TestAppContext,
     script: PaneMoveScript,
 ) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
-    let fake = FakeHerdr::snapshot_with_live_events_and_script(two_tab_merge_snapshot(), script);
+    let fake = FakeHerdr::serving_with_script(two_tab_merge_snapshot(), script);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -635,26 +625,19 @@ fn assert_existing_tab_move(request: &Value, tab_id: &str, target_pane_id: &str)
     assert_eq!(request["params"]["focus"], json!(true));
 }
 
-fn merge_into_b_events() -> Vec<Value> {
-    let mut moved = pane_on_tab("p-left", "t-b", true);
-    moved.tab_id = "t-b".into();
-    vec![
-        json!({
-            "event": "pane_moved",
-            "data": {
-                "type": "pane_moved",
-                "pane": moved,
-                "previous_pane_id": "p-left",
-                "previous_workspace_id": "w",
-                "previous_tab_id": "t-a",
-            }
-        }),
-        json!({
-            "event": "tab_closed",
-            "data": { "type": "tab_closed", "tab_id": "t-a", "workspace_id": "w" }
-        }),
-        layout_event(layout_on_tab("t-b", "p-b", "p-left")),
-    ]
+/// After the merge into `t-b`: the single-pane source tab closed and `t-b`
+/// holds `p-b | p-left`.
+fn merge_into_b_state(snapshot: &mut HierarchySnapshot) {
+    snapshot.tabs.retain(|tab| tab.tab_id != "t-a");
+    if let Some(pane) = snapshot
+        .panes
+        .iter_mut()
+        .find(|pane| pane.pane_id == "p-left")
+    {
+        pane.tab_id = "t-b".into();
+        pane.focused = true;
+    }
+    snapshot.layouts = vec![layout_on_tab("t-b", "p-b", "p-left")];
 }
 
 #[gpui::test]
@@ -791,7 +774,12 @@ fn existing_tab_events_settle_after_the_response(cx: &mut TestAppContext) {
     let point = hover_existing_drop(&view, cx, "t-b");
     cx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
-    send_events(&fake, merge_into_b_events(), cx);
+    push_state(&fake, &view, cx, merge_into_b_state, |snapshot| {
+        snapshot.tabs.iter().all(|tab| tab.tab_id != "t-a")
+            && snapshot
+                .pane("p-left")
+                .is_some_and(|pane| pane.tab_id == "t-b")
+    });
     view.read_with(cx, |this, _| {
         assert!(this.pane_detaches.is_empty());
         let snapshot = this.snapshot.as_ref().expect("snapshot");
@@ -808,45 +796,30 @@ fn existing_tab_events_settle_after_the_response(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn existing_tab_events_before_the_response_still_converge(cx: &mut TestAppContext) {
-    let script = PaneMoveScript {
-        events_before_insert_response: Mutex::new(merge_into_b_events()),
-        ..PaneMoveScript::default()
-    };
-    let (fake, view, cx) = connect_merge_view_scripted(cx, script);
+    let (fake, view, cx) = connect_merge_view_scripted(cx, PaneMoveScript::default());
     let point = hover_existing_drop(&view, cx, "t-b");
     view.update_in(cx, |this, window, cx| {
         assert!(this.finish_pane_drag((f32::from(point.x), f32::from(point.y)), window, cx));
         assert!(this.pane_detaches.contains_key("t-a"));
         assert!(!this.pane_detaches.get("t-a").unwrap().responded);
     });
-    let mut events_while_pending = false;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        let _ = cx.executor().tick();
-        view.read_with(cx, |this, _| {
-            let moved = this.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot
-                    .pane("p-left")
-                    .is_some_and(|pane| pane.tab_id == "t-b")
-            });
-            if moved {
-                let pending = this
-                    .pane_detaches
-                    .get("t-a")
-                    .expect("events must not drop the pending transfer before the response");
-                assert!(!pending.responded);
-                events_while_pending = true;
-            }
-        });
-        if events_while_pending {
-            break;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert!(
-        events_while_pending,
-        "the race was exercised: events landed while the transfer was still pending"
-    );
+    apply_snapshot_before_response(&fake, &view, merge_into_b_state, cx);
+    view.read_with(cx, |this, _| {
+        let pending = this
+            .pane_detaches
+            .get("t-a")
+            .expect("a pushed snapshot must not discard the pending transfer");
+        assert!(!pending.responded);
+        assert_eq!(
+            this.snapshot
+                .as_ref()
+                .unwrap()
+                .pane("p-left")
+                .unwrap()
+                .tab_id,
+            "t-b"
+        );
+    });
     cx.run_until_parked();
     view.read_with(cx, |this, _| {
         assert!(this.pane_detaches.is_empty());
@@ -866,7 +839,9 @@ fn merging_the_last_pane_does_not_send_tab_close(cx: &mut TestAppContext) {
     let point = hover_existing_drop(&view, cx, "t-b");
     cx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
-    send_events(&fake, merge_into_b_events(), cx);
+    push_state(&fake, &view, cx, merge_into_b_state, |snapshot| {
+        snapshot.tabs.iter().all(|tab| tab.tab_id != "t-a")
+    });
     view.read_with(cx, |this, _| {
         assert!(this.pane_detaches.is_empty());
         let snapshot = this.snapshot.as_ref().expect("snapshot");
@@ -1033,10 +1008,7 @@ fn two_pane_source_merge_snapshot() -> HierarchySnapshot {
 fn connect_two_pane_merge_view(
     cx: &mut TestAppContext,
 ) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
-    let fake = FakeHerdr::snapshot_with_live_events_and_script(
-        two_pane_source_merge_snapshot(),
-        PaneMoveScript::default(),
-    );
+    let fake = FakeHerdr::serving(two_pane_source_merge_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -1050,21 +1022,20 @@ fn connect_two_pane_merge_view(
     (fake, view, cx)
 }
 
-fn multi_pane_merge_into_b_events() -> Vec<Value> {
-    vec![
-        json!({
-            "event": "pane_moved",
-            "data": {
-                "type": "pane_moved",
-                "pane": pane_on_tab("p-left", "t-b", true),
-                "previous_pane_id": "p-left",
-                "previous_workspace_id": "w",
-                "previous_tab_id": "t-a",
-            }
-        }),
-        layout_event(single_pane_layout("t-a", "p-right")),
-        layout_event(layout_on_tab("t-b", "p-b", "p-left")),
-    ]
+/// Two-pane source: `t-a` stays with `p-right` while `t-b` gains `p-left`.
+fn multi_pane_merge_into_b_state(snapshot: &mut HierarchySnapshot) {
+    if let Some(pane) = snapshot
+        .panes
+        .iter_mut()
+        .find(|pane| pane.pane_id == "p-left")
+    {
+        pane.tab_id = "t-b".into();
+        pane.focused = true;
+    }
+    snapshot.layouts = vec![
+        single_pane_layout("t-a", "p-right"),
+        layout_on_tab("t-b", "p-b", "p-left"),
+    ];
 }
 
 #[gpui::test]
@@ -1076,7 +1047,20 @@ fn merging_from_a_multi_pane_tab_keeps_the_source_tab(cx: &mut TestAppContext) {
     let moves = fake.requests_for("pane.move");
     assert_eq!(moves.len(), 1, "exactly one pane.move: {moves:?}");
     assert_existing_tab_move(&moves[0], "t-b", "p-b");
-    send_events(&fake, multi_pane_merge_into_b_events(), cx);
+    push_state(
+        &fake,
+        &view,
+        cx,
+        multi_pane_merge_into_b_state,
+        |snapshot| {
+            snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| layout.panes.len() == 1)
+                && snapshot
+                    .layout_for("t-b")
+                    .is_some_and(|layout| layout.panes.len() == 2)
+        },
+    );
     view.read_with(cx, |this, _| {
         assert!(this.pane_detaches.is_empty(), "the transfer must settle");
         let snapshot = this.snapshot.as_ref().expect("snapshot");

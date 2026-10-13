@@ -55,39 +55,6 @@ fn revertible_persist(kind: FailureKind, tag: &str) -> SettingsPersist {
 }
 
 #[test]
-fn pane_not_found_agent_status_subscribe_failure_resyncs() {
-    let error = HerdrError::Api {
-        code: "pane_not_found".into(),
-        message: "pane w19:p3 not found".into(),
-    };
-    assert_eq!(
-        agent_status_subscribe_failure_action(&error),
-        AgentStatusSubscribeFailureAction::Resync
-    );
-}
-
-#[test]
-fn other_agent_status_subscribe_api_failures_are_reported() {
-    let error = HerdrError::Api {
-        code: "unknown_type".into(),
-        message: "subscription rejected".into(),
-    };
-    assert_eq!(
-        agent_status_subscribe_failure_action(&error),
-        AgentStatusSubscribeFailureAction::Report
-    );
-}
-
-#[test]
-fn non_api_agent_status_subscribe_failures_are_reported() {
-    let error = HerdrError::EventStreamClosed("socket closed".into());
-    assert_eq!(
-        agent_status_subscribe_failure_action(&error),
-        AgentStatusSubscribeFailureAction::Report
-    );
-}
-
-#[test]
 fn settings_persist_keeps_only_the_latest_unwritten_value() {
     let mut pending = None;
     let started = enqueue_settings_persist(
@@ -337,66 +304,6 @@ fn two_tab_snapshot() -> HierarchySnapshot {
     }
 }
 
-fn status_event(pane_id: &str, status: AgentStatus, agent: &str) -> HerdrEvent {
-    HerdrEvent::PaneAgentStatusChanged {
-        pane_id: pane_id.into(),
-        workspace_id: "w".into(),
-        agent_status: status,
-        agent: Some(agent.into()),
-        title: None,
-        display_agent: Some("Codex".into()),
-        state_labels: HashMap::new(),
-    }
-}
-
-#[test]
-fn agent_notifications_require_a_real_working_to_terminal_transition() {
-    let mut snapshot = two_tab_snapshot();
-    snapshot.panes[0].agent = Some("codex".into());
-    snapshot.panes[0].display_agent = Some("Codex".into());
-    snapshot.panes[0].agent_status = AgentStatus::Working;
-
-    let notices = events::agent_system_notifications(
-        &snapshot,
-        &[
-            Ok(status_event("p-a", AgentStatus::Done, "codex")),
-            Ok(status_event("p-a", AgentStatus::Done, "codex")),
-            Ok(status_event("p-a", AgentStatus::Working, "codex")),
-            Ok(status_event("p-a", AgentStatus::Blocked, "codex")),
-        ],
-        None,
-    );
-    assert_eq!(notices.len(), 2, "repeated terminal states must not notify");
-
-    snapshot.panes[0].agent_status = AgentStatus::Idle;
-    assert!(
-        events::agent_system_notifications(
-            &snapshot,
-            &[Ok(status_event("p-a", AgentStatus::Done, "codex"))],
-            None,
-        )
-        .is_empty(),
-        "an initial idle/done snapshot replay is not a completed work transition"
-    );
-}
-
-#[test]
-fn agent_notifications_ignore_visible_and_stale_agent_events() {
-    let mut snapshot = two_tab_snapshot();
-    snapshot.panes[0].agent = Some("codex".into());
-    snapshot.panes[0].agent_status = AgentStatus::Working;
-    let event = status_event("p-a", AgentStatus::Done, "codex");
-    assert!(events::agent_system_notifications(&snapshot, &[Ok(event)], Some("p-a")).is_empty());
-    assert!(
-        events::agent_system_notifications(
-            &snapshot,
-            &[Ok(status_event("p-a", AgentStatus::Done, "claude"))],
-            None,
-        )
-        .is_empty()
-    );
-}
-
 #[test]
 fn cmd_w_closes_the_selected_split_pane() {
     let mut snapshot = two_tab_snapshot();
@@ -418,13 +325,6 @@ fn cmd_w_closes_the_tab_when_it_is_the_last_pane() {
         }
         other => panic!("expected tab close, got {other:?}"),
     }
-}
-
-#[test]
-fn stale_observe_frames_do_not_replace_or_paint_the_local_display_grid() {
-    assert!(!incoming_frame_should_apply(false, (80, 24), (80, 24)));
-    assert!(!incoming_frame_should_apply(true, (120, 40), (80, 24)));
-    assert!(incoming_frame_should_apply(true, (120, 40), (120, 40)));
 }
 
 fn target(pane_id: &str, mode: TerminalMode, focused: bool) -> PaneRuntimeTarget {
@@ -466,7 +366,7 @@ fn newly_visible_panes_attempt_non_takeover_control_only_once() {
 
     prime_automatic_terminal_control(&mut session, &first_visible, &live);
     assert_eq!(session.controls.get("p-a"), Some(&TerminalMode::Control));
-    assert!(demote_terminal_control(&mut session, "p-a"));
+    session.controls.remove("p-a");
 
     prime_automatic_terminal_control(&mut session, &first_visible, &live);
     assert!(
@@ -691,123 +591,9 @@ fn a_closed_stream_is_respawned_instead_of_kept() {
 }
 
 #[test]
-fn a_process_exit_closes_the_stream_without_an_app_error() {
-    assert!(is_expected_terminal_exit(&HerdrError::TerminalClosed(
-        "terminal t1 exited".into()
-    )));
-    assert!(is_expected_terminal_exit(&HerdrError::TerminalClosed(
-        "terminal worker stopped".into()
-    )));
-    assert!(!is_expected_terminal_exit(&HerdrError::Protocol(
-        "frame gap".into()
-    )));
-}
-
-#[test]
-fn lost_control_demotes_the_pane_to_observe_before_any_reconnect() {
-    let mut session = SessionPanes::new(SessionKey {
-        profile_id: "local".into(),
-        session_name: "work".into(),
-    });
-    session
-        .controls
-        .insert("p-a".into(), TerminalMode::ControlTakeover);
-    session
-        .controls
-        .insert("p-b".into(), TerminalMode::ControlTakeover);
-
-    assert!(demote_terminal_control(&mut session, "p-a"));
-    assert!(!session.controls.contains_key("p-a"));
-    assert_eq!(
-        session.controls.get("p-b"),
-        Some(&TerminalMode::ControlTakeover),
-        "another pane's control must survive this pane's takeover loss"
-    );
-    assert!(!demote_terminal_control(&mut session, "p-a"));
-}
-
-#[test]
-fn control_loss_reasons_are_distinguished_from_generic_stream_closure() {
-    assert_eq!(
-            terminal_control_loss(&HerdrError::TerminalClosed(
-                "terminal attach failed: terminal t1 already has an attached client; retry with --takeover".into()
-            )),
-            Some(TerminalControlLoss::Busy)
-        );
-    assert_eq!(
-        terminal_control_loss(&HerdrError::TerminalClosed(
-            "terminal attach taken over".into()
-        )),
-        Some(TerminalControlLoss::TakenOver)
-    );
-    assert_eq!(
-        terminal_control_loss(&HerdrError::TerminalClosed("terminal t1 exited".into())),
-        None
-    );
-}
-
-#[test]
 fn snapshot_refresh_queues_when_one_is_already_in_flight() {
     assert!(snapshot_refresh_should_queue(true));
     assert!(!snapshot_refresh_should_queue(false));
-}
-
-#[test]
-fn snapshot_handoff_releases_only_when_no_refresh_is_in_flight() {
-    assert!(snapshot_handoff_should_release(false));
-    assert!(!snapshot_handoff_should_release(true));
-}
-
-#[test]
-fn pane_move_capability_comes_from_protocol_or_version() {
-    assert!(HerdrCapabilities::detect("0.6.0", 14).pane_move);
-    assert!(HerdrCapabilities::detect("0.9.2", 20).pane_move);
-    assert!(HerdrCapabilities::detect("0.7.0", 0).pane_move);
-    assert!(HerdrCapabilities::detect("herdr 0.7.1", 0).pane_move);
-    assert!(HerdrCapabilities::detect("v1.0.0-beta.1", 0).pane_move);
-    assert!(!HerdrCapabilities::detect("0.6.9", 13).pane_move);
-    assert!(HerdrCapabilities::detect("0.7", 13).pane_move);
-    assert!(!HerdrCapabilities::detect("", 0).pane_move);
-    assert!(!HerdrCapabilities::detect("garbage", 0).pane_move);
-    assert!(!HerdrCapabilities::detect("x.y.z", 0).pane_move);
-    assert_eq!(
-        HerdrCapabilities::default(),
-        HerdrCapabilities { pane_move: false }
-    );
-}
-
-#[test]
-fn semver_parsing_is_lenient_but_never_invents_numbers() {
-    assert_eq!(parse_semver("0.7.0"), Some([0, 7, 0]));
-    assert_eq!(parse_semver("herdr 0.8.1"), Some([0, 8, 1]));
-    assert_eq!(parse_semver("v1.2.3-rc.1+build"), Some([1, 2, 3]));
-    assert_eq!(parse_semver("2"), Some([2, 0, 0]));
-    assert_eq!(parse_semver(""), None);
-    assert_eq!(parse_semver("garbage"), None);
-}
-
-#[test]
-fn unknown_method_errors_are_recognised_by_code_and_message() {
-    let api = |code: &str, message: &str| HerdrError::Api {
-        code: code.into(),
-        message: message.into(),
-    };
-    assert!(is_unknown_method_error(&api(
-        "invalid_request",
-        "invalid request: unknown variant `pane.move`, expected one of `pane.list`"
-    )));
-    assert!(is_unknown_method_error(&api("unknown_method", "nope")));
-    assert!(!is_unknown_method_error(&api(
-        "invalid_request",
-        "invalid request: missing field `target_pane_id`"
-    )));
-    assert!(!is_unknown_method_error(&api(
-        "not_found",
-        "pane p-9 not found"
-    )));
-    assert!(!is_unknown_method_error(&HerdrError::Protocol(
-        "empty".into()
-    )));
 }
 
 #[test]
@@ -1047,33 +833,6 @@ fn worktree_list_result_is_ignored_after_the_target_workspace_is_gone() {
 }
 
 #[test]
-fn disconnecting_the_event_stream_abandons_an_in_flight_worktree_list() {
-    let action = poll_event_stream(&mut HierarchySnapshot::default(), || {
-        Err(HerdrError::EventStreamClosed("event worker stopped".into()))
-    });
-    assert!(
-        effects_for(&action).abandon_worktree_list,
-        "injecting Disconnect without dropping worktree_list_task must fail this test"
-    );
-    let loading = Overlay::WorktreeOpen(WorktreeOpenState::Loading {
-        owner: sample_session("alpha"),
-        workspace_id: "w1".into(),
-    });
-    assert!(
-        matches!(
-            overlay_after_abandoning_worktree_list(loading),
-            Overlay::None
-        ),
-        "disconnect must clear the Loading overlay, not leave it for a stale list result"
-    );
-    assert!(!effects_for(&EventPollAction::Applied { reordered: false }).abandon_worktree_list);
-    assert!(!effects_for(&EventPollAction::Idle).abandon_worktree_list);
-    assert!(!effects_for(&EventPollAction::Resync { error: None }).abandon_worktree_list);
-    let closed_worker = EventPollAction::Disconnect("event worker stopped".into());
-    assert!(effects_for(&closed_worker).abandon_worktree_list);
-}
-
-#[test]
 fn abandoning_a_session_clears_only_the_worktree_open_overlay() {
     let loading = Overlay::WorktreeOpen(WorktreeOpenState::Loading {
         owner: sample_session("alpha"),
@@ -1095,202 +854,6 @@ fn abandoning_a_session_clears_only_the_worktree_open_overlay() {
         overlay_after_abandoning_worktree_list(create),
         Overlay::WorktreeCreate { .. }
     ));
-}
-
-#[test]
-fn a_rejected_subscription_is_lost_instead_of_idle() {
-    let loaded = LoadedEvents::from_subscribe(Err(HerdrError::Api {
-        code: "unknown_type".into(),
-        message: "events.subscribe rejected".into(),
-    }));
-    let LoadedEvents::Lost(detail) = loaded else {
-        panic!("a failed subscribe is Lost, not Idle");
-    };
-    assert!(detail.contains("events.subscribe rejected"));
-}
-
-#[test]
-fn a_successful_subscription_is_live() {
-    let (_tx, rx) = futures::channel::mpsc::unbounded();
-    let loaded = LoadedEvents::from_subscribe(Ok(EventSubscription::new(rx)));
-    assert!(matches!(loaded, LoadedEvents::Live(_)));
-}
-
-#[test]
-fn a_dead_event_stream_is_marked_lost_instead_of_idle() {
-    let next = poll_event_stream(&mut HierarchySnapshot::default(), || {
-        Err(HerdrError::EventStreamClosed("event worker stopped".into()))
-    })
-    .event_stream();
-    assert!(
-        matches!(next, Some(EventStreamState::Lost(_))),
-        "a closed subscription must become Lost, not Idle"
-    );
-}
-
-#[test]
-fn a_dead_event_stream_does_not_reschedule_the_poll() {
-    let action = poll_event_stream(&mut HierarchySnapshot::default(), || {
-        Err(HerdrError::EventStreamClosed("event worker stopped".into()))
-    });
-    assert!(
-        !effects_for(&action).reschedule,
-        "polling a closed stream has nothing left to wait for"
-    );
-}
-
-#[test]
-fn a_quiet_live_stream_keeps_polling_without_refreshing() {
-    let action = poll_event_stream(&mut HierarchySnapshot::default(), || Ok(None));
-    assert_eq!(action, EventPollAction::Idle);
-    assert!(effects_for(&action).reschedule);
-    assert!(action.event_stream().is_none());
-}
-
-#[test]
-fn closing_the_selected_last_tab_resyncs_instead_of_selecting_the_first_remaining_tab() {
-    let mut snapshot = two_tab_snapshot();
-    snapshot.tabs.push(test_tab("t-c", 3, "gamma"));
-    snapshot.panes.push(test_pane("p-c", "t-c"));
-    snapshot.focused_workspace_id = Some("w".into());
-    snapshot.focused_tab_id = Some("t-c".into());
-    snapshot.focused_pane_id = Some("p-c".into());
-    snapshot.workspaces.push(ocherdr_core::WorkspaceInfo {
-        workspace_id: "w".into(),
-        number: 1,
-        label: "one".into(),
-        focused: true,
-        pane_count: 3,
-        tab_count: 3,
-        active_tab_id: "t-c".into(),
-        agent_status: AgentStatus::Idle,
-        tokens: HashMap::new(),
-        worktree: None,
-    });
-    let mut selection = Selection {
-        connection_id: "local".into(),
-        workspace_id: Some("w".into()),
-        tab_id: Some("t-c".into()),
-        pane_id: Some("p-c".into()),
-        session_name: None,
-    };
-    let mut events = vec![
-        Ok(Some(HerdrEvent::PaneClosed {
-            workspace_id: "w".into(),
-            pane_id: "p-c".into(),
-        })),
-        Ok(None),
-    ]
-    .into_iter();
-    let action = apply_event_stream(&mut snapshot, &mut selection, || events.next().unwrap());
-    assert_eq!(selection.tab_id.as_deref(), Some("t-c"));
-    assert_eq!(action, EventPollAction::Resync { error: None });
-}
-
-#[test]
-fn pane_updated_is_applied_without_resyncing_the_snapshot() {
-    let mut snapshot = two_tab_snapshot();
-    snapshot.panes[0].revision = 1;
-    let mut updated = snapshot.panes[0].clone();
-    updated.revision = 9;
-    let mut events = vec![
-        Ok(Some(HerdrEvent::PaneUpdated {
-            pane: updated.clone(),
-        })),
-        Ok(None),
-    ]
-    .into_iter();
-    let action = poll_event_stream(&mut snapshot, || events.next().unwrap());
-    assert_eq!(action, EventPollAction::Applied { reordered: false });
-    assert!(!effects_for(&action).resync);
-    assert!(effects_for(&action).apply_local);
-    assert!(effects_for(&action).reschedule);
-    assert!(action.event_stream().is_none());
-    assert_eq!(snapshot.panes[0], updated);
-}
-
-#[test]
-fn only_an_order_publishing_event_reports_a_settled_reorder() {
-    let mut snapshot = two_tab_snapshot();
-    let mut updated = snapshot.panes[0].clone();
-    updated.revision = 9;
-    let mut events = vec![
-        Ok(Some(HerdrEvent::PaneUpdated { pane: updated })),
-        Ok(None),
-    ]
-    .into_iter();
-    assert_eq!(
-        poll_event_stream(&mut snapshot, || events.next().unwrap()),
-        EventPollAction::Applied { reordered: false },
-        "a pane update leaves the order alone, so a pending reorder is still pending"
-    );
-
-    let workspaces = snapshot.workspaces.clone();
-    let mut events = vec![
-        Ok(Some(HerdrEvent::WorkspaceMoved {
-            workspace_id: "w".into(),
-            insert_index: 0,
-            workspaces,
-        })),
-        Ok(None),
-    ]
-    .into_iter();
-    assert_eq!(
-        poll_event_stream(&mut snapshot, || events.next().unwrap()),
-        EventPollAction::Applied { reordered: true }
-    );
-}
-
-#[test]
-fn a_pending_reorder_is_released_by_everything_except_an_empty_poll() {
-    assert!(effects_for(&EventPollAction::Applied { reordered: true }).settle_reorder);
-    assert!(effects_for(&EventPollAction::Resync { error: None }).settle_reorder);
-    assert!(
-        effects_for(&EventPollAction::Disconnect("stream died".into())).settle_reorder,
-        "a dead stream will never deliver the moved event, so the gate must open"
-    );
-    assert!(!effects_for(&EventPollAction::Applied { reordered: false }).settle_reorder);
-    assert!(
-        !effects_for(&EventPollAction::Idle).settle_reorder,
-        "an empty poll says nothing about the request still in flight"
-    );
-}
-
-#[test]
-fn applied_poll_effects_do_not_resync() {
-    let applied = effects_for(&EventPollAction::Applied { reordered: false });
-    assert!(!applied.resync);
-    assert!(applied.apply_local);
-    assert!(applied.notify);
-    assert!(applied.reschedule);
-    assert!(applied.error.is_none());
-    let resync = effects_for(&EventPollAction::Resync { error: None });
-    assert!(resync.resync);
-    assert!(!resync.apply_local);
-    assert!(resync.reschedule);
-}
-
-#[test]
-fn a_malformed_event_resyncs_without_dropping_the_stream() {
-    let mut events = vec![
-        Err(HerdrError::Protocol("event is missing `data`".into())),
-        Ok(None),
-    ]
-    .into_iter();
-    let action = poll_event_stream(&mut HierarchySnapshot::default(), || events.next().unwrap());
-    let EventPollAction::Resync { error } = &action else {
-        panic!("payload errors must resync, got {action:?}");
-    };
-    assert!(
-        error
-            .as_ref()
-            .is_some_and(|detail| detail.contains("`data`"))
-    );
-    let effects = effects_for(&action);
-    assert!(effects.resync);
-    assert!(effects.error.is_some());
-    assert!(effects.reschedule);
-    assert!(action.event_stream().is_none());
 }
 
 #[test]

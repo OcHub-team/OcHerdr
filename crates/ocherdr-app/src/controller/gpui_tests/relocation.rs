@@ -1,9 +1,8 @@
 use super::*;
 #[cfg(target_os = "macos")]
 use crate::Overlay;
-use ocherdr_core::HerdrEvent;
 #[cfg(target_os = "macos")]
-use ocherdr_herdr::{TerminalEvent, TerminalNotificationKind};
+use ocherdr_herdr::TerminalNotificationKind;
 #[cfg(target_os = "macos")]
 use ocherdr_terminal::SurfaceMouseButton;
 
@@ -41,72 +40,49 @@ pub(super) fn single_pane_layout(tab_id: &str, pane_id: &str) -> ocherdr_core::P
     }
 }
 
-pub(super) fn layout_event(layout: ocherdr_core::PaneLayout) -> Value {
-    json!({
-        "event": "layout_updated",
-        "data": { "type": "layout_updated", "layout": layout }
-    })
-}
-
-/// What Herdr broadcasts for step 1 (`p-left` parked in `t-tmp`):
-/// `tab.created → pane.moved → layout.updated(t-a) → layout.updated(t-tmp)`.
-fn park_events() -> Vec<Value> {
-    vec![
-        json!({ "event": "tab_created", "data": { "type": "tab_created", "tab": temp_tab() } }),
-        json!({
-            "event": "pane_moved",
-            "data": {
-                "type": "pane_moved",
-                "pane": parked_pane_json("p-left"),
-                "previous_pane_id": "p-left",
-                "previous_workspace_id": "w",
-                "previous_tab_id": "t-a",
-                "created_tab": temp_tab(),
-            }
-        }),
-        layout_event(single_pane_layout("t-a", "p-right")),
-        layout_event(single_pane_layout("t-tmp", "p-left")),
-    ]
-}
-
-/// What Herdr broadcasts for step 2 (`p-left` back beside `p-right` as the
-/// second child): `tab.closed → pane.moved → layout.updated(t-a)`.
-fn insert_events() -> Vec<Value> {
-    let mut back = split_pane("p-left", true);
-    back.tab_id = "t-a".into();
-    vec![
-        json!({
-            "event": "tab_closed",
-            "data": { "type": "tab_closed", "tab_id": "t-tmp", "workspace_id": "w" }
-        }),
-        json!({
-            "event": "pane_moved",
-            "data": {
-                "type": "pane_moved",
-                "pane": back,
-                "previous_pane_id": "p-left",
-                "previous_workspace_id": "w",
-                "previous_tab_id": "t-tmp",
-                "closed_tab_id": "t-tmp",
-            }
-        }),
-        layout_event(two_pane_layout("p-right", "p-left")),
-    ]
-}
-
-pub(super) fn send_events(fake: &FakeHerdr, events: Vec<Value>, cx: &mut VisualTestContext) {
-    for event in events {
-        fake.send_event(event);
+/// What Herdr's hierarchy looks like after step 1 (`p-left` parked in
+/// `t-tmp`): the temp tab exists, both tabs hold one pane each.
+pub(super) fn park_state(snapshot: &mut HierarchySnapshot) {
+    snapshot.tabs.push(temp_tab());
+    if let Some(pane) = snapshot
+        .panes
+        .iter_mut()
+        .find(|pane| pane.pane_id == "p-left")
+    {
+        pane.tab_id = "t-tmp".into();
+        pane.focused = false;
     }
-    thread::sleep(Duration::from_millis(30));
-    cx.run_until_parked();
+    snapshot.layouts = vec![
+        single_pane_layout("t-a", "p-right"),
+        single_pane_layout("t-tmp", "p-left"),
+    ];
+}
+
+/// After step 2 (`p-left` back beside `p-right` as the second child): the
+/// temporary tab is gone and `t-a` holds both panes.
+pub(super) fn insert_state(snapshot: &mut HierarchySnapshot) {
+    snapshot.tabs.retain(|tab| tab.tab_id != "t-tmp");
+    if let Some(pane) = snapshot
+        .panes
+        .iter_mut()
+        .find(|pane| pane.pane_id == "p-left")
+    {
+        pane.tab_id = "t-a".into();
+        pane.focused = true;
+    }
+    snapshot.layouts = vec![two_pane_layout("p-right", "p-left")];
+}
+
+/// After the corrective swap: `p-left` leads the tab.
+pub(super) fn swap_state(snapshot: &mut HierarchySnapshot) {
+    snapshot.layouts = vec![two_pane_layout("p-left", "p-right")];
 }
 
 fn connect_edge_view(
     cx: &mut TestAppContext,
     script: PaneMoveScript,
 ) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
-    let fake = FakeHerdr::snapshot_with_live_events_and_script(two_pane_snapshot(), script);
+    let fake = FakeHerdr::serving_with_script(two_pane_snapshot(), script);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| {
@@ -158,11 +134,8 @@ fn assert_insert_request(request: &Value) {
 }
 
 #[gpui::test]
-fn a_right_drop_issues_two_pane_moves_back_to_back_and_settles_without_a_resync(
-    cx: &mut TestAppContext,
-) {
+fn a_right_drop_issues_two_pane_moves_back_to_back_and_settles(cx: &mut TestAppContext) {
     let (fake, view, cx) = connect_edge_view(cx, PaneMoveScript::default());
-    let snapshots_before = fake.requests_for("session.snapshot").len();
     drag_left_pane_to(&view, RIGHT_EDGE, cx);
     view.read_with(cx, |this, _| {
         let pending = this.pane_relocations.get("t-a").expect("plan pending");
@@ -222,8 +195,10 @@ fn a_right_drop_issues_two_pane_moves_back_to_back_and_settles_without_a_resync(
         assert!(this.hidden_tab_ids().contains("t-tmp"));
     });
 
-    // Step 1 events: the temp tab is real in the snapshot but hidden.
-    send_events(&fake, park_events(), cx);
+    // Step 1 state: the temp tab is real in the snapshot but hidden.
+    push_state(&fake, &view, cx, park_state, |snapshot| {
+        snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp")
+    });
     view.read_with(cx, |this, _| {
         let snapshot = this.snapshot.as_ref().expect("snapshot");
         assert!(snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp"));
@@ -262,8 +237,13 @@ fn a_right_drop_issues_two_pane_moves_back_to_back_and_settles_without_a_resync(
         ));
     });
 
-    // Step 2 events: the final layout settles the plan.
-    send_events(&fake, insert_events(), cx);
+    // Step 2 state: the final layout settles the plan.
+    push_state(&fake, &view, cx, insert_state, |snapshot| {
+        snapshot.tabs.iter().all(|tab| tab.tab_id != "t-tmp")
+            && snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| layout.panes.len() == 2)
+    });
     view.read_with(cx, |this, _| {
         let pending = this.pane_relocations.get("t-a");
         assert!(
@@ -298,11 +278,6 @@ fn a_right_drop_issues_two_pane_moves_back_to_back_and_settles_without_a_resync(
         assert_eq!(layout.panes[1].pane_id, "p-left");
         assert_eq!(this.selection.pane_id.as_deref(), Some("p-left"));
     });
-    assert_eq!(
-        fake.requests_for("session.snapshot").len(),
-        snapshots_before,
-        "the incremental pane.moved apply never resyncs"
-    );
     assert_eq!(fake.requests_for("pane.move").len(), 2);
 }
 
@@ -315,56 +290,32 @@ fn visible_tab_ids(view: &crate::OcHerdrView) -> Vec<String> {
         .collect()
 }
 
-/// Events and responses ride different sockets: `tab.created` for the
-/// temporary tab can be applied while the plan is still `Parking`, before
+/// The snapshot push and the response ride different channels: the push for
+/// the temporary tab can be applied while the plan is still `Parking`, before
 /// the step-1 response names the tab. The strip must hide it at every step
 /// of the executor, not only once the response has been applied.
 #[gpui::test]
 fn the_temporary_tab_is_hidden_before_the_park_response_names_it(cx: &mut TestAppContext) {
-    let script = PaneMoveScript {
-        events_before_park_response: Mutex::new(park_events()),
-        ..PaneMoveScript::default()
-    };
-    let (fake, view, cx) = connect_edge_view(cx, script);
+    let (fake, view, cx) = connect_edge_view(cx, PaneMoveScript::default());
     drag_left_pane_to(&view, RIGHT_EDGE, cx);
-
-    // Step the executor one task at a time. The fake answers step 1 only
-    // after the four step-1 events are on the wire, so the event task and
-    // the response continuation are both runnable after the request.
-    let mut parking_with_temp_tab = false;
-    let mut ticks = 0;
-    loop {
-        let ran = cx.executor().tick();
-        view.read_with(cx, |this, _| {
-            assert!(
-                !visible_tab_ids(this).iter().any(|id| id == "t-tmp"),
-                "tick {ticks}: the temp tab reached the strip"
-            );
-            let temp_tab_known = this
-                .snapshot
+    apply_snapshot_before_response(&fake, &view, park_state, cx);
+    view.read_with(cx, |this, _| {
+        assert_eq!(
+            this.pane_relocations.get("t-a").map(|p| &p.phase),
+            Some(&crate::RelocationPhase::Parking)
+        );
+        assert!(
+            this.snapshot
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp"));
-            if temp_tab_known
-                && this.pane_relocations.get("t-a").map(|p| &p.phase)
-                    == Some(&crate::RelocationPhase::Parking)
-            {
-                parking_with_temp_tab = true;
-                assert!(this.hidden_tab_ids().contains("t-tmp"));
-            }
-        });
-        ticks += 1;
-        if !ran {
-            if fake.requests_for("pane.move").len() >= 2 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-            assert!(ticks < 2_000, "step 2 never went out");
-        }
-    }
-    assert!(
-        parking_with_temp_tab,
-        "the race was exercised: the temp tab was in the snapshot while Parking"
-    );
+                .unwrap()
+                .tabs
+                .iter()
+                .any(|tab| tab.tab_id == "t-tmp")
+        );
+        assert!(this.hidden_tab_ids().contains("t-tmp"));
+        assert!(!visible_tab_ids(this).iter().any(|id| id == "t-tmp"));
+    });
+    cx.run_until_parked();
     view.update(cx, |this, cx| {
         assert!(matches!(
             this.pane_relocations.get("t-a").map(|p| &p.phase),
@@ -381,7 +332,12 @@ fn the_temporary_tab_is_hidden_before_the_park_response_names_it(cx: &mut TestAp
         assert_eq!(this.selection.tab_id.as_deref(), Some("t-a"));
     });
 
-    send_events(&fake, insert_events(), cx);
+    push_state(&fake, &view, cx, insert_state, |snapshot| {
+        snapshot.tabs.iter().all(|tab| tab.tab_id != "t-tmp")
+            && snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| layout.panes.len() == 2)
+    });
     thread::sleep(Duration::from_millis(220));
     view.update(cx, |this, _| {
         this.expire_pane_motion(Instant::now(), false);
@@ -445,8 +401,15 @@ fn a_left_drop_adds_a_pane_swap_after_the_second_move(cx: &mut TestAppContext) {
             }
         );
     });
-    send_events(&fake, park_events(), cx);
-    send_events(&fake, insert_events(), cx);
+    push_state(&fake, &view, cx, park_state, |snapshot| {
+        snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp")
+    });
+    push_state(&fake, &view, cx, insert_state, |snapshot| {
+        snapshot.tabs.iter().all(|tab| tab.tab_id != "t-tmp")
+            && snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| layout.panes.len() == 2)
+    });
     view.read_with(cx, |this, _| {
         let pending = this.pane_relocations.get("t-a").expect("still pending");
         assert_eq!(
@@ -459,11 +422,11 @@ fn a_left_drop_adds_a_pane_swap_after_the_second_move(cx: &mut TestAppContext) {
         );
     });
     // The swap's layout: source first.
-    send_events(
-        &fake,
-        vec![layout_event(two_pane_layout("p-left", "p-right"))],
-        cx,
-    );
+    push_state(&fake, &view, cx, swap_state, |snapshot| {
+        snapshot
+            .layout_for("t-a")
+            .is_some_and(|layout| layout.panes[0].pane_id == "p-left")
+    });
     view.read_with(cx, |this, _| {
         let pending = this.pane_relocations.get("t-a");
         assert!(
@@ -490,7 +453,9 @@ fn a_failed_second_move_parks_the_pane_and_retry_reissues_it(cx: &mut TestAppCon
     drag_left_pane_to(&view, RIGHT_EDGE, cx);
     cx.run_until_parked();
     assert_eq!(fake.requests_for("pane.move").len(), 2);
-    send_events(&fake, park_events(), cx);
+    push_state(&fake, &view, cx, park_state, |snapshot| {
+        snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp")
+    });
     view.read_with(cx, |this, _| {
         let pending = this.pane_relocations.get("t-a").expect("parked plan");
         assert_eq!(
@@ -560,20 +525,32 @@ fn a_foreign_layout_during_an_insert_reverts_to_authority(cx: &mut TestAppContex
     cx.run_until_parked();
     assert_eq!(fake.requests_for("pane.move").len(), 2);
     // Someone split the tab before our move landed.
-    let mut layout = two_pane_layout("p-left", "p-right");
-    layout.panes.push(ocherdr_core::LayoutPane {
-        pane_id: "p-new".into(),
-        focused: false,
-        rect: layout_rect(60, 20, 60, 20),
-    });
-    layout.panes[1].rect = layout_rect(60, 0, 60, 20);
-    layout.splits.push(ocherdr_core::LayoutSplit {
-        id: "split_1_1".into(),
-        direction: ocherdr_core::SplitDirection::Down,
-        ratio: 0.5,
-        rect: layout_rect(60, 0, 60, 40),
-    });
-    send_events(&fake, vec![layout_event(layout)], cx);
+    push_state(
+        &fake,
+        &view,
+        cx,
+        |snapshot| {
+            let mut layout = two_pane_layout("p-left", "p-right");
+            layout.panes.push(ocherdr_core::LayoutPane {
+                pane_id: "p-new".into(),
+                focused: false,
+                rect: layout_rect(60, 20, 60, 20),
+            });
+            layout.panes[1].rect = layout_rect(60, 0, 60, 20);
+            layout.splits.push(ocherdr_core::LayoutSplit {
+                id: "split_1_1".into(),
+                direction: ocherdr_core::SplitDirection::Down,
+                ratio: 0.5,
+                rect: layout_rect(60, 0, 60, 40),
+            });
+            snapshot.layouts = vec![layout];
+        },
+        |snapshot| {
+            snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| layout.panes.len() == 3)
+        },
+    );
     view.read_with(cx, |this, _| {
         assert!(
             this.pane_relocations.is_empty(),
@@ -597,20 +574,21 @@ fn edge_zones_need_both_the_flag_and_the_capability(cx: &mut TestAppContext) {
     assert!(fake.requests_for("pane.move").is_empty());
     drop(fake);
 
-    // Flag on, Herdr too old for `pane.move`.
-    let mut snapshot = two_pane_snapshot();
-    snapshot.version = "0.6.0".into();
-    snapshot.protocol = 13;
-    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    // Flag on, but no connection: the capability is off.
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| {
         this.headless_terminals = true;
         this.pane_edge_relocation = true;
-    });
-    connect_view_to_fake_and_resync(&view, &fake, cx);
-    view.update(cx, |this, _| this.terminal_surface_bounds = Some(SURFACE));
-    view.read_with(cx, |this, _| {
+        this.snapshot = Some(two_pane_snapshot());
+        this.selection = Selection {
+            connection_id: "local".into(),
+            session_name: Some("alpha".into()),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-a".into()),
+            pane_id: Some("p-left".into()),
+        };
+        this.terminal_surface_bounds = Some(SURFACE);
         assert!(!this.pane_move_supported());
         assert!(!this.edge_drops_enabled());
     });
@@ -620,7 +598,6 @@ fn edge_zones_need_both_the_flag_and_the_capability(cx: &mut TestAppContext) {
         assert!(this.pane_relocations.is_empty());
         assert!(this.pane_drag_return.is_some(), "the preview returned home");
     });
-    assert!(fake.requests_for("pane.move").is_empty());
 }
 
 fn key(name: &str, control: bool) -> gpui::KeyDownEvent {
@@ -662,29 +639,65 @@ fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestCo
     cx.run_until_parked();
 }
 
-/// Ghostty encodes mouse reports on its IO thread. The pane listener must
-/// forward them as soon as they exist; relying on the next pointer or key
-/// event to flush left a click's release (and a quick click entirely)
+fn pane_test_point(
+    view: &Entity<OcHerdrView>,
+    cx: &VisualTestContext,
+) -> gpui::Point<gpui::Pixels> {
+    view.read_with(cx, |this, _| {
+        let (x, y, width, height) = this.pane("p-left").expect("left pane").body_bounds;
+        gpui::point(gpui::px(x + width * 0.4), gpui::px(y + height * 0.4))
+    })
+}
+
+/// Wait until the endpoint records a mouse event of `kind` for `pane_id`.
+/// The input lane runs on the endpoint worker thread, so pump the executor
+/// and yield real time while it catches up.
+#[cfg(target_os = "macos")]
+fn wait_for_mouse_input(
+    fake: &FakeHerdr,
+    pane_id: &str,
+    kind: ep::ClientMouseKind,
+    cx: &mut VisualTestContext,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = fake.pane_inputs(pane_id).iter().any(|event| {
+            matches!(event, ep::ClientPaneInputEvent::Mouse { kind: reported, .. } if *reported == kind)
+        });
+        if seen {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mouse {kind:?} never reached {pane_id}: {:?}",
+            fake.pane_inputs(pane_id)
+        );
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Mouse-capture state arrives on the endpoint's surface frame. A click must
+/// reach the endpoint as soon as it happens; relying on a later pointer or
+/// key event to flush left a click's release (and a quick click entirely)
 /// stranded until something unrelated happened in the pane.
 #[gpui::test]
 #[cfg(target_os = "macos")]
 fn mouse_click_is_forwarded_without_a_follow_up_ui_event(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
     measure_two_terminal_bodies(&view, cx);
-    view.update_in(cx, |this, _window, cx| {
-        let owner = this.current_session_key().expect("connected session");
-        assert!(this.apply_herdr_frames(
-            &owner,
-            "p-left",
-            Some(vec![Ok(TerminalEvent::MouseCapture {
-                enabled: true,
-                sgr_pixels: false,
-            })]),
-            cx,
-        ));
+    push_surface_frame(
+        &view,
+        surface_frame(vec![
+            surface_pane("p-left", (0, 0, 40, 30), true, true, false),
+            surface_pane("p-right", (40, 0, 40, 30), false, false, false),
+        ]),
+        cx,
+    );
+    view.read_with(cx, |this, _| {
         assert!(
             this.pane("p-left")
                 .expect("agent terminal")
@@ -693,7 +706,7 @@ fn mouse_click_is_forwarded_without_a_follow_up_ui_event(cx: &mut TestAppContext
         );
     });
 
-    let point = gpui::point(gpui::px(100.), gpui::px(100.));
+    let point = pane_test_point(&view, cx);
     let left_down = gpui::MouseDownEvent {
         button: gpui::MouseButton::Left,
         position: point,
@@ -712,18 +725,20 @@ fn mouse_click_is_forwarded_without_a_follow_up_ui_event(cx: &mut TestAppContext
         this.pane_mouse_up(&left_up, window, cx);
     });
 
-    // Deliberately no `pump_terminal_input`: only the listener may forward.
-    let has_report = |suffix: u8| {
-        fake.terminal_inputs("p-left")
-            .iter()
-            .any(|bytes| bytes.starts_with(b"\x1b[<0;") && bytes.ends_with(&[suffix]))
+    // Deliberately no extra pointer traffic: the click itself must forward.
+    let has_report = |kind: ep::ClientMouseKind| {
+        fake.pane_inputs("p-left").iter().any(|event| {
+            matches!(event, ep::ClientPaneInputEvent::Mouse { kind: reported, .. } if *reported == kind)
+        })
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !(has_report(b'M') && has_report(b'm')) {
+    while !(has_report(ep::ClientMouseKind::Down(ep::ClientMouseButton::Left))
+        && has_report(ep::ClientMouseKind::Up(ep::ClientMouseButton::Left)))
+    {
         assert!(
             Instant::now() < deadline,
             "listener never forwarded the click: {:?}",
-            fake.terminal_inputs("p-left")
+            fake.pane_inputs("p-left")
         );
         cx.run_until_parked();
         thread::sleep(Duration::from_millis(20));
@@ -741,7 +756,7 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
         .expect("left pane");
     agent.agent = Some("codex".into());
     agent.display_agent = Some("Codex".into());
-    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let fake = FakeHerdr::serving(snapshot);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -756,21 +771,21 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
         );
     });
 
-    let point = gpui::point(gpui::px(100.), gpui::px(100.));
-    let left_down = gpui::MouseDownEvent {
+    let point = pane_test_point(&view, cx);
+    let mut left_down = gpui::MouseDownEvent {
         button: gpui::MouseButton::Left,
         position: point,
         modifiers: Default::default(),
         click_count: 1,
         first_mouse: false,
     };
-    let left_up = gpui::MouseUpEvent {
+    let mut left_up = gpui::MouseUpEvent {
         button: gpui::MouseButton::Left,
         position: point,
         modifiers: Default::default(),
         click_count: 1,
     };
-    let drag_point = gpui::point(gpui::px(180.), gpui::px(120.));
+    let drag_point = point + gpui::point(gpui::px(20.), gpui::px(10.));
     let drag_move = gpui::MouseMoveEvent {
         position: drag_point,
         pressed_button: Some(gpui::MouseButton::Left),
@@ -791,29 +806,31 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
         ));
         this.pane_mouse_move(&drag_move, window, cx);
         this.pane_mouse_up(&drag_up, window, cx);
-        this.pump_terminal_input();
     });
     assert!(
-        fake.terminal_inputs("p-left").is_empty(),
+        fake.pane_inputs("p-left").is_empty(),
         "unknown mouse state must remain a local text selection"
     );
-    measure_two_terminal_bodies(&view, cx);
 
-    view.update_in(cx, |this, _window, cx| {
-        let owner = this.current_session_key().expect("connected session");
-        assert!(this.apply_herdr_frames(
-            &owner,
-            "p-left",
-            Some(vec![Ok(TerminalEvent::MouseCapture {
-                enabled: true,
-                sgr_pixels: false,
-            })]),
-            cx,
-        ));
+    // The surface frame carries the pane's authoritative capture flag.
+    push_surface_frame(
+        &view,
+        surface_frame(vec![
+            surface_pane("p-left", (0, 0, 40, 30), true, true, false),
+            surface_pane("p-right", (40, 0, 40, 30), false, false, false),
+        ]),
+        cx,
+    );
+    view.read_with(cx, |this, _| {
         let runtime = this.pane("p-left").expect("agent terminal");
         assert_eq!(runtime.mouse_capture, Some((true, false)));
         assert!(runtime.terminal.mouse_captured());
     });
+
+    // Applying the first surface permits normal layout and can move the pane
+    // away from the synthetic bounds used to create its native terminal.
+    left_down.position = pane_test_point(&view, cx);
+    left_up.position = left_down.position;
 
     view.update_in(cx, |this, window, cx| {
         this.pane_mouse_down("p-left".into(), &left_down, window, cx);
@@ -823,37 +840,29 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
         ));
         this.pane_mouse_up(&left_up, window, cx);
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !fake
-        .terminal_inputs("p-left")
-        .iter()
-        .any(|bytes| bytes.starts_with(b"\x1b[<0;") && bytes.ends_with(b"m"))
-    {
-        assert!(Instant::now() < deadline, "Ghostty never wrote the click");
-        view.update(cx, |this, _| this.pump_terminal_input());
-        cx.run_until_parked();
-        thread::sleep(Duration::from_millis(20));
-    }
-    let mouse_inputs = fake.terminal_inputs("p-left");
-    assert!(
-        mouse_inputs
-            .iter()
-            .any(|bytes| bytes.starts_with(b"\x1b[<0;") && bytes.ends_with(b"M")),
-        "missing mouse press: {mouse_inputs:?}"
+    wait_for_mouse_input(
+        &fake,
+        "p-left",
+        ep::ClientMouseKind::Down(ep::ClientMouseButton::Left),
+        cx,
     );
-    assert!(
-        mouse_inputs
-            .iter()
-            .any(|bytes| bytes.starts_with(b"\x1b[<0;") && bytes.ends_with(b"m")),
-        "missing mouse release: {mouse_inputs:?}"
+    wait_for_mouse_input(
+        &fake,
+        "p-left",
+        ep::ClientMouseKind::Up(ep::ClientMouseButton::Left),
+        cx,
     );
-    assert!(
-        mouse_inputs
-            .iter()
-            .any(|bytes| bytes.starts_with(b"\x1b[<35;") && bytes.ends_with(b"M")),
-        "moving onto a mouse-aware TUI should report hover motion: {mouse_inputs:?}"
-    );
-    measure_two_terminal_bodies(&view, cx);
+
+    // A mouse-aware TUI also gets hover motion without a button held.
+    let hover = gpui::MouseMoveEvent {
+        position: left_down.position + gpui::point(gpui::px(10.), gpui::px(5.)),
+        pressed_button: None,
+        modifiers: Default::default(),
+    };
+    view.update_in(cx, |this, window, cx| {
+        this.pane_surface_mouse_move("p-left", &hover, window, cx);
+    });
+    wait_for_mouse_input(&fake, "p-left", ep::ClientMouseKind::Moved, cx);
 
     let right_down = gpui::MouseDownEvent {
         button: gpui::MouseButton::Right,
@@ -881,25 +890,21 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
             Some(crate::AuxMouseDrag { pane_id, .. }) if pane_id == "p-left"
         ));
         this.pane_aux_mouse_up("p-left", SurfaceMouseButton::Right, &right_up, window, cx);
-        this.pump_terminal_input();
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !fake
-        .terminal_inputs("p-left")
-        .iter()
-        .any(|bytes| bytes.starts_with(b"\x1b[<2;") && bytes.ends_with(b"m"))
-    {
-        assert!(
-            Instant::now() < deadline,
-            "Ghostty never wrote the secondary click"
-        );
-        view.update(cx, |this, _| this.pump_terminal_input());
-        cx.run_until_parked();
-        thread::sleep(Duration::from_millis(20));
-    }
-    measure_two_terminal_bodies(&view, cx);
+    wait_for_mouse_input(
+        &fake,
+        "p-left",
+        ep::ClientMouseKind::Down(ep::ClientMouseButton::Right),
+        cx,
+    );
+    wait_for_mouse_input(
+        &fake,
+        "p-left",
+        ep::ClientMouseKind::Up(ep::ClientMouseButton::Right),
+        cx,
+    );
 
-    let before_shift = fake.terminal_inputs("p-left").len();
+    let before_shift = fake.pane_inputs("p-left").len();
     let shift_down = gpui::MouseDownEvent {
         modifiers: gpui::Modifiers {
             shift: true,
@@ -926,29 +931,26 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
             "Shift click did not start selection: {:?}",
             this.surface_drag
         );
-        // Shift may be released before the mouse button. Ghostty keeps this
-        // press as local selection; it must not turn the release into a TUI
-        // mouse report.
+        // Shift may be released before the mouse button. The press stays a
+        // local selection; it must not turn the release into a TUI report.
         this.pane_mouse_up(&shift_up, window, cx);
-        this.pump_terminal_input();
     });
     assert_eq!(
-        fake.terminal_inputs("p-left").len(),
+        fake.pane_inputs("p-left").len(),
         before_shift,
         "Shift bypasses mouse capture and remains local text selection"
     );
 
+    // Capture off again: the pane goes back to selection-first.
+    push_surface_frame(
+        &view,
+        surface_frame(vec![
+            surface_pane("p-left", (0, 0, 40, 30), true, false, false),
+            surface_pane("p-right", (40, 0, 40, 30), false, false, false),
+        ]),
+        cx,
+    );
     view.update_in(cx, |this, window, cx| {
-        let owner = this.current_session_key().expect("connected session");
-        assert!(this.apply_herdr_frames(
-            &owner,
-            "p-left",
-            Some(vec![Ok(TerminalEvent::MouseCapture {
-                enabled: false,
-                sgr_pixels: false,
-            })]),
-            cx,
-        ));
         assert_eq!(
             this.pane("p-left").unwrap().mouse_capture,
             Some((false, false))
@@ -966,8 +968,8 @@ fn auto_mouse_mode_uses_herdr_authority_instead_of_guessing_from_agent(cx: &mut 
 #[gpui::test]
 fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppContext) {
     let mut snapshot = pane_move_capable_snapshot();
-    snapshot.version = "0.8.2".into();
-    snapshot.protocol = 20;
+    snapshot.version = "0.9.4".into();
+    snapshot.protocol = 22;
     snapshot.tabs.truncate(2);
     snapshot.tabs[0].pane_count = 1;
     snapshot.tabs[1].pane_count = 1;
@@ -983,10 +985,15 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
         single_pane_layout("t-b", "p-b"),
     ];
 
-    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let fake = FakeHerdr::serving(snapshot);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
+    assert_eq!(
+        fake.endpoint_connections(),
+        1,
+        "one endpoint connection carries every pane"
+    );
     view.update_in(cx, |this, window, cx| {
         this.sync_measured_pane_body(
             "p-a",
@@ -1000,23 +1007,37 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
         this.pane_mount_scheduled = false;
         this.ensure_session_terminals(cx);
     });
+    push_surface_frame(
+        &view,
+        surface_frame(vec![surface_pane(
+            "p-a",
+            (0, 0, 50, 32),
+            true,
+            false,
+            false,
+        )]),
+        cx,
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_attach_count("p-a") == 0
-        || !view.read_with(cx, |this, _| {
-            this.pane("p-a")
-                .is_some_and(|runtime| runtime.frame.is_some())
-        })
-    {
-        assert!(Instant::now() < deadline, "first tab never painted");
+    while !view.read_with(cx, |this, _| {
+        this.pane("p-a")
+            .is_some_and(|runtime| runtime.frame.is_some())
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "native renderer never delivered its first frame"
+        );
         cx.run_until_parked();
         thread::sleep(Duration::from_millis(10));
     }
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.pane("p-a")
+                .is_some_and(|runtime| runtime.frame.is_some()),
+            "first tab painted"
+        );
+    });
     let original_context = view.read_with(cx, |this, _| this.pane("p-a").unwrap().frame_context);
-    assert_eq!(
-        fake.terminal_attach_modes("p-a"),
-        vec![true],
-        "the first visible pane acquires non-takeover control so Herdr resizes its PTY"
-    );
 
     view.update(cx, |this, cx| {
         this.selection.tab_id = Some("t-b".into());
@@ -1039,11 +1060,22 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
         this.pane_mount_scheduled = false;
         this.ensure_session_terminals(cx);
     });
+    push_surface_frame(
+        &view,
+        surface_frame(vec![surface_pane(
+            "p-b",
+            (0, 0, 50, 32),
+            true,
+            false,
+            false,
+        )]),
+        cx,
+    );
 
     assert_eq!(
-        fake.terminal_attach_modes("p-a"),
-        vec![true],
-        "hiding a controlled pane must not replace its private stream"
+        fake.endpoint_connections(),
+        1,
+        "hiding a pane must not replace the session's endpoint connection"
     );
 
     view.update(cx, |this, cx| {
@@ -1057,27 +1089,21 @@ fn tab_switch_retains_the_hidden_native_surface_and_stream(cx: &mut TestAppConte
         assert_eq!(restored.frame_context, original_context);
     });
     assert_eq!(
-        fake.terminal_attach_modes("p-a"),
-        vec![true],
-        "switching away and back reuses the original control stream"
+        fake.endpoint_connections(),
+        1,
+        "switching away and back reuses the original endpoint connection"
     );
 }
 
 #[gpui::test]
 fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppContext) {
-    let fake_a = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
-    let fake_b = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake_a = FakeHerdr::serving(two_pane_snapshot());
+    let fake_b = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake_a, cx);
     measure_two_terminal_bodies(&view, cx);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while fake_a.terminal_attach_count("p-left") == 0 {
-        assert!(Instant::now() < deadline, "host A terminal never attached");
-        cx.run_until_parked();
-        thread::sleep(Duration::from_millis(10));
-    }
+    assert_eq!(fake_a.endpoint_connections(), 1, "host A endpoint attached");
 
     view.update(cx, |this, cx| {
         let local_owner = this.current_session_key().expect("local session owner");
@@ -1121,14 +1147,7 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
                 sessions: vec![session_b],
                 session_index: Some(0),
                 connection: connection_b,
-                herdr_capabilities: crate::controller::HerdrCapabilities::from_snapshot(
-                    &snapshot_b,
-                ),
                 event_stream: EventStreamState::Idle,
-                event_listen: None,
-                agent_status_listen: None,
-                agent_status_panes: std::collections::HashSet::new(),
-                agent_status_handoff: None,
                 snapshot: Some(snapshot_b),
                 selection: Selection {
                     connection_id: "remote-test".into(),
@@ -1147,28 +1166,39 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
         this.select_profile(profile_b_index, cx);
         assert!(this.parked_hosts.contains_key("local"));
         assert!(
-            this.parked_hosts["local"].agent_status_listen.is_some(),
-            "switching machines must retain the established status stream"
+            this.parked_hosts["local"]
+                .session_panes
+                .as_ref()
+                .is_some_and(|session| session.endpoint.is_some()),
+            "switching machines must retain the established endpoint stream"
         );
-        assert_eq!(fake_a.terminal_detach_count("p-left"), 0);
-        assert!(this.apply_agent_status_batch_for(
+        assert_eq!(fake_a.endpoint_disconnects(), 0);
+        assert!(this.apply_endpoint_batch(
             &local_owner,
-            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
-                pane_id: "p-right".into(),
-                workspace_id: "w".into(),
-                agent_status: AgentStatus::Done,
-                agent: Some("codex".into()),
-                title: None,
-                display_agent: Some("Codex".into()),
-                state_labels: HashMap::new(),
-            })]),
+            vec![Ok(EndpointEvent::SemanticNotification(
+                ep::SemanticNotification {
+                    kind: ep::SemanticNotificationKind::Finished,
+                    title: String::new(),
+                    body: None,
+                    sound: None,
+                    agent: Some("Codex".into()),
+                    workspace_id: Some("w".into()),
+                    tab_id: Some("t-a".into()),
+                    pane_id: Some("p-right".into()),
+                    position: None,
+                },
+            ))],
             cx,
         ));
 
         this.select_profile(0, cx);
         assert_eq!(this.current_profile().id(), "local");
-        assert_eq!(fake_a.terminal_attach_count("p-left"), 1);
-        assert_eq!(fake_a.terminal_detach_count("p-left"), 0);
+        assert_eq!(
+            fake_a.endpoint_connections(),
+            1,
+            "the parked endpoint connection is reused"
+        );
+        assert_eq!(fake_a.endpoint_disconnects(), 0);
 
         this.disconnect_host("local", cx);
     });
@@ -1179,7 +1209,7 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
     );
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fake_a.terminal_detach_count("p-left") == 0 {
+    while fake_a.endpoint_disconnects() == 0 {
         assert!(
             Instant::now() < deadline,
             "explicit disconnect never detached host A"
@@ -1187,12 +1217,12 @@ fn host_switch_parks_terminal_stream_until_explicit_disconnect(cx: &mut TestAppC
         cx.run_until_parked();
         thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(fake_a.terminal_detach_count("p-left"), 1);
+    assert_eq!(fake_a.endpoint_disconnects(), 1);
 }
 
 #[gpui::test]
 fn host_switcher_red_x_disconnects_without_switching_hosts(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -1217,8 +1247,8 @@ fn host_switcher_red_x_disconnects_without_switching_hosts(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn notification_copy_button_wins_over_the_terminal_behind_it(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+fn notification_detail_copy_button_wins_over_the_terminal_behind_it(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -1227,7 +1257,7 @@ fn notification_copy_button_wins_over_the_terminal_behind_it(cx: &mut TestAppCon
     cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(500.)));
     view.update(cx, |this, cx| {
         this.notifications.update(cx, |host, cx| {
-            host.notify(
+            let notification = host.notify(
                 ochub_ui::notifications::NotificationRequest::new(
                     ochub_ui::notifications::NotificationLevel::Error,
                     "Copy title",
@@ -1236,15 +1266,15 @@ fn notification_copy_button_wins_over_the_terminal_behind_it(cx: &mut TestAppCon
                 .timeout(Duration::from_secs(60)),
                 cx,
             );
-            cx.notify();
+            host.show_details(notification, cx);
         });
     });
     cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
     cx.run_until_parked();
 
     let copy = cx
-        .debug_bounds("notification-copy-1")
-        .expect("notification copy button");
+        .debug_bounds("notification-copy")
+        .expect("notification detail copy button");
     let copy_center = copy.center();
     let pointer = (f32::from(copy_center.x), f32::from(copy_center.y));
     view.read_with(cx, |this, _| {
@@ -1266,20 +1296,32 @@ fn notification_copy_button_wins_over_the_terminal_behind_it(cx: &mut TestAppCon
     assert_eq!(
         cx.read_from_clipboard().and_then(|item| item.text()),
         Some("Copy title\nCopy detail".into()),
-        "the toast must intercept the click instead of starting a terminal selection"
+        "the notification center must intercept the click instead of starting a terminal selection"
     );
 }
 
-/// Real Ghostty surfaces (not `headless_terminals`): a key press takes control,
-/// then libghostty encodes it and sends its bytes to that pane's stream.
+/// Real Ghostty surfaces (not `headless_terminals`): a key press takes
+/// control, then the endpoint carries it to that pane as a semantic input
+/// event — and only that pane.
 #[gpui::test]
 #[cfg(target_os = "macos")]
-fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+fn a_key_press_reaches_only_the_selected_pane_through_the_endpoint(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
     measure_two_terminal_bodies(&view, cx);
+    let shift_enter = ep::ClientPaneInputEvent::Key {
+        code: ep::ClientKeyCode::Enter,
+        modifiers: 1,
+        kind: ep::ClientKeyKind::Press,
+        repeat_count: 1,
+        shifted_codepoint: None,
+        generated_text: None,
+        tracks_release: true,
+        physical_key_id: None,
+        windows_record: None,
+    };
     view.update_in(cx, |this, window, cx| {
         assert_eq!(this.selection.pane_id.as_deref(), Some("p-left"));
         assert!(
@@ -1287,26 +1329,23 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
             "the visible tab spawns a Ghostty surface"
         );
         assert!(this.pane("p-right").is_some());
-        let mut shift_enter = key("enter", false);
-        shift_enter.keystroke.modifiers.shift = true;
-        shift_enter.keystroke.key_char = Some("\n".into());
-        this.send_key(&shift_enter, window, cx);
+        let mut shift_enter_event = key("enter", false);
+        shift_enter_event.keystroke.modifiers.shift = true;
+        shift_enter_event.keystroke.key_char = Some("\n".into());
+        this.send_key(&shift_enter_event, window, cx);
     });
-    // Ghostty writes to the pty from its IO thread; production drains the
-    // queue on every frame and event poll, the test pumps it by hand.
+    // The endpoint worker thread writes the input lane; poll until it lands.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_inputs("p-left").is_empty() {
-        assert!(Instant::now() < deadline, "Ghostty never wrote the key");
-        view.update(cx, |this, _| this.pump_terminal_input());
+    while fake.pane_inputs("p-left").is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the key never reached the endpoint"
+        );
         cx.run_until_parked();
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(10));
     }
-    // Ghostty's legacy encoding of Shift+Enter reaches Herdr losslessly.
-    assert_eq!(
-        fake.terminal_inputs("p-left"),
-        vec![b"\x1b[27;2;13~".to_vec()]
-    );
-    assert!(fake.terminal_inputs("p-right").is_empty());
+    assert_eq!(fake.pane_inputs("p-left"), vec![shift_enter.clone()]);
+    assert!(fake.pane_inputs("p-right").is_empty());
 
     // PixPin and Finder expose an image as a local file path. Keep the file
     // alive while both local pass-through and remote protocol bridging exercise it.
@@ -1315,39 +1354,47 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
     std::fs::write(&clipboard_image, b"\x89PNG\r\n\x1a\nremote").expect("clipboard image");
 
     // On a local profile the file-backed image must still reach the agent as
-    // the original Cmd+V through its Kitty keyboard protocol.
+    // the original Cmd+V chord.
+    let cmd_v = ep::ClientPaneInputEvent::Key {
+        code: ep::ClientKeyCode::Char('v'),
+        modifiers: 8,
+        kind: ep::ClientKeyKind::Press,
+        repeat_count: 1,
+        shifted_codepoint: None,
+        generated_text: None,
+        tracks_release: true,
+        physical_key_id: None,
+        windows_record: None,
+    };
     view.update_in(cx, |this, window, cx| {
-        let runtime = this.pane_mut("p-left").expect("selected terminal");
-        runtime.terminal.apply_frame(b"\x1b[>1u", false);
         cx.write_to_clipboard(gpui::ClipboardItem {
             entries: vec![gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
                 vec![clipboard_image.clone()].into(),
             ))],
         });
-        let mut cmd_v = key("v", false);
-        cmd_v.keystroke.modifiers.platform = true;
-        this.send_key(&cmd_v, window, cx);
+        let mut cmd_v_event = key("v", false);
+        cmd_v_event.keystroke.modifiers.platform = true;
+        this.send_key(&cmd_v_event, window, cx);
     });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_inputs("p-left").len() < 2 {
+    while fake.pane_inputs("p-left").len() < 2 {
         assert!(
             Instant::now() < deadline,
-            "Ghostty never forwarded image-only Cmd+V"
+            "image-only Cmd+V never passed through"
         );
-        view.update(cx, |this, _| this.pump_terminal_input());
         cx.run_until_parked();
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        fake.terminal_inputs("p-left"),
-        vec![b"\x1b[27;2;13~".to_vec(), b"\x1b[118;9u".to_vec()]
+        fake.pane_inputs("p-left"),
+        vec![shift_enter.clone(), cmd_v.clone()]
     );
 
     // The same file-backed Cmd+V on an SSH profile reads the local file in the
-    // background, then sends its bytes over Herdr's private protocol.
+    // background, then sends its bytes over the endpoint's clipboard bridge.
     view.update_in(cx, |this, window, cx| {
         this.profiles[0] = ConnectionProfile::Ssh {
-            // Keep the fixture's existing per-pane child stream while making
+            // Keep the fixture's existing endpoint connection while making
             // routing remote. Production profile ids are unique; this test id
             // intentionally matches Local's synthetic `local` owner.
             id: "local".into(),
@@ -1367,18 +1414,18 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
             this.current_profile(),
             ConnectionProfile::Ssh { .. }
         ));
-        let mut cmd_v = key("v", false);
-        cmd_v.keystroke.modifiers.platform = true;
-        this.send_key(&cmd_v, window, cx);
+        let mut cmd_v_event = key("v", false);
+        cmd_v_event.keystroke.modifiers.platform = true;
+        this.send_key(&cmd_v_event, window, cx);
     });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_images("p-left").is_empty() {
+    while fake.clipboard_images().is_empty() {
         assert!(
             Instant::now() < deadline,
-            "remote ClipboardImage never reached the pane stream"
+            "remote ClipboardImage never reached the endpoint"
         );
         cx.run_until_parked();
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(10));
     }
 
     // Herdr users also paste with Ctrl+V. It must take the identical native
@@ -1387,24 +1434,32 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
         this.send_key(&key("v", true), window, cx);
     });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_images("p-left").len() < 2 {
+    while fake.clipboard_images().len() < 2 {
         assert!(
             Instant::now() < deadline,
-            "Ctrl+V ClipboardImage never reached the pane stream"
+            "Ctrl+V ClipboardImage never reached the endpoint"
         );
         cx.run_until_parked();
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        fake.terminal_inputs("p-left"),
-        vec![b"\x1b[27;2;13~".to_vec(), b"\x1b[118;9u".to_vec()],
-        "remote image paste must not leak Cmd+V or Ctrl+V into the PTY"
+        fake.pane_inputs("p-left"),
+        vec![shift_enter, cmd_v],
+        "remote image paste must not leak Cmd+V or Ctrl+V as keys"
     );
     assert_eq!(
-        fake.terminal_images("p-left"),
+        fake.clipboard_images(),
         vec![
-            ("png".into(), b"\x89PNG\r\n\x1a\nremote".to_vec()),
-            ("png".into(), b"\x89PNG\r\n\x1a\nremote".to_vec()),
+            (
+                "p-left".into(),
+                "png".into(),
+                b"\x89PNG\r\n\x1a\nremote".to_vec()
+            ),
+            (
+                "p-left".into(),
+                "png".into(),
+                b"\x89PNG\r\n\x1a\nremote".to_vec()
+            ),
         ]
     );
 }
@@ -1412,7 +1467,7 @@ fn a_key_press_reaches_only_the_selected_panes_stream_through_ghostty(cx: &mut T
 #[gpui::test]
 #[cfg(target_os = "macos")]
 fn herdr_system_toast_reaches_the_os_notification_center(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -1420,14 +1475,13 @@ fn herdr_system_toast_reaches_the_os_notification_center(cx: &mut TestAppContext
 
     view.update(cx, |this, cx| {
         let owner = this.current_session_key().expect("connected session");
-        assert!(this.apply_herdr_frames(
+        assert!(this.apply_endpoint_batch(
             &owner,
-            "p-right",
-            Some(vec![Ok(TerminalEvent::Notify {
+            vec![Ok(EndpointEvent::Notify {
                 kind: TerminalNotificationKind::SystemToast,
                 message: "Codex finished".into(),
                 body: Some("workspace 1".into()),
-            })]),
+            })],
             cx,
         ));
     });
@@ -1444,48 +1498,52 @@ fn herdr_system_toast_reaches_the_os_notification_center(cx: &mut TestAppContext
     });
     cx.run_until_parked();
     view.read_with(cx, |this, _| {
-        assert_eq!(this.selection.pane_id.as_deref(), Some("p-right"));
+        assert_eq!(
+            this.selection.pane_id.as_deref(),
+            Some("p-left"),
+            "an endpoint toast carries no pane target, so clicking it changes nothing"
+        );
     });
 }
 
 #[gpui::test]
 #[cfg(target_os = "macos")]
 fn background_agent_completion_reaches_the_os_notification_center(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
 
+    let finished = || {
+        EndpointEvent::SemanticNotification(ep::SemanticNotification {
+            kind: ep::SemanticNotificationKind::Finished,
+            title: String::new(),
+            body: None,
+            sound: None,
+            agent: Some("Codex".into()),
+            workspace_id: Some("w".into()),
+            tab_id: Some("t-a".into()),
+            pane_id: Some("p-right".into()),
+            position: None,
+        })
+    };
     view.update(cx, |this, cx| {
         this.i18n = I18n::new(Language::English);
-        let workspace_id = {
-            let pane = this
-                .snapshot
-                .as_mut()
-                .and_then(|snapshot| {
-                    snapshot
-                        .panes
-                        .iter_mut()
-                        .find(|pane| pane.pane_id == "p-right")
-                })
-                .expect("background pane");
-            pane.agent = Some("codex".into());
-            pane.display_agent = Some("Codex".into());
-            pane.agent_status = AgentStatus::Working;
-            pane.workspace_id.clone()
-        };
-        assert!(this.apply_agent_status_batch(
-            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
-                pane_id: "p-right".into(),
-                workspace_id,
-                agent_status: AgentStatus::Done,
-                agent: Some("codex".into()),
-                title: None,
-                display_agent: Some("Codex".into()),
-                state_labels: HashMap::new(),
-            })]),
-            cx,
-        ));
+        let pane = this
+            .snapshot
+            .as_mut()
+            .and_then(|snapshot| {
+                snapshot
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == "p-right")
+            })
+            .expect("background pane");
+        pane.agent = Some("codex".into());
+        pane.display_agent = Some("Codex".into());
+        pane.agent_status = AgentStatus::Working;
+        let owner = this.current_session_key().expect("connected session");
+        assert!(this.apply_endpoint_batch(&owner, vec![Ok(finished())], cx));
     });
 
     let shown = cx.shown_system_notifications();
@@ -1494,29 +1552,23 @@ fn background_agent_completion_reaches_the_os_notification_center(cx: &mut TestA
     assert!(shown[0].body.starts_with("Local · "));
 
     view.update(cx, |this, cx| {
-        assert!(this.apply_agent_status_batch(
-            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
-                pane_id: "p-right".into(),
-                workspace_id: "w".into(),
-                agent_status: AgentStatus::Done,
-                agent: Some("codex".into()),
-                title: None,
-                display_agent: Some("Codex".into()),
-                state_labels: HashMap::new(),
-            })]),
-            cx,
-        ));
+        // The semantic channel has no event log to dedupe against; the
+        // selected pane's own completion stays quiet only while it is visible.
+        this.selection.pane_id = Some("p-right".into());
+        this.window_active = true;
+        let owner = this.current_session_key().expect("connected session");
+        assert!(this.apply_endpoint_batch(&owner, vec![Ok(finished())], cx));
     });
     assert_eq!(
         cx.shown_system_notifications().len(),
         1,
-        "a repeated done event must not notify twice"
+        "the visible selected pane's completion must not notify"
     );
 }
 
 #[gpui::test]
 fn clicking_an_agent_notification_jumps_to_its_pane(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -1536,16 +1588,22 @@ fn clicking_an_agent_notification_jumps_to_its_pane(cx: &mut TestAppContext) {
         pane.agent = Some("codex".into());
         pane.display_agent = Some("Codex".into());
         pane.agent_status = AgentStatus::Working;
-        assert!(this.apply_agent_status_batch(
-            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
-                pane_id: "p-right".into(),
-                workspace_id: "w".into(),
-                agent_status: AgentStatus::Done,
-                agent: Some("codex".into()),
-                title: None,
-                display_agent: Some("Codex".into()),
-                state_labels: HashMap::new(),
-            })]),
+        let owner = this.current_session_key().expect("connected session");
+        assert!(this.apply_endpoint_batch(
+            &owner,
+            vec![Ok(EndpointEvent::SemanticNotification(
+                ep::SemanticNotification {
+                    kind: ep::SemanticNotificationKind::Finished,
+                    title: String::new(),
+                    body: None,
+                    sound: None,
+                    agent: Some("Codex".into()),
+                    workspace_id: Some("w".into()),
+                    tab_id: Some("t-b".into()),
+                    pane_id: Some("p-right".into()),
+                    position: None,
+                },
+            ))],
             cx,
         ));
     });
@@ -1586,8 +1644,8 @@ fn clicking_an_agent_notification_jumps_to_its_pane(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn clicking_a_parked_hosts_agent_notification_switches_host_and_pane(cx: &mut TestAppContext) {
-    let fake_a = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
-    let fake_b = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake_a = FakeHerdr::serving(two_pane_snapshot());
+    let fake_b = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake_a, cx);
@@ -1635,14 +1693,7 @@ fn clicking_a_parked_hosts_agent_notification_switches_host_and_pane(cx: &mut Te
                 sessions: vec![session_b],
                 session_index: Some(0),
                 connection: connection_b,
-                herdr_capabilities: crate::controller::HerdrCapabilities::from_snapshot(
-                    &snapshot_b,
-                ),
                 event_stream: EventStreamState::Idle,
-                event_listen: None,
-                agent_status_listen: None,
-                agent_status_panes: std::collections::HashSet::new(),
-                agent_status_handoff: None,
                 snapshot: Some(snapshot_b),
                 selection: Selection {
                     connection_id: "remote-click-test".into(),
@@ -1658,17 +1709,21 @@ fn clicking_a_parked_hosts_agent_notification_switches_host_and_pane(cx: &mut Te
             },
         );
         this.select_profile(profile_b_index, cx);
-        assert!(this.apply_agent_status_batch_for(
+        assert!(this.apply_endpoint_batch(
             &local_owner,
-            Some(vec![Ok(HerdrEvent::PaneAgentStatusChanged {
-                pane_id: "p-right".into(),
-                workspace_id: "w".into(),
-                agent_status: AgentStatus::Done,
-                agent: Some("codex".into()),
-                title: None,
-                display_agent: Some("Codex".into()),
-                state_labels: HashMap::new(),
-            })]),
+            vec![Ok(EndpointEvent::SemanticNotification(
+                ep::SemanticNotification {
+                    kind: ep::SemanticNotificationKind::Finished,
+                    title: String::new(),
+                    body: None,
+                    sound: None,
+                    agent: Some("Codex".into()),
+                    workspace_id: Some("w".into()),
+                    tab_id: Some("t-a".into()),
+                    pane_id: Some("p-right".into()),
+                    position: None,
+                },
+            ))],
             cx,
         ));
     });
@@ -1695,7 +1750,7 @@ fn clicking_a_parked_hosts_agent_notification_switches_host_and_pane(cx: &mut Te
 
 #[gpui::test]
 fn wheel_interaction_reuses_automatic_controls_without_changing_focus(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -1797,7 +1852,9 @@ fn a_disconnect_while_parked_restores_the_notice_from_the_reconnect_snapshot(
     let (fake, view, cx) = connect_edge_view(cx, script);
     drag_left_pane_to(&view, RIGHT_EDGE, cx);
     cx.run_until_parked();
-    send_events(&fake, park_events(), cx);
+    push_state(&fake, &view, cx, park_state, |snapshot| {
+        snapshot.tabs.iter().any(|tab| tab.tab_id == "t-tmp")
+    });
     view.update(cx, |this, cx| {
         assert!(this.parked_relocation("t-a").is_some());
         // The connection drops: local state is abandoned, the parked pane

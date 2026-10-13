@@ -2,192 +2,109 @@
 
 ## Ownership boundary
 
-Herdr is the source of truth for sessions, PTYs, processes, workspaces, tabs, panes,
-layouts, persistence, and agent detection. OcHerdr projects that state into a native
-window and sends explicit public API mutations back to Herdr.
+Herdr owns sessions, PTYs, processes, workspaces, tabs, panes, layouts,
+persistence, and agent detection. OcHerdr projects that state into a native
+window and sends explicit API operations back to Herdr.
 
-OcHerdr does not link or modify Herdr. It mirrors the serialization-relevant v20
-private client schema in a frozen codec and exposes only version-neutral terminal
-commands and events to the rest of the application.
+OcHerdr requires Herdr 0.9.0 or newer. The endpoint contract is checked against
+[Herdr 0.9.4](https://github.com/herdrdev/herdr/tree/7e26bad94044eba205033111a0ce8033ede7e24f).
+It negotiates endpoint generation 1 and four named codecs independently of
+Herdr's private binary protocol number. The current shared envelope is protocol
+22; the application does not use the old per-pane protocol-20 attach path.
+
+The macOS renderer uses the Ghostty development tree toward 1.4, pinned together
+with its embedding patch and archive checksum in
+[`vendor/ghosttykit/version.env`](../vendor/ghosttykit/version.env). Frames carry
+explicit leases and layout contexts. Releases may run on a Metal completion
+thread; final surface destruction is dispatched to the application thread.
 
 ## Data flow
 
-1. Run `herdr session list --json` locally or through `ssh -T`.
-2. For a local session, connect directly to its public `herdr.sock`.
-3. For a remote session, one persistent OpenSSH process uses two StreamLocal forwards
-   to map both the public API socket and private client socket into an owner-private
-   `/tmp/ocherdr-*` directory.
-4. Bootstrap state with `session.snapshot`; unknown fields are ignored for forward
-   compatibility.
-5. Use public API methods for Workspace, Tab, Pane, and layout mutations.
-6. Open a measured pane through the native private socket as `ObserveTerminal`. A
-   click, wheel gesture, or terminal input replaces that pane's connection with
-   `ControlTerminal { takeover: true }` without releasing other controlled panes.
-   Only the selected pane receives keyboard/IME input and terminal focus; wheel input
-   targets the pane under the pointer. Hidden panes retain their existing stream mode,
-   while recently visited Ghostty surfaces and frames remain in a bounded LRU cache.
-   Release every private connection when its pane is evicted or the session changes.
-7. Feed decoded ANSI bytes into Ghostty's `manualMirror` surface. Ghostty owns VT
-   state, shaping, glyph/image rendering, and produces a leased BGRA IOSurface.
-8. Wrap that IOSurface as a CoreVideo pixel buffer without copying it and without
-   attaching color-space metadata (`CVPixelBuffer::from_io_surface(..., None)`).
-   GPUI samples the BGRA frame as sRGB (`surface()` defaults to sRGB; the
-   Display-P3 fragment conversion in GPUI is unused) and releases the Ghostty
-   frame token only after the command buffer completes. GhosttyKit labels leased
-   Metal frames as Display P3, but OcHerdr does not forward that tag.
-9. Ghostty follows the application's effective light/dark appearance.
+1. Discover sessions with `herdr session list --json`, locally or through SSH.
+2. Connect to the public API socket for `session.snapshot` and operations outside
+   the endpoint's advertised methods. Remote API calls use a persistent OpenSSH
+   StreamLocal forward in a private temporary directory.
+3. Open one endpoint per session: the companion client socket locally, or
+   `ssh -T … herdr --session … remote-client-bridge` remotely. Default sessions
+   omit the `--session` option.
+4. Negotiate `endpoint.hello.v1`, `shell.snapshot.v1`, `shell.surface.v1`,
+   `shell.input.semantic.v1`, and `shell.blob.v1`. Reject unsupported generations
+   and core codecs. Unknown optional named controls are ignored.
+5. Use endpoint snapshot pushes as invalidation cues for an authoritative
+   `session.snapshot` pull. Refreshes are single-flight, with one queued retry
+   when another push arrives during a fetch.
+6. Activate the visible endpoint surface and synchronize client focus and view
+   selection. Herdr returns composited full frames and row patches with pane
+   rectangles. `SurfaceDecoder` extracts each pane and emits styled ANSI updates.
+7. Feed those updates to Ghostty's manual-mirror surfaces on macOS, or the
+   portable VT renderer on Linux and Windows. Ghostty handles VT state, shaping,
+   glyph rendering, and leased BGRA IOSurfaces.
+8. Wrap the IOSurface as a CoreVideo pixel buffer without copying. Keep the
+   frame lease until GPUI completes its Metal commands; see
+   [color rendering](color-rendering.md) for the compositor color-space contract.
+
+`surface_reuse`, `surface_delta`, and `surface_scroll` are optional encodings.
+OcHerdr does not request them, so Herdr keeps sending full V1 surfaces and V1
+row patches. A patch must match the retained surface revision before it applies.
 
 ## Host residency
 
-The status-bar host selector changes which host runtime is visible; it does not replace the
-runtime. A live background host retains its `SessionConnection`, OpenSSH tunnel, event worker,
-snapshot, selection, pane runtimes, and private terminal streams in a profile-keyed parking map.
-Terminal and event workers carry a `(profile_id, session_name)` owner key, so equal pane ids on
-different hosts cannot route frames into the active host by mistake. Events for a parked host are
-drained as connection liveness signals, and the current snapshot is fetched again when that host
-returns to the foreground.
+Switching hosts parks the previous connection, snapshot, selection, and pane
+renderers in a profile-keyed runtime. It disables that endpoint's surface
+interest while retaining its session connection. Switching back reactivates the
+surface and refreshes authoritative state.
 
-Only an explicit disconnect action, profile removal/reconfiguration, session replacement, or app
-shutdown releases a parked runtime. Normal tab and host switches therefore preserve Herdr's
-client id and client-scoped resources such as staged clipboard images. OcHerdr never evicts a live
-host connection automatically; the switcher exposes a disconnect button for that resource choice.
+Workers carry a `(profile_id, session_name)` owner key. Equal pane IDs on different
+hosts cannot route frames or events into one another. Snapshot invalidations for
+parked hosts also refresh their rows when the aggregate sidebar is visible.
+
+An explicit disconnect, profile reconfiguration/removal, session replacement,
+or shutdown releases a parked runtime. Ordinary tab and host switches keep the
+client identity and client-scoped resources such as staged clipboard images.
+Hidden pane renderers remain in a bounded cache.
+
+## Input and clipboard
+
+GPUI keys, releases, IME commits, paste, and mouse actions become semantic
+`ClientPaneInputEvent` values addressed to a pane. Herdr encodes them for that
+pane's actual terminal modes. App shortcuts and focused overlay inputs consume
+events before terminal forwarding. Ghostty's locally encoded output is drained
+without forwarding it a second time.
+
+The server's pane-surface metadata is the authority for mouse capture. Shift
+selection remains local; other captured pointer events include the pane's cell
+and pixel geometry. Keyboard focus follows the selected pane, while wheel input
+targets the pane beneath the pointer.
+
+An image paste uses one `ClipboardImage` message on the existing session
+endpoint. OcHerdr validates the local image and 16 MiB limit; Herdr stages it on
+the host that owns the pane. No second SSH command or remote shell utility is
+needed. Text and file-path paste retain the normal semantic-input path.
 
 ## SSH policy
 
-OcHerdr delegates configuration, keys, agents, proxies, known hosts, and authentication
-to `/usr/bin/ssh`. Background commands use BatchMode and bounded connection timeouts so
-the GUI cannot hang on an invisible prompt. First-use authentication and installation
-are deliberately opened in the user's system Terminal.
+OcHerdr delegates keys, agents, proxies, known hosts, and authentication to the
+system OpenSSH client. Background commands use BatchMode and bounded connection
+timeouts. First-use authentication and installation use the system Terminal.
 
-Remote command arguments are POSIX-quoted before OpenSSH constructs its remote command
-string. User labels and paths used for topology mutations travel as JSON through the
-forwarded public socket instead of through a shell.
+Remote command arguments are POSIX-quoted. Topology operations travel as JSON,
+not shell fragments. Endpoint requests are serialized to match Herdr's
+single-flight request lane; failures remain scoped to their request.
 
-An image-only or single file-backed image pasted with `Cmd+V` or `Ctrl+V` follows the
-same local-client boundary as Herdr remote attach. File-backed clipboard providers
-such as PixPin are recognized before GPUI's path-to-text fallback; OcHerdr reads the
-local file on a background executor, validates its signature and 16 MiB limit, then
-sends `ClipboardImage` over the selected pane's existing private connection. Herdr
-stages and pastes the path on the host that owns the PTY. No second SSH process, remote
-shell, X11 clipboard, `cat`, or `rm` is required.
+## Protocol compatibility and notifications
 
-## Terminal policy
+`ocherdr-herdr/src/endpoint_v1.rs` preserves the enum and field order of Herdr's
+shared bincode envelope. New endpoint behavior is named and negotiated rather
+than appended arbitrarily to that envelope. Frozen upstream JSON fixtures and
+a golden binary envelope cover compatibility. A live test can also exercise
+handshake, input, split requests, full surfaces, and patches against an isolated
+server selected by `OCHERDR_TEST_CLIENT_SOCKET`.
 
-Only one controller may own one terminal, but a single OcHerdr may independently
-control multiple terminals. Panes begin as observers and direct interaction promotes
-the target pane while preserving the other controlled panes. Stream mode is separate
-from focus: keyboard, IME, and focus-in/out reporting go to the selected pane, while
-wheel input goes to the pane under the pointer. A takeover by another client demotes
-only the affected pane locally; it is promoted again only by another direct
-interaction. Untouched panes on hidden tabs remain observers. Panes already controlled
-by OcHerdr retain that control stream across tab switches, and all hidden panes retain
-their most recent surface until LRU eviction. A sequence gap in a delta frame
-invalidates the local terminal state and requires a fresh bridge. A full frame is an
-ANSI redraw and is applied to the existing Ghostty surface; it does not destroy or
-recreate renderer state.
+Semantic agent completion and attention notifications arrive on the endpoint.
+OcHerdr posts them through the local operating system's notification service,
+including for remote sessions, while suppressing the selected pane's alert when
+its window is frontmost. Clicking an alert selects its host and pane.
 
-Terminal input follows the reverse path: GPUI key or committed-text events enter
-Ghostty's native input encoder, and its exact output bytes are sent losslessly in the
-private protocol's `Input` message. This preserves application-cursor mode, bracketed
-paste, modifier protocols, and other terminal modes.
-
-Key presses, repeats, and releases go through `ghostty_surface_key`. The surface runs
-in `GHOSTTY_SURFACE_IO_MANUAL_MIRROR` mode with an `io_write_cb`, so everything
-Ghostty wants to write to the pty (encoded keys, pastes, mouse reports, query
-replies) lands in one per-surface queue that `Terminal::try_input` drains; the
-controller forwards it to the selected pane's control stream after each key and on
-every frame and event poll. OcHerdr's own shortcuts (`handle_app_shortcut`: ⌘
-combos, the Ctrl+B prefix mode, overlay keys) are claimed before the terminal sees
-the key, and the matching key-up is swallowed too. IME-composed text keeps its own
-commit path and is written as-is.
-
-The event Ghostty receives mirrors what Ghostty.app builds from an `NSEvent`:
-`keycode` is the macOS virtual keycode (mapped back from GPUI's key name through the
-US ANSI layout, since GPUI does not expose the hardware code), `text` is GPUI's
-`key_char` for plain keys and the chord's own character for Ctrl/Alt chords,
-`unshifted_codepoint` is the key name when it is a single character, and Shift is
-reported as consumed when it produced the text. Ghostty then tracks the kitty
-keyboard protocol and modifyOtherKeys state itself, so Shift+Enter is
-`ESC [27;2;13~` in the legacy encoding and `ESC [13;2u` once an application such as
-Claude Code enables the kitty protocol.
-
-Ghostty's default keybindings are application actions (tabs, splits, windows, font
-size, search, inspector) that OcHerdr either implements itself or does not offer,
-and a bound key never reaches the pty. `ocherdr-terminal` therefore starts every
-Ghostty config it loads with `keybind = clear` and restores only the macOS defaults
-that are pty writes (`super+left/right/backspace` → `^A`/`^E`/`^U`,
-`alt+left/right` → `ESC b`/`ESC f`), so a key OcHerdr does not claim is encoded
-exactly as Ghostty would encode it with those bindings. The same base config sets
-`macos-option-as-alt = true`: Option is Alt, prefixing `ESC` rather than typing the
-macOS symbol, which is what OcHerdr sent before it used Ghostty's encoder.
-
-## Private protocol evolution
-
-The snapshot's `protocol` value selects a codec before a terminal socket is opened.
-Unknown versions are rejected; OcHerdr never guesses a layout or falls back to the
-process/NDJSON adapter.
-
-`ocherdr-herdr/src/private_v20.rs` is a frozen wire schema. Enum and field order are
-part of bincode's ABI and are guarded by golden byte fixtures. Application code cannot
-import it. `private_protocol.rs` owns the explicit version registry, handshake, limits,
-and mapping between wire values and the stable `TerminalCommand` / `TerminalEvent`
-facade.
-
-`Notify` messages are part of the stable terminal facade and are rendered if Herdr
-delivers one to that terminal client. They are not the source of agent-completion
-alerts: Herdr's generic notifications target its foreground app client, while
-OcHerdr's pane sockets use terminal-attach mode. Instead, OcHerdr detects genuine
-`working -> done` and `working -> blocked` transitions on its parameterized
-`pane.agent_status_changed` subscriptions and posts those through GPUI's platform
-notification API. The subscription handoff keeps startup and reconnect replay quiet,
-and inactive hosts retain their established status listener when the user switches
-machines. On macOS the platform API uses `UNUserNotificationCenter`; Windows uses
-native Toast notifications with the OcHerdr AppUserModelID; Linux uses the XDG
-notification D-Bus service through `notify-rust`.
-
-For a future v21, add a new `private_v21.rs`, copy the released Herdr schema exactly,
-add independent golden fixtures, register one new codec variant, and implement only
-the facade mappings that changed. The SSH tunnel, pane lifecycle, clipboard reader,
-Ghostty integration, and controllers must not depend on a versioned wire type and
-therefore should require no edits. The end-to-end fake-socket test must run once per
-registered codec before support is advertised.
-
-## Agent status events
-
-OcHerdr opens two independent `events.subscribe` connections.
-
-The session-wide EventHub types are subscribed once at connect and never
-rebuilt. Herdr starts those at sequence 0 and, after the subscribe ACK,
-replays retained history. OcHerdr never applies that startup burst to the
-rendered snapshot: every batch extends a short quiet-period deadline. Once
-the stream is quiet, OcHerdr fetches and installs one authoritative snapshot.
-Events arriving while that snapshot is in flight request another snapshot,
-so historical `layout.updated` states are never presented as a startup
-animation and a concurrent live change is not silently lost.
-
-The per-pane `pane.agent_status_changed` subscription is rebuilt when the
-snapshot pane set changes. Herdr starts those parameterized entries at the
-hub's current sequence, so a rebuild does not replay status history.
-
-Herdr does not merge the two connections into a globally ordered stream:
-detect/release on the session subscription and status on the per-pane
-subscription can arrive out of order.
-
-OcHerdr therefore treats a name mismatch between a status event and the pane's
-current agent as `Resync`. That catches cross-subscription reordering of
-*different* agents. It cannot distinguish two instances of the same kind
-(`grok` then another `grok` in the same pane). In that case a stale status
-event can apply to the new generation and stay until the next status event
-or a resync; it is not necessarily brief.
-
-Known limitation (session replay vs snapshot): the quiet-period deadline is a
-presentation barrier, not a protocol watermark. It prevents retained history
-from being rendered and converges through a final snapshot, but a continuously
-busy stream can postpone startup convergence. Herdr should still provide
-either a replay-complete event or monotonic event sequences with an atomic
-snapshot watermark for an exact protocol-level barrier.
-
-A complete fix for cross-stream reordering still needs Herdr to provide a
-globally sequenced aggregate subscription and a snapshot barrier. Until
-then the same-kind restart race is an accepted limitation; OcHerdr does
-not add local generation tracking for it.
+Herdr's full TUI settings are not currently embedded through this endpoint path.
+The toolbar explains that boundary; OcHerdr's own appearance settings remain
+available in the app.

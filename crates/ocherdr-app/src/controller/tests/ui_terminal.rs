@@ -815,37 +815,24 @@ fn agent_info_parses_the_custom_name_instead_of_display_metadata() {
 }
 
 #[test]
-fn agent_panel_refreshes_output_from_that_pane_status_events() {
+fn agent_panel_refreshes_output_when_that_pane_status_changes() {
     let overlay = agent_panel("p-a");
-    let status = HerdrEvent::PaneAgentStatusChanged {
-        pane_id: "p-a".into(),
-        workspace_id: "w".into(),
-        agent_status: AgentStatus::Working,
-        agent: Some("grok".into()),
-        title: None,
-        display_agent: Some("grok".into()),
-        state_labels: HashMap::new(),
-    };
-    let other = HerdrEvent::PaneAgentStatusChanged {
-        pane_id: "p-b".into(),
-        workspace_id: "w".into(),
-        agent_status: AgentStatus::Done,
-        agent: Some("grok".into()),
-        title: None,
-        display_agent: Some("grok".into()),
-        state_labels: HashMap::new(),
-    };
-    assert!(agent_panel_refresh_from_batch(
+    let mut snapshot = two_tab_snapshot();
+    snapshot.panes[0].agent_status = AgentStatus::Working;
+    snapshot.panes[1].agent_status = AgentStatus::Done;
+    assert!(agent_panel_refresh_needed(
         &overlay,
-        Some(&[Ok(status.clone())]),
+        Some(AgentStatus::Done),
+        Some(&snapshot)
     ));
-    assert!(!agent_panel_refresh_from_batch(
-        &overlay,
-        Some(&[Ok(other)]),
-    ));
-    assert!(!agent_panel_refresh_from_batch(
+    assert!(
+        !agent_panel_refresh_needed(&overlay, Some(AgentStatus::Working), Some(&snapshot)),
+        "a status flip on another pane leaves the panel's output alone"
+    );
+    assert!(!agent_panel_refresh_needed(
         &Overlay::Appearance,
-        Some(&[Ok(status)])
+        Some(AgentStatus::Done),
+        Some(&snapshot)
     ));
 }
 

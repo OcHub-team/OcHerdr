@@ -28,7 +28,7 @@ pub use relocation::{
 };
 pub use split_drag::{apply_ratios, pinned_ratios};
 
-pub const MINIMUM_HERDR_VERSION: &str = "0.8.1";
+pub const MINIMUM_HERDR_VERSION: &str = "0.9.0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

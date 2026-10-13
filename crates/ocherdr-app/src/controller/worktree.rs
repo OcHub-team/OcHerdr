@@ -54,7 +54,7 @@ impl OcHerdrView {
     }
 
     /// Switch to the tab a `*.create` / `worktree.open` response names, now
-    /// or once the matching events have been applied. `Selection::reconcile`
+    /// or once a snapshot push carries it. `Selection::reconcile`
     /// deliberately ignores `tab.focused` from other clients, so the tab
     /// this client itself asked for has to be selected explicitly.
     pub(super) fn follow_created_tab(
@@ -72,7 +72,7 @@ impl OcHerdrView {
     }
 
     /// Select the pending created tab if the snapshot has it and at least one
-    /// of its panes; otherwise keep waiting for the events.
+    /// of its panes; otherwise keep waiting for the next snapshot push.
     pub(super) fn settle_pending_created_tab(&mut self, cx: &mut Context<Self>) {
         let Some(tab_id) = self.pending_created_tab.clone() else {
             return;
@@ -317,10 +317,10 @@ impl OcHerdrView {
             self.abandon_worktree_list();
             return;
         };
-        let socket = connection.socket_path().to_owned();
+        let client = connection.api_client();
         self.worktree_list_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { request_socket(&socket, "worktree.list", params) })
+                .background_spawn(async move { client.request("worktree.list", params) })
                 .await;
             this.update(cx, |this, cx| {
                 this.worktree_list_task = None;

@@ -113,10 +113,6 @@ impl OcHerdrView {
             runtime.color_scheme_dark = palette.dark;
             runtime.palette_signature = palette.signature();
         }
-        if let Some(settings) = &self.herdr_settings {
-            let palette = palette.clone();
-            settings.update(cx, |settings, cx| settings.apply_palette(&palette, cx));
-        }
         if let Some(error) = palette_error {
             self.notify_failure(FailureKind::ApplyPalette, error, cx);
         }

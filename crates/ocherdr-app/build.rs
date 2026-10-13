@@ -27,7 +27,9 @@ const LOCALES: &[(&str, &str)] = &[("en", "EN"), ("zh-Hans", "ZH")];
 const REFERENCE: &str = "en";
 
 fn main() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("i18n");
+    let dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"))
+            .join("i18n");
     println!("cargo:rerun-if-changed={}", dir.display());
 
     let catalogs: BTreeMap<&str, BTreeMap<String, String>> = LOCALES

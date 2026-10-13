@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
@@ -118,59 +119,37 @@ fn private_socket_path_is_derived_exactly_like_herdr() {
         client_socket_path_from_api(Path::new("/tmp/custom-api")),
         PathBuf::from("/tmp/custom-api-client.sock")
     );
-    assert_eq!(SUPPORTED_TERMINAL_PROTOCOL_VERSIONS, &[20]);
     assert_eq!(MAX_CLIPBOARD_IMAGE_BYTES, 16 * 1024 * 1024);
 }
 
 #[test]
-fn ssh_tunnel_forwards_public_and_private_sockets_in_one_process() {
-    let profile = ConnectionProfile::Ssh {
-        id: "server".into(),
-        label: "Server".into(),
-        destination: "deploy@example.com".into(),
-        port: Some(2202),
-        identity_file: Some("/Keys/work key".into()),
-        proxy_jump: None,
-        herdr_path: "herdr".into(),
-    };
-    let command = ssh_tunnel_command(
-        &profile,
-        "/tmp/local-api.sock:/remote/herdr.sock",
-        "/tmp/local-client.sock:/remote/herdr-client.sock",
-    )
-    .unwrap();
-    let arguments = command
-        .get_args()
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    let forwards = arguments
-        .windows(2)
-        .filter(|arguments| arguments[0] == "-L")
-        .map(|arguments| arguments[1].as_str())
-        .collect::<Vec<_>>();
+fn bridge_args_omit_session_flag_for_the_default_session() {
     assert_eq!(
-        forwards,
-        [
-            "/tmp/local-api.sock:/remote/herdr.sock",
-            "/tmp/local-client.sock:/remote/herdr-client.sock",
-        ]
-    );
-    assert!(arguments.windows(2).any(|args| args == ["-p", "2202"]));
-    assert!(
-        arguments
-            .windows(2)
-            .any(|args| args == ["-i", "/Keys/work key"])
+        bridge_args("default", "remote-client-bridge"),
+        ["remote-client-bridge"]
     );
     assert_eq!(
-        arguments.last().map(String::as_str),
-        Some("deploy@example.com")
+        bridge_args("default", "remote-api-bridge"),
+        ["remote-api-bridge"]
+    );
+}
+
+#[test]
+fn bridge_args_place_session_flag_before_the_subcommand() {
+    assert_eq!(
+        bridge_args("agents", "remote-client-bridge"),
+        ["--session", "agents", "remote-client-bridge"]
+    );
+    assert_eq!(
+        bridge_args("work one", "remote-api-bridge"),
+        ["--session", "work one", "remote-api-bridge"]
     );
 }
 
 #[test]
 fn an_empty_open_channel_does_not_wake_the_ui() {
     use futures::FutureExt as _;
-    let (_tx, mut rx) = futures_mpsc::unbounded::<u8>();
+    let (_tx, mut rx) = futures::channel::mpsc::unbounded::<u8>();
     assert!(
         next_batch(&mut rx).now_or_never().is_none(),
         "空通道不应该唤醒 UI"
@@ -180,7 +159,7 @@ fn an_empty_open_channel_does_not_wake_the_ui() {
 #[test]
 fn a_ready_channel_drains_already_queued_items() {
     use futures::FutureExt as _;
-    let (tx, mut rx) = futures_mpsc::unbounded();
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
     tx.unbounded_send(1).unwrap();
     tx.unbounded_send(2).unwrap();
     tx.unbounded_send(3).unwrap();
@@ -193,247 +172,9 @@ fn a_ready_channel_drains_already_queued_items() {
 #[test]
 fn a_closed_channel_ends_the_stream_instead_of_waiting() {
     use futures::FutureExt as _;
-    let (tx, mut rx) = futures_mpsc::unbounded::<u8>();
+    let (tx, mut rx) = futures::channel::mpsc::unbounded::<u8>();
     drop(tx);
     assert_eq!(next_batch(&mut rx).now_or_never(), Some(None));
-}
-
-const PANE_ID_REQUIRED_SUBSCRIPTIONS: &[&str] = &[
-    "pane.agent_status_changed",
-    "pane.scroll_changed",
-    "pane.output_matched",
-];
-
-#[test]
-fn subscription_list_excludes_types_that_require_pane_id() {
-    assert_eq!(EVENT_SUBSCRIPTIONS.len(), 24);
-    for kind in ["worktree.created", "worktree.opened", "worktree.removed"] {
-        assert!(
-            EVENT_SUBSCRIPTIONS.contains(&kind),
-            "{kind} must be in the session-wide subscribe list"
-        );
-    }
-    for required in PANE_ID_REQUIRED_SUBSCRIPTIONS {
-        assert!(
-            !EVENT_SUBSCRIPTIONS.contains(required),
-            "{required} requires pane_id and must not be in the session-wide subscribe list"
-        );
-    }
-}
-
-#[test]
-fn a_subscription_started_ack_succeeds() {
-    parse_subscription_ack(r#"{"id":"ocherdr-events-1","result":{"type":"subscription_started"}}"#)
-        .unwrap();
-}
-
-#[test]
-fn event_lines_are_decoded_from_the_data_payload() {
-    let event = parse_event_line(
-        r#"{"data":{"type":"workspace_focused","workspace_id":"w1"},"event":"workspace_focused"}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        event,
-        HerdrEvent::WorkspaceFocused {
-            workspace_id: "w1".into()
-        }
-    );
-}
-
-#[test]
-fn agent_status_event_lines_use_the_dotted_envelope_without_a_data_type() {
-    let working = parse_event_line(
-        r#"{"data":{"agent":"t21-probe","agent_status":"working","pane_id":"wC:p4","workspace_id":"wC"},"event":"pane.agent_status_changed"}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        working,
-        HerdrEvent::PaneAgentStatusChanged {
-            pane_id: "wC:p4".into(),
-            workspace_id: "wC".into(),
-            agent_status: AgentStatus::Working,
-            agent: Some("t21-probe".into()),
-            title: None,
-            display_agent: None,
-            state_labels: Default::default(),
-        }
-    );
-
-    let done = parse_event_line(
-        r#"{"data":{"agent":"t21-probe","agent_status":"done","pane_id":"wC:p4","title":"t21 title","workspace_id":"wC"},"event":"pane.agent_status_changed"}"#,
-    )
-    .unwrap();
-    let HerdrEvent::PaneAgentStatusChanged {
-        agent_status,
-        title,
-        ..
-    } = done
-    else {
-        panic!("expected pane agent status changed");
-    };
-    assert_eq!(agent_status, AgentStatus::Done);
-    assert_eq!(title.as_deref(), Some("t21 title"));
-}
-
-#[test]
-fn session_subscriptions_are_the_session_wide_eventhub_list() {
-    let subscriptions = session_subscriptions();
-    assert_eq!(subscriptions.len(), EVENT_SUBSCRIPTIONS.len());
-    assert_eq!(subscriptions[0], json!({"type": EVENT_SUBSCRIPTIONS[0]}));
-    assert!(
-        !subscriptions
-            .iter()
-            .any(|value| value.get("pane_id").is_some())
-    );
-    assert!(EVENT_SUBSCRIPTIONS.contains(&"pane.agent_detected"));
-    assert!(!EVENT_SUBSCRIPTIONS.contains(&"pane.agent_status_changed"));
-}
-
-#[test]
-fn agent_status_subscriptions_are_parameterized_and_separate_from_the_session_list() {
-    // Herdr starts parameterized pane.agent_status_changed at
-    // current_sequence; session-wide Event types replay from 0.
-    let subscriptions = agent_status_subscriptions(&["wC:p1".into(), "wC:p4".into()]);
-    assert_eq!(
-        subscriptions,
-        vec![
-            json!({"type": "pane.agent_status_changed", "pane_id": "wC:p1"}),
-            json!({"type": "pane.agent_status_changed", "pane_id": "wC:p4"}),
-        ]
-    );
-}
-
-#[test]
-fn unknown_event_types_are_unknown_and_broken_payloads_error() {
-    assert_eq!(
-        parse_event_line(
-            r#"{"data":{"type":"some_future_event","whatever":1},"event":"some_future_event"}"#
-        )
-        .unwrap(),
-        HerdrEvent::Unknown
-    );
-    let missing_data = parse_event_line(r#"{"event":"pane_updated"}"#).unwrap_err();
-    assert!(matches!(missing_data, HerdrError::Protocol(message) if message.contains("`data`")));
-    let broken =
-        parse_event_line(r#"{"data":{"type":"pane_updated"},"event":"pane_updated"}"#).unwrap_err();
-    assert!(matches!(broken, HerdrError::Json(_)));
-}
-
-#[test]
-fn connect_returns_err_when_subscribe_is_rejected() {
-    let directory = tempfile::TempDir::new().unwrap();
-    let socket_path = directory.path().join("api.sock");
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let mut payload = serde_json::to_vec(&json!({
-            "id": "",
-            "error": {
-                "code": "invalid_request",
-                "message": "invalid request: missing field `pane_id`"
-            }
-        }))
-        .unwrap();
-        payload.push(b'\n');
-        stream.write_all(&payload).unwrap();
-        stream.flush().unwrap();
-    });
-    match EventStream::connect(&socket_path) {
-        Err(HerdrError::Api { code, message }) => {
-            assert_eq!(code, "invalid_request");
-            assert!(message.contains("pane_id"));
-        }
-        Err(error) => panic!("expected invalid_request, got {error:?}"),
-        Ok(_) => panic!("rejected subscribe must return Err"),
-    }
-}
-
-#[test]
-fn session_subscribe_sends_only_session_wide_types() {
-    let directory = tempfile::TempDir::new().unwrap();
-    let socket_path = directory.path().join("api.sock");
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    let (request_tx, request_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        request_tx.send(line).unwrap();
-        let mut payload = serde_json::to_vec(&json!({
-            "id": "",
-            "error": {
-                "code": "captured",
-                "message": "request captured"
-            }
-        }))
-        .unwrap();
-        payload.push(b'\n');
-        stream.write_all(&payload).unwrap();
-        stream.flush().unwrap();
-    });
-    match EventStream::connect(&socket_path) {
-        Err(HerdrError::Api { code, .. }) => assert_eq!(code, "captured"),
-        Err(error) => panic!("expected captured request, got {error:?}"),
-        Ok(_) => panic!("subscribe was supposed to be rejected after capture"),
-    }
-    let request: Value = serde_json::from_str(&request_rx.recv().unwrap()).unwrap();
-    assert_eq!(request["method"], "events.subscribe");
-    let subscriptions = request["params"]["subscriptions"].as_array().unwrap();
-    assert_eq!(subscriptions.len(), EVENT_SUBSCRIPTIONS.len());
-    assert_eq!(subscriptions[0], json!({"type": EVENT_SUBSCRIPTIONS[0]}));
-    assert!(
-        !subscriptions
-            .iter()
-            .any(|value| value["type"] == "pane.agent_status_changed")
-    );
-}
-
-#[test]
-fn agent_status_subscribe_sends_only_parameterized_pane_entries() {
-    let directory = tempfile::TempDir::new().unwrap();
-    let socket_path = directory.path().join("api.sock");
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    let (request_tx, request_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        request_tx.send(line).unwrap();
-        let mut payload = serde_json::to_vec(&json!({
-            "id": "",
-            "error": {
-                "code": "captured",
-                "message": "request captured"
-            }
-        }))
-        .unwrap();
-        payload.push(b'\n');
-        stream.write_all(&payload).unwrap();
-        stream.flush().unwrap();
-    });
-    match EventStream::connect_agent_status(&socket_path, &["p1".into(), "p2".into()]) {
-        Err(HerdrError::Api { code, .. }) => assert_eq!(code, "captured"),
-        Err(error) => panic!("expected captured request, got {error:?}"),
-        Ok(_) => panic!("subscribe was supposed to be rejected after capture"),
-    }
-    let request: Value = serde_json::from_str(&request_rx.recv().unwrap()).unwrap();
-    assert_eq!(request["method"], "events.subscribe");
-    assert_eq!(
-        request["params"]["subscriptions"],
-        json!([
-            {"type": "pane.agent_status_changed", "pane_id": "p1"},
-            {"type": "pane.agent_status_changed", "pane_id": "p2"},
-        ])
-    );
 }
 
 #[test]
@@ -488,6 +229,7 @@ fn request_socket_returns_the_result_when_the_server_replies() {
 }
 
 #[test]
+#[ignore = "requires a live local herdr >= 0.9 server"]
 fn endpoint_handshake_against_live_server() {
     // OCHERDR_TEST_CLIENT_SOCKET overrides the default session socket so the
     // handshake can be exercised against a disposable named session.
@@ -505,7 +247,13 @@ fn endpoint_handshake_against_live_server() {
         return;
     }
     let endpoint = crate::TerminalEndpoint::new(socket);
-    let (session, mut events) = crate::endpoint::EndpointSession::spawn(endpoint, 80, 24, 8, 17);
+    let (session, mut events) = crate::endpoint::EndpointSession::spawn(
+        crate::endpoint::EndpointTransport::Local(endpoint),
+        80,
+        24,
+        8,
+        17,
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut welcome = None;
     let mut snapshot = None;
@@ -761,4 +509,351 @@ fn ssh_commands_forward_proxy_jump() {
         attach_command(&profile, "work"),
         "ssh -t -p 2202 -i /Keys/work -J bastion deploy@example.com 'exec /opt/herdr session attach work'"
     );
+}
+
+#[cfg(unix)]
+fn spawn_fake_endpoint_server(
+    respond: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::TempDir::new().unwrap();
+    let socket_path = directory.path().join("client.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        respond(stream);
+    });
+    (directory, socket_path)
+}
+
+#[cfg(unix)]
+fn next_endpoint_event(
+    events: &mut crate::endpoint::EndpointEventReceiver,
+) -> Option<Result<crate::endpoint::EndpointEvent>> {
+    futures::executor::block_on(futures::StreamExt::next(events))
+}
+
+#[cfg(unix)]
+#[test]
+fn endpoint_handshake_with_fake_server_negotiates_and_captures_the_snapshot() {
+    use crate::endpoint::EndpointEvent;
+    use crate::endpoint_v1 as ep;
+
+    let welcome = ep::EndpointServerWelcome {
+        generation: ep::ENDPOINT_PROTOCOL_GENERATION,
+        server_version: "herdr 0.9.0".into(),
+        snapshot_codec: ep::ENDPOINT_SNAPSHOT_KIND.into(),
+        surface_codec: ep::SURFACE_CODEC_V1.into(),
+        input_codec: ep::INPUT_CODEC_V1.into(),
+        blob_codec: ep::BLOB_CODEC_V1.into(),
+        methods: vec!["client_shell.surface.set".into(), "pane.split".into()],
+        capabilities: vec![ep::HEALTH_CHECK_CAPABILITY.into()],
+        error: None,
+    };
+    let (_directory, socket_path) = spawn_fake_endpoint_server(move |mut stream| {
+        let hello: ep::ClientMessage = ep::read_message(&mut stream, ep::MAX_FRAME_SIZE).unwrap();
+        let ep::ClientMessage::EndpointControl { kind, data } = hello else {
+            panic!("expected endpoint hello, got {hello:?}");
+        };
+        assert_eq!(kind, ep::ENDPOINT_HELLO_KIND);
+        let hello: ep::EndpointClientHello = serde_json::from_str(&data).unwrap();
+        assert_eq!(hello.generation, ep::ENDPOINT_PROTOCOL_GENERATION);
+
+        ep::write_message(
+            &mut stream,
+            &ep::ServerMessage::EndpointControl {
+                kind: ep::ENDPOINT_WELCOME_KIND.into(),
+                data: serde_json::to_string(&welcome).unwrap(),
+            },
+        )
+        .unwrap();
+        ep::write_message(
+            &mut stream,
+            &ep::ServerMessage::EndpointControl {
+                kind: ep::ENDPOINT_SNAPSHOT_KIND.into(),
+                data: serde_json::to_string(&json!({
+                    "boot_id": "boot-1",
+                    "revision": 7,
+                    "config_diagnostic": null,
+                    "product_announcement": null,
+                    "update_available": null,
+                    "update_install_command": "",
+                    "server_keybindings_toml": null,
+                    "latest_release_notes_available": false,
+                    "integration_updates_available": false,
+                    "worktree_directory": "",
+                    "release_notes": null,
+                    "focused_workspace_id": null,
+                    "focused_tab_id": null,
+                    "focused_pane_id": null,
+                    "tab_bar_right": [],
+                    "tab_bar_right_separator": "",
+                    "agent_view_label": null,
+                    "agent_order": [],
+                    "workspaces": [],
+                    "tabs": [],
+                    "panes": [],
+                    "agents": [],
+                    "commands": []
+                }))
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        // Keep the connection open until the client detaches.
+        let mut buffer = [0_u8; 64];
+        let _ = stream.read(&mut buffer);
+    });
+
+    let transport = crate::endpoint::EndpointTransport::local(socket_path);
+    let (_session, mut events) = crate::endpoint::EndpointSession::spawn(transport, 80, 24, 8, 17);
+    let welcome_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut negotiated = None;
+    let mut snapshot = None;
+    while std::time::Instant::now() < welcome_deadline
+        && (negotiated.is_none() || snapshot.is_none())
+    {
+        match next_endpoint_event(&mut events) {
+            Some(Ok(EndpointEvent::Welcome(welcome))) => negotiated = Some(welcome),
+            Some(Ok(EndpointEvent::Snapshot(shell))) => snapshot = Some(shell),
+            Some(Ok(_)) => {}
+            Some(Err(error)) => panic!("handshake failed: {error}"),
+            None => panic!("endpoint stream closed during handshake"),
+        }
+    }
+    let negotiated = negotiated.expect("welcome never arrived");
+    assert_eq!(negotiated.server_version, "herdr 0.9.0");
+    assert_eq!(
+        negotiated.methods,
+        ["client_shell.surface.set", "pane.split"]
+    );
+    let snapshot = snapshot.expect("snapshot never arrived");
+    assert_eq!(snapshot.boot_id, "boot-1");
+    assert_eq!(snapshot.revision, 7);
+}
+
+#[cfg(unix)]
+#[test]
+fn endpoint_negotiation_failure_names_the_minimum_herdr_version() {
+    // A pre-0.9 server does not understand the endpoint hello and drops the
+    // connection; the error must tell the user to upgrade instead of falling
+    // back to a legacy codec.
+    let (_directory, socket_path) = spawn_fake_endpoint_server(|mut stream| {
+        let hello: crate::endpoint_v1::ClientMessage =
+            crate::endpoint_v1::read_message(&mut stream, crate::endpoint_v1::MAX_FRAME_SIZE)
+                .unwrap();
+        drop(hello);
+        drop(stream);
+    });
+
+    let transport = crate::endpoint::EndpointTransport::local(socket_path);
+    let (_session, mut events) = crate::endpoint::EndpointSession::spawn(transport, 80, 24, 8, 17);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "no error arrived");
+        match next_endpoint_event(&mut events) {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(MINIMUM_HERDR_VERSION),
+                    "error must name {MINIMUM_HERDR_VERSION}: {message}"
+                );
+                assert!(
+                    message.contains("upgrade Herdr"),
+                    "error must direct the upgrade: {message}"
+                );
+                break;
+            }
+            None => panic!("stream closed without surfacing the negotiation error"),
+        }
+    }
+}
+
+/// Live probe against a running local Herdr >= 0.9 server: prints the
+/// endpoint welcome (advertised methods/capabilities) and exercises a few
+/// read-only endpoint-scoped API calls to map the endpoint API surface.
+/// Run explicitly:
+/// `cargo test -p ocherdr-herdr endpoint_probe_live -- --ignored --nocapture`
+#[test]
+#[ignore = "requires a live local herdr >= 0.9 server"]
+fn endpoint_probe_live_endpoint_api_surface() {
+    use endpoint::{EndpointCommand, EndpointEvent, EndpointSession};
+    use futures::StreamExt as _;
+
+    let home = std::env::var_os("HOME").expect("HOME is set");
+    let socket_path = PathBuf::from(home).join(".config/herdr/herdr.sock");
+    if !socket_path.exists() {
+        eprintln!("no local herdr socket at {socket_path:?}; skipping");
+        return;
+    }
+    let profile = ConnectionProfile::Local {
+        herdr_path: "herdr".into(),
+    };
+    let session = SessionSummary {
+        name: DEFAULT_SESSION_NAME.into(),
+        default: true,
+        running: true,
+        socket_path,
+        session_dir: PathBuf::new(),
+    };
+    let connection = SessionConnection::connect(&profile, &session).expect("connect");
+    let (endpoint_session, events) =
+        EndpointSession::spawn(connection.endpoint_transport(), 80, 24, 8, 16);
+
+    // Bridge the async receiver onto a std channel so the probe can time out.
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut events = events;
+        while let Some(item) = futures::executor::block_on(events.next()) {
+            if tx.send(item).is_err() {
+                break;
+            }
+        }
+    });
+
+    let probe_methods = [
+        "session.snapshot",
+        "workspace.list",
+        "agent.list",
+        "worktree.list",
+    ];
+    let mut welcome_printed = false;
+    let mut requested = false;
+    let mut answered = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline && answered < probe_methods.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok(item) = rx.recv_timeout(remaining) else {
+            eprintln!("probe: timed out waiting for endpoint events");
+            break;
+        };
+        match item {
+            Ok(EndpointEvent::Welcome(welcome)) => {
+                welcome_printed = true;
+                eprintln!("probe: server_version = {}", welcome.server_version);
+                eprintln!("probe: capabilities = {:?}", welcome.capabilities);
+                eprintln!("probe: methods ({}):", welcome.methods.len());
+                for method in &welcome.methods {
+                    eprintln!("  - {method}");
+                }
+            }
+            Ok(EndpointEvent::Snapshot(_)) if !requested && welcome_printed => {
+                // boot_id is captured by now; the lane accepts requests.
+                requested = true;
+                for method in probe_methods {
+                    let id = endpoint_session
+                        .request(method, json!({}))
+                        .expect("queue probe request");
+                    eprintln!("probe: queued {method} as {id}");
+                }
+            }
+            Ok(EndpointEvent::Response { request_id, data }) => {
+                answered += 1;
+                let text = String::from_utf8_lossy(&data);
+                eprintln!(
+                    "probe: response {request_id}: {}",
+                    &text[..text.len().min(400)]
+                );
+            }
+            Ok(EndpointEvent::ShellError(message)) => {
+                eprintln!("probe: shell error: {message}");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("probe: stream error: {error}");
+                break;
+            }
+        }
+    }
+    let _ = endpoint_session.send(EndpointCommand::Detach);
+    eprintln!("probe: done (answered {answered}/{})", probe_methods.len());
+}
+
+/// Probe `command.invoke` as a potential generic dispatcher for methods the
+/// endpoint lane does not expose directly (session.snapshot, agent.*).
+/// Run explicitly:
+/// `cargo test -p ocherdr-herdr endpoint_probe_command_invoke -- --ignored --nocapture`
+#[test]
+#[ignore = "requires a live local herdr >= 0.9 server"]
+fn endpoint_probe_command_invoke() {
+    use endpoint::{EndpointCommand, EndpointEvent, EndpointSession};
+    use futures::StreamExt as _;
+
+    let home = std::env::var_os("HOME").expect("HOME is set");
+    let socket_path = PathBuf::from(home).join(".config/herdr/herdr.sock");
+    if !socket_path.exists() {
+        eprintln!("no local herdr socket; skipping");
+        return;
+    }
+    let profile = ConnectionProfile::Local {
+        herdr_path: "herdr".into(),
+    };
+    let session = SessionSummary {
+        name: DEFAULT_SESSION_NAME.into(),
+        default: true,
+        running: true,
+        socket_path,
+        session_dir: PathBuf::new(),
+    };
+    let connection = SessionConnection::connect(&profile, &session).expect("connect");
+    let (endpoint_session, events) =
+        EndpointSession::spawn(connection.endpoint_transport(), 80, 24, 8, 16);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut events = events;
+        while let Some(item) = futures::executor::block_on(events.next()) {
+            if tx.send(item).is_err() {
+                break;
+            }
+        }
+    });
+
+    // (label, params) candidates for command.invoke's expected shape.
+    let attempts: [(&str, Value); 3] = [
+        (
+            "command-as-string",
+            json!({"command": "session.snapshot", "params": {}}),
+        ),
+        (
+            "method-as-string",
+            json!({"method": "session.snapshot", "params": {}}),
+        ),
+        ("bare-name", json!({"name": "session.snapshot"})),
+    ];
+    let mut requested = false;
+    let mut answered = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline && answered < attempts.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok(item) = rx.recv_timeout(remaining) else {
+            eprintln!("probe2: timed out");
+            break;
+        };
+        match item {
+            Ok(EndpointEvent::Snapshot(_)) if !requested => {
+                requested = true;
+                for (label, params) in &attempts {
+                    let id = endpoint_session
+                        .request("command.invoke", params.clone())
+                        .expect("queue");
+                    eprintln!("probe2: queued {label} as {id}");
+                }
+            }
+            Ok(EndpointEvent::Response { request_id, data }) => {
+                answered += 1;
+                let text = String::from_utf8_lossy(&data);
+                eprintln!(
+                    "probe2: response {request_id}: {}",
+                    &text[..text.len().min(500)]
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("probe2: stream error: {error}");
+                break;
+            }
+        }
+    }
+    let _ = endpoint_session.send(EndpointCommand::Detach);
+    eprintln!("probe2: done");
 }

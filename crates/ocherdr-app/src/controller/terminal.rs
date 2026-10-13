@@ -1,10 +1,5 @@
 use super::*;
 
-/// What woke a pane listener on the Ghostty side.
-pub(super) enum GhosttyWake {
-    Frame(Option<std::result::Result<RenderedFrame, ocherdr_terminal::TerminalError>>),
-    Input(Option<Vec<u8>>),
-}
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) static HERDR_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -13,18 +8,6 @@ impl OcHerdrView {
     pub(crate) fn ensure_session_terminals(&mut self, cx: &mut Context<Self>) {
         let profile_id = self.current_profile().id().to_owned();
         let Some(session_name) = self.current_session().map(|session| session.name.clone()) else {
-            self.stop_session_terminals();
-            return;
-        };
-        if self.snapshot.is_none() {
-            self.stop_session_terminals();
-            return;
-        }
-        let Some(terminal_endpoint) = self
-            .connection
-            .as_ref()
-            .map(SessionConnection::terminal_endpoint)
-        else {
             self.stop_session_terminals();
             return;
         };
@@ -42,11 +25,16 @@ impl OcHerdrView {
             self.pane_resize_serial = self.pane_resize_serial.wrapping_add(1);
             self.session_panes = Some(SessionPanes::new(incoming));
         }
-        // Protocol 22+ sessions multiplex everything over one endpoint
-        // connection; it must exist before panes spawn so they can share it.
+        // The endpoint connection carries every pane's composited surface and
+        // the session's snapshot/event push; it must exist before panes spawn
+        // so they can share it. Its first snapshot push also drives the first
+        // `session.snapshot` pull after a reload.
         self.ensure_endpoint_session(cx);
-        let snapshot = self.snapshot.as_ref().expect("snapshot checked above");
-        let terminal_protocol = snapshot.protocol;
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            // Pane mirrors wait for the first snapshot the endpoint push
+            // triggers; the endpoint itself is already connecting above.
+            return;
+        };
         let live_pane_ids = snapshot_pane_ids(snapshot);
         let pane_tabs = snapshot
             .panes
@@ -117,10 +105,9 @@ impl OcHerdrView {
             panes.retain(|pane_id, _| live_pane_ids.contains(pane_id));
 
             // Visibility and control ownership are independent. Keep a hidden
-            // pane's existing private stream intact so an ordinary tab switch
-            // does not detach from Herdr, discard client-scoped resources, and
-            // reconnect when the user returns. LRU eviction and real pane or
-            // session removal still drop the stream normally.
+            // pane's mirror runtime intact so an ordinary tab switch does not
+            // recreate Ghostty state when the user returns. LRU eviction and
+            // real pane or session removal still drop the runtime normally.
             for target in &wanted {
                 let pane_id = &target.pane_id;
                 let mode = target.mode;
@@ -128,7 +115,7 @@ impl OcHerdrView {
                     panes.get(pane_id).map(|runtime| runtime.mode),
                     panes
                         .get(pane_id)
-                        .is_some_and(|runtime| runtime.session.is_closed() || runtime.exit_seen),
+                        .is_some_and(|runtime| runtime.endpoint.is_closed() || runtime.exit_seen),
                     mode,
                 ) {
                     VisiblePanePlan::Keep
@@ -143,16 +130,7 @@ impl OcHerdrView {
                                 runtime.color_scheme_dark = palette.dark;
                                 runtime.palette_signature = palette.signature();
                             }
-                            if let Some(frames) = sync_pane_session(
-                                runtime,
-                                mode,
-                                target.focused,
-                                terminal_endpoint.clone(),
-                                terminal_protocol,
-                                pane_id.clone(),
-                            ) {
-                                pending_listens.push((pane_id.clone(), Some(frames)));
-                            }
+                            sync_pane_session(runtime, mode, target.focused);
                         }
                     }
                     VisiblePanePlan::Spawn => {
@@ -167,6 +145,12 @@ impl OcHerdrView {
                             mount_more = true;
                             continue;
                         }
+                        // Endpoint sessions carry every pane on one
+                        // connection; the runtime's mirror waits for the
+                        // server-composited surface.
+                        let Some(handle) = endpoint_handle.clone() else {
+                            continue;
+                        };
                         let cols = 80;
                         let rows = 24;
                         match Terminal::new(cols, rows, 10_000, &palette) {
@@ -182,34 +166,11 @@ impl OcHerdrView {
                                     too_small.push(pane_id.clone());
                                     continue;
                                 }
-                                let (session, frames) = match &endpoint_handle {
-                                    // Endpoint sessions carry every pane on one
-                                    // connection; the runtime's mirror waits
-                                    // for the server-composited surface.
-                                    Some(handle) => (
-                                        PaneChannel::Endpoint {
-                                            handle: handle.clone(),
-                                            pane_id: pane_id.clone(),
-                                        },
-                                        None,
-                                    ),
-                                    None => {
-                                        let (session, frames) = TerminalSession::spawn(
-                                            terminal_endpoint.clone(),
-                                            terminal_protocol,
-                                            pane_id.clone(),
-                                            mode,
-                                            resolved.columns,
-                                            resolved.rows,
-                                        );
-                                        (PaneChannel::Private(session), Some(frames))
-                                    }
-                                };
                                 terminal.set_focus(target.focused);
                                 panes.insert(
                                     pane_id.clone(),
                                     PaneRuntime {
-                                        session,
+                                        endpoint: handle,
                                         terminal,
                                         frame: None,
                                         mode,
@@ -232,7 +193,7 @@ impl OcHerdrView {
                                 );
                                 mounted += 1;
                                 spawned.insert(pane_id.clone());
-                                pending_listens.push((pane_id.clone(), frames));
+                                pending_listens.push(pane_id.clone());
                             }
                             Err(error) => spawn_error = Some(error.to_string()),
                         }
@@ -281,19 +242,14 @@ impl OcHerdrView {
         if let Some(error) = spawn_error {
             self.notify_failure(FailureKind::SpawnTerminal, error, cx);
         }
-        for (pane_id, frames) in pending_listens {
+        for pane_id in pending_listens {
             let owner = self
                 .session_panes
                 .as_ref()
                 .expect("pane listener requires a live session")
                 .owner
                 .clone();
-            let task = match frames {
-                Some(frames) => Self::listen_pane(owner, pane_id.clone(), frames, cx),
-                // Endpoint panes have no private stream; the listener only
-                // services the mirror's own frame queue.
-                None => Self::listen_pane_mirror(owner, pane_id.clone(), cx),
-            };
+            let task = Self::listen_pane_mirror(owner, pane_id.clone(), cx);
             if let Some(runtime) = self.pane_mut(&pane_id) {
                 runtime.listen = Some(task);
             }
@@ -351,89 +307,6 @@ impl OcHerdrView {
         cx.notify();
     }
 
-    pub(super) fn demote_lost_terminal_control(
-        &mut self,
-        pane_id: &str,
-        loss: TerminalControlLoss,
-        mode: TerminalMode,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(session) = self.session_panes.as_mut() else {
-            return false;
-        };
-        if !demote_terminal_control(session, pane_id) {
-            return false;
-        }
-        // The first visible-pane control request is deliberately
-        // non-takeover. An existing owner is normal: reconnect once as an
-        // observer without presenting an error or retrying control.
-        if mode == TerminalMode::Control && loss == TerminalControlLoss::Busy {
-            return true;
-        }
-        let (kind, detail) = match loss {
-            TerminalControlLoss::Busy => (
-                FailureKind::TerminalControlBusy,
-                self.i18n.text(k::NOTIFY_DETAIL_TERMINAL_CONTROL_BUSY),
-            ),
-            TerminalControlLoss::TakenOver => (
-                FailureKind::TerminalControlTakenOver,
-                self.i18n.text(k::NOTIFY_DETAIL_TERMINAL_CONTROL_TAKEN_OVER),
-            ),
-        };
-        self.notify_failure(kind, detail, cx);
-        true
-    }
-
-    pub(super) fn listen_pane(
-        owner: SessionKey,
-        pane_id: String,
-        mut frames: TerminalEventReceiver,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            loop {
-                let herdr = next_batch(&mut frames);
-                // Ghostty renders frames and encodes key/mouse input on its
-                // own threads. Wake on either so a click's press and release
-                // reach Herdr immediately instead of at the next UI event that
-                // happens to flush the pane.
-                let ghostty = poll_fn(|task_cx| {
-                    this.update(cx, |this, _| {
-                        let Some(runtime) = this.pane_for_owner_mut(&owner, &pane_id) else {
-                            return Poll::Ready(GhosttyWake::Frame(None));
-                        };
-                        if let Poll::Ready(frame) = runtime.terminal.poll_frame(task_cx) {
-                            return Poll::Ready(GhosttyWake::Frame(frame));
-                        }
-                        runtime.terminal.poll_input(task_cx).map(GhosttyWake::Input)
-                    })
-                    .unwrap_or(Poll::Ready(GhosttyWake::Frame(None)))
-                });
-                pin_mut!(herdr, ghostty);
-                let keep = match future::select(herdr, ghostty).await {
-                    Either::Left((batch, _)) => this
-                        .update(cx, |this, cx| {
-                            this.apply_herdr_frames(&owner, &pane_id, batch, cx)
-                        })
-                        .unwrap_or(false),
-                    Either::Right((GhosttyWake::Frame(frame), _)) => this
-                        .update(cx, |this, cx| {
-                            this.apply_ghostty_frame(&owner, &pane_id, frame, cx)
-                        })
-                        .unwrap_or(false),
-                    Either::Right((GhosttyWake::Input(bytes), _)) => this
-                        .update(cx, |this, cx| {
-                            this.apply_ghostty_input(&owner, &pane_id, bytes, cx)
-                        })
-                        .unwrap_or(false),
-                };
-                if !keep {
-                    break;
-                }
-            }
-        })
-    }
-
     /// Mirror-only listener for endpoint-mode panes: there is no per-pane
     /// Herdr stream, so the task just services the Ghostty frame queue.
     /// Terminal content arrives through the session-level endpoint listener.
@@ -466,173 +339,6 @@ impl OcHerdrView {
                 }
             }
         })
-    }
-
-    pub(super) fn apply_herdr_frames(
-        &mut self,
-        owner: &SessionKey,
-        pane_id: &str,
-        batch: Option<Vec<std::result::Result<TerminalEvent, HerdrError>>>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let active = self.is_active_session(owner);
-        let composing = active.then(|| self.ime_marked.clone()).flatten();
-        let selected_pane = active.then(|| self.selection.pane_id.clone()).flatten();
-        let visible_pane_ids = if active {
-            self.optimistic_visible_pane_ids()
-        } else {
-            HashSet::new()
-        };
-        let mut error = None;
-        let mut hierarchy_changed = false;
-        let mut control_loss = None;
-        let mut changed = false;
-        let mut notifications = Vec::new();
-        let keep = {
-            let Some(runtime) = self.pane_for_owner_mut(owner, pane_id) else {
-                return false;
-            };
-            match batch {
-                None => {
-                    runtime.exit_seen = true;
-                    hierarchy_changed = true;
-                    false
-                }
-                Some(items) => {
-                    let mut closed = false;
-                    for item in items {
-                        match item {
-                            Ok(TerminalEvent::Frame(frame)) => {
-                                let frame_size = (frame.width, frame.height);
-                                if !incoming_frame_should_apply(
-                                    runtime.viewport_ready,
-                                    runtime.size,
-                                    frame_size,
-                                ) {
-                                    // A stream reconnected at its bootstrap size can deliver a
-                                    // full frame before Herdr applies this pane's measured
-                                    // viewport. Before the initial measurement, or while waiting
-                                    // for a new viewport-sized frame, keep the last compatible
-                                    // frame instead of painting a stale grid into the upper-left
-                                    // corner.
-                                    continue;
-                                }
-                                runtime.terminal.apply_frame(&frame.bytes, frame.full);
-                                if frame.full {
-                                    // A full Ghostty replay resets terminal modes. Herdr's ANSI
-                                    // blit contains cells and cursor state, not the originating
-                                    // application's DEC mouse modes. Restore Herdr's side-channel
-                                    // authority when available. Unknown is deliberately not
-                                    // guessed from agent detection: an agent can be at a shell or
-                                    // another non-mouse screen, where a normal drag must select.
-                                    if let Some((mouse_enabled, sgr_pixels)) = runtime.mouse_capture
-                                    {
-                                        runtime
-                                            .terminal
-                                            .set_mouse_capture(mouse_enabled, sgr_pixels);
-                                    }
-                                }
-                                if selected_pane.as_deref() == Some(pane_id)
-                                    && let Some(preedit) = composing.as_deref()
-                                {
-                                    runtime.terminal.set_preedit(Some(preedit));
-                                }
-                            }
-                            Ok(TerminalEvent::Notify {
-                                kind,
-                                message,
-                                body,
-                            }) => notifications.push((kind, message, body)),
-                            Ok(TerminalEvent::MouseCapture {
-                                enabled,
-                                sgr_pixels,
-                            }) => {
-                                runtime.mouse_capture = Some((enabled, sgr_pixels));
-                                runtime.terminal.set_mouse_capture(enabled, sgr_pixels);
-                            }
-                            Ok(TerminalEvent::KittyKeyboardReportAll { enabled }) => {
-                                runtime.terminal.set_kitty_keyboard_report_all(enabled)
-                            }
-                            Err(stream_error) => {
-                                runtime.exit_seen = true;
-                                control_loss = runtime
-                                    .mode
-                                    .is_controlled()
-                                    .then(|| {
-                                        terminal_control_loss(&stream_error)
-                                            .map(|loss| (loss, runtime.mode))
-                                    })
-                                    .flatten();
-                                hierarchy_changed = control_loss.is_none();
-                                closed = true;
-                                if !is_expected_terminal_exit(&stream_error)
-                                    && control_loss.is_none()
-                                {
-                                    error = Some((
-                                        FailureKind::TerminalStream,
-                                        stream_error.to_string(),
-                                    ));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if let Err(runtime_error) = Terminal::tick_runtime() {
-                        error = Some((FailureKind::TerminalRuntime, runtime_error.to_string()));
-                    }
-                    if forward_terminal_input(runtime).is_err() {
-                        runtime.exit_seen = true;
-                        hierarchy_changed = true;
-                        closed = true;
-                    }
-                    match runtime.terminal.try_frame() {
-                        Ok(Some(frame)) if frame.host_context == runtime.frame_context => {
-                            runtime.frame = Some(frame);
-                            if visible_pane_ids.contains(pane_id) {
-                                changed = true;
-                            }
-                        }
-                        Ok(Some(_)) | Ok(None) => {}
-                        Err(frame_error) => {
-                            error = Some((FailureKind::RenderTerminal, frame_error.to_string()))
-                        }
-                    }
-                    !closed
-                }
-            }
-        };
-        for (kind, message, body) in notifications {
-            self.post_herdr_notification(owner, pane_id, kind, message, body, cx);
-        }
-        if !active {
-            if !keep || error.is_some() {
-                if let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) {
-                    runtime.event_stream = EventStreamState::Lost(
-                        HerdrError::TerminalClosed("terminal stream disconnected".into())
-                            .to_string()
-                            .into(),
-                    );
-                }
-                cx.notify();
-            }
-            return keep;
-        }
-        if let Some((kind, detail)) = error {
-            self.notify_failure(kind, detail, cx);
-        }
-        if let Some((loss, mode)) = control_loss
-            && self.demote_lost_terminal_control(pane_id, loss, mode, cx)
-        {
-            self.ensure_session_terminals(cx);
-            cx.notify();
-        }
-        if hierarchy_changed {
-            self.resync_snapshot(self.event_epoch, cx);
-        }
-        if changed {
-            self.render_cache.notify_terminal(cx);
-        }
-        keep
     }
 
     pub(super) fn post_herdr_notification(
@@ -720,14 +426,14 @@ impl OcHerdrView {
         };
         let mut error = None;
         let mut changed = false;
-        let mut hierarchy_changed = false;
-        let keep = {
+        {
             let Some(runtime) = self.pane_for_owner_mut(owner, pane_id) else {
                 return false;
             };
             let Some(frame) = frame else {
                 return false;
             };
+            discard_terminal_input(runtime);
             match frame {
                 Ok(frame) if frame.host_context == runtime.frame_context => {
                     runtime.frame = Some(frame);
@@ -738,84 +444,14 @@ impl OcHerdrView {
                     error = Some((FailureKind::RenderTerminal, frame_error.to_string()))
                 }
             }
-            if forward_terminal_input(runtime).is_err() {
-                runtime.exit_seen = true;
-                hierarchy_changed = true;
-                false
-            } else {
-                true
-            }
-        };
-        if !active {
-            if !keep || error.is_some() {
-                if let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) {
-                    runtime.event_stream = EventStreamState::Lost(
-                        HerdrError::TerminalClosed("terminal renderer disconnected".into())
-                            .to_string()
-                            .into(),
-                    );
-                }
-                cx.notify();
-            }
-            return keep;
         }
         if let Some((kind, detail)) = error {
             self.notify_failure(kind, detail, cx);
         }
-        if hierarchy_changed {
-            self.resync_snapshot(self.event_epoch, cx);
-        }
         if changed {
             self.render_cache.notify_terminal(cx);
         }
-        keep
-    }
-
-    /// Forward a pty write Ghostty just encoded, plus anything queued behind
-    /// it. `None` means the surface is gone and the listener should stop.
-    pub(super) fn apply_ghostty_input(
-        &mut self,
-        owner: &SessionKey,
-        pane_id: &str,
-        bytes: Option<Vec<u8>>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let active = self.is_active_session(owner);
-        let Some(bytes) = bytes else {
-            return false;
-        };
-        let keep = {
-            let Some(runtime) = self.pane_for_owner_mut(owner, pane_id) else {
-                return false;
-            };
-            let sent = if runtime.mode.is_controlled() {
-                runtime
-                    .session
-                    .send(TerminalCommand::Input(bytes))
-                    .map_err(|_| ())
-            } else {
-                Ok(())
-            };
-            if sent.is_err() || forward_terminal_input(runtime).is_err() {
-                runtime.exit_seen = true;
-                false
-            } else {
-                true
-            }
-        };
-        if !keep {
-            if active {
-                self.resync_snapshot(self.event_epoch, cx);
-            } else if let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) {
-                runtime.event_stream = EventStreamState::Lost(
-                    HerdrError::TerminalClosed("terminal stream closed".into())
-                        .to_string()
-                        .into(),
-                );
-                cx.notify();
-            }
-        }
-        keep
+        true
     }
 
     /// Pane ids painted in the selected tab, including panes Herdr has
@@ -1068,21 +704,14 @@ impl OcHerdrView {
             if !pane_grid_mountable(resolved.columns, resolved.rows) {
                 collapse = true;
             }
-            let size = (resolved.columns, resolved.rows);
-            // Herdr distinguishes the stream mode: a controller resize
-            // changes the shared PTY, while an observer resize updates only
-            // that observer's render viewport. The native protocol handles
-            // both modes in place, so resizing never tears down the surface or
-            // its private stream. Endpoint panes keep `runtime.size`
-            // server-owned: the frame's `inner_rect` is the authoritative
-            // cell grid, local measurement only drives the framebuffer.
-            let endpoint = matches!(runtime.session, PaneChannel::Endpoint { .. });
-            if !endpoint {
-                runtime.size = size;
-            } else if runtime.size.0 > 0 {
-                // resize_pixels sized the framebuffer to local pixels but
-                // also resolved its own cell grid; endpoint frames arrive
-                // encoded for the server's inner_rect grid, so re-assert it.
+            // Endpoint panes keep `runtime.size` server-owned: the frame's
+            // `inner_rect` is the authoritative cell grid, local measurement
+            // only drives the framebuffer. resize_pixels sized the framebuffer
+            // to local pixels but also resolved its own cell grid; endpoint
+            // frames arrive encoded for the server's inner_rect grid, so
+            // re-assert it. The canvas change itself reaches Herdr through
+            // `endpoint_send_resize` below.
+            if runtime.size.0 > 0 {
                 let _ = runtime
                     .terminal
                     .set_grid_size(runtime.size.0.max(1), runtime.size.1.max(1));
@@ -1091,19 +720,11 @@ impl OcHerdrView {
             runtime.viewport_ready = pending.pixels.0 > 0 && pending.pixels.1 > 0;
             if collapse {
                 // Keep only the shell/dividers. A later, larger measurement
-                // makes the pane mountable again and creates a fresh stream.
+                // makes the pane mountable again and creates a fresh mirror.
             } else {
-                let _ = runtime.session.send(TerminalCommand::Resize {
-                    cols: resolved.columns,
-                    rows: resolved.rows,
-                    cell_width_px: resolved.cell_width_px,
-                    cell_height_px: resolved.cell_height_px,
-                });
-            }
-            // Resizing swaps the framebuffer context. Produce and collect the
-            // first matching frame now instead of waiting for a pointer or key
-            // event to take the same refresh path.
-            if !collapse {
+                // Resizing swaps the framebuffer context. Produce and collect
+                // the first matching frame now instead of waiting for a
+                // pointer or key event to take the same refresh path.
                 flush_pane_surface(runtime);
             }
         }

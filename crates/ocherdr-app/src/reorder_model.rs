@@ -443,9 +443,9 @@ pub(crate) struct PendingSplitCommit {
     /// Requests still without a response.
     pub(crate) outstanding: usize,
     /// Split ratios of the tab's layout as last seen, and how many ratio
-    /// changes landed since release: Herdr emits one `layout.updated` per
-    /// request, so once every request is answered and as many changes have
-    /// landed the batch is over even if Herdr kept other ratios.
+    /// changes landed since release: Herdr's snapshot push carries one layout
+    /// per request, so once every request is answered and as many changes
+    /// have landed the batch is over even if Herdr kept other ratios.
     pub(crate) last_ratios: Vec<f32>,
     pub(crate) layouts_seen: usize,
 }

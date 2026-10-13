@@ -7,22 +7,20 @@ use crate::text_input::TextInput;
 use anyhow::Result;
 use gpui_platform::application;
 use ocherdr_core::{
-    AgentInfo, AgentNameError, AgentStatus, AgentStatusHandoff, ConnectionProfile, DropEdge,
-    DropZone, HerdrEvent, HierarchySnapshot, LayoutNode, LayoutRect, LayoutSplit, PaneInfo,
-    PaneLayout, PredictedLayout, PredictedPane, ReorderHover, Selection, SessionSummary,
-    SnapshotUpdate, SplitDirection, WorktreeInfo, WorktreeSourceInfo, ZoneRect, drop_zone,
-    layout_fingerprint, predict_insert_pane, predict_relocation_steps, predict_remove_pane,
-    predict_swap, rebuild_tree, reorder_insert_index, split_ratio_from_drag, split_rect,
-    valid_split_ratio,
+    AgentInfo, AgentNameError, AgentStatus, ConnectionProfile, DropEdge, DropZone,
+    HierarchySnapshot, LayoutNode, LayoutRect, LayoutSplit, PaneInfo, PaneLayout, PredictedLayout,
+    PredictedPane, ReorderHover, Selection, SessionSummary, SplitDirection, WorktreeInfo,
+    WorktreeSourceInfo, ZoneRect, drop_zone, layout_fingerprint, predict_insert_pane,
+    predict_relocation_steps, predict_remove_pane, predict_swap, rebuild_tree,
+    reorder_insert_index, split_ratio_from_drag, split_rect, valid_split_ratio,
 };
 use ocherdr_files::{
     BackendKind as FileBackendKind, FileEntry, FileService, FileVersion, TransferMonitor,
     TransferProgress,
 };
 use ocherdr_herdr::{
-    EventSubscription, HerdrError, HostHealthStatus, MAX_CLIPBOARD_IMAGE_BYTES, SessionConnection,
-    TerminalCommand, TerminalMode, TerminalNotificationKind, TerminalScrollDirection,
-    TerminalSession, discover_sessions, endpoint::EndpointHandle, request_socket,
+    HerdrError, HostHealthStatus, MAX_CLIPBOARD_IMAGE_BYTES, SessionConnection, TerminalMode,
+    TerminalNotificationKind, discover_sessions, endpoint::EndpointHandle,
 };
 use ocherdr_terminal::{
     KeyAction, KeyModifiers, RenderedFrame, SurfaceMouseButton, Terminal, TerminalPalette,
@@ -59,7 +57,6 @@ use serde_json::{Value, json};
 mod a11y;
 mod config;
 mod controller;
-use controller::HerdrCapabilities;
 mod file_panel;
 mod fonts;
 mod herdr_settings;
@@ -72,8 +69,7 @@ mod pane_model;
 mod pane_tab_drop;
 mod pane_templates;
 mod reorder_model;
-// Retain the upstream component API alongside OcHerdr's native editing layer.
-#[allow(dead_code)]
+mod shortcuts;
 mod text_input;
 mod theme_ansi;
 mod ui;
@@ -104,7 +100,6 @@ const TAB_REORDER_GAP_PX: f32 = 4.;
 const REORDER_ANIMATION: Duration = Duration::from_millis(180);
 const TAB_CLOSE_ANIMATION: Duration = Duration::from_millis(150);
 /// Fade of the ⌘N tab hints when Command is pressed or released.
-const TAB_SHORTCUT_ANIMATION: Duration = Duration::from_millis(100);
 const TAB_PILL_WIDTH: f32 = 160.;
 const TAB_TITLE_ACTION_WELL: f32 = 32.;
 const TAB_TITLE_FADE_WIDTH: f32 = 16.;
@@ -141,13 +136,9 @@ const PANE_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const PANE_MOUNT_BATCH_SIZE: usize = 1;
 const PANE_MOUNT_DELAY: Duration = Duration::from_millis(1);
 /// Keep recently visited pane surfaces alive across tab switches. This avoids
-/// recreating Metal/Ghostty state on every switch while bounding private socket,
-/// framebuffer, and scrollback usage for sessions with many tabs.
+/// recreating Metal/Ghostty state on every switch while bounding framebuffer
+/// and scrollback usage for sessions with many tabs.
 const PANE_RUNTIME_CACHE_LIMIT: usize = 24;
-/// Herdr does not mark the end of retained EventHub replay. This quiet period
-/// only decides when OcHerdr may resume applying incremental payloads; current
-/// snapshots are refreshed throughout replay and remain visible immediately.
-const STARTUP_REPLAY_QUIET_DELAY: Duration = Duration::from_millis(150);
 /// Share of the target pane it keeps on an edge drop (design §5.3: 0.5 in
 /// the first version; presets come later).
 const PANE_EDGE_DROP_RATIO: f32 = 0.5;
@@ -413,8 +404,6 @@ struct LoadedSession {
     sessions: Vec<SessionSummary>,
     selected: Option<usize>,
     connection: Option<SessionConnection>,
-    events: LoadedEvents,
-    snapshot: Option<HierarchySnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -426,33 +415,15 @@ enum HostConnectionState {
     Degraded,
 }
 
-enum LoadedEvents {
-    Idle,
-    Live(EventSubscription),
-    Lost(SharedString),
-}
-
-impl LoadedEvents {
-    fn from_subscribe(result: std::result::Result<EventSubscription, HerdrError>) -> Self {
-        match result {
-            Ok(events) => Self::Live(events),
-            Err(error) => Self::Lost(error.to_string().into()),
-        }
-    }
-}
-
+#[derive(Clone, Debug)]
 pub(crate) enum EventStreamState {
-    /// No live session, or the selected session is not running.
+    /// No live session, or the endpoint connection has not finished
+    /// negotiating yet.
     Idle,
     Live,
-    /// Subscribe failed, or a live stream later died. The snapshot is not live.
+    /// Endpoint negotiation failed, or a live stream later died. The snapshot
+    /// is not live.
     Lost(SharedString),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartupReplaySync {
-    Draining { serial: u64 },
-    Refreshing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,16 +443,16 @@ struct AgentNotificationTarget {
 struct SessionPanes {
     /// Dropping a mismatched owner drops every pane runtime and its listen task.
     owner: SessionKey,
-    /// One client-owned shell connection per session on endpoint-capable
-    /// servers (private protocol 22+, Herdr 0.9.x). `None` keeps the legacy
-    /// per-pane private streams.
+    /// The client-owned endpoint shell connection for this session: it carries
+    /// the composited tab surface, semantic input, and the snapshot/event push
+    /// every pane shares.
     endpoint: Option<crate::controller::endpoint::EndpointRuntime>,
     panes: HashMap<String, PaneRuntime>,
     /// Panes this OcHerdr instance currently controls. A first visible pane
     /// starts with non-takeover control so its PTY adopts the measured local
     /// viewport; direct interaction upgrades an observer with takeover.
     /// Ownership is per terminal, so distinct panes can stay controlled at
-    /// the same time. Hidden or remotely taken-over panes are removed.
+    /// the same time. Hidden panes are removed.
     controls: HashMap<String, TerminalMode>,
     /// Pane ids for which this session already made its one automatic,
     /// non-takeover control attempt. Busy panes fall back to observation and
@@ -493,23 +464,21 @@ struct SessionPanes {
 
 /// A live Herdr session parked while another host is visible. Ownership of
 /// the connection and pane runtimes stays here, so switching hosts does not
-/// kill the SSH tunnel or send terminal `Detach` messages.
+/// kill the SSH bridges or detach the endpoint session.
 struct ParkedHostRuntime {
     sessions: Vec<SessionSummary>,
     session_index: Option<usize>,
     connection: SessionConnection,
-    herdr_capabilities: HerdrCapabilities,
+    /// Endpoint connection state, kept for the aggregate sidebar's Degraded
+    /// presentation.
     event_stream: EventStreamState,
-    event_listen: Option<Task<()>>,
-    agent_status_listen: Option<Task<()>>,
-    agent_status_panes: HashSet<String>,
-    agent_status_handoff: Option<AgentStatusHandoff<HerdrEvent>>,
     snapshot: Option<HierarchySnapshot>,
     selection: Selection,
     session_panes: Option<SessionPanes>,
     pane_viewports: HashMap<String, MeasuredPaneViewport>,
-    /// The aggregate sidebar keeps parked hosts' snapshots fresh from their
-    /// event streams; refresh is single-flight with one queued re-request.
+    /// The aggregate sidebar refreshes parked hosts' snapshots when their
+    /// endpoint pushes a snapshot; refresh is single-flight with one queued
+    /// re-request.
     snapshot_refreshing: bool,
     snapshot_refresh_pending: bool,
 }
@@ -555,51 +524,13 @@ impl SessionPanes {
     }
 }
 
-/// How a pane talks to Herdr. Endpoint-capable servers multiplex all panes
-/// over one session connection; older servers keep a private stream per pane.
-enum PaneChannel {
-    Private(TerminalSession),
-    Endpoint {
-        handle: EndpointHandle,
-        pane_id: String,
-    },
-}
-
-impl PaneChannel {
-    fn is_closed(&self) -> bool {
-        match self {
-            Self::Private(session) => session.is_closed(),
-            Self::Endpoint { handle, .. } => handle.is_closed(),
-        }
-    }
-
-    /// Compatibility send for commands that map onto the endpoint channel.
-    /// Raw byte input has no endpoint representation — input paths branch to
-    /// semantic events before reaching this.
-    fn send(&self, command: TerminalCommand) -> Result<(), HerdrError> {
-        match (self, command) {
-            (Self::Private(session), command) => session.send(command),
-            (
-                Self::Endpoint { handle, pane_id },
-                TerminalCommand::ClipboardImage { extension, bytes },
-            ) => handle.send(ocherdr_herdr::endpoint::EndpointCommand::ClipboardImage {
-                target: ocherdr_herdr::endpoint::EndpointClipboardTarget::Pane(pane_id.clone()),
-                extension,
-                bytes,
-            }),
-            // Resize/scroll/release are session-surface or pane-scroll concerns
-            // handled by the endpoint paths that know the pane's scroll offset.
-            (Self::Endpoint { .. }, _) => Ok(()),
-        }
-    }
-}
-
 struct PaneRuntime {
-    /// First-visible panes attempt non-takeover control so the remote PTY is
-    /// sized before it paints. Untouched panes observe; panes already controlled
-    /// by this OcHerdr keep their stream across tab switches. Explicit
-    /// interaction can promote an observer with takeover.
-    session: PaneChannel,
+    /// The pane's writer half of the session's endpoint connection. First-
+    /// visible panes attempt non-takeover control so the remote PTY is sized
+    /// before it paints; untouched panes observe; explicit interaction can
+    /// promote an observer with takeover. Mode itself is only local
+    /// bookkeeping — the server streams every visible pane regardless.
+    endpoint: EndpointHandle,
     terminal: Terminal,
     frame: Option<RenderedFrame>,
     mode: TerminalMode,
@@ -613,8 +544,7 @@ struct PaneRuntime {
     /// `inner_rect`; the two differ by sub-cell rounding and stay separate
     /// so selection/IME math and pixel-mouse geometry each use the right one.
     pixel_size: (u32, u32),
-    /// Server-reported `inner_rect` pixels on the endpoint path; (0, 0)
-    /// before the first frame or on the private stream.
+    /// Server-reported `inner_rect` pixels; (0, 0) before the first frame.
     endpoint_pixels: (u32, u32),
     /// True after this pane's body has supplied an actual local viewport.
     /// Bootstrap frames use 80×24 and must not reach the Metal surface first.
@@ -624,12 +554,13 @@ struct PaneRuntime {
     palette_signature: u64,
     /// Dropping this cancels the pane's await loop.
     listen: Option<Task<()>>,
-    /// The Herdr stream ended; keep the last frame until the snapshot drops this pane.
+    /// The endpoint connection ended; keep the last frame until the snapshot
+    /// drops this pane.
     exit_seen: bool,
     /// Whether Herdr has supplied the authoritative terminal mouse-reporting
-    /// state for this private stream. `None` stays selection-first: agent
-    /// detection does not prove that the pane's current screen reports mouse
-    /// input, and guessing would make ordinary terminal text unselectable.
+    /// state for this pane. `None` stays selection-first: agent detection
+    /// does not prove that the pane's current screen reports mouse input, and
+    /// guessing would make ordinary terminal text unselectable.
     mouse_capture: Option<(bool, bool)>,
     /// Leftover pixel delta from trackpad wheel events, in the pane's Y axis.
     scroll_px: f32,
@@ -1076,23 +1007,9 @@ struct OcHerdrView {
     /// Hosts whose most recent explicit connection attempt failed. This is UI
     /// state only; it never causes an automatic reconnect.
     failed_hosts: HashSet<String>,
-    /// What the connected Herdr can do, derived from the last full snapshot.
-    herdr_capabilities: HerdrCapabilities,
+    /// Endpoint connection state for the active session: drives the
+    /// Connected/Degraded presentation and accessibility reporting.
     event_stream: EventStreamState,
-    /// Dropping this cancels the session-wide event await loop.
-    event_listen: Option<Task<()>>,
-    /// Retained events are invalidations until replay goes quiet. Unlike the
-    /// old barrier, every replay batch refreshes the visible current snapshot.
-    startup_replay_sync: Option<StartupReplaySync>,
-    startup_replay_serial: u64,
-    /// Dropping this cancels the per-pane agent-status await loop.
-    agent_status_listen: Option<Task<()>>,
-    /// In-flight agent-status subscribe that will replace `agent_status_listen`.
-    agent_status_rebuild: Option<Task<()>>,
-    /// Pane ids the current (or in-flight) agent-status subscribe was built for.
-    agent_status_panes: HashSet<String>,
-    /// Status events held until the post-subscribe snapshot is installed.
-    agent_status_handoff: Option<AgentStatusHandoff<HerdrEvent>>,
     snapshot: Option<HierarchySnapshot>,
     selection: Selection,
     operation: Option<SharedString>,
@@ -1101,7 +1018,7 @@ struct OcHerdrView {
     /// agent completion notification while the user can actually see it.
     window_active: bool,
     /// OcHerdr-owned native agent notifications. Unlike Herdr `SystemToast`,
-    /// these are driven by the pane status subscription available to this UI.
+    /// these are driven by the endpoint's semantic-notification push.
     agent_notifications: bool,
     /// Herdr-compatible five-state status presentation used consistently by
     /// workspace, pane, and agent surfaces.
@@ -1138,8 +1055,8 @@ struct OcHerdrView {
     tab_scroll: ScrollHandle,
     hovered_tab_id: Option<String>,
     /// Tab this client asked Herdr to create and has not switched to yet:
-    /// the response can land before `tab.created` / `pane.created` are
-    /// applied, so the switch waits until the tab and a pane exist locally.
+    /// the response can land before the next pushed snapshot is applied, so
+    /// the switch waits until the tab and a pane exist locally.
     pending_created_tab: Option<String>,
     /// Dropping this cancels a pending show or hide.
     tab_preview_task: Option<Task<()>>,
@@ -1153,10 +1070,12 @@ struct OcHerdrView {
     /// Command is down: the tab strip shows its ⌘N hints.
     command_held: bool,
     /// Opacity of the ⌘N hints, eased toward `command_held`.
-    shortcut_reveal: Transition,
+    shortcut_reveal: ochub_ui::shortcuts::ShortcutReveal,
+    shortcut_help_focus: ochub_ui::modal::ModalFocusState,
+    shortcut_help_search: Entity<TextInput>,
     prefix_pending: bool,
-    /// The last key-down was an OcHerdr shortcut; swallow its key-up.
-    suppress_key_release: bool,
+    /// Releases paired with key-downs consumed by the shell.
+    consumed_key_releases: ochub_ui::shortcuts::KeyReleaseTracker,
     surface_drag: SurfaceDrag,
     aux_mouse_drag: Option<AuxMouseDrag>,
     /// A released divider drag whose `layout.set_split_ratio` batch is still
@@ -1286,6 +1205,7 @@ enum Overlay {
     RemoteForm(RemoteForm),
     Appearance,
     HerdrSettings,
+    ShortcutHelp,
     HostSwitcher,
     ContextMenu(HierarchyContextMenu),
     FileContextMenu(FileContextMenu),
@@ -1536,8 +1456,8 @@ fn main() {
             let loaded = load_settings();
             let menu_i18n = I18n::new(loaded.language);
             I18n::install(loaded.language);
-            if let Some(directory) = dirs::config_dir() {
-                theme::set_themes_dir(directory.join("OcHerdr/themes"));
+            if let Some(paths) = config::AppPaths::user() {
+                theme::set_themes_dir(paths.themes());
             }
             ochub_ui::install(cx);
             cx.on_action(quit_app);

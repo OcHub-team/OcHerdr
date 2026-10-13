@@ -2,6 +2,67 @@ use super::*;
 #[cfg(target_os = "macos")]
 use gpui::Focusable;
 
+/// Pump the executor until the view's stream shows `Lost` with `expected` in
+/// the detail. The endpoint handshake and socket reads run on real threads,
+/// so a bare `run_until_parked` can return before the failure lands on the
+/// view — and a reconnect test starts from an older `Lost` it must wait past.
+fn wait_for_event_stream_lost(
+    view: &Entity<OcHerdrView>,
+    cx: &mut VisualTestContext,
+    expected: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let lost = view.read_with(cx, |this, _| {
+            matches!(&this.event_stream, EventStreamState::Lost(detail) if detail.contains(expected))
+        });
+        if lost {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the endpoint failure never marked the stream Lost with {expected:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A Herdr too old for `tab.move`: the endpoint generation-1 shell protocol
+/// works, but the NDJSON API serves `session.snapshot` only and rejects every
+/// other method. `FakeHerdr` has no named constructor for this combination.
+fn tab_move_rejecting_fake(snapshot: HierarchySnapshot) -> FakeHerdr {
+    FakeHerdr::start(snapshot, PaneMoveScript::default(), false, true)
+}
+
+/// Supply pane geometry and drive the mount scheduler so the visible tab
+/// spawns real Ghostty mirrors. relocation.rs keeps an identical private
+/// helper; this copy is local because that one is not shared.
+#[cfg(target_os = "macos")]
+fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestContext) {
+    view.update_in(cx, |this, window, cx| {
+        for (pane_id, x) in [("p-left", 0.), ("p-right", 400.)] {
+            this.sync_measured_pane_body(
+                pane_id,
+                gpui::Bounds {
+                    origin: gpui::point(gpui::px(x), gpui::px(0.)),
+                    size: gpui::size(gpui::px(400.), gpui::px(300.)),
+                },
+                window,
+                cx,
+            );
+        }
+        // The production scheduler spreads one mount over each wall-clock
+        // turn. GPUI's parked test executor does not advance that timer, so
+        // drive the same two batches explicitly after supplying geometry.
+        for _ in 0..2 {
+            this.pane_mount_scheduled = false;
+            this.ensure_session_terminals(cx);
+        }
+    });
+    cx.run_until_parked();
+}
+
 #[gpui::test]
 fn command_comma_opens_ocherdr_settings_in_place(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);
@@ -27,69 +88,93 @@ fn command_comma_opens_ocherdr_settings_in_place(cx: &mut TestAppContext) {
 
 #[gpui::test]
 #[cfg(target_os = "macos")]
-fn settings_toolbar_opens_embedded_client_and_close_restores_pane_input(cx: &mut TestAppContext) {
-    let (fake, view, cx) = connect_two_pane_view(cx);
+fn settings_toolbar_opens_the_explanation_overlay_and_close_restores_pane_input(
+    cx: &mut TestAppContext,
+) {
+    let fake = FakeHerdr::serving(two_pane_snapshot());
+    let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    measure_two_terminal_bodies(&view, cx);
     let before = view.read_with(cx, |this, _| this.selection.clone());
+
+    // Baseline: with the surface focused, a key reaches the selected pane
+    // through the endpoint's semantic input lane.
+    view.update_in(cx, |this, window, cx| this.focus.focus(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.pane_inputs("p-left").is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the pane never received the baseline key"
+        );
+        cx.run_until_parked();
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pane_inputs_before = fake.pane_inputs("p-left").len();
+
     let gear = cx
         .debug_bounds("open-herdr-settings")
         .expect("settings toolbar button");
     cx.simulate_click(gear.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    view.read_with(cx, |this, _| {
+    assert!(
+        cx.debug_bounds("close-herdr-settings").is_some(),
+        "the overlay renders the explanation panel instead of a settings client"
+    );
+    view.update_in(cx, |this, window, _| {
         assert!(matches!(this.overlay, crate::Overlay::HerdrSettings));
         assert!(this.herdr_settings.is_some());
         assert!(!crate::key_goes_to_terminal(&this.overlay));
+        assert!(
+            this.dialog_focus.is_focused(window),
+            "the explanation dialog takes focus"
+        );
     });
-    assert!(cx.debug_bounds("herdr-settings-surface").is_some());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_attach_count("__settings") == 0 {
-        assert!(Instant::now() < deadline, "settings never connected");
-        cx.run_until_parked();
-        thread::sleep(Duration::from_millis(10));
-    }
-    // Explicitly drive a key through GPUI, which must only reach the settings
-    // connection, even though the selected pane is still mounted behind it.
-    let pane_inputs = fake.terminal_inputs(before.pane_id.as_deref().unwrap());
-    cx.simulate_keystrokes("down");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_inputs("__settings").is_empty() {
-        assert!(Instant::now() < deadline, "settings never received the key");
-        cx.run_until_parked();
-        thread::sleep(Duration::from_millis(10));
-    }
-    // Ghostty can encode the press using its initial extended keyboard mode
-    // or legacy mode after the first full frame resets the surface.
-    let settings_inputs = fake.terminal_inputs("__settings");
-    assert!(
-        settings_inputs == vec![b"\x1b[B".to_vec()]
-            || settings_inputs == vec![b"\x1b[1;1:1B".to_vec()],
-        "unexpected settings key: {settings_inputs:?}"
-    );
     assert_eq!(
-        fake.terminal_inputs(before.pane_id.as_deref().unwrap()),
-        pane_inputs
+        fake.endpoint_connections(),
+        1,
+        "endpoint-generation servers get no embedded settings client"
     );
+
+    // Explicitly drive a key through GPUI. The dialog consumes it, so it
+    // reaches neither the pane mounted behind the overlay nor any settings
+    // connection.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    thread::sleep(Duration::from_millis(100));
+    cx.run_until_parked();
+    assert_eq!(
+        fake.pane_inputs("p-left").len(),
+        pane_inputs_before,
+        "the overlay must swallow keys instead of leaking them to the pane"
+    );
+    view.read_with(cx, |this, _| {
+        assert!(matches!(this.overlay, crate::Overlay::HerdrSettings));
+    });
+
     let close = cx
         .debug_bounds("close-herdr-settings")
         .expect("settings close button");
     cx.simulate_click(close.center(), gpui::Modifiers::default());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while fake.terminal_detach_count("__settings") == 0 {
-        assert!(Instant::now() < deadline, "settings never detached");
-        cx.run_until_parked();
-        thread::sleep(Duration::from_millis(10));
-    }
+    cx.run_until_parked();
     view.update_in(cx, |this, window, cx| {
         assert!(matches!(this.overlay, crate::Overlay::None));
         assert!(this.herdr_settings.is_none());
         assert!(this.focus.is_focused(window));
         assert_eq!(this.selection.pane_id, before.pane_id);
         assert_eq!(this.selection.tab_id, before.tab_id);
-        // Reopening uses a fresh entity/connection and remains in the window.
+        // Reopening uses a fresh entity and remains in the window.
         this.open_herdr_settings(cx);
         assert!(matches!(this.overlay, crate::Overlay::HerdrSettings));
         this.close_herdr_settings(window, cx);
     });
+    assert_eq!(
+        fake.endpoint_connections(),
+        1,
+        "closing the overlay leaves the session endpoint as the only connection"
+    );
 }
 
 #[gpui::test]
@@ -113,7 +198,9 @@ fn command_backspace_edits_the_focused_gpui_field_before_terminal_input(cx: &mut
             is_held: false,
             prefer_character_input: false,
         };
-        assert!(this.handle_text_input_macos_editing(&event, window, cx));
+        assert!(ochub_ui::text_input::dispatch_focused_editing_key(
+            &event, window, cx
+        ));
     });
     view.read_with(cx, |this, cx| {
         assert_eq!(
@@ -219,15 +306,19 @@ fn command_backspace_handles_dynamically_created_fields_and_preserves_compositio
         is_held: false,
         prefer_character_input: false,
     };
-    view.update_in(cx, |this, window, cx| {
+    view.update_in(cx, |_this, window, cx| {
         input.update(cx, |input, cx| input.set_content("first\n中文😀", cx));
         input.read(cx).focus_handle(cx).focus(window, cx);
-        assert!(this.handle_text_input_macos_editing(&event, window, cx));
+        assert!(ochub_ui::text_input::dispatch_focused_editing_key(
+            &event, window, cx
+        ));
         assert_eq!(input.read(cx).content().as_ref(), "first\n");
         input.update(cx, |input, cx| {
             input.replace_and_mark_text_in_range(None, "候选", None, window, cx)
         });
-        assert!(this.handle_text_input_macos_editing(&event, window, cx));
+        assert!(ochub_ui::text_input::dispatch_focused_editing_key(
+            &event, window, cx
+        ));
         assert_eq!(input.read(cx).content().as_ref(), "first\n候选");
     });
 }
@@ -763,79 +854,93 @@ fn a_prompt_failure_completes_after_its_panel_closes(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_closed_event_poll_marks_the_stream_lost_and_stops_rescheduling(cx: &mut TestAppContext) {
+fn a_closed_endpoint_stream_marks_the_stream_lost_and_stops_rescheduling(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
+    cx.executor().allow_parking();
+    view.update(cx, |this, _| this.headless_terminals = true);
+    connect_view_to_fake_and_resync(&view, &fake, cx);
 
     let keep = view.update(cx, |this, cx| {
-        this.event_stream = EventStreamState::Live;
-        this.apply_event_batch(None, cx)
+        assert!(
+            matches!(this.event_stream, EventStreamState::Live),
+            "the connected fixture starts Live"
+        );
+        let owner = this.current_session_key().expect("connected session");
+        this.apply_endpoint_batch(
+            &owner,
+            vec![Err(ocherdr_herdr::HerdrError::EventStreamClosed(
+                "endpoint worker stopped".into(),
+            ))],
+            cx,
+        )
     });
 
     view.read_with(cx, |this, _| {
         assert!(
-            matches!(this.event_stream, EventStreamState::Lost(_)),
-            "a closed poll must write Lost onto the view, not leave Live/Idle"
+            matches!(&this.event_stream, EventStreamState::Lost(detail) if detail.contains("endpoint worker stopped")),
+            "a closed stream must write Lost onto the view, not leave Live/Idle"
         );
     });
     assert!(
         !keep,
-        "a closed poll has nothing left to wait for and must not reschedule"
+        "a closed stream has nothing left to wait for and must not reschedule"
     );
 }
 
 #[gpui::test]
-fn startup_replay_batch_refreshes_the_visible_current_snapshot_immediately(
-    cx: &mut TestAppContext,
-) {
-    let current = two_pane_snapshot();
-    let fake = FakeHerdr::snapshot_with_live_events(current.clone());
+fn a_pushed_snapshot_refreshes_the_visible_current_snapshot_immediately(cx: &mut TestAppContext) {
+    // The served hierarchy starts without p-right; the push carries the
+    // current state.
+    let mut stale = two_pane_snapshot();
+    stale.panes.retain(|pane| pane.pane_id != "p-right");
+    stale.layouts = vec![single_pane_layout("t-a", "p-left")];
+    let fake = FakeHerdr::serving(stale);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
-
-    view.update(cx, |this, cx| {
-        let session = SessionSummary {
-            name: "alpha".into(),
-            running: true,
-            socket_path: fake.socket_path(),
-            session_dir: fake._dir.path().join("alpha"),
-            default: false,
-        };
-        this.connection = Some(
-            SessionConnection::connect(&this.profiles[0], &session).expect("connect fake Herdr"),
-        );
-        this.sessions = vec![session];
-        this.session_index = Some(0);
-        let mut stale = current;
-        stale.panes.retain(|pane| pane.pane_id != "p-right");
-        this.snapshot = Some(stale);
-        this.startup_replay_sync = Some(crate::StartupReplaySync::Draining { serial: 1 });
-
-        assert!(this.apply_event_batch(
-            Some(vec![Ok(ocherdr_core::HerdrEvent::LayoutUpdated {
-                layout: two_pane_layout("p-right", "p-left"),
-            })]),
-            cx,
-        ));
-    });
-    cx.run_until_parked();
-
+    view.update(cx, |this, _| this.headless_terminals = true);
+    connect_view_to_fake_and_resync(&view, &fake, cx);
     view.read_with(cx, |this, _| {
         assert!(
             this.snapshot
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.pane("p-right").is_some()),
-            "the first replay batch must fetch current state instead of waiting for replay quiet"
+                .is_some_and(|snapshot| snapshot.pane("p-right").is_none()),
+            "the fixture starts with a stale single-pane snapshot"
+        );
+    });
+    let pulls_before = fake.requests_for("session.snapshot").len();
+
+    push_state(
+        &fake,
+        &view,
+        cx,
+        |snapshot| {
+            snapshot.panes.push(split_pane("p-right", false));
+            snapshot.layouts = vec![two_pane_layout("p-left", "p-right")];
+        },
+        |snapshot| snapshot.pane("p-right").is_some(),
+    );
+
+    view.read_with(cx, |this, _| {
+        let snapshot = this.snapshot.as_ref().expect("snapshot");
+        assert!(
+            snapshot.pane("p-right").is_some(),
+            "the push must fetch current state instead of leaving the stale frame on screen"
+        );
+        assert_eq!(
+            snapshot.layout_for("t-a").map(|layout| layout.panes.len()),
+            Some(2),
         );
     });
     assert!(
-        !fake.requests_for("session.snapshot").is_empty(),
-        "the replay invalidation must issue an authoritative refresh"
+        fake.requests_for("session.snapshot").len() > pulls_before,
+        "the push invalidation must issue an authoritative refresh"
     );
 }
 
 #[gpui::test]
-fn reload_writes_a_rejected_subscription_as_lost_instead_of_idle(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_ok_subscribe_rejected();
+fn reload_writes_a_rejected_endpoint_handshake_as_lost_instead_of_idle(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::snapshot_ok_endpoint_rejected();
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
 
@@ -843,61 +948,69 @@ fn reload_writes_a_rejected_subscription_as_lost_instead_of_idle(cx: &mut TestAp
         point_local_profile_at_fake(this, &fake);
         this.reload(None, cx);
     });
-    cx.run_until_parked();
+    wait_for_event_stream_lost(&view, cx, "endpoint rejected generation");
 
     view.read_with(cx, |this, _| {
         assert!(
-            matches!(&this.event_stream, EventStreamState::Lost(detail) if detail.contains("events.subscribe rejected")),
-            "reload must write the failed subscribe as Lost, not Idle"
+            matches!(&this.event_stream, EventStreamState::Lost(detail) if detail.contains("endpoint rejected generation")),
+            "reload must write the refused handshake as Lost, not Idle"
         );
         assert_eq!(
             session_name(this),
             Some("alpha"),
-            "the rejected subscribe still selected a running session"
+            "the refused handshake still selected a running session"
         );
     });
 }
 
 #[gpui::test]
-fn stale_pane_agent_status_subscribe_resyncs_without_notifying(cx: &mut TestAppContext) {
-    let fake = StalePaneHerdr::new();
+fn a_snapshot_push_for_a_stale_pane_set_resyncs_without_notifying(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::serving(agent_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
-
-    view.update(cx, |this, cx| {
-        let session = SessionSummary {
-            name: "stale-pane-test".into(),
-            running: true,
-            socket_path: fake.socket_path.clone(),
-            session_dir: fake._dir.path().join("stale-pane-test"),
-            default: false,
-        };
-        this.connection = Some(
-            SessionConnection::connect(&this.profiles[0], &session)
-                .expect("connect stale pane session"),
+    view.update(cx, |this, _| this.headless_terminals = true);
+    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.pane("p1").is_some()),
+            "the fixture starts with the pane on screen"
         );
-        this.sessions = vec![session];
-        this.session_index = Some(0);
-        this.snapshot = Some(agent_snapshot());
-        this.ensure_agent_status_stream(cx);
     });
-    cx.run_until_parked();
+    let pulls_before = fake.requests_for("session.snapshot").len();
 
-    let rejection_count = fake.agent_status_rejections.load(Ordering::Relaxed);
-    assert!(
-        rejection_count > 0,
-        "the fixture must prove it matched and rejected pane.agent_status_changed"
+    // The server no longer has the pane the client is showing.
+    push_state(
+        &fake,
+        &view,
+        cx,
+        |snapshot| {
+            snapshot.panes.clear();
+            snapshot.agents.clear();
+            snapshot.focused_pane_id = None;
+            for workspace in &mut snapshot.workspaces {
+                workspace.pane_count = 0;
+            }
+            for tab in &mut snapshot.tabs {
+                tab.pane_count = 0;
+            }
+        },
+        |snapshot| snapshot.panes.is_empty(),
     );
+
     assert_eq!(
-        rejection_count, 1,
-        "an unchanged pane snapshot must not turn resync into a subscribe loop"
-    );
-    assert_eq!(
-        fake.snapshot_requests.load(Ordering::Relaxed),
-        1,
-        "pane_not_found must trigger one snapshot resync"
+        fake.requests_for("session.snapshot").len(),
+        pulls_before + 1,
+        "a stale pane set must trigger exactly one snapshot resync"
     );
     view.read_with(cx, |this, cx| {
+        assert!(
+            this.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.pane("p1").is_none()),
+            "the authoritative snapshot replaced the stale pane set"
+        );
         assert_eq!(
             this.notifications.read(cx).history().count(),
             0,
@@ -908,15 +1021,13 @@ fn stale_pane_agent_status_subscribe_resyncs_without_notifying(cx: &mut TestAppC
 
 #[gpui::test]
 fn a_rejected_tab_move_returns_the_display_to_authoritative_order(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_ok_subscribe_rejected();
+    let mut snapshot = three_tab_snapshot();
+    snapshot.tabs.truncate(2);
+    let fake = tab_move_rejecting_fake(snapshot);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
-
-    view.update(cx, |this, cx| {
-        point_local_profile_at_fake(this, &fake);
-        this.reload(None, cx);
-    });
-    cx.run_until_parked();
+    view.update(cx, |this, _| this.headless_terminals = true);
+    connect_view_to_fake_and_resync(&view, &fake, cx);
 
     let order = ["t-a", "t-b"].map(str::to_owned).to_vec();
     let list = ReorderList::Tabs {
@@ -942,7 +1053,21 @@ fn a_rejected_tab_move_returns_the_display_to_authoritative_order(cx: &mut TestA
         assert_eq!(projection.positions, [1, 0]);
     });
 
-    cx.run_until_parked();
+    // The strict API rejects `tab.move`; the response lands on a worker
+    // thread, so pump until the gate opens.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let cleared = view.read_with(cx, |this, _| this.pending_reorder.is_none());
+        if cleared {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rejected tab.move never released the reorder gate"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 
     view.read_with(cx, |this, _| {
         assert!(
@@ -953,24 +1078,15 @@ fn a_rejected_tab_move_returns_the_display_to_authoritative_order(cx: &mut TestA
 }
 
 #[gpui::test]
-fn a_conflicting_tab_moved_event_replaces_the_pending_projection_with_authority(
+fn a_conflicting_pushed_snapshot_replaces_the_pending_projection_with_authority(
     cx: &mut TestAppContext,
 ) {
-    let initial = three_tab_snapshot();
-    let fake = FakeHerdr::snapshot_with_live_events(initial);
+    let fake = FakeHerdr::serving(three_tab_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
-
-    view.update(cx, |this, cx| {
-        point_local_profile_at_fake(this, &fake);
-        this.reload(None, cx);
-    });
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(crate::STARTUP_REPLAY_QUIET_DELAY);
-    cx.run_until_parked();
+    view.update(cx, |this, _| this.headless_terminals = true);
+    connect_view_to_fake_and_resync(&view, &fake, cx);
     view.read_with(cx, |this, _| {
-        assert_eq!(this.startup_replay_sync, None);
         assert!(!this.snapshot_refreshing);
     });
     let original = ["t-a", "t-b", "t-c"].map(str::to_owned).to_vec();
@@ -995,35 +1111,36 @@ fn a_conflicting_tab_moved_event_replaces_the_pending_projection_with_authority(
             .as_ref()
             .and_then(|pending| pending.display.as_ref());
         let projection = reorder_projection(&list, &original, None, pending)
-            .expect("the accepted move remains pending until a moved event arrives");
+            .expect("the accepted move remains pending until a snapshot push arrives");
         assert_eq!(projection.positions, [2, 0, 1]);
     });
 
-    let authoritative_tabs = vec![
-        test_tab("t-c", 3, "gamma"),
-        test_tab("t-a", 1, "alpha"),
-        test_tab("t-b", 2, "beta"),
-    ];
-    fake.send_event(json!({
-        "event": "tab_moved",
-        "data": {
-            "type": "tab_moved",
-            "workspace_id": "w",
-            "tab_id": "t-a",
-            "insert_index": 1,
-            "tabs": authoritative_tabs,
-        }
-    }));
-    // The socket fixture has proved the write completed. Let the detached
-    // production EventStream reader enqueue it before draining GPUI work.
-    thread::sleep(Duration::from_millis(20));
-    cx.run_until_parked();
+    // The server's authoritative order conflicts with the prediction.
+    push_state(
+        &fake,
+        &view,
+        cx,
+        |snapshot| {
+            snapshot.tabs = vec![
+                test_tab("t-c", 3, "gamma"),
+                test_tab("t-a", 1, "alpha"),
+                test_tab("t-b", 2, "beta"),
+            ];
+        },
+        |snapshot| {
+            snapshot
+                .tabs
+                .iter()
+                .map(|tab| tab.tab_id.as_str())
+                .eq(["t-c", "t-a", "t-b"])
+        },
+    );
 
     view.read_with(cx, |this, _| {
         let snapshot = this
             .snapshot
             .as_ref()
-            .expect("the live event applies to the production view snapshot");
+            .expect("the pushed snapshot applies to the production view snapshot");
         let authoritative = snapshot
             .tabs_for("w")
             .map(|tab| tab.tab_id.clone())
@@ -1031,7 +1148,7 @@ fn a_conflicting_tab_moved_event_replaces_the_pending_projection_with_authority(
         assert_eq!(
             authoritative,
             ["t-c", "t-a", "t-b"],
-            "the flushed fake event must reach the production event path"
+            "the pushed snapshot must reach the production resync path"
         );
         let pending = this
             .pending_reorder
@@ -1051,14 +1168,14 @@ fn a_conflicting_tab_moved_event_replaces_the_pending_projection_with_authority(
         );
         assert!(
             this.pending_reorder.is_none(),
-            "the authoritative moved event also releases the reorder gate"
+            "the authoritative snapshot also releases the reorder gate"
         );
     });
 }
 
 #[gpui::test]
 fn clicking_the_status_bar_reconnects_the_current_session(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_ok_subscribe_rejected();
+    let fake = FakeHerdr::snapshot_ok_endpoint_rejected();
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
 
@@ -1091,7 +1208,7 @@ fn clicking_the_status_bar_reconnects_the_current_session(cx: &mut TestAppContex
         .debug_bounds("reconnect-live-updates")
         .expect("status bar reconnect control should be in the rendered tree");
     cx.simulate_click(bounds.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
+    wait_for_event_stream_lost(&view, cx, "endpoint rejected generation");
 
     view.read_with(cx, |this, _| {
         assert_eq!(
@@ -1100,8 +1217,8 @@ fn clicking_the_status_bar_reconnects_the_current_session(cx: &mut TestAppContex
             "status-bar reconnect must call reload with the current session name, not None and not a no-op"
         );
         assert!(
-            matches!(&this.event_stream, EventStreamState::Lost(detail) if detail.contains("events.subscribe rejected")),
-            "the reconnect reload must still record the rejected subscribe as Lost"
+            matches!(&this.event_stream, EventStreamState::Lost(detail) if detail.contains("endpoint rejected generation")),
+            "the reconnect reload must still record the refused handshake as Lost"
         );
     });
 }
@@ -1301,6 +1418,92 @@ fn ssh_import_migrates_legacy_ssh_config_organization(cx: &mut TestAppContext) {
         assert!(
             !center.host_metadata.contains_key("ssh-config:prod-box"),
             "the legacy entry is consumed by the migration"
+        );
+    });
+}
+
+#[gpui::test]
+fn shortcut_help_filters_and_returns_focus_without_terminal_actions(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(640.)));
+    view.update_in(cx, |this, window, cx| {
+        this.focus.focus(window, cx);
+    });
+    cx.run_until_parked();
+    let help = crate::shortcuts::COMMANDS
+        .iter()
+        .find(|(command, _)| *command == crate::shortcuts::Command::Help)
+        .unwrap()
+        .1;
+    cx.simulate_keystrokes(help.stroke());
+    cx.run_until_parked();
+    view.read_with(cx, |this, cx| {
+        assert!(matches!(this.overlay, crate::Overlay::ShortcutHelp));
+        assert!(!this.prefix_pending);
+        assert_eq!(this.shortcut_help_search.read(cx).content().as_ref(), "");
+    });
+    let search_before = cx
+        .debug_bounds("shortcut-help-search")
+        .expect("search field");
+    cx.simulate_input("new tab");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.debug_bounds("shortcut-help-search"),
+        Some(search_before),
+        "filtering must keep the search field in place"
+    );
+    view.read_with(cx, |this, cx| {
+        assert_eq!(
+            this.shortcut_help_search.read(cx).content().as_ref(),
+            "new tab"
+        )
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(matches!(this.overlay, crate::Overlay::None))
+    });
+}
+
+#[gpui::test]
+fn shortcut_help_does_not_replace_an_editing_overlay(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    view.update(cx, |this, cx| {
+        this.overlay = crate::Overlay::Appearance;
+        this.open_shortcut_help(cx);
+        assert!(matches!(this.overlay, crate::Overlay::Appearance));
+    });
+}
+
+#[gpui::test]
+fn notification_center_keeps_shell_shortcuts_and_closing_key_release(cx: &mut TestAppContext) {
+    let (view, cx) = open_view(cx);
+    view.update_in(cx, |this, window, cx| {
+        this.focus.focus(window, cx);
+        this.notifications.update(cx, |host, cx| {
+            let id = host.error("Connection failed", "Test detail", cx);
+            host.show_details(id, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("ctrl-b");
+    view.read_with(cx, |this, cx| {
+        assert!(this.notifications.read(cx).is_center_open());
+        assert!(
+            !this.prefix_pending,
+            "notification input must not arm terminal shortcuts"
+        );
+        assert!(matches!(this.overlay, crate::Overlay::None));
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.update_in(cx, |this, window, cx| {
+        assert!(!this.notifications.read(cx).is_center_open());
+        assert!(this.focus.is_focused(window));
+        assert!(
+            this.consumed_key_releases
+                .consume(&gpui::Keystroke::parse("escape").unwrap()),
+            "the closing Escape release must not be forwarded to the terminal"
         );
     });
 }

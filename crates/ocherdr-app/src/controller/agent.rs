@@ -59,13 +59,13 @@ impl OcHerdrView {
         let Some(connection) = &self.connection else {
             return;
         };
-        let socket = connection.socket_path().to_owned();
+        let client = connection.api_client();
         let sent_text = text.clone();
         let params = json!({ "target": pane_id, "text": text });
         let target = pane_id.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { request_socket(&socket, "agent.prompt", params) })
+                .background_spawn(async move { client.request("agent.prompt", params) })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
@@ -140,7 +140,7 @@ impl OcHerdrView {
                 let Some(connection) = &self.connection else {
                     return;
                 };
-                let socket = connection.socket_path().to_owned();
+                let client = connection.api_client();
                 let params = match name {
                     Some(name) => json!({ "target": pane_id, "name": name }),
                     None => json!({ "target": pane_id }),
@@ -148,9 +148,7 @@ impl OcHerdrView {
                 let target = pane_id.clone();
                 let task = cx.spawn(async move |this, cx| {
                     let result = cx
-                        .background_spawn(
-                            async move { request_socket(&socket, "agent.rename", params) },
-                        )
+                        .background_spawn(async move { client.request("agent.rename", params) })
                         .await;
                     this.update(cx, |this, cx| {
                         this.agent_renames.remove(&target);
@@ -199,12 +197,12 @@ impl OcHerdrView {
             return;
         };
         let pane_id = pane_id.clone();
-        let socket = connection.socket_path().to_owned();
+        let client = connection.api_client();
         let params = json!({ "target": pane_id, "keys": keys });
         let target = pane_id.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { request_socket(&socket, "agent.send_keys", params) })
+                .background_spawn(async move { client.request("agent.send_keys", params) })
                 .await;
             this.update(cx, |this, cx| {
                 this.agent_keys.remove(&target);
@@ -231,12 +229,12 @@ impl OcHerdrView {
             return;
         };
         let pane_id = pane_id.clone();
-        let socket = connection.socket_path().to_owned();
+        let client = connection.api_client();
         let params = json!({ "target": pane_id });
         let target = pane_id.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { request_socket(&socket, "agent.get", params) })
+                .background_spawn(async move { client.request("agent.get", params) })
                 .await;
             this.update(cx, |this, cx| {
                 if agent_panel_pane(&this.overlay) != Some(target.as_str()) {
@@ -277,7 +275,7 @@ impl OcHerdrView {
             return;
         };
         let pane_id = pane_id.clone();
-        let socket = connection.socket_path().to_owned();
+        let client = connection.api_client();
         let params = json!({
             "target": pane_id,
             "source": AGENT_OUTPUT_SOURCE,
@@ -285,7 +283,7 @@ impl OcHerdrView {
         });
         let task = cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { request_socket(&socket, "agent.read", params) })
+                .background_spawn(async move { client.request("agent.read", params) })
                 .await;
             this.update(cx, |this, cx| {
                 if agent_panel_pane(&this.overlay) != Some(pane_id.as_str()) {

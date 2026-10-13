@@ -1,4 +1,3 @@
-use super::relocation::send_events;
 use super::*;
 
 pub(super) fn created_tab() -> TabInfo {
@@ -53,38 +52,18 @@ pub(super) fn created_workspace_pane() -> PaneInfo {
     pane
 }
 
-/// What Herdr broadcasts for `tab.create`: `tab.created → pane.created`
-/// (`tab.focused` too, which the sticky selection ignores on purpose).
-fn tab_create_events() -> Vec<Value> {
-    vec![
-        json!({ "event": "tab_created", "data": { "type": "tab_created", "tab": created_tab() } }),
-        json!({ "event": "pane_created", "data": { "type": "pane_created", "pane": created_pane() } }),
-        json!({ "event": "tab_focused", "data": { "type": "tab_focused", "tab_id": "t-new", "workspace_id": "w" } }),
-    ]
-}
-
-fn workspace_create_events() -> Vec<Value> {
-    vec![
-        json!({
-            "event": "workspace_created",
-            "data": { "type": "workspace_created", "workspace": created_workspace() }
-        }),
-        json!({
-            "event": "tab_created",
-            "data": { "type": "tab_created", "tab": created_workspace_tab() }
-        }),
-        json!({
-            "event": "pane_created",
-            "data": { "type": "pane_created", "pane": created_workspace_pane() }
-        }),
-    ]
+/// What Herdr's hierarchy looks like after a `tab.create` this client did not
+/// issue (another window asked for it): the tab and its root pane exist.
+fn foreign_tab_created(snapshot: &mut HierarchySnapshot) {
+    snapshot.tabs.push(created_tab());
+    snapshot.panes.push(created_pane());
 }
 
 fn connect_three_tab_view(
     cx: &mut TestAppContext,
     script: PaneMoveScript,
 ) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
-    let fake = FakeHerdr::snapshot_with_live_events_and_script(three_tab_snapshot(), script);
+    let fake = FakeHerdr::serving_with_script(three_tab_snapshot(), script);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -108,14 +87,44 @@ fn assert_selected(
     });
 }
 
+/// Wait out the create race: the snapshot push, the NDJSON resync it
+/// triggers, and the create response land on executor tasks fed by the fake's
+/// socket threads, in either order.
+fn wait_for_created_selection(
+    view: &Entity<OcHerdrView>,
+    cx: &mut VisualTestContext,
+    ids: (&str, &str, &str),
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let settled = view.read_with(cx, |this, _| {
+            this.selection.workspace_id.as_deref() == Some(ids.0)
+                && this.selection.tab_id.as_deref() == Some(ids.1)
+                && this.selection.pane_id.as_deref() == Some(ids.2)
+                && this.pending_created_tab.is_none()
+        });
+        if settled {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the created tab was never selected"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[gpui::test]
-fn a_created_tab_is_selected_when_its_events_beat_the_response(cx: &mut TestAppContext) {
-    let script = PaneMoveScript::default();
-    *script.events_before_create_response.lock().unwrap() = tab_create_events();
+fn a_created_tab_is_selected_when_its_snapshot_push_beats_the_response(cx: &mut TestAppContext) {
+    let script = PaneMoveScript {
+        push_before_create_response: AtomicBool::new(true),
+        ..PaneMoveScript::default()
+    };
     let (fake, view, cx) = connect_three_tab_view(cx, script);
 
     view.update(cx, |this, cx| this.create_tab(cx));
-    cx.run_until_parked();
+    wait_for_created_selection(&view, cx, ("w", "t-new", "p-new"));
 
     let creates = fake.requests_for("tab.create");
     assert_eq!(creates.len(), 1);
@@ -127,7 +136,9 @@ fn a_created_tab_is_selected_when_its_events_beat_the_response(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn a_created_tab_is_selected_once_its_events_arrive_after_the_response(cx: &mut TestAppContext) {
+fn a_created_tab_is_selected_once_its_snapshot_push_arrives_after_the_response(
+    cx: &mut TestAppContext,
+) {
     let (fake, view, cx) = connect_three_tab_view(cx, PaneMoveScript::default());
 
     view.update(cx, |this, cx| this.create_tab(cx));
@@ -143,7 +154,18 @@ fn a_created_tab_is_selected_once_its_events_arrive_after_the_response(cx: &mut 
         assert_eq!(this.pending_created_tab.as_deref(), Some("t-new"));
     });
 
-    send_events(&fake, tab_create_events(), cx);
+    // The fake applied the create when it answered; this push is the
+    // broadcast a live Herdr emits right after.
+    push_state(
+        &fake,
+        &view,
+        cx,
+        |_| {},
+        |snapshot| {
+            snapshot.tabs.iter().any(|tab| tab.tab_id == "t-new")
+                && snapshot.panes.iter().any(|pane| pane.pane_id == "p-new")
+        },
+    );
 
     assert_selected(&view, cx, ("w", "t-new", "p-new"));
 }
@@ -152,7 +174,9 @@ fn a_created_tab_is_selected_once_its_events_arrive_after_the_response(cx: &mut 
 fn a_tab_created_elsewhere_does_not_steal_the_selection(cx: &mut TestAppContext) {
     let (fake, view, cx) = connect_three_tab_view(cx, PaneMoveScript::default());
 
-    send_events(&fake, tab_create_events(), cx);
+    push_state(&fake, &view, cx, foreign_tab_created, |snapshot| {
+        snapshot.tabs.iter().any(|tab| tab.tab_id == "t-new")
+    });
 
     view.read_with(cx, |this, _| {
         assert_eq!(this.selection.tab_id.as_deref(), Some("t-a"));
@@ -172,19 +196,38 @@ fn a_created_workspace_is_selected_with_its_first_tab_and_pane(cx: &mut TestAppC
         assert_eq!(this.pending_created_tab.as_deref(), Some("t-w-new"));
     });
 
-    send_events(&fake, workspace_create_events(), cx);
+    // The fake applied the create when it answered; this push is the
+    // broadcast a live Herdr emits right after.
+    push_state(
+        &fake,
+        &view,
+        cx,
+        |_| {},
+        |snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.workspace_id == "w-new")
+                && snapshot.tabs.iter().any(|tab| tab.tab_id == "t-w-new")
+                && snapshot.panes.iter().any(|pane| pane.pane_id == "p-w-new")
+        },
+    );
 
     assert_selected(&view, cx, ("w-new", "t-w-new", "p-w-new"));
 }
 
 #[gpui::test]
-fn a_created_workspace_is_selected_when_its_events_beat_the_response(cx: &mut TestAppContext) {
-    let script = PaneMoveScript::default();
-    *script.events_before_create_response.lock().unwrap() = workspace_create_events();
+fn a_created_workspace_is_selected_when_its_snapshot_push_beats_the_response(
+    cx: &mut TestAppContext,
+) {
+    let script = PaneMoveScript {
+        push_before_create_response: AtomicBool::new(true),
+        ..PaneMoveScript::default()
+    };
     let (_fake, view, cx) = connect_three_tab_view(cx, script);
 
     view.update(cx, |this, cx| this.create_workspace(cx));
-    cx.run_until_parked();
+    wait_for_created_selection(&view, cx, ("w-new", "t-w-new", "p-w-new"));
 
     assert_selected(&view, cx, ("w-new", "t-w-new", "p-w-new"));
 }

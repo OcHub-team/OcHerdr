@@ -1,5 +1,9 @@
-//! Frozen client-side mirror of Herdr's client-socket wire schema at private
-//! protocol version 22, limited to endpoint generation 1 (`endpoint.hello.v1`).
+//! Client-side mirror of Herdr 0.9.4's endpoint generation 1 (`endpoint.hello.v1`).
+//!
+//! Audited against herdrdev/herdr v0.9.4, commit
+//! `7e26bad94044eba205033111a0ce8033ede7e24f`, `src/protocol/{wire,endpoint}.rs`.
+//! The shared binary envelope is protocol 22; endpoint compatibility is negotiated
+//! independently through the generation and named codecs, not the build version.
 //!
 //! Herdr intentionally does not publish this wire schema as a library crate.
 //! Generation 1 is Herdr's documented compatibility floor: `ClientMessage` and
@@ -31,9 +35,13 @@ pub const PRESENTATION_EFFECTS_READY_KIND: &str = "endpoint.presentation.ready.v
 /// 0.9.1: optional encodings this mirror does not negotiate.
 pub const SURFACE_REUSE_KIND: &str = "endpoint.surface-reuse.v1";
 pub const SURFACE_DELTA_KIND: &str = "endpoint.surface-delta.v1";
+/// Optional scroll-aware patches; not requested by this client.
+pub const SURFACE_SCROLL_KIND: &str = "endpoint.surface-scroll.v1";
 /// 0.9.1: opaque agent-view projection; ignored when not negotiated.
 pub const AGENT_VIEW_PROJECTION_CAPABILITY: &str = "agent_view_projection";
 pub const AGENT_VIEW_PROJECTION_KIND: &str = "endpoint.agent-view.v1";
+pub const AGENT_COMPLETIONS_CAPABILITY: &str = "agent_completions";
+pub const AGENT_COMPLETIONS_KIND: &str = "endpoint.agent-completions.v1";
 
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
@@ -215,7 +223,7 @@ pub enum ClientClipboardImageTarget {
 // Client → Server messages
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
     TerminalHello {
         version: u32,
@@ -842,6 +850,9 @@ pub struct EndpointClientHello {
     /// 0.9.1: opt-in surface-delta encoding. We do not advertise it.
     #[serde(default)]
     pub surface_delta: bool,
+    /// Opt-in scroll-aware patches. We keep using full surfaces and V1 patches.
+    #[serde(default)]
+    pub surface_scroll: bool,
     #[serde(default)]
     pub snapshot_codecs: Vec<String>,
     #[serde(default)]
@@ -866,6 +877,7 @@ impl EndpointClientHello {
             surface_active: false,
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             snapshot_codecs: vec![ENDPOINT_SNAPSHOT_KIND.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -954,7 +966,7 @@ pub fn write_message<W: Write, M: Serialize>(
     Ok(())
 }
 
-pub fn read_message<R: Read, M: for<'de> Deserialize<'de>>(
+pub fn read_message<R: Read + ?Sized, M: for<'de> Deserialize<'de>>(
     reader: &mut R,
     maximum: usize,
 ) -> Result<M, FramingError> {
@@ -980,7 +992,10 @@ pub fn read_message<R: Read, M: for<'de> Deserialize<'de>>(
     Ok(message)
 }
 
-fn read_exact_or_eof<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), FramingError> {
+fn read_exact_or_eof<R: Read + ?Sized>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> Result<(), FramingError> {
     reader.read_exact(buffer).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
             FramingError::UnexpectedEof
@@ -989,3 +1004,6 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), F
         }
     })
 }
+
+#[cfg(test)]
+mod tests;

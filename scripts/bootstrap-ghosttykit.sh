@@ -3,26 +3,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-GHOSTTY_COMMIT="3da10da73ae848c0310e3e0f0cb29e509c2f6963"
-GHOSTTY_BUILD_FLAVOR="crashsubdir-cmux-crash-sentry-off-v1"
-EXPECTED_SHA256="6a02a2ec3794de79a02af993083292a89517d2533eb20c746deca377f23456bd"
+source "$REPO_ROOT/vendor/ghosttykit/version.env"
 ARCHIVE_NAME="GhosttyKit.xcframework.tar.gz"
 TAG="xcframework-${GHOSTTY_COMMIT}-${GHOSTTY_BUILD_FLAVOR}"
-DOWNLOAD_URL="https://github.com/manaflow-ai/ghostty/releases/download/${TAG}/${ARCHIVE_NAME}"
+DOWNLOAD_URL="https://github.com/${GHOSTTY_REPOSITORY}/releases/download/${TAG}/${ARCHIVE_NAME}"
 OUTPUT_PARENT="$REPO_ROOT/vendor/ghosttykit"
 OUTPUT_DIR="$OUTPUT_PARENT/GhosttyKit.xcframework"
 
 if [ -d "$OUTPUT_DIR" ]; then
   INSTALLED_COMMIT="$(cat "$OUTPUT_DIR/.ghostty_sha" 2>/dev/null || true)"
+  INSTALLED_FLAVOR="$(cat "$OUTPUT_DIR/.ghostty_build_flavor" 2>/dev/null || true)"
   if [ "$INSTALLED_COMMIT" = "$GHOSTTY_COMMIT" ] \
+    && [ "$INSTALLED_FLAVOR" = "$GHOSTTY_BUILD_FLAVOR" ] \
     && [ -f "$OUTPUT_DIR/macos-arm64_x86_64/ghostty-internal.a" ] \
     && [ -f "$OUTPUT_DIR/macos-arm64_x86_64/Headers/ghostty.h" ]; then
     echo "GhosttyKit $GHOSTTY_COMMIT is already available at $OUTPUT_DIR"
     exit 0
   fi
-  echo "GhosttyKit at $OUTPUT_DIR is incomplete or belongs to another commit" >&2
-  echo "move it aside, then rerun this script" >&2
-  exit 1
+  echo "Updating GhosttyKit at $OUTPUT_DIR"
 fi
 
 DOWNLOAD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ocherdr-ghosttykit.XXXXXX")"
@@ -48,10 +46,22 @@ if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
 fi
 
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
-if [ ! -d "$EXTRACT_DIR/GhosttyKit.xcframework" ]; then
-  echo "GhosttyKit archive does not contain GhosttyKit.xcframework" >&2
+if [ ! -f "$EXTRACT_DIR/GhosttyKit.xcframework/macos-arm64_x86_64/ghostty-internal.a" ] \
+  || [ ! -f "$EXTRACT_DIR/GhosttyKit.xcframework/macos-arm64_x86_64/Headers/ghostty.h" ] \
+  || [ "$(cat "$EXTRACT_DIR/GhosttyKit.xcframework/.ghostty_sha" 2>/dev/null || true)" != "$GHOSTTY_COMMIT" ] \
+  || [ "$(cat "$EXTRACT_DIR/GhosttyKit.xcframework/.ghostty_build_flavor" 2>/dev/null || true)" != "$GHOSTTY_BUILD_FLAVOR" ]; then
+  echo "GhosttyKit archive is incomplete or has mismatched build metadata" >&2
   exit 1
 fi
 
-mv "$EXTRACT_DIR/GhosttyKit.xcframework" "$OUTPUT_DIR"
+# Keep the previous framework intact until download and verification succeed.
+if [ -d "$OUTPUT_DIR" ]; then
+  mv "$OUTPUT_DIR" "$DOWNLOAD_DIR/previous.xcframework"
+fi
+if ! mv "$EXTRACT_DIR/GhosttyKit.xcframework" "$OUTPUT_DIR"; then
+  if [ -d "$DOWNLOAD_DIR/previous.xcframework" ]; then
+    mv "$DOWNLOAD_DIR/previous.xcframework" "$OUTPUT_DIR"
+  fi
+  exit 1
+fi
 echo "Installed GhosttyKit $GHOSTTY_COMMIT at $OUTPUT_DIR"

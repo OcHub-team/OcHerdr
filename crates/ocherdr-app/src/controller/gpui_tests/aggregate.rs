@@ -1,7 +1,5 @@
 use super::*;
-use std::collections::HashSet;
 
-use crate::controller::HerdrCapabilities;
 use crate::{ParkedHostRuntime, SidebarMode};
 
 fn remote_snapshot() -> HierarchySnapshot {
@@ -90,12 +88,7 @@ fn fake_parked_runtime() -> ParkedHostRuntime {
             &session,
         )
         .expect("local connection construction is pure"),
-        herdr_capabilities: HerdrCapabilities::default(),
         event_stream: EventStreamState::Live,
-        event_listen: None,
-        agent_status_listen: None,
-        agent_status_panes: HashSet::new(),
-        agent_status_handoff: None,
         snapshot: Some(remote_snapshot()),
         selection: remote_selection(),
         session_panes: None,

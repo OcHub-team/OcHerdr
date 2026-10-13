@@ -11,7 +11,6 @@ pub(crate) enum FailureKind {
     LoadConfiguration,
     DiscoverSessions,
     RefreshSnapshot,
-    ApplyLiveUpdate,
     UpdateFavorites,
     ApplyOrganization,
     RemoveHosts,
@@ -28,8 +27,6 @@ pub(crate) enum FailureKind {
     RenderTerminal,
     TerminalStream,
     TerminalRuntime,
-    TerminalControlBusy,
-    TerminalControlTakenOver,
     CannotEditThisMac,
     NeedGroupOrTag,
     CannotRemoveActiveHost,
@@ -62,14 +59,11 @@ impl FailureKind {
             | Self::NoSessionSelected
             | Self::MissingTheme
             | Self::AgentBlocked
-            | Self::TerminalControlBusy
-            | Self::TerminalControlTakenOver
             | Self::PaneMisordered
             | Self::ImportHostUnsupported => NotificationLevel::Warning,
             Self::LoadConfiguration
             | Self::DiscoverSessions
             | Self::RefreshSnapshot
-            | Self::ApplyLiveUpdate
             | Self::UpdateFavorites
             | Self::ApplyOrganization
             | Self::RemoveHosts
@@ -97,7 +91,6 @@ impl FailureKind {
             Self::LoadConfiguration => k::NOTIFY_LOAD_CONFIGURATION,
             Self::DiscoverSessions => k::NOTIFY_DISCOVER_SESSIONS,
             Self::RefreshSnapshot => k::NOTIFY_REFRESH_SESSION,
-            Self::ApplyLiveUpdate => k::NOTIFY_APPLY_LIVE_UPDATE,
             Self::UpdateFavorites => k::NOTIFY_UPDATE_FAVORITES,
             Self::ApplyOrganization => k::NOTIFY_APPLY_ORGANIZATION,
             Self::RemoveHosts => k::NOTIFY_REMOVE_HOSTS,
@@ -114,8 +107,6 @@ impl FailureKind {
             Self::RenderTerminal => k::NOTIFY_RENDER_TERMINAL,
             Self::TerminalStream => k::NOTIFY_TERMINAL_STREAM,
             Self::TerminalRuntime => k::NOTIFY_TERMINAL_RUNTIME,
-            Self::TerminalControlBusy => k::NOTIFY_TERMINAL_CONTROL_BUSY,
-            Self::TerminalControlTakenOver => k::NOTIFY_TERMINAL_CONTROL_TAKEN_OVER,
             Self::CannotEditThisMac => k::NOTIFY_CANNOT_EDIT_THIS_MAC,
             Self::NeedGroupOrTag => k::NOTIFY_CANNOT_APPLY_ORGANIZATION,
             Self::CannotRemoveActiveHost => k::NOTIFY_CANNOT_REMOVE_HOST,

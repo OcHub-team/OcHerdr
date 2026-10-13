@@ -3,15 +3,6 @@ use std::fs;
 use std::io::Read as _;
 use std::path::Path;
 
-// Observe component creation rather than enumerating form fields. This also
-// includes TextInput's lazily-created Find field and future UI inputs, without
-// retaining closed dialogs or changing the pinned UI dependency.
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct TextInputRegistry(Vec<WeakEntity<TextInput>>);
-#[cfg(target_os = "macos")]
-impl ochub_ui::gpui::Global for TextInputRegistry {}
-
 #[derive(Debug, PartialEq, Eq)]
 enum CommandPaste {
     PassThrough,
@@ -232,43 +223,6 @@ fn image_bytes_match_signature(extension: &str, bytes: &[u8]) -> bool {
 }
 
 impl OcHerdrView {
-    #[cfg(target_os = "macos")]
-    pub(super) fn install_text_input_editing(cx: &mut App) {
-        if cx.has_global::<TextInputRegistry>() {
-            return;
-        }
-        cx.set_global(TextInputRegistry::default());
-        cx.observe_new::<TextInput>(|_, _, cx| {
-            let entity = cx.entity().downgrade();
-            cx.global_mut::<TextInputRegistry>().0.push(entity);
-        })
-        .detach();
-    }
-    /// Route native editing only to the focused field, never to its pane.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn handle_text_input_macos_editing(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !TextInput::is_macos_editing_key(event) {
-            return false;
-        }
-        let registry = cx.global_mut::<TextInputRegistry>();
-        registry.0.retain(|input| input.is_upgradable());
-        let inputs: Vec<_> = registry.0.iter().filter_map(WeakEntity::upgrade).collect();
-        for input in inputs {
-            if !input.read(cx).focus_handle(cx).is_focused(window) {
-                continue;
-            }
-            return input.update(cx, |input, cx| {
-                input.handle_macos_editing_key(event, window, cx)
-            });
-        }
-        false
-    }
-
     pub(crate) fn create_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(workspace_id) = self.selection.workspace_id.clone() {
             self.invoke_with_response(
@@ -407,7 +361,12 @@ impl OcHerdrView {
         }
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        if modifiers.control && !modifiers.platform && !modifiers.alt && key == "b" {
+        if modifiers.control
+            && !modifiers.platform
+            && !modifiers.alt
+            && !modifiers.shift
+            && key == "b"
+        {
             self.prefix_pending = true;
             if matches!(
                 self.overlay,
@@ -462,128 +421,51 @@ impl OcHerdrView {
                 return true;
             }
         }
-        if only_primary_modifier(modifiers) {
-            if let Some(number) = tab_index_from_keystroke(key, event.keystroke.key_char.as_deref())
-            {
-                self.select_tab_number(number, cx);
-                return true;
-            }
-            #[cfg(target_os = "macos")]
-            let handled = match (key, modifiers.shift) {
-                ("t", false) => {
-                    self.create_tab(cx);
-                    true
-                }
-                ("w", true) => {
-                    if let Some(target) = self.selected_workspace_target() {
-                        self.request_close(target, cx);
-                    }
-                    true
-                }
-                ("w", false) => {
-                    if let Some(target) = self.cmd_w_close_target() {
-                        self.request_close(target, cx);
-                    }
-                    true
-                }
-                ("n", true) => {
-                    self.create_workspace(cx);
-                    true
-                }
-                ("e", true) => {
-                    self.toggle_file_panel(cx);
-                    true
-                }
-                ("l", false) if self.file_panel.open => {
-                    self.open_file_panel_address(window, cx);
-                    true
-                }
-                (",", false) => {
-                    self.open_appearance(cx);
-                    true
-                }
-                ("c", false) => {
-                    self.copy_selection(cx);
-                    true
-                }
-                ("a", false) => {
-                    self.select_all_visible(cx);
-                    true
-                }
-                ("[", false) => {
-                    self.cycle_tab(-1, cx);
-                    true
-                }
-                ("]", false) => {
-                    self.cycle_tab(1, cx);
-                    true
-                }
-                _ => false,
-            };
-            #[cfg(not(target_os = "macos"))]
-            let handled = match (key, modifiers.shift) {
-                ("t", true) => {
-                    self.create_tab(cx);
-                    true
-                }
-                ("w", true) => {
-                    if let Some(target) = self.cmd_w_close_target() {
-                        self.request_close(target, cx);
-                    }
-                    true
-                }
-                ("n", true) => {
-                    self.create_workspace(cx);
-                    true
-                }
-                ("e", true) => {
-                    self.toggle_file_panel(cx);
-                    true
-                }
-                ("l", true) if self.file_panel.open => {
-                    self.open_file_panel_address(window, cx);
-                    true
-                }
-                (",", false) => {
-                    self.open_appearance(cx);
-                    true
-                }
-                ("c", true) => {
-                    self.copy_selection(cx);
-                    true
-                }
-                ("a", true) => {
-                    self.select_all_visible(cx);
-                    true
-                }
-                ("[", true) => {
-                    self.cycle_tab(-1, cx);
-                    true
-                }
-                ("]", true) => {
-                    self.cycle_tab(1, cx);
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                return true;
-            }
-        }
-        if modifiers.control && key == "tab" {
-            self.cycle_tab(if modifiers.shift { -1 } else { 1 }, cx);
+        if only_primary_modifier(modifiers)
+            && !modifiers.shift
+            && let Some(number) = tab_index_from_keystroke(key, event.keystroke.key_char.as_deref())
+        {
+            self.select_tab_number(number, cx);
             return true;
         }
-        if key == "f2" && !modifiers.platform && !modifiers.control && !modifiers.alt {
-            let target = self
-                .selected_tab_target()
-                .or_else(|| self.selected_workspace_target());
-            if let Some(target) = target {
-                self.open_rename(target, window, cx);
+        use crate::shortcuts::{Command, command_for};
+        let Some(command) = command_for(&event.keystroke) else {
+            return false;
+        };
+        match command {
+            Command::NewTab => self.create_tab(cx),
+            Command::CloseWorkspace => {
+                if let Some(target) = self.selected_workspace_target() {
+                    self.request_close(target, cx);
+                }
             }
-            return true;
+            Command::ClosePane => {
+                if let Some(target) = self.cmd_w_close_target() {
+                    self.request_close(target, cx);
+                }
+            }
+            Command::NewWorkspace => self.create_workspace(cx),
+            Command::ToggleFiles => self.toggle_file_panel(cx),
+            Command::FileAddress if self.file_panel.open => {
+                self.open_file_panel_address(window, cx)
+            }
+            Command::FileAddress => return false,
+            Command::Appearance => self.open_appearance(cx),
+            Command::Copy => self.copy_selection(cx),
+            Command::SelectAll => self.select_all_visible(cx),
+            Command::PreviousTab => self.cycle_tab(-1, cx),
+            Command::NextTab => self.cycle_tab(1, cx),
+            Command::Rename => {
+                if let Some(target) = self
+                    .selected_tab_target()
+                    .or_else(|| self.selected_workspace_target())
+                {
+                    self.open_rename(target, window, cx);
+                }
+            }
+            Command::Help => self.open_shortcut_help(cx),
         }
-        false
+        true
     }
 
     pub(crate) fn send_key(
@@ -592,9 +474,14 @@ impl OcHerdrView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.notifications.read(cx).is_center_open() {
+            self.consumed_key_releases.record(&event.keystroke);
+            cx.stop_propagation();
+            return;
+        }
         if self.handle_app_shortcut(event, window, cx) {
             // The matching key-up must not reach the terminal either.
-            self.suppress_key_release = true;
+            self.consumed_key_releases.record(&event.keystroke);
             cx.stop_propagation();
             return;
         }
@@ -616,41 +503,29 @@ impl OcHerdrView {
         let mut remote_image = None;
         let mut suppress_key_release = false;
         let mut endpoint_events = Vec::new();
-        let stream_closed = {
+        {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
             };
             if !runtime.mode.is_controlled() {
                 return;
             }
-            let endpoint = matches!(runtime.session, PaneChannel::Endpoint { .. });
             match paste.unwrap_or(CommandPaste::PassThrough) {
                 CommandPaste::Text(text) => {
-                    if endpoint {
-                        // The server applies the pane's bracketed-paste mode.
-                        endpoint_events.push(ClientPaneInputEvent::Paste(text));
-                    } else {
-                        runtime.terminal.paste(&text);
-                    }
+                    // The server applies the pane's bracketed-paste mode.
+                    endpoint_events.push(ClientPaneInputEvent::Paste(text));
                     suppress_key_release = true;
                     cx.stop_propagation();
-                    if endpoint {
-                        false
-                    } else {
-                        drain_terminal_input(runtime)
-                    }
                 }
                 CommandPaste::RemoteImage(image) => {
                     suppress_key_release = true;
                     cx.stop_propagation();
                     remote_image = Some(image);
-                    false
                 }
                 CommandPaste::RemoteImageError(error) => {
                     suppress_key_release = true;
                     paste_error = Some(error);
                     cx.stop_propagation();
-                    false
                 }
                 CommandPaste::PassThrough => {
                     // Match Ghostty's performable paste binding: an image-only
@@ -661,33 +536,19 @@ impl OcHerdrView {
                     } else {
                         KeyAction::Press
                     };
-                    if endpoint {
-                        let Some(event) = endpoint_key_event(key, action) else {
-                            return;
-                        };
-                        endpoint_events.push(event);
-                        cx.stop_propagation();
-                        false
-                    } else {
-                        if !runtime.terminal.send_key(
-                            action,
-                            &key.key,
-                            key.key_char.as_deref(),
-                            gpui_key_modifiers(key.modifiers),
-                        ) {
-                            return;
-                        }
-                        cx.stop_propagation();
-                        drain_terminal_input(runtime)
-                    }
+                    let Some(event) = endpoint_key_event(key, action) else {
+                        return;
+                    };
+                    endpoint_events.push(event);
+                    cx.stop_propagation();
                 }
             }
-        };
+        }
         if !endpoint_events.is_empty() {
             self.endpoint_pane_input(&pane_id, endpoint_events);
         }
         if suppress_key_release {
-            self.suppress_key_release = true;
+            self.consumed_key_releases.record(&event.keystroke);
         }
         if let Some(error) = paste_error {
             let detail = error.detail(self.i18n);
@@ -695,9 +556,6 @@ impl OcHerdrView {
         }
         if let Some(image) = remote_image {
             self.bridge_remote_clipboard_image(pane_id, image, cx);
-        }
-        if stream_closed {
-            self.resync_snapshot(self.event_epoch, cx);
         }
     }
 
@@ -746,12 +604,17 @@ impl OcHerdrView {
                         );
                         return;
                     }
-                    let result = runtime
-                        .session
-                        .send(TerminalCommand::ClipboardImage { extension, bytes });
+                    let result = runtime.endpoint.send(
+                        ocherdr_herdr::endpoint::EndpointCommand::ClipboardImage {
+                            target: ocherdr_herdr::endpoint::EndpointClipboardTarget::Pane(
+                                pane_id.clone(),
+                            ),
+                            extension,
+                            bytes,
+                        },
+                    );
                     if let Err(error) = result {
                         this.notify_failure(FailureKind::ClipboardImagePaste, error, cx);
-                        this.resync_snapshot(this.event_epoch, cx);
                     }
                 }
                 Err(error) => {
@@ -765,13 +628,14 @@ impl OcHerdrView {
     }
 
     /// Key releases matter only to applications that asked the kitty
-    /// keyboard protocol to report them; Ghostty decides.
+    /// keyboard protocol to report them; the server decides.
     pub(crate) fn send_key_release(
         &mut self,
         event: &ochub_ui::gpui::KeyUpEvent,
         cx: &mut Context<Self>,
     ) {
-        if std::mem::take(&mut self.suppress_key_release)
+        if self.consumed_key_releases.consume(&event.keystroke)
+            || self.notifications.read(cx).is_center_open()
             || self.ime_marked.is_some()
             || self.prefix_pending
             || self.pane_keyboard_move.is_some()
@@ -781,34 +645,14 @@ impl OcHerdrView {
         let Some(pane_id) = self.selection.pane_id.clone() else {
             return;
         };
-        let key = &event.keystroke;
-        let mut endpoint_event = None;
-        let stream_closed = {
-            let Some(runtime) = self.pane_mut(&pane_id) else {
-                return;
-            };
-            if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
-                // Report-all keyboard state lives on the server; it decides
-                // whether a release reaches the pane.
-                endpoint_event = endpoint_key_event(key, KeyAction::Release);
-                false
-            } else {
-                if !runtime.terminal.send_key(
-                    KeyAction::Release,
-                    &key.key,
-                    None,
-                    gpui_key_modifiers(key.modifiers),
-                ) {
-                    return;
-                }
-                drain_terminal_input(runtime)
-            }
-        };
-        if let Some(event) = endpoint_event {
-            self.endpoint_pane_input(&pane_id, vec![event]);
+        if self.pane(&pane_id).is_none() {
+            return;
         }
-        if stream_closed {
-            self.resync_snapshot(self.event_epoch, cx);
+        let key = &event.keystroke;
+        // Report-all keyboard state lives on the server; it decides whether a
+        // release reaches the pane.
+        if let Some(event) = endpoint_key_event(key, KeyAction::Release) {
+            self.endpoint_pane_input(&pane_id, vec![event]);
         }
     }
 
@@ -866,7 +710,7 @@ impl OcHerdrView {
             let captured = runtime
                 .terminal
                 .begin_text_selection(surface.0, surface.1, modifiers);
-            if captured && matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+            if captured {
                 endpoint_event = Some(endpoint_mouse_event(
                     ClientMouseKind::Down(ClientMouseButton::Left),
                     mouse,
@@ -921,17 +765,16 @@ impl OcHerdrView {
         let modifiers = gpui_key_modifiers(event.modifiers);
         runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
         let captured = runtime.terminal.mouse_button(true, button, modifiers);
-        let endpoint_event = (captured && matches!(runtime.session, PaneChannel::Endpoint { .. }))
-            .then(|| {
-                endpoint_mouse_event(
-                    ClientMouseKind::Down(endpoint_mouse_button(button)),
-                    mouse_point(event.position),
-                    runtime,
-                    endpoint_modifiers(event.modifiers),
-                    0,
-                    f64::from(window.scale_factor()),
-                )
-            });
+        let endpoint_event = captured.then(|| {
+            endpoint_mouse_event(
+                ClientMouseKind::Down(endpoint_mouse_button(button)),
+                mouse_point(event.position),
+                runtime,
+                endpoint_modifiers(event.modifiers),
+                0,
+                f64::from(window.scale_factor()),
+            )
+        });
         flush_pane_surface(runtime);
         if let Some(event) = endpoint_event {
             self.endpoint_pane_input(&pane_id, vec![event]);
@@ -980,16 +823,14 @@ impl OcHerdrView {
             runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
         }
         let _ = runtime.terminal.mouse_button(false, button, modifiers);
-        let endpoint_event = matches!(runtime.session, PaneChannel::Endpoint { .. }).then(|| {
-            endpoint_mouse_event(
-                ClientMouseKind::Up(endpoint_mouse_button(button)),
-                mouse_point(event.position),
-                runtime,
-                endpoint_modifiers(event.modifiers),
-                0,
-                f64::from(window.scale_factor()),
-            )
-        });
+        let endpoint_event = Some(endpoint_mouse_event(
+            ClientMouseKind::Up(endpoint_mouse_button(button)),
+            mouse_point(event.position),
+            runtime,
+            endpoint_modifiers(event.modifiers),
+            0,
+            f64::from(window.scale_factor()),
+        ));
         flush_pane_surface(runtime);
         if let Some(event) = endpoint_event {
             self.endpoint_pane_input(pane_id, vec![event]);
@@ -1026,17 +867,16 @@ impl OcHerdrView {
         let modifiers = gpui_key_modifiers(event.modifiers);
         let captured = runtime.terminal.mouse_captured() && !modifiers.shift;
         runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
-        let endpoint_event = (captured && matches!(runtime.session, PaneChannel::Endpoint { .. }))
-            .then(|| {
-                endpoint_mouse_event(
-                    ClientMouseKind::Moved,
-                    mouse_point(event.position),
-                    runtime,
-                    endpoint_modifiers(event.modifiers),
-                    0,
-                    f64::from(window.scale_factor()),
-                )
-            });
+        let endpoint_event = captured.then(|| {
+            endpoint_mouse_event(
+                ClientMouseKind::Moved,
+                mouse_point(event.position),
+                runtime,
+                endpoint_modifiers(event.modifiers),
+                0,
+                f64::from(window.scale_factor()),
+            )
+        });
         flush_pane_surface(runtime);
         if let Some(event) = endpoint_event {
             self.endpoint_pane_input(pane_id, vec![event]);
@@ -1079,16 +919,14 @@ impl OcHerdrView {
                     modifiers.shift = drag.shift;
                     if let Some(runtime) = self.pane_mut(&drag.pane_id) {
                         runtime.terminal.mouse_pos(surface.0, surface.1, modifiers);
-                        if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
-                            endpoint_event = Some(endpoint_mouse_event(
-                                ClientMouseKind::Drag(endpoint_mouse_button(drag.button)),
-                                mouse_point(event.position),
-                                runtime,
-                                endpoint_modifiers(event.modifiers),
-                                0,
-                                f64::from(window.scale_factor()),
-                            ));
-                        }
+                        endpoint_event = Some(endpoint_mouse_event(
+                            ClientMouseKind::Drag(endpoint_mouse_button(drag.button)),
+                            mouse_point(event.position),
+                            runtime,
+                            endpoint_modifiers(event.modifiers),
+                            0,
+                            f64::from(window.scale_factor()),
+                        ));
                         flush_pane_surface(runtime);
                     }
                 }
@@ -1129,7 +967,7 @@ impl OcHerdrView {
             runtime
                 .terminal
                 .update_text_selection(surface.0, surface.1, modifiers);
-            if captured && matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+            if captured {
                 endpoint_event = Some(endpoint_mouse_event(
                     ClientMouseKind::Drag(ClientMouseButton::Left),
                     mouse_point(event.position),
@@ -1185,7 +1023,7 @@ impl OcHerdrView {
                 window.scale_factor(),
             );
             runtime.terminal.end_text_selection(point, modifiers);
-            if captured && matches!(runtime.session, PaneChannel::Endpoint { .. }) {
+            if captured {
                 endpoint_event = Some(endpoint_mouse_event(
                     ClientMouseKind::Up(ClientMouseButton::Left),
                     mouse_point(event.position),
@@ -1225,18 +1063,16 @@ impl OcHerdrView {
                     ..Default::default()
                 },
             );
-            if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
-                endpoint_event = Some(endpoint_mouse_event(
-                    ClientMouseKind::Up(endpoint_mouse_button(drag.button)),
-                    // The release lands wherever the press started; the
-                    // server only needs the button transition.
-                    (runtime.body_bounds.0, runtime.body_bounds.1),
-                    runtime,
-                    u8::from(drag.shift),
-                    0,
-                    1.0,
-                ));
-            }
+            endpoint_event = Some(endpoint_mouse_event(
+                ClientMouseKind::Up(endpoint_mouse_button(drag.button)),
+                // The release lands wherever the press started; the
+                // server only needs the button transition.
+                (runtime.body_bounds.0, runtime.body_bounds.1),
+                runtime,
+                u8::from(drag.shift),
+                0,
+                1.0,
+            ));
             flush_pane_surface(runtime);
         }
         if let Some(event) = endpoint_event {

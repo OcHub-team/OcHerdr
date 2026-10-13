@@ -73,7 +73,7 @@ fn terminal_paints_reuse_chrome_but_model_changes_invalidate_it(cx: &mut TestApp
 
 #[gpui::test]
 fn retina_wheel_handler_converts_logical_pixels_before_sending(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);

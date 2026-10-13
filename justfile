@@ -7,6 +7,8 @@ export DEVELOPER_DIR := env_var_or_default("DEVELOPER_DIR", "/Applications/Xcode
 
 app_bundle := "target/qa/OcHerdr.app"
 app_binary := app_bundle / "Contents/MacOS/ocherdr"
+# Only coordinated local development has this ignored exact-source config.
+local_ui_config := if path_exists(".cargo/local-ui.toml") == "true" { "--config .cargo/local-ui.toml" } else { "" }
 
 # Show the available workflow instead of starting a GUI unexpectedly.
 default:
@@ -17,7 +19,7 @@ doctor:
     @command -v cargo >/dev/null || { echo "error: cargo is not installed" >&2; exit 1; }
     @command -v rustc >/dev/null || { echo "error: rustc is not installed" >&2; exit 1; }
     @test -f vendor/ghosttykit/GhosttyKit.xcframework/macos-arm64_x86_64/ghostty-internal.a || { echo "error: run 'just bootstrap-ghosttykit' first" >&2; exit 1; }
-    @echo "Rust $(rustc --version | awk '{print $2}') · GhosttyKit 3da10da · macOS $(sw_vers -productVersion)"
+    @echo "Rust $(rustc --version | awk '{print $2}') · GhosttyKit $(cut -c1-12 vendor/ghosttykit/GhosttyKit.xcframework/.ghostty_sha) · macOS $(sw_vers -productVersion)"
     @if command -v herdr >/dev/null; then echo "Herdr $(herdr --version 2>/dev/null || echo installed)"; else echo "warning: herdr is not on PATH; the GUI will open without a local session"; fi
 
 # Download and verify the pinned GhosttyKit XCFramework.
@@ -26,15 +28,15 @@ bootstrap-ghosttykit:
 
 # Start the debug build for day-to-day development.
 run: doctor
-    cargo run -p ocherdr --locked
+    cargo run {{local_ui_config}} -p ocherdr --locked
 
 # Start the optimized binary without packaging an app bundle.
 run-release: doctor
-    cargo run --release -p ocherdr --locked
+    cargo run {{local_ui_config}} --release -p ocherdr --locked
 
 # Fast workspace type-check.
 check:
-    cargo check --workspace --all-targets --locked
+    cargo check {{local_ui_config}} --workspace --all-targets --locked
 
 # Apply Rust formatting.
 fmt:
@@ -42,21 +44,21 @@ fmt:
 
 # Run the warning-free lint gate used by CI.
 lint:
-    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy {{local_ui_config}} --workspace --all-targets --locked -- -D warnings
 
 # Run all unit and documentation tests.
 test:
-    cargo test --workspace --locked
+    cargo test {{local_ui_config}} --workspace --locked
 
 # Run the same quality gate as GitHub Actions without changing source files.
 ci:
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets --locked -- -D warnings
-    cargo test --workspace --locked
+    cargo clippy {{local_ui_config}} --workspace --all-targets --locked -- -D warnings
+    cargo test {{local_ui_config}} --workspace --locked
 
 # Build the optimized OcHerdr executable.
 build-release: doctor
-    cargo build --release -p ocherdr --locked
+    cargo build {{local_ui_config}} --release -p ocherdr --locked
 
 # Create an ad-hoc signed macOS app bundle at target/qa/OcHerdr.app.
 qa-app: build-release
@@ -81,4 +83,8 @@ open:
 
 # Remove Cargo and packaged QA build artifacts.
 clean:
-    cargo clean
+    cargo clean {{local_ui_config}}
+
+# Prepare an exact UI Git snapshot for local coordinated development.
+use-local-ui repository="../ochub-ui":
+    python3 scripts/use-local-ui.py "{{repository}}"

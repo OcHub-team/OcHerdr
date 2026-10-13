@@ -171,10 +171,12 @@ fn clipboard_write_prefers_plain_text_payload() {
         ffi::ghostty_clipboard_content_s {
             mime: mime_html.as_ptr(),
             data: html.as_ptr(),
+            len: html.as_bytes().len(),
         },
         ffi::ghostty_clipboard_content_s {
             mime: mime_plain.as_ptr(),
             data: plain.as_ptr(),
+            len: plain.as_bytes().len(),
         },
     ];
     assert_eq!(
@@ -190,6 +192,7 @@ fn clipboard_write_skips_empty_payloads() {
     let contents = [ffi::ghostty_clipboard_content_s {
         mime: mime.as_ptr(),
         data: data.as_ptr(),
+        len: data.as_bytes().len(),
     }];
     assert_eq!(clipboard_text_from_items(&contents), None);
     assert_eq!(clipboard_text_from_contents(std::ptr::null(), 2), None);
@@ -344,4 +347,16 @@ fn keys_are_encoded_by_ghostty_for_the_terminal_modes_in_effect() {
         press(&terminal, "enter", Some("\n"), SHIFT),
         b"\x1b[27;2;13~"
     );
+}
+
+#[test]
+fn clipboard_write_honors_explicit_length_without_nul_termination() {
+    let mime = CString::new("text/plain").unwrap();
+    let bytes = b"hello\0worldIGNORED";
+    let contents = [ffi::ghostty_clipboard_content_s {
+        mime: mime.as_ptr(),
+        data: bytes.as_ptr().cast(),
+        len: 11,
+    }];
+    assert_eq!(clipboard_text_from_items(&contents).as_deref(), Some("hello\0world"));
 }

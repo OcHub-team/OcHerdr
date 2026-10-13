@@ -467,26 +467,57 @@ keybind = alt+right=esc:f
     unsafe impl Send for SurfaceCore {}
     unsafe impl Sync for SurfaceCore {}
 
+    struct SurfaceDisposal {
+        raw: *mut c_void,
+        callback_state: *mut CallbackState,
+    }
+
+    unsafe extern "C" fn dispose_surface(context: *mut c_void) {
+        // SAFETY: the context is transferred exactly once by SurfaceCore::drop.
+        let disposal = unsafe { Box::from_raw(context.cast::<SurfaceDisposal>()) };
+        if !disposal.raw.is_null() {
+            // SAFETY: all frame leases have ended, and disposal runs on the app
+            // thread after any Metal completion callback has returned.
+            unsafe { ffi::ghostty_surface_free(disposal.raw) };
+        }
+        if !disposal.callback_state.is_null() {
+            // SAFETY: surface_free joined the workers before releasing userdata.
+            unsafe { drop(Arc::from_raw(disposal.callback_state)) };
+        }
+    }
+
+    unsafe extern "C" {
+        static _dispatch_main_q: u8;
+        fn pthread_main_np() -> std::ffi::c_int;
+        fn dispatch_async_f(
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: unsafe extern "C" fn(*mut c_void),
+        );
+    }
+
     impl Drop for SurfaceCore {
         fn drop(&mut self) {
-            let raw = self.raw.swap(std::ptr::null_mut(), Ordering::AcqRel);
-            if !raw.is_null() {
-                // SAFETY: this is the last strong owner. Frame leases also own this core,
-                // so no acquired IOSurface remains when surface teardown begins.
-                unsafe {
-                    ffi::ghostty_surface_request_process_termination(raw);
-                    ffi::ghostty_surface_free(raw);
-                }
-            }
-
-            let callback_state = self
-                .callback_state
-                .swap(std::ptr::null_mut(), Ordering::AcqRel);
-            if !callback_state.is_null() {
-                // SAFETY: the pointer was created by Arc::into_raw exactly once and is
-                // reclaimed only after Ghostty has stopped invoking surface callbacks.
-                unsafe {
-                    drop(Arc::from_raw(callback_state));
+            let disposal = Box::new(SurfaceDisposal {
+                raw: self.raw.swap(std::ptr::null_mut(), Ordering::AcqRel),
+                callback_state: self
+                    .callback_state
+                    .swap(std::ptr::null_mut(), Ordering::AcqRel),
+            });
+            let has_surface = !disposal.raw.is_null();
+            let context = Box::into_raw(disposal).cast::<c_void>();
+            // A Metal callback can hold the last strong reference while GPUI
+            // closes a pane. Freeing there would wait for that same callback.
+            // Dispatch final destruction to the main queue in that case.
+            unsafe {
+                if !has_surface || pthread_main_np() != 0 {
+                    dispose_surface(context);
+                } else {
+                    dispatch_async_f(
+                        std::ptr::addr_of!(_dispatch_main_q).cast_mut().cast(),
+                        context,
+                        dispose_surface,
+                    );
                 }
             }
         }
@@ -556,7 +587,6 @@ keybind = alt+right=esc:f
                     confirm_read_clipboard_cb: Some(runtime_confirm_read_clipboard),
                     write_clipboard_cb: Some(runtime_write_clipboard),
                     close_surface_cb: Some(runtime_close_surface),
-                    tmux_control_cb: None,
                 };
                 let app = ffi::ghostty_app_new(&runtime, config);
                 ffi::ghostty_config_free(config);
@@ -631,14 +661,12 @@ keybind = alt+right=esc:f
     /// # Safety
     /// `config` must be a live, not yet finalized Ghostty config.
     unsafe fn load_base_config(config: ffi::ghostty_config_t) {
-        let source = c"ocherdr-base";
-        // SAFETY: Ghostty copies both strings during the call.
+        // SAFETY: Ghostty copies the configuration bytes during the call.
         unsafe {
             ffi::ghostty_config_load_string(
                 config,
                 BASE_CONFIG.as_ptr().cast::<c_char>(),
                 BASE_CONFIG.len(),
-                source.as_ptr(),
             );
         }
     }
@@ -659,13 +687,16 @@ keybind = alt+right=esc:f
         _userdata: *mut c_void,
         _clipboard: ffi::ghostty_clipboard_e,
         _state: *mut c_void,
-    ) -> bool {
-        false
+        _mimes: *const *const c_char,
+        _mime_count: usize,
+        _list: bool,
+    ) -> ffi::ghostty_clipboard_read_result_e {
+        ffi::ghostty_clipboard_read_result_e_GHOSTTY_CLIPBOARD_READ_UNAVAILABLE
     }
 
     unsafe extern "C" fn runtime_confirm_read_clipboard(
         _userdata: *mut c_void,
-        _text: *const c_char,
+        _contents: *const ffi::ghostty_clipboard_confirm_s,
         _state: *mut c_void,
         _request: ffi::ghostty_clipboard_request_e,
     ) {
@@ -700,7 +731,13 @@ keybind = alt+right=esc:f
     fn clipboard_text_from_items(items: &[ffi::ghostty_clipboard_content_s]) -> Option<String> {
         let preferred = items.iter().find(|item| mime_is_plain_text(item.mime));
         let item = preferred.or(items.first())?;
-        c_ptr_to_string(item.data).filter(|text| !text.is_empty())
+        if item.data.is_null() || item.len == 0 {
+            return None;
+        }
+        // SAFETY: Ghostty provides exactly `len` bytes for this callback. The
+        // new clipboard ABI does not require a trailing NUL.
+        let bytes = unsafe { std::slice::from_raw_parts(item.data.cast::<u8>(), item.len) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
     }
 
     fn mime_is_plain_text(ptr: *const c_char) -> bool {
@@ -716,10 +753,6 @@ keybind = alt+right=esc:f
         }
         // SAFETY: Ghostty clipboard payloads are NUL-terminated for the callback.
         Some(unsafe { CStr::from_ptr(ptr) }.to_bytes())
-    }
-
-    fn c_ptr_to_string(ptr: *const c_char) -> Option<String> {
-        Some(String::from_utf8_lossy(c_ptr_to_bytes(ptr)?).into_owned())
     }
 
     unsafe extern "C" {

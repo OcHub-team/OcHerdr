@@ -1,5 +1,18 @@
 use super::*;
 
+/// What Herdr's hierarchy looks like once a centre swap or a two-column
+/// template rebuild lands: `p-left` follows `p-right` in `t-a`'s layout.
+fn swapped_layout_state(snapshot: &mut HierarchySnapshot) {
+    snapshot.layouts = vec![two_pane_layout("p-right", "p-left")];
+}
+
+/// The pushed layout settles once `p-right` leads `t-a`.
+fn swapped_layout_applied(snapshot: &HierarchySnapshot) -> bool {
+    snapshot
+        .layout_for("t-a")
+        .is_some_and(|layout| layout.panes[0].pane_id == "p-right")
+}
+
 #[gpui::test]
 fn a_two_pane_template_parks_then_rebuilds_the_tab(cx: &mut TestAppContext) {
     let (fake, view, cx) = connect_two_pane_view(cx);
@@ -117,9 +130,13 @@ fn a_two_pane_template_parks_then_rebuilds_the_tab(cx: &mut TestAppContext) {
         );
     });
 
-    fake.send_event(swapped_layout_event());
-    thread::sleep(Duration::from_millis(20));
-    cx.run_until_parked();
+    push_state(
+        &fake,
+        &view,
+        cx,
+        swapped_layout_state,
+        swapped_layout_applied,
+    );
     view.read_with(cx, |this, _| {
         assert!(this.pane_template_commits.is_empty());
         assert!(!this.tab_relocation_locked("t-a"));
@@ -247,9 +264,13 @@ fn a_centre_drop_sends_one_pane_swap_and_settles_on_the_matching_layout(cx: &mut
         );
     });
 
-    fake.send_event(swapped_layout_event());
-    thread::sleep(Duration::from_millis(20));
-    cx.run_until_parked();
+    push_state(
+        &fake,
+        &view,
+        cx,
+        swapped_layout_state,
+        swapped_layout_applied,
+    );
     view.read_with(cx, |this, _| {
         let pending = this.pane_relocations.get("t-a");
         assert!(
@@ -515,12 +536,19 @@ fn a_layout_that_does_not_match_the_plan_reverts_to_authority(cx: &mut TestAppCo
         ratio: 0.5,
         rect: layout_rect(60, 0, 60, 40),
     });
-    fake.send_event(json!({
-        "event": "layout_updated",
-        "data": { "type": "layout_updated", "layout": layout }
-    }));
-    thread::sleep(Duration::from_millis(20));
-    cx.run_until_parked();
+    push_state(
+        &fake,
+        &view,
+        cx,
+        move |snapshot| {
+            snapshot.layouts = vec![layout];
+        },
+        |snapshot| {
+            snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| layout.panes.len() == 3)
+        },
+    );
     view.read_with(cx, |this, _| {
         assert!(
             this.pane_relocations.is_empty(),
@@ -546,7 +574,7 @@ fn a_rejected_swap_drops_the_plan_and_unlocks_the_tab(cx: &mut TestAppContext) {
     let mut snapshot = two_pane_snapshot();
     snapshot.panes[1].pane_id = "reject".into();
     snapshot.layouts = vec![two_pane_layout("p-left", "reject")];
-    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let fake = FakeHerdr::serving(snapshot);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -653,7 +681,19 @@ fn a_split_drag_squeezes_the_preview_and_sends_one_set_split_ratio(cx: &mut Test
     landed.splits[0].ratio = ratio as f32;
     landed.panes[0].rect = layout_rect(0, 0, 84, 40);
     landed.panes[1].rect = layout_rect(84, 0, 36, 40);
-    send_events(&fake, vec![layout_event(landed)], cx);
+    push_state(
+        &fake,
+        &view,
+        cx,
+        move |snapshot| {
+            snapshot.layouts = vec![landed];
+        },
+        |snapshot| {
+            snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| layout.panes[0].rect.width == 84)
+        },
+    );
     view.read_with(cx, |this, _| {
         assert!(this.split_commit.is_none(), "the matching layout settles");
         assert!(!this.pane_resize_frozen("p-left"), "settling unfreezes");
@@ -719,7 +759,7 @@ fn dragging_the_outer_divider_keeps_the_inner_one_pinned_and_sends_both_ratios(
         split_pane("p3", false),
     ];
     snapshot.layouts = vec![nested_three_pane_layout(0.5, 0.5)];
-    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let fake = FakeHerdr::serving(snapshot);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -773,13 +813,18 @@ fn dragging_the_outer_divider_keeps_the_inner_one_pinned_and_sends_both_ratios(
 
     // Herdr answers with one layout per request: the first (outer moved,
     // inner still 0.5) must not flash; the second settles the batch.
-    send_events(
+    push_state(
         &fake,
-        vec![layout_event(nested_three_pane_layout(
-            outer_ratio as f32,
-            0.5,
-        ))],
+        &view,
         cx,
+        move |snapshot| {
+            snapshot.layouts = vec![nested_three_pane_layout(outer_ratio as f32, 0.5)];
+        },
+        move |snapshot| {
+            snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| (layout.splits[0].ratio - outer_ratio as f32).abs() < 1e-6)
+        },
     );
     view.read_with(cx, |this, _| {
         assert!(
@@ -795,13 +840,21 @@ fn dragging_the_outer_divider_keeps_the_inner_one_pinned_and_sends_both_ratios(
         assert!((squeezed.split(&[false]).expect("inner").1 - 0.25).abs() < 1e-6);
         assert!(this.pane_resize_frozen("p2"));
     });
-    send_events(
+    push_state(
         &fake,
-        vec![layout_event(nested_three_pane_layout(
-            outer_ratio as f32,
-            inner_ratio as f32,
-        ))],
+        &view,
         cx,
+        move |snapshot| {
+            snapshot.layouts = vec![nested_three_pane_layout(
+                outer_ratio as f32,
+                inner_ratio as f32,
+            )];
+        },
+        move |snapshot| {
+            snapshot
+                .layout_for("t-a")
+                .is_some_and(|layout| (layout.splits[1].ratio - inner_ratio as f32).abs() < 1e-6)
+        },
     );
     view.read_with(cx, |this, _| {
         assert!(this.split_commit.is_none(), "the last layout settles");

@@ -42,7 +42,7 @@ fn connect_transfer_view(
     cx: &mut TestAppContext,
     script: PaneMoveScript,
 ) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
-    let fake = FakeHerdr::snapshot_with_live_events_and_script(transfer_snapshot(), script);
+    let fake = FakeHerdr::serving_with_script(transfer_snapshot(), script);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -56,7 +56,7 @@ fn connect_snapshot(
     cx: &mut TestAppContext,
     snapshot: HierarchySnapshot,
 ) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(snapshot);
+    let fake = FakeHerdr::serving(snapshot);
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);

@@ -1,13 +1,13 @@
 //! Herdr endpoint generation 1 integration.
 //!
-//! Servers at private protocol 22+ (Herdr 0.9.x) no longer offer the numbered
-//! per-pane streams OcHerdr 0.8.x compatibility keeps. Instead one client-owned
-//! shell connection per session carries the session snapshot, the composited
-//! tab surface, semantic input, and an endpoint-scoped API channel. This module
-//! adapts that single stream onto OcHerdr's per-pane model: `SurfaceDecoder`
-//! slices each pane's `inner_rect` out of the composited frame and re-encodes
-//! it as ANSI for the pane's own terminal mirror.
+//! One client-owned shell connection per session carries the composited tab
+//! surface, semantic input, snapshot pushes, semantic notifications, and an
+//! endpoint-scoped API channel. This module adapts that single stream onto
+//! OcHerdr's per-pane model: `SurfaceDecoder` slices each pane's `inner_rect`
+//! out of the composited frame and re-encodes it as ANSI for the pane's own
+//! terminal mirror.
 
+use super::events::AgentSystemNotification;
 use super::*;
 
 pub(crate) use ocherdr_herdr::endpoint::EndpointHandle;
@@ -17,15 +17,9 @@ use ocherdr_herdr::endpoint::{
 use ocherdr_herdr::endpoint_v1 as ep;
 pub(crate) use ocherdr_herdr::endpoint_v1::{
     ClientKeyCode, ClientKeyKind, ClientMouseButton, ClientMouseGeometry, ClientMouseKind,
-    ClientMousePosition, ClientPaneInputEvent,
+    ClientMousePosition, ClientPaneInputEvent, SemanticNotification, SemanticNotificationKind,
 };
 use ocherdr_herdr::surface_ansi::{PaneRenderUpdate, SurfaceDecoder};
-
-/// First private protocol version that carries the endpoint shell protocol.
-/// Herdr 0.9.0/0.9.1 both report private protocol 22. Protocol 21 only ever
-/// shipped on pre-0.9 preview builds, so it is intentionally not bridged:
-/// those servers keep using neither path and surface as unsupported.
-pub(crate) const ENDPOINT_MIN_PROTOCOL: u32 = 22;
 
 /// A live client-owned shell connection for one session.
 pub(crate) struct EndpointRuntime {
@@ -64,24 +58,24 @@ impl OcHerdrView {
             .is_some_and(|session| session.endpoint.is_some())
     }
 
-    /// True when the connected server can host an endpoint session, whether or
-    /// not the connection has finished negotiating.
-    pub(crate) fn endpoint_capable(&self) -> bool {
-        self.snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.protocol >= ENDPOINT_MIN_PROTOCOL)
-    }
-
-    /// Spawns the session-level endpoint connection when the server supports
-    /// it. Safe to call on every `ensure_session_terminals`.
+    /// Spawns the session-level endpoint connection. Every supported server
+    /// (Herdr 0.9+) hosts one; a negotiation failure arrives as a stream
+    /// error on the listener and marks the host degraded. Safe to call on
+    /// every `ensure_session_terminals`.
     pub(super) fn ensure_endpoint_session(&mut self, cx: &mut Context<Self>) {
-        if !self.endpoint_capable() {
-            return;
-        }
         #[cfg(test)]
         if self.headless_terminals {
             return;
         }
+        self.spawn_endpoint_session(cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_endpoint_session_for_test(&mut self, cx: &mut Context<Self>) {
+        self.spawn_endpoint_session(cx);
+    }
+
+    fn spawn_endpoint_session(&mut self, cx: &mut Context<Self>) {
         if self
             .session_panes
             .as_ref()
@@ -89,10 +83,10 @@ impl OcHerdrView {
         {
             return;
         }
-        let Some(terminal_endpoint) = self
+        let Some(transport) = self
             .connection
             .as_ref()
-            .map(SessionConnection::terminal_endpoint)
+            .map(SessionConnection::endpoint_transport)
         else {
             return;
         };
@@ -101,7 +95,7 @@ impl OcHerdrView {
             return;
         };
         let (endpoint_session, events) =
-            EndpointSession::spawn(terminal_endpoint, cols, rows, cell.0, cell.1);
+            EndpointSession::spawn(transport, cols, rows, cell.0, cell.1);
         let mut runtime = EndpointRuntime::new(endpoint_session);
         runtime.cell_px = cell;
         runtime.surface = (cols, rows);
@@ -321,6 +315,19 @@ impl OcHerdrView {
         cx.spawn(async move |this, cx| {
             loop {
                 let Some(batch) = next_batch(&mut events).await else {
+                    // Clean EOF: the server closed without a Shutdown frame.
+                    // Run the same closed-path teardown an Err batch would
+                    // have run; it no-ops when the session already detached
+                    // intentionally (its endpoint runtime is gone).
+                    let _ = this.update(cx, |this, cx| {
+                        this.apply_endpoint_batch(
+                            &owner,
+                            vec![Err(HerdrError::TerminalClosed(
+                                "endpoint connection closed".into(),
+                            ))],
+                            cx,
+                        )
+                    });
                     break;
                 };
                 let keep = this
@@ -347,8 +354,11 @@ impl OcHerdrView {
         let mut closed = false;
         let mut updates: Vec<PaneRenderUpdate> = Vec::new();
         let mut notifies = Vec::new();
+        let mut semantic = Vec::new();
         let mut clipboards = Vec::new();
         let mut report_all = Vec::new();
+        let mut welcomed = false;
+        let mut snapshot_push = false;
         let mut view_sync = false;
         {
             let Some(session) = self.session_for_owner_mut(owner) else {
@@ -359,12 +369,18 @@ impl OcHerdrView {
             };
             for item in batch {
                 match item {
-                    // The snapshot duplicates `session.snapshot` on the public
-                    // socket, which stays authoritative for the hierarchy. Its
-                    // arrival doubles as the cue to re-verify the pushed view
-                    // after a refused request.
-                    Ok(EndpointEvent::Welcome(_)) => {}
+                    // Negotiation finished: the stream is the session's liveness
+                    // signal, so the host flips to Connected/Live here.
+                    Ok(EndpointEvent::Welcome(_)) => {
+                        welcomed = true;
+                    }
+                    // The endpoint's snapshot duplicates the public socket's
+                    // `session.snapshot`, which stays authoritative for the
+                    // hierarchy: its arrival is the invalidation cue that
+                    // drives a fresh pull, and doubles as the cue to re-verify
+                    // the pushed view after a refused request.
                     Ok(EndpointEvent::Snapshot(_)) => {
+                        snapshot_push = true;
                         view_sync = true;
                     }
                     Ok(EndpointEvent::Surface(frame)) => {
@@ -395,9 +411,9 @@ impl OcHerdrView {
                     }) => {
                         notifies.push((kind, message, body));
                     }
-                    // Agent attention state already arrives through the
-                    // public-socket snapshot the hierarchy renders from.
-                    Ok(EndpointEvent::SemanticNotification(_)) => {}
+                    Ok(EndpointEvent::SemanticNotification(notification)) => {
+                        semantic.push(notification);
+                    }
                     Ok(EndpointEvent::ShellError(message)) => {
                         error = Some((FailureKind::TerminalStream, message));
                     }
@@ -430,11 +446,27 @@ impl OcHerdrView {
                 }
             }
         }
+        if welcomed {
+            self.set_event_stream_state(owner, EventStreamState::Live);
+        }
         if active && view_sync && !closed {
             self.endpoint_sync_view();
         }
+        if snapshot_push && !closed {
+            if active {
+                self.resync_snapshot(self.event_epoch, cx);
+            } else if self.sidebar_mode == SidebarMode::Aggregate {
+                // Aggregate mode lists parked hosts' rows: keep their
+                // snapshots fresh from the endpoint stream that is already
+                // running for the parked connection.
+                self.refresh_parked_snapshot(&owner.profile_id, cx);
+            }
+        }
         for (kind, message, body) in notifies {
             self.post_herdr_notification(owner, "", kind, message, body, cx);
+        }
+        for notification in semantic {
+            self.post_semantic_notification(owner, notification, cx);
         }
         for data in clipboards {
             cx.write_to_clipboard(ClipboardItem::new_string(data));
@@ -445,8 +477,8 @@ impl OcHerdrView {
         {
             runtime.terminal.set_kitty_keyboard_report_all(enabled);
         }
-        if let Some((kind, detail)) = error {
-            self.notify_failure(kind, detail, cx);
+        if let Some((kind, detail)) = &error {
+            self.notify_failure(*kind, detail, cx);
         }
         if closed {
             if let Some(session) = self.session_for_owner_mut(owner) {
@@ -455,7 +487,22 @@ impl OcHerdrView {
                     runtime.exit_seen = true;
                 }
             }
+            let detail = error
+                .map(|(_, detail)| detail.into())
+                .unwrap_or_else(|| "endpoint connection closed".into());
+            self.set_event_stream_state(owner, EventStreamState::Lost(detail));
             if active {
+                self.cancel_split_drag();
+                self.split_commit = None;
+                self.cancel_reorder_drag();
+                self.cancel_pane_drag();
+                self.cancel_keyboard_pane_move();
+                self.pending_created_tab = None;
+                // Requests already sent cannot be cancelled; the reconnect
+                // snapshot is the authority for what actually happened.
+                self.abort_pane_relocations_for_disconnect();
+                self.abort_tab_transfer_for_disconnect(cx);
+                self.abandon_worktree_list();
                 self.resync_snapshot(self.event_epoch, cx);
             }
             cx.notify();
@@ -496,8 +543,126 @@ impl OcHerdrView {
         true
     }
 
+    /// Records the endpoint connection state for `owner`, whether it is the
+    /// visible session or parked on another host.
+    fn set_event_stream_state(&mut self, owner: &SessionKey, state: EventStreamState) {
+        if self.is_active_session(owner) {
+            self.event_stream = state;
+        } else if let Some(runtime) = self.parked_hosts.get_mut(&owner.profile_id) {
+            runtime.event_stream = state;
+        }
+    }
+
+    /// Routes an endpoint semantic notification (agent finished / needs
+    /// attention) to a native system notification, mirroring the presentation
+    /// the snapshot-driven agent notices use.
+    pub(super) fn post_semantic_notification(
+        &mut self,
+        owner: &SessionKey,
+        notification: SemanticNotification,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.agent_notifications {
+            return;
+        }
+        let status = match notification.kind {
+            SemanticNotificationKind::Finished => AgentStatus::Done,
+            SemanticNotificationKind::NeedsAttention => AgentStatus::Blocked,
+            _ => return,
+        };
+        let Some(pane_id) = notification.pane_id.clone() else {
+            return;
+        };
+        let active = self.is_active_session(owner);
+        // A selected pane only suppresses its own completion notification
+        // while the user can actually see it.
+        if active
+            && self.window_active
+            && self.selection.pane_id.as_deref() == Some(pane_id.as_str())
+        {
+            return;
+        }
+        let (snapshot, host) = if active {
+            (
+                self.snapshot.as_ref(),
+                self.current_profile().label().to_owned(),
+            )
+        } else {
+            (
+                self.parked_hosts
+                    .get(&owner.profile_id)
+                    .and_then(|runtime| runtime.snapshot.as_ref()),
+                self.profiles
+                    .iter()
+                    .find(|profile| profile.id() == owner.profile_id)
+                    .map(ConnectionProfile::label)
+                    .unwrap_or(&owner.profile_id)
+                    .to_owned(),
+            )
+        };
+        let pane = snapshot.and_then(|snapshot| snapshot.pane(&pane_id));
+        let agent = notification
+            .agent
+            .as_deref()
+            .filter(|label| !label.is_empty())
+            .or_else(|| {
+                let label = pane.map(|pane| pane.display_name())?;
+                (!label.is_empty()).then_some(label)
+            })
+            .unwrap_or(pane_id.as_str())
+            .to_owned();
+        let workspace = notification
+            .workspace_id
+            .as_deref()
+            .map(|id| {
+                snapshot
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.workspace_id == id)
+                    })
+                    .map(|workspace| workspace.label.as_str())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(id)
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        let tab = notification
+            .tab_id
+            .as_deref()
+            .map(|id| {
+                snapshot
+                    .and_then(|snapshot| snapshot.tabs.iter().find(|tab| tab.tab_id == id))
+                    .map(|tab| tab.label.as_str())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(id)
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        self.post_agent_system_notification(
+            owner,
+            &host,
+            AgentSystemNotification {
+                status,
+                agent,
+                workspace,
+                tab,
+                pane_id,
+                terminal_id: pane
+                    .map(|pane| pane.terminal_id.clone())
+                    .unwrap_or_default(),
+            },
+            cx,
+        );
+    }
+
     /// Applies one pane's ANSI blit + geometry to its terminal mirror.
-    fn apply_endpoint_pane_update(&mut self, owner: &SessionKey, update: PaneRenderUpdate) -> bool {
+    pub(super) fn apply_endpoint_pane_update(
+        &mut self,
+        owner: &SessionKey,
+        update: PaneRenderUpdate,
+    ) -> bool {
         let Some(runtime) = self.pane_for_owner_mut(owner, &update.pane_id) else {
             return false;
         };

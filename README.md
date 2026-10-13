@@ -9,19 +9,21 @@ OcHerdr is intentionally a client, not another multiplexer:
 - state and mutations use Herdr's public JSON socket API;
 - local and remote sessions share the same typed model;
 - remote transport uses the system OpenSSH client and SSH config;
-- terminal frames and input use a versioned facade over Herdr's private client protocol;
+- terminal frames and semantic input use Herdr's stable endpoint generation 1;
 - terminal rendering uses Ghostty Metal on macOS and a portable styled VT renderer on Linux and Windows;
+- macOS pins the Ghostty development line toward 1.4, with [audited embedding sources and checksummed binaries](vendor/ghosttykit/README.md);
 - application controls come from [`ochub-ui`](https://github.com/OcHub-team/ochub-ui).
 
 ## Status
 
-The repository targets macOS, Linux, Windows, and Herdr `0.8.1+`. The first milestone includes:
+The repository targets macOS, Linux, Windows, and Herdr `0.9.0+`, with the endpoint
+contract checked against `0.9.4`. The first milestone includes:
 
 - local and SSH-host session discovery;
 - an in-app host center for filtering, organizing, diagnosing, and switching SSH hosts;
 - live workspace, tab, pane, layout, and agent status rendering;
-- independent `--takeover` control for each pane after a click, wheel, or input action;
-- read-only observation of untouched panes, with a bounded cache of hidden tab surfaces and streams;
+- one persistent endpoint connection per session, with input addressed to individual panes;
+- a bounded cache of hidden tab surfaces, with inactive hosts pausing surface streaming;
 - workspace/tab creation, rename, close, and pane operations through the public API;
 - native context menus for workspace, tab, and pane actions;
 - platform-native shortcuts plus Herdr's `Ctrl+B` prefix workflow;
@@ -32,19 +34,42 @@ The repository targets macOS, Linux, Windows, and Herdr `0.8.1+`. The first mile
 - theme families, native blur/clear backdrops, and adjustable shell opacity;
 - runtime internationalization with system-language detection, English, and Simplified Chinese;
 - OcHerdr-owned agent completion and attention alerts through the host notification center;
-- an embedded Herdr TUI settings panel through the toolbar, using the connected host/session;
+- Herdr settings guidance through the toolbar;
 - stopped-session guidance through the system Terminal.
 
-OcHerdr does not link or modify Herdr. It implements protocol 20 of Herdr's private
-`herdr-client.sock` wire format behind an isolated codec, and never stores SSH passwords
-or private keys. Unknown protocol versions fail closed with an upgrade error.
+OcHerdr does not link or modify Herdr. It negotiates `endpoint.hello.v1` and the
+snapshot, surface, semantic-input, and blob codecs over `herdr-client.sock` or
+Herdr's SSH stdio bridge. The shared binary envelope is protocol 22; endpoint
+compatibility is independent of the numbered private protocol. Unsupported
+generations or core codecs fail with an upgrade error. SSH passwords and private
+keys are never stored.
+
+## Keyboard discovery and shared UI
+
+Click **Keyboard shortcuts** in the status bar or press **Cmd+/** on macOS
+(**Ctrl+Shift+/** elsewhere) to search the shortcut reference. Pressing Escape
+returns focus to the previous control. Hold Command or Control to reveal tab
+numbers without shifting the tab titles. `Ctrl+B`, then `M`, enters keyboard
+pane movement; the reference also lists the prefix navigation keys.
+
+Text fields use `ochub-ui` directly, including native word/line selection,
+undo, Find, macOS `Ctrl+T` transpose, `Cmd+Shift+V` plain-text paste, and input
+method composition protection. Terminal focus keeps terminal control sequences.
+
+OcHub and OcHerdr share `ochub-ui` 0.7.0 and the same pinned GPUI revision.
+For an unpublished local UI commit, run `just use-local-ui ../ochub-ui` before
+`just check` or `just qa-app`. The ignored exact-source snapshot preserves the
+Git revision in `Cargo.lock`; the normal upstream dependency remains intact.
+Direct Cargo commands also need `--config .cargo/local-ui.toml` in this mode.
+Set `OCHERDR_CONFIG_DIR` to use a separate configuration directory for QA;
+the override covers connections, settings, themes, and window state.
 
 ## Requirements
 
 - macOS 14 or newer, a current x86_64 Linux desktop, or Windows 10/11 x86_64
-- Rust 1.97.1 (selected by `rust-toolchain.toml`)
+- Rust 1.98.1 (selected by `rust-toolchain.toml`)
 - Xcode Command Line Tools on macOS; standard Wayland/X11 development libraries on Linux
-- Herdr 0.8.1 or newer
+- Herdr 0.9.0 or newer (tested with 0.9.4)
 
 ## Install
 
@@ -130,21 +155,17 @@ These editor copies are removed when OcHerdr exits.
 With an image-only or file-backed image clipboard (including PixPin and Finder),
 `Cmd+V` stays native for local panes. For an SSH pane, either `Cmd+V` or `Ctrl+V`
 reads and validates the local image in the background, then sends one `ClipboardImage`
-message over the pane's existing Herdr connection. Herdr stages the bytes on the target
+message over the session's existing endpoint connection. Herdr stages the bytes on the target
 host and pastes its path. No extra SSH command, remote shell utility, X11 clipboard, or
-Herdr server modification is involved. Switching machines keeps that same pane connection
+Herdr server modification is involved. Switching machines keeps that same session connection
 alive, so the client-scoped staged image remains valid until the host is explicitly disconnected.
 
 The native Herdr prefix also works: press `Ctrl+B`, then use `C` for a tab,
 `Shift+N` for a workspace, `N/P` to cycle tabs, `Shift+T/W/P` to rename,
 `Shift+X/D` to close, `H/J/K/L` to focus panes, `1…9` to switch tabs, or `S`
-to open Herdr settings inside OcHerdr. The gear opens the same panel; the palette
-and `Cmd+,` continue to open OcHerdr's own appearance settings. Herdr owns the TUI
-settings and saves them on the connected host. The panel uses a separate full-app
-client with connection-local bindings (`F12` opens settings), so custom server
-prefixes do not prevent entry and no config keys are overwritten. Existing Herdr
-dialogs, including onboarding, are preserved. Closing the panel detaches only
-that client and restores focus to OcHerdr's panes.
+to open Herdr settings guidance. The gear opens the same panel; the palette and
+`Cmd+,` open OcHerdr's own appearance settings. Herdr's full TUI settings are not
+embedded by the endpoint client; use Herdr on the connected host to edit them.
 
 On macOS, text fields (including dynamically created Find fields) support:
 
@@ -163,12 +184,9 @@ such as `.env` and `.git`, locally and over SFTP. Toggle it with `Cmd+Shift+.` o
 macOS (`Ctrl+H` elsewhere) while the file panel is open. The preference is saved;
 changing it refreshes expanded directories and invalidates collapsed-directory caches.
 
-OcHerdr listens to the same per-pane agent status stream that keeps its UI current and
-posts a native notification when an agent moves from working to done or blocked. This
-does not depend on Herdr's `toast.delivery` setting or on Herdr treating OcHerdr's
-terminal-attach sockets as its foreground app client. Startup snapshots, reconnect
-replay, repeated terminal states, and the pane currently visible in the frontmost
-OcHerdr window do not produce duplicate alerts. Agent notifications can be disabled
+OcHerdr receives semantic agent completion and attention notifications over the
+session endpoint. The pane currently visible in the frontmost OcHerdr window does
+not produce an alert. Agent notifications can be disabled
 under General settings. They use Notification Center on macOS, native Toast
 notifications on Windows, and the XDG notification service on Linux; remote Herdr
 sessions notify on the computer running OcHerdr. Clicking a notification activates
@@ -181,7 +199,7 @@ OcHerdr.
 | `ocherdr-app` | GPUI shell, `ochub-ui` composition, selection and terminal surfaces |
 | `ocherdr-core` | Connection/session hierarchy, layout snapshots, compatibility model |
 | `ocherdr-files` | Unified local/SFTP filesystem operations and recursive transfers |
-| `ocherdr-herdr` | Public JSON socket, dual-socket OpenSSH tunnel, and versioned terminal protocol codecs |
+| `ocherdr-herdr` | Public JSON socket, OpenSSH API forwarding, endpoint stdio bridge, and generation-1 codecs |
 | `ocherdr-terminal` | GhosttyKit/Metal renderer on macOS and portable styled VT renderer on Linux/Windows |
 
 On macOS, GhosttyKit is pinned and checksum-verified by `scripts/bootstrap-ghosttykit.sh`. GPUI
@@ -210,3 +228,9 @@ some revisions can introduce GPL-licensed transitive code even though OcHerdr an
 
 Maintainer release setup and the tag-to-Homebrew flow are documented in
 [`docs/releasing.md`](docs/releasing.md).
+
+If the pinned GPUI commit is also local, run
+`python3 scripts/use-local-ui.py ../ochub-ui --gpui-repository ../zed`.
+The Git URL mapping applies only to that fetch; lockfile source identities and global Git settings remain intact.
+
+See [the shared UI integration record](docs/shared-ui-2026-10-14.md) for component ownership and validation.

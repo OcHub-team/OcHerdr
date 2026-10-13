@@ -179,6 +179,7 @@ impl OcHerdrView {
             (Overlay::RemoteForm(_), false) => self.close_add_remote(cx),
             (Overlay::HostSwitcher, false) => self.close_host_switcher(cx),
             (Overlay::Appearance, false) => self.close_appearance(window, cx),
+            (Overlay::ShortcutHelp, false) => self.set_overlay(Overlay::None, cx),
             (Overlay::AgentPanel { .. }, false) => self.close_agent_panel(window, cx),
             (Overlay::Update(_), true) => self.confirm_update_dialog(cx),
             (Overlay::Update(_), false) => self.close_update_dialog(window, cx),
@@ -191,6 +192,7 @@ impl OcHerdrView {
             }
             _ => return false,
         }
+        self.consumed_key_releases.record(&event.keystroke);
         cx.stop_propagation();
         true
     }
@@ -408,36 +410,25 @@ impl OcHerdrView {
             cx.notify();
             return;
         };
-        let Some((endpoint, protocol)) = self
-            .connection
-            .as_ref()
-            .zip(self.snapshot.as_ref())
-            .map(|(connection, snapshot)| (connection.terminal_endpoint(), snapshot.protocol))
-        else {
-            return;
-        };
         let title = format!(
             "{} · {}",
             profile_display_label(&self.current_profile(), self.i18n),
             session.name
         );
-        let palette = current_terminal_palette(&self.appearance);
         let focus = self.dialog_focus.clone();
         let parent = cx.entity().downgrade();
         let i18n = self.i18n;
         self.set_overlay(Overlay::HerdrSettings, cx);
-        self.herdr_settings = Some(cx.new(|cx| {
-            crate::herdr_settings::HerdrSettings::new(
-                endpoint, protocol, title, palette, focus, parent, i18n, cx,
-            )
-        }));
+        self.herdr_settings =
+            Some(cx.new(|cx| {
+                crate::herdr_settings::HerdrSettings::new(title, focus, parent, i18n, cx)
+            }));
         self.pending_focus = Some(PendingFocus::Dialog);
         cx.notify();
     }
 
     pub(crate) fn close_herdr_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_overlay(Overlay::None, cx);
-        self.suppress_key_release = true;
         self.focus.focus(window, cx);
         self.ensure_session_terminals(cx);
         self.resync_snapshot(self.event_epoch, cx);

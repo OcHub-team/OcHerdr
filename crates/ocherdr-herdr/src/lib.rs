@@ -1,45 +1,40 @@
 //! Herdr transports used by OcHerdr.
 //!
-//! Session state uses Herdr's public NDJSON API. Terminal rendering and input use
-//! a versioned private-protocol facade over the companion client socket.
+//! Rendering, semantic input, and session-invalidation pushes use Herdr's
+//! stable endpoint protocol over the companion client socket (locally) or an
+//! SSH stdio bridge running Herdr's `remote-client-bridge` (remotely). API
+//! methods outside the endpoint lane's allowlist — `session.snapshot`,
+//! `agent.*`, `pane.move` — use Herdr's public NDJSON API socket directly
+//! (locally) or through an `ssh -N -L` StreamLocal forward (remotely; Herdr
+//! has no stdio bridge for the API socket).
 
 pub mod endpoint;
 pub mod endpoint_v1;
-mod private_protocol;
-mod private_v20;
-mod scroll_queue;
-#[cfg(all(test, unix))]
-mod settings_tests;
 pub mod surface_ansi;
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(windows)]
 use uds_windows::UnixStream;
 
-use futures::channel::mpsc::{self as futures_mpsc, Receiver, UnboundedReceiver};
-use futures::{FutureExt as _, SinkExt as _, Stream};
-use ocherdr_core::{
-    AgentStatus, ConnectionProfile, HerdrEvent, HierarchySnapshot, MINIMUM_HERDR_VERSION,
-    SessionSummary,
-};
+use futures::{FutureExt as _, Stream};
+use ocherdr_core::{ConnectionProfile, HierarchySnapshot, MINIMUM_HERDR_VERSION, SessionSummary};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use thiserror::Error;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = private_protocol::MAX_CLIPBOARD_IMAGE_BYTES;
-pub const SUPPORTED_TERMINAL_PROTOCOL_VERSIONS: &[u32] = private_protocol::SUPPORTED_VERSIONS;
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = endpoint_v1::MAX_CLIPBOARD_IMAGE_PAYLOAD;
+/// Herdr's name for the implicit session; `--session` is omitted for it.
+const DEFAULT_SESSION_NAME: &str = "default";
 
 #[derive(Debug, Error)]
 pub enum HerdrError {
@@ -450,11 +445,11 @@ pub struct TerminalEndpoint {
 }
 
 impl TerminalEndpoint {
-    fn new(socket_path: PathBuf) -> Self {
+    pub(crate) fn new(socket_path: PathBuf) -> Self {
         Self { socket_path }
     }
 
-    fn connect(&self) -> io::Result<UnixStream> {
+    pub(crate) fn connect(&self) -> io::Result<UnixStream> {
         UnixStream::connect(&self.socket_path)
     }
 
@@ -464,9 +459,8 @@ impl TerminalEndpoint {
 }
 
 pub struct SessionConnection {
-    api_socket_path: PathBuf,
-    terminal_endpoint: TerminalEndpoint,
-    _tunnel: Option<SshTunnel>,
+    api: ApiClient,
+    endpoint: endpoint::EndpointTransport,
 }
 
 impl SessionConnection {
@@ -474,23 +468,18 @@ impl SessionConnection {
         let remote_client_socket = client_socket_path_from_api(&session.socket_path);
         match profile {
             ConnectionProfile::Local { .. } => Ok(Self {
-                api_socket_path: session.socket_path.clone(),
-                terminal_endpoint: TerminalEndpoint::new(remote_client_socket),
-                _tunnel: None,
+                api: ApiClient(ApiChannel::Local(session.socket_path.clone())),
+                endpoint: endpoint::EndpointTransport::local(remote_client_socket),
             }),
-            ConnectionProfile::Ssh { .. } => {
-                let tunnel = SshTunnel::open(profile, &session.socket_path, &remote_client_socket)?;
-                Ok(Self {
-                    api_socket_path: tunnel.local_api_socket.clone(),
-                    terminal_endpoint: TerminalEndpoint::new(tunnel.local_client_socket.clone()),
-                    _tunnel: Some(tunnel),
-                })
-            }
+            ConnectionProfile::Ssh { .. } => Ok(Self {
+                api: ApiClient(ApiChannel::Ssh(SshApiTunnel::spawn(profile, session)?)),
+                endpoint: endpoint::EndpointTransport::ssh(profile.clone(), session.name.clone()),
+            }),
         }
     }
 
     pub fn snapshot(&self) -> Result<HierarchySnapshot> {
-        let result = self.invoke("session.snapshot", json!({}))?;
+        let result = self.api_request("session.snapshot", json!({}))?;
         let snapshot = result
             .get("snapshot")
             .cloned()
@@ -498,24 +487,16 @@ impl SessionConnection {
         Ok(serde_json::from_value(snapshot)?)
     }
 
-    pub fn invoke(&self, method: &str, params: Value) -> Result<Value> {
-        request_socket(&self.api_socket_path, method, params)
+    pub fn api_request(&self, method: &str, params: Value) -> Result<Value> {
+        self.api.request(method, params)
     }
 
-    pub fn subscribe(&self) -> Result<EventStream> {
-        EventStream::connect(&self.api_socket_path)
+    pub fn api_client(&self) -> ApiClient {
+        self.api.clone()
     }
 
-    pub fn subscribe_background(&self) -> Result<EventSubscription> {
-        subscribe_events(&self.api_socket_path)
-    }
-
-    pub fn socket_path(&self) -> &Path {
-        &self.api_socket_path
-    }
-
-    pub fn terminal_endpoint(&self) -> TerminalEndpoint {
-        self.terminal_endpoint.clone()
+    pub fn endpoint_transport(&self) -> endpoint::EndpointTransport {
+        self.endpoint.clone()
     }
 }
 
@@ -604,47 +585,84 @@ fn timeout_or_io(error: io::Error, timeout: Duration) -> HerdrError {
     }
 }
 
-struct SshTunnel {
-    child: Child,
-    local_api_socket: PathBuf,
-    local_client_socket: PathBuf,
-    _directory: TempDir,
+#[derive(Clone)]
+enum ApiChannel {
+    Local(PathBuf),
+    Ssh(SshApiTunnel),
 }
 
-impl SshTunnel {
-    fn open(
-        profile: &ConnectionProfile,
-        remote_api_socket: &Path,
-        remote_client_socket: &Path,
-    ) -> Result<Self> {
+/// Cheaply cloneable NDJSON API client that can be moved into background
+/// tasks. Each call opens a short-lived socket connection; on SSH profiles
+/// the socket is the local end of a StreamLocal forward.
+#[derive(Clone)]
+pub struct ApiClient(ApiChannel);
+
+impl ApiClient {
+    /// One NDJSON JSON-RPC call on Herdr's public API.
+    pub fn request(&self, method: &str, params: Value) -> Result<Value> {
+        match &self.0 {
+            ApiChannel::Local(socket_path) => request_socket(socket_path, method, params),
+            ApiChannel::Ssh(tunnel) => request_socket(&tunnel.local_socket, method, params),
+        }
+    }
+}
+
+/// A persistent `ssh -N -L local.sock:remote.sock` process forwarding the
+/// remote session's public API socket to a local-only socket file. Herdr
+/// ships a stdio bridge only for the client socket (`remote-client-bridge`),
+/// so the NDJSON API rides OpenSSH's StreamLocal forwarding instead.
+#[derive(Clone)]
+struct SshApiTunnel {
+    local_socket: PathBuf,
+    _state: Arc<SshBridgeState>,
+    _directory: Arc<tempfile::TempDir>,
+}
+
+impl SshApiTunnel {
+    fn spawn(profile: &ConnectionProfile, session: &SessionSummary) -> Result<Self> {
+        let ConnectionProfile::Ssh {
+            destination,
+            port,
+            identity_file,
+            proxy_jump,
+            ..
+        } = profile
+        else {
+            return Err(HerdrError::Protocol(
+                "SSH API tunnel requires an SSH profile".into(),
+            ));
+        };
         #[cfg(target_os = "windows")]
         let temporary_root = std::env::temp_dir();
         #[cfg(not(target_os = "windows"))]
         let temporary_root = PathBuf::from("/tmp");
         let directory = tempfile::Builder::new()
-            .prefix("ocherdr-")
+            .prefix("ocherdr-api-")
             .tempdir_in(temporary_root)?;
-        let local_api_socket = directory.path().join("api.sock");
-        let local_client_socket = directory.path().join("client.sock");
+        let local_socket = directory.path().join("api.sock");
         #[cfg(target_os = "windows")]
-        let local_api_forward = Path::new("api.sock");
+        let local_forward = Path::new("api.sock");
         #[cfg(not(target_os = "windows"))]
-        let local_api_forward = local_api_socket.as_path();
-        #[cfg(target_os = "windows")]
-        let local_client_forward = Path::new("client.sock");
-        #[cfg(not(target_os = "windows"))]
-        let local_client_forward = local_client_socket.as_path();
-        let api_forwarding = format!(
+        let local_forward = local_socket.as_path();
+        let forwarding = format!(
             "{}:{}",
-            local_api_forward.display(),
-            remote_api_socket.display()
+            local_forward.display(),
+            session.socket_path.display()
         );
-        let client_forwarding = format!(
-            "{}:{}",
-            local_client_forward.display(),
-            remote_client_socket.display()
+        let mut command = Command::new(system_ssh());
+        command
+            .arg("-N")
+            .args(["-o", "ExitOnForwardFailure=yes"])
+            .args(["-o", "StreamLocalBindUnlink=yes"])
+            .arg("-L")
+            .arg(&forwarding);
+        add_ssh_common(
+            &mut command,
+            destination,
+            *port,
+            identity_file.as_deref(),
+            proxy_jump.as_deref(),
         );
-        let mut command = ssh_tunnel_command(profile, &api_forwarding, &client_forwarding)?;
         #[cfg(target_os = "windows")]
         command.current_dir(directory.path());
         command
@@ -653,82 +671,178 @@ impl SshTunnel {
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            if local_api_socket.exists() && local_client_socket.exists() {
-                return Ok(Self {
-                    child,
-                    local_api_socket,
-                    local_client_socket,
-                    _directory: directory,
-                });
+        let local_socket = loop {
+            if local_socket.exists() {
+                break local_socket;
             }
             if let Some(status) = child.try_wait()? {
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|pipe| {
-                        let mut reader = BufReader::new(pipe);
-                        let mut message = String::new();
-                        let _ = reader.read_to_string(&mut message);
-                        message
-                    })
-                    .unwrap_or_default();
+                let mut message = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut message);
+                }
                 return Err(HerdrError::Ssh(format!(
-                    "tunnel exited with {status}: {stderr}"
+                    "API tunnel exited with {status}: {}",
+                    message.trim()
                 )));
             }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HerdrError::Ssh(
+                    "timed out forwarding the remote Herdr API socket".into(),
+                ));
+            }
             thread::sleep(Duration::from_millis(40));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        Err(HerdrError::Ssh(
-            "timed out opening the Herdr socket tunnel".into(),
-        ))
+        };
+        // The stderr pipe stays with the child so a later ssh failure keeps
+        // its diagnostics; the tunnel itself reports through request errors.
+        Ok(Self {
+            local_socket,
+            _state: SshBridgeState::new(child, Arc::new(Mutex::new(String::new()))),
+            _directory: Arc::new(directory),
+        })
     }
 }
 
-fn ssh_tunnel_command(
+/// State shared between an SSH bridge owner and its watchdog. Killing the
+/// child is how every blocked side unblocks.
+pub(crate) struct SshBridgeState {
+    child: Mutex<Child>,
+    stderr: Arc<Mutex<String>>,
+}
+
+impl SshBridgeState {
+    fn new(child: Child, stderr: Arc<Mutex<String>>) -> Arc<Self> {
+        Arc::new(Self {
+            child: Mutex::new(child),
+            stderr,
+        })
+    }
+
+    pub(crate) fn kill(&self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
+    }
+
+    /// The tail of the bridge's stderr, when it captured anything.
+    pub(crate) fn stderr_tail(&self) -> Option<String> {
+        let stderr = self.stderr.lock().ok()?.trim().to_owned();
+        (!stderr.is_empty()).then_some(stderr)
+    }
+}
+
+impl Drop for SshBridgeState {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A spawned `ssh -T <dest> '<discovery script> exec herdr … <subcommand>'`
+/// child with piped stdio and a drained stderr tail.
+pub(crate) struct SshStdioBridge {
+    pub(crate) state: Arc<SshBridgeState>,
+    pub(crate) stdin: ChildStdin,
+    pub(crate) stdout: ChildStdout,
+}
+
+/// `--session` precedes the bridge subcommand and is omitted for the default
+/// session, matching Herdr's own remote client argument layout.
+fn bridge_args<'a>(session_name: &'a str, subcommand: &'a str) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(3);
+    if session_name != DEFAULT_SESSION_NAME {
+        args.extend(["--session", session_name]);
+    }
+    args.push(subcommand);
+    args
+}
+
+/// Spawns an SSH stdio bridge running Herdr's `remote-client-bridge` against
+/// `session_name`. `--session` precedes the subcommand and is omitted for the
+/// default session, matching Herdr's own remote client.
+pub(crate) fn spawn_ssh_bridge(
     profile: &ConnectionProfile,
-    api_forwarding: &str,
-    client_forwarding: &str,
-) -> Result<Command> {
+    session_name: &str,
+    subcommand: &str,
+) -> Result<SshStdioBridge> {
     let ConnectionProfile::Ssh {
         destination,
         port,
         identity_file,
         proxy_jump,
+        herdr_path,
         ..
     } = profile
     else {
         return Err(HerdrError::Protocol(
-            "SSH tunnel requires an SSH profile".into(),
+            "SSH bridge requires an SSH profile".into(),
         ));
     };
+    let args = bridge_args(session_name, subcommand);
     let mut command = Command::new(system_ssh());
+    add_ssh_common(
+        &mut command,
+        destination,
+        *port,
+        identity_file.as_deref(),
+        proxy_jump.as_deref(),
+    );
+    let remote = remote_herdr_command(herdr_path, &args);
     command
-        .args(["-N", "-T", "-o", "BatchMode=yes"])
-        .args(["-o", "ConnectTimeout=8", "-o", "ExitOnForwardFailure=yes"])
-        .args([
-            "-o",
-            "StreamLocalBindUnlink=yes",
-            "-o",
-            "ServerAliveInterval=15",
-        ])
-        .args(["-o", "ServerAliveCountMax=3", "-L"])
-        .arg(api_forwarding)
-        .arg("-L")
-        .arg(client_forwarding);
-    if let Some(port) = port {
-        command.arg("-p").arg(port.to_string());
+        .arg("--")
+        .arg(remote)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HerdrError::Ssh("ssh bridge stdin was not piped".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HerdrError::Ssh("ssh bridge stdout was not piped".into()))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| HerdrError::Ssh("ssh bridge stderr was not piped".into()))?;
+    let stderr = Arc::new(Mutex::new(String::new()));
+    thread::spawn({
+        let stderr = stderr.clone();
+        move || drain_stderr(stderr_pipe, stderr)
+    });
+    Ok(SshStdioBridge {
+        state: SshBridgeState::new(child, stderr),
+        stdin,
+        stdout,
+    })
+}
+
+/// The OpenSSH `-T` flag in `add_ssh_common` already disables the remote pty, so
+/// a bridge's stderr carries only ssh diagnostics and remote Herdr errors.
+const SSH_STDERR_TAIL_BYTES: usize = 4 * 1024;
+
+fn drain_stderr(pipe: impl Read, sink: Arc<Mutex<String>>) {
+    let mut reader = BufReader::new(pipe);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(count) => {
+                if let Ok(mut sink) = sink.lock() {
+                    sink.push_str(&String::from_utf8_lossy(&chunk[..count]));
+                    if sink.len() > SSH_STDERR_TAIL_BYTES {
+                        let keep = sink.len() - SSH_STDERR_TAIL_BYTES;
+                        sink.drain(..keep);
+                    }
+                }
+            }
+        }
     }
-    if let Some(identity_file) = identity_file {
-        command.arg("-i").arg(identity_file);
-    }
-    if let Some(proxy_jump) = proxy_jump {
-        command.arg("-J").arg(proxy_jump);
-    }
-    command.arg(destination);
-    Ok(command)
 }
 
 fn system_ssh() -> &'static str {
@@ -736,239 +850,6 @@ fn system_ssh() -> &'static str {
     return "ssh.exe";
     #[cfg(not(target_os = "windows"))]
     return "/usr/bin/ssh";
-}
-
-impl Drop for SshTunnel {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-pub(crate) const EVENT_SUBSCRIPTIONS: &[&str] = &[
-    "workspace.created",
-    "workspace.updated",
-    "workspace.metadata_updated",
-    "workspace.renamed",
-    "workspace.moved",
-    "workspace.reordered",
-    "workspace.closed",
-    "workspace.focused",
-    "worktree.created",
-    "worktree.opened",
-    "worktree.removed",
-    "tab.created",
-    "tab.closed",
-    "tab.focused",
-    "tab.renamed",
-    "tab.moved",
-    "pane.created",
-    "pane.closed",
-    "pane.updated",
-    "pane.focused",
-    "pane.moved",
-    "pane.exited",
-    "pane.agent_detected",
-    "layout.updated",
-];
-
-pub struct EventStream {
-    reader: BufReader<UnixStream>,
-}
-
-impl EventStream {
-    fn connect(socket_path: &Path) -> Result<Self> {
-        Self::connect_with_subscriptions(socket_path, session_subscriptions(), "ocherdr-events")
-    }
-
-    fn connect_agent_status(socket_path: &Path, pane_ids: &[String]) -> Result<Self> {
-        Self::connect_with_subscriptions(
-            socket_path,
-            agent_status_subscriptions(pane_ids),
-            "ocherdr-agent-status",
-        )
-    }
-
-    fn connect_with_subscriptions(
-        socket_path: &Path,
-        subscriptions: Vec<Value>,
-        id_prefix: &str,
-    ) -> Result<Self> {
-        let mut stream = UnixStream::connect(socket_path)?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
-        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
-        let id = format!("{id_prefix}-{}", REQUEST_ID.fetch_add(1, Ordering::Relaxed));
-        write_socket_json(
-            &mut stream,
-            &json!({
-                "id": id,
-                "method": "events.subscribe",
-                "params": { "subscriptions": subscriptions }
-            }),
-            REQUEST_TIMEOUT,
-        )?;
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|error| timeout_or_io(error, REQUEST_TIMEOUT))?;
-        parse_subscription_ack(&line)?;
-        // Idle gaps after subscribe are normal; SSH ServerAlive* closes a dead tunnel.
-        reader.get_mut().set_read_timeout(None)?;
-        Ok(Self { reader })
-    }
-
-    pub fn next_event(&mut self) -> Result<Option<HerdrEvent>> {
-        let mut line = String::new();
-        let count = self.reader.read_line(&mut line)?;
-        if count == 0 {
-            return Ok(None);
-        }
-        Ok(Some(parse_event_line(&line)?))
-    }
-}
-
-fn parse_subscription_ack(line: &str) -> Result<()> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Err(HerdrError::Protocol("empty subscription ack".into()));
-    }
-    let value: Value = serde_json::from_str(line)?;
-    if let Some(error) = api_error(&value) {
-        return Err(error);
-    }
-    match value
-        .get("result")
-        .and_then(|result| result.get("type"))
-        .and_then(Value::as_str)
-    {
-        Some("subscription_started") => Ok(()),
-        Some(other) => Err(HerdrError::Protocol(format!(
-            "unexpected subscription ack type `{other}`"
-        ))),
-        None => Err(HerdrError::Protocol(
-            "subscription ack is missing `result.type`".into(),
-        )),
-    }
-}
-
-fn parse_event_line(line: &str) -> Result<HerdrEvent> {
-    let value: Value = serde_json::from_str(line)?;
-    let Some(data) = value.get("data") else {
-        return Err(HerdrError::Protocol("event is missing `data`".into()));
-    };
-    // Parameterized subscriptions use a different envelope: `event` is a dotted
-    // name and `data` has no `type` tag.
-    if value.get("event").and_then(Value::as_str) == Some("pane.agent_status_changed") {
-        return parse_agent_status_changed(data);
-    }
-    Ok(serde_json::from_value(data.clone())?)
-}
-
-fn parse_agent_status_changed(data: &Value) -> Result<HerdrEvent> {
-    #[derive(Deserialize)]
-    struct Payload {
-        pane_id: String,
-        workspace_id: String,
-        agent_status: AgentStatus,
-        #[serde(default)]
-        agent: Option<String>,
-        #[serde(default)]
-        title: Option<String>,
-        #[serde(default)]
-        display_agent: Option<String>,
-        #[serde(default)]
-        state_labels: HashMap<String, String>,
-    }
-    let payload: Payload = serde_json::from_value(data.clone())?;
-    Ok(HerdrEvent::PaneAgentStatusChanged {
-        pane_id: payload.pane_id,
-        workspace_id: payload.workspace_id,
-        agent_status: payload.agent_status,
-        agent: payload.agent,
-        title: payload.title,
-        display_agent: payload.display_agent,
-        state_labels: payload.state_labels,
-    })
-}
-
-/// Session-wide EventHub types. Herdr starts these at sequence 0 and
-/// replays retained history. OcHerdr subscribes once at connect and
-/// never rebuilds this list.
-fn session_subscriptions() -> Vec<Value> {
-    EVENT_SUBSCRIPTIONS
-        .iter()
-        .map(|kind| json!({ "type": kind }))
-        .collect()
-}
-
-/// Parameterized `pane.agent_status_changed`. Herdr starts these at
-/// `current_sequence`, so a rebuild does not replay retained status
-/// history.
-fn agent_status_subscriptions(pane_ids: &[String]) -> Vec<Value> {
-    pane_ids
-        .iter()
-        .map(|pane_id| {
-            json!({
-                "type": "pane.agent_status_changed",
-                "pane_id": pane_id,
-            })
-        })
-        .collect()
-}
-
-pub fn subscribe_events(socket_path: &Path) -> Result<EventSubscription> {
-    Ok(EventSubscription::spawn(EventStream::connect(socket_path)?))
-}
-
-pub fn subscribe_agent_status(
-    socket_path: &Path,
-    pane_ids: &[String],
-) -> Result<EventSubscription> {
-    Ok(EventSubscription::spawn(EventStream::connect_agent_status(
-        socket_path,
-        pane_ids,
-    )?))
-}
-
-pub struct EventSubscription {
-    events: UnboundedReceiver<Result<HerdrEvent>>,
-}
-
-impl EventSubscription {
-    pub fn new(events: UnboundedReceiver<Result<HerdrEvent>>) -> Self {
-        Self { events }
-    }
-
-    fn spawn(mut stream: EventStream) -> Self {
-        let (event_tx, event_rx) = futures_mpsc::unbounded();
-        thread::spawn(move || {
-            loop {
-                match stream.next_event() {
-                    Ok(Some(event)) => {
-                        if event_tx.unbounded_send(Ok(event)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let fatal = !error.is_event_payload_error();
-                        if event_tx.unbounded_send(Err(error)).is_err() {
-                            break;
-                        }
-                        if fatal {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        Self::new(event_rx)
-    }
-
-    pub async fn next_batch(&mut self) -> Option<Vec<Result<HerdrEvent>>> {
-        next_batch(&mut self.events).await
-    }
 }
 
 const STREAM_BATCH_LIMIT: usize = 128;
@@ -1004,36 +885,6 @@ impl TerminalMode {
     pub const fn is_controlled(self) -> bool {
         matches!(self, Self::Control | Self::ControlTakeover)
     }
-
-    const fn takes_over(self) -> bool {
-        matches!(self, Self::ControlTakeover)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalFrame {
-    pub seq: u64,
-    pub width: u16,
-    pub height: u16,
-    pub full: bool,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalEvent {
-    Frame(TerminalFrame),
-    Notify {
-        kind: TerminalNotificationKind,
-        message: String,
-        body: Option<String>,
-    },
-    MouseCapture {
-        enabled: bool,
-        sgr_pixels: bool,
-    },
-    KittyKeyboardReportAll {
-        enabled: bool,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1041,158 +892,6 @@ pub enum TerminalNotificationKind {
     Sound,
     Toast,
     SystemToast,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalCommand {
-    Input(Vec<u8>),
-    ClipboardImage {
-        extension: String,
-        bytes: Vec<u8>,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-        cell_width_px: u32,
-        cell_height_px: u32,
-    },
-    Scroll {
-        direction: TerminalScrollDirection,
-        lines: u16,
-    },
-    Release,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalScrollDirection {
-    Up,
-    Down,
-}
-
-pub struct TerminalSession {
-    commands: scroll_queue::CommandSender,
-    alive: Arc<AtomicBool>,
-}
-
-/// A small queue deliberately applies backpressure to Herdr's terminal
-/// reader. Full frames can be large; an unbounded queue made a temporarily
-/// stalled GPUI retain every frame for every pane.
-pub type TerminalEventReceiver = Receiver<Result<TerminalEvent>>;
-const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4;
-
-impl TerminalSession {
-    /// Attach the full Herdr UI and request its settings using client-local
-    /// bindings. No terminal ownership or takeover request is sent.
-    pub fn spawn_settings(
-        endpoint: TerminalEndpoint,
-        protocol: u32,
-        cols: u16,
-        rows: u16,
-    ) -> (Self, TerminalEventReceiver) {
-        Self::spawn_inner(
-            endpoint,
-            protocol,
-            String::new(),
-            TerminalMode::Observe,
-            cols,
-            rows,
-            true,
-        )
-    }
-
-    pub fn spawn(
-        endpoint: TerminalEndpoint,
-        protocol: u32,
-        target: String,
-        mode: TerminalMode,
-        cols: u16,
-        rows: u16,
-    ) -> (Self, TerminalEventReceiver) {
-        Self::spawn_inner(endpoint, protocol, target, mode, cols, rows, false)
-    }
-
-    fn spawn_inner(
-        endpoint: TerminalEndpoint,
-        protocol: u32,
-        target: String,
-        mode: TerminalMode,
-        cols: u16,
-        rows: u16,
-        settings: bool,
-    ) -> (Self, TerminalEventReceiver) {
-        let (command_tx, command_rx) = scroll_queue::channel();
-        let (mut event_tx, event_rx) =
-            futures_mpsc::channel::<Result<TerminalEvent>>(TERMINAL_EVENT_QUEUE_CAPACITY);
-        let alive = Arc::new(AtomicBool::new(true));
-        let worker_alive = alive.clone();
-        thread::spawn(move || {
-            let connection = private_protocol::connect(private_protocol::TerminalConnect {
-                endpoint: &endpoint,
-                protocol,
-                target: &target,
-                mode,
-                settings,
-                cols,
-                rows,
-                cell_width_px: 0,
-                cell_height_px: 0,
-            });
-            let (mut reader, mut writer) = match connection {
-                Ok(connection) => connection,
-                Err(error) => {
-                    worker_alive.store(false, Ordering::Release);
-                    let _ = futures::executor::block_on(event_tx.send(Err(error)));
-                    return;
-                }
-            };
-            let _writer = thread::spawn(move || {
-                while let Some(command) = command_rx.recv() {
-                    let release = command == TerminalCommand::Release;
-                    if writer.send(command).is_err() || release {
-                        break;
-                    }
-                }
-            });
-            loop {
-                match reader.read_event() {
-                    Ok(Some(event)) => {
-                        if futures::executor::block_on(event_tx.send(Ok(event))).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = futures::executor::block_on(event_tx.send(Err(error)));
-                        break;
-                    }
-                }
-            }
-            worker_alive.store(false, Ordering::Release);
-        });
-        (
-            Self {
-                commands: command_tx,
-                alive,
-            },
-            event_rx,
-        )
-    }
-
-    pub fn send(&self, command: TerminalCommand) -> Result<()> {
-        self.commands
-            .send(command)
-            .map_err(|_| HerdrError::TerminalClosed("terminal worker stopped".into()))
-    }
-
-    pub fn is_closed(&self) -> bool {
-        !self.alive.load(Ordering::Acquire)
-    }
-}
-
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
-        let _ = self.commands.send(TerminalCommand::Release);
-    }
 }
 
 pub fn ssh_host_aliases() -> Vec<String> {

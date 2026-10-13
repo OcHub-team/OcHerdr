@@ -25,6 +25,13 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn user() -> Option<Self> {
+        if let Some(directory) =
+            std::env::var_os("OCHERDR_CONFIG_DIR").filter(|value| !value.is_empty())
+        {
+            return Some(Self {
+                dir: PathBuf::from(directory),
+            });
+        }
         dirs::config_dir().map(|directory| Self {
             dir: directory.join("OcHerdr"),
         })

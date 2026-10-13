@@ -3,15 +3,11 @@ use std::task::Poll;
 
 use ocherdr_core::{WorkspaceInfo, WorktreeInfo, WorktreeList, WorktreeSourceInfo};
 
-use futures::future::{self, Either, poll_fn};
-use futures::pin_mut;
+use futures::future::poll_fn;
 use ocherdr_core::{
-    AGENT_OUTPUT_SOURCE, AGENT_STATUS_HANDOFF_LIMIT, AgentStatusHandoff,
-    agent_output_should_refresh, agent_status_panes_after_stream_closed,
-    agent_status_stream_should_rebuild, event_panes_after_failed_subscribe, parse_agent_name,
-    reorder_hover_along_axis, reorder_insert_index,
+    AGENT_OUTPUT_SOURCE, parse_agent_name, reorder_hover_along_axis, reorder_insert_index,
 };
-use ocherdr_herdr::{TerminalEvent, TerminalEventReceiver, next_batch, subscribe_agent_status};
+use ocherdr_herdr::next_batch;
 
 use ochub_ui::notifications::NotificationHost;
 
@@ -82,9 +78,13 @@ impl OcHerdrView {
         cx: &mut Context<Self>,
     ) -> Self {
         crate::text_input::init(cx);
-        #[cfg(target_os = "macos")]
-        Self::install_text_input_editing(cx);
         let i18n = I18n::new(loaded.language);
+        let shortcut_help_search = cx.new(|cx| TextInput::new(cx, ""));
+        cx.subscribe(
+            &shortcut_help_search,
+            |_, _, _: &crate::text_input::TextInputEvent, cx| cx.notify(),
+        )
+        .detach();
         let appearance = loaded.appearance;
         let persistence = loaded.persistence;
         let storage_notices = loaded.storage_notices;
@@ -121,6 +121,7 @@ impl OcHerdrView {
             this.endpoint_set_focused(this.window_active);
             if !window.is_window_active() {
                 this.set_command_held(false, cx);
+                this.consumed_key_releases.clear();
                 this.end_text_drag();
             }
         })
@@ -157,15 +158,7 @@ impl OcHerdrView {
             pending_host_target: None,
             collapsed_aggregate_hosts: HashSet::new(),
             failed_hosts: HashSet::new(),
-            herdr_capabilities: HerdrCapabilities::default(),
             event_stream: EventStreamState::Idle,
-            event_listen: None,
-            startup_replay_sync: None,
-            startup_replay_serial: 0,
-            agent_status_listen: None,
-            agent_status_rebuild: None,
-            agent_status_panes: HashSet::new(),
-            agent_status_handoff: None,
             snapshot: None,
             selection: Selection {
                 connection_id: selected_profile_id,
@@ -205,9 +198,11 @@ impl OcHerdrView {
             tab_preview_hovered: false,
             tab_close_reveals: HashMap::new(),
             command_held: false,
-            shortcut_reveal: Transition::settled(0., TAB_SHORTCUT_ANIMATION),
+            shortcut_reveal: ochub_ui::shortcuts::ShortcutReveal::default(),
+            shortcut_help_focus: ochub_ui::modal::ModalFocusState::new(cx),
+            shortcut_help_search,
             prefix_pending: false,
-            suppress_key_release: false,
+            consumed_key_releases: ochub_ui::shortcuts::KeyReleaseTracker::default(),
             surface_drag: SurfaceDrag::Idle,
             aux_mouse_drag: None,
             split_commit: None,
@@ -350,12 +345,7 @@ impl OcHerdrView {
             sessions: std::mem::take(&mut self.sessions),
             session_index: self.session_index.take(),
             connection,
-            herdr_capabilities: std::mem::take(&mut self.herdr_capabilities),
             event_stream: std::mem::replace(&mut self.event_stream, EventStreamState::Idle),
-            event_listen: self.event_listen.take(),
-            agent_status_listen: self.agent_status_listen.take(),
-            agent_status_panes: std::mem::take(&mut self.agent_status_panes),
-            agent_status_handoff: self.agent_status_handoff.take(),
             snapshot: self.snapshot.take(),
             selection: std::mem::take(&mut self.selection),
             session_panes: self.session_panes.take(),
@@ -373,35 +363,14 @@ impl OcHerdrView {
         self.sessions = runtime.sessions;
         self.session_index = runtime.session_index;
         self.connection = Some(runtime.connection);
-        self.herdr_capabilities = runtime.herdr_capabilities;
         self.event_stream = runtime.event_stream;
-        self.event_listen = runtime.event_listen;
-        self.agent_status_listen = runtime.agent_status_listen;
-        self.agent_status_panes = runtime.agent_status_panes;
-        self.agent_status_handoff = runtime.agent_status_handoff;
         self.snapshot = runtime.snapshot;
         self.selection = runtime.selection;
         self.session_panes = runtime.session_panes;
         self.pane_viewports = runtime.pane_viewports;
         self.selection.connection_id = profile_id.to_owned();
 
-        if !matches!(self.event_stream, EventStreamState::Live)
-            && let Some(connection) = &self.connection
-        {
-            match connection.subscribe_background() {
-                Ok(subscription) => {
-                    let owner = self.current_session_key();
-                    self.event_stream = EventStreamState::Live;
-                    self.event_listen =
-                        owner.map(|owner| Self::listen_events(owner, subscription, cx));
-                }
-                Err(error) => {
-                    self.event_stream = EventStreamState::Lost(error.to_string().into());
-                }
-            }
-        }
         self.resync_snapshot(self.event_epoch, cx);
-        self.ensure_agent_status_stream(cx);
         // The endpoint connection survived parking with surfaces suspended;
         // re-activate so it resumes compositing the restored view.
         self.endpoint_activate(cx);
@@ -411,12 +380,6 @@ impl OcHerdrView {
     fn reset_for_host_transition(&mut self) {
         self.load_epoch = self.load_epoch.wrapping_add(1);
         self.event_epoch = self.event_epoch.wrapping_add(1);
-        self.startup_replay_sync = None;
-        self.startup_replay_serial = self.startup_replay_serial.wrapping_add(1);
-        self.agent_status_listen = None;
-        self.agent_status_rebuild = None;
-        self.agent_status_panes.clear();
-        self.agent_status_handoff = None;
         self.snapshot_refreshing = false;
         self.snapshot_refresh_pending = false;
         self.pane_mount_scheduled = false;
@@ -436,19 +399,15 @@ impl OcHerdrView {
         self.failed_hosts.remove(profile_id);
         if self.current_profile().id() != profile_id {
             if let Some(mut runtime) = self.parked_hosts.remove(profile_id) {
-                runtime.event_listen = None;
-                runtime.agent_status_listen = None;
                 runtime.session_panes = None;
             }
             cx.notify();
             return;
         }
         self.reset_for_host_transition();
-        self.event_listen = None;
         self.event_stream = EventStreamState::Idle;
         self.sessions.clear();
         self.session_index = None;
-        self.herdr_capabilities = HerdrCapabilities::default();
         self.snapshot = None;
         self.selection = Selection {
             connection_id: profile_id.to_owned(),
@@ -509,14 +468,7 @@ impl OcHerdrView {
         self.failed_hosts.remove(self.current_profile().id());
         self.load_epoch = self.load_epoch.wrapping_add(1);
         self.event_epoch = self.event_epoch.wrapping_add(1);
-        self.event_listen = None;
         self.event_stream = EventStreamState::Idle;
-        self.startup_replay_sync = None;
-        self.startup_replay_serial = self.startup_replay_serial.wrapping_add(1);
-        self.agent_status_listen = None;
-        self.agent_status_rebuild = None;
-        self.agent_status_panes.clear();
-        self.agent_status_handoff = None;
         self.pending_created_tab = None;
         self.surface_drag = SurfaceDrag::Idle;
         self.pending_tab_transfer = None;
@@ -547,26 +499,16 @@ impl OcHerdrView {
                 .background_spawn(async move {
                     let sessions = discover_sessions(&profile)?;
                     let selected = preferred_session_index(&sessions, preferred_session.as_deref());
-                    let (connection, events, snapshot) = if let Some(index) = selected {
-                        if sessions[index].running {
-                            let connection =
-                                SessionConnection::connect(&profile, &sessions[index])?;
-                            let snapshot = connection.snapshot()?;
-                            let events =
-                                LoadedEvents::from_subscribe(connection.subscribe_background());
-                            (Some(connection), events, Some(snapshot))
-                        } else {
-                            (None, LoadedEvents::Idle, None)
+                    let connection = match selected {
+                        Some(index) if sessions[index].running => {
+                            Some(SessionConnection::connect(&profile, &sessions[index])?)
                         }
-                    } else {
-                        (None, LoadedEvents::Idle, None)
+                        _ => None,
                     };
                     Ok::<_, HerdrError>(LoadedSession {
                         sessions,
                         selected,
                         connection,
-                        events,
-                        snapshot,
                     })
                 })
                 .await;
@@ -582,35 +524,13 @@ impl OcHerdrView {
                         this.sessions = loaded.sessions;
                         this.session_index = loaded.selected;
                         this.connection = loaded.connection;
-                        this.snapshot = loaded.snapshot;
-                        this.herdr_capabilities = this
-                            .snapshot
-                            .as_ref()
-                            .map(HerdrCapabilities::from_snapshot)
-                            .unwrap_or_default();
                         this.selection.connection_id = this.current_profile().id().into();
                         this.selection.session_name =
                             this.current_session().map(|s| s.name.clone());
-                        if let Some(snapshot) = &this.snapshot {
-                            this.selection.reconcile(snapshot);
-                        }
+                        // The endpoint's snapshot push drives the first
+                        // `session.snapshot` pull; `ensure_session_terminals`
+                        // spawns the endpoint session that produces it.
                         this.ensure_session_terminals(cx);
-                        match loaded.events {
-                            LoadedEvents::Idle => {
-                                this.event_stream = EventStreamState::Idle;
-                            }
-                            LoadedEvents::Lost(detail) => {
-                                this.event_stream = EventStreamState::Lost(detail);
-                            }
-                            LoadedEvents::Live(subscription) => {
-                                this.event_stream = EventStreamState::Live;
-                                this.schedule_startup_replay_quiet(cx);
-                                let owner = this.current_session_key();
-                                this.event_listen =
-                                    owner.map(|owner| Self::listen_events(owner, subscription, cx));
-                            }
-                        }
-                        this.ensure_agent_status_stream(cx);
                     }
                     Err(error) => {
                         this.failed_hosts
@@ -618,14 +538,7 @@ impl OcHerdrView {
                         this.sessions.clear();
                         this.session_index = None;
                         this.connection = None;
-                        this.herdr_capabilities = HerdrCapabilities::default();
                         this.event_stream = EventStreamState::Idle;
-                        this.event_listen = None;
-                        this.startup_replay_sync = None;
-                        this.agent_status_listen = None;
-                        this.agent_status_rebuild = None;
-                        this.agent_status_panes.clear();
-                        this.agent_status_handoff = None;
                         this.snapshot = None;
                         this.session_panes = None;
                         this.notify_failure(FailureKind::DiscoverSessions, error, cx);
@@ -644,7 +557,7 @@ impl OcHerdrView {
         }
         self.park_current_host();
         // Invalidate only work that was not transferred into the parked
-        // runtime. The live event/status listeners continue to own that host.
+        // runtime. The parked endpoint listener continues to own that host.
         self.reset_for_host_transition();
         self.profile_index = index;
         self.host_center
@@ -655,9 +568,7 @@ impl OcHerdrView {
             self.sessions.clear();
             self.session_index = None;
             self.connection = None;
-            self.herdr_capabilities = HerdrCapabilities::default();
             self.event_stream = EventStreamState::Idle;
-            self.event_listen = None;
             self.snapshot = None;
             self.session_panes = None;
             self.pane_viewports.clear();
@@ -932,7 +843,7 @@ impl OcHerdrView {
         self.overlay = overlay_after_abandoning_worktree_list(self.overlay.clone());
     }
 
-    fn set_overlay(&mut self, overlay: Overlay, cx: &mut Context<Self>) {
+    pub(super) fn set_overlay(&mut self, overlay: Overlay, cx: &mut Context<Self>) {
         if !matches!(overlay, Overlay::HerdrSettings) {
             // Dropping the settings entity cancels its frame task and detaches
             // only its full-app client. Existing pane streams stay connected.

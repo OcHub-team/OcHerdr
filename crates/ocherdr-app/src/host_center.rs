@@ -9,7 +9,7 @@ use ocherdr_herdr::{
 };
 use ochub_ui::gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Render,
-    ScrollHandle, SharedString, Task, Window, prelude::*, px,
+    ScrollHandle, SharedString, Task, Window, px,
 };
 
 use super::*;

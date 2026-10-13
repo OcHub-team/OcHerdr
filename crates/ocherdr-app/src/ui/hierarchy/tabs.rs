@@ -58,12 +58,7 @@ impl OcHerdrView {
                 reveal.value(now, reduce_motion)
             })
             .collect::<Vec<_>>();
-        self.shortcut_reveal
-            .retarget(if self.command_held { 1. } else { 0. }, now, reduce_motion);
-        if self.shortcut_reveal.is_animating(now, reduce_motion) {
-            window.request_animation_frame();
-        }
-        let shortcut_reveal = self.shortcut_reveal.value(now, reduce_motion);
+        let shortcut_reveal = self.shortcut_reveal.opacity(self.command_held, window, cx);
         let drag = match &self.surface_drag {
             SurfaceDrag::Reorder(drag) => Some(drag),
             _ => None,

@@ -5,13 +5,12 @@
 //! introduce a second status type or a test-only controller.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -20,8 +19,9 @@ use ocherdr_core::{
     AgentInfo, AgentStatus, ConnectionProfile, HierarchySnapshot, PaneInfo, ReorderHover,
     Selection, SessionSummary, TabInfo, WorkspaceInfo,
 };
+use ocherdr_herdr::endpoint::EndpointEvent;
+use ocherdr_herdr::endpoint_v1 as ep;
 use ocherdr_herdr::{HostHealthStatus, SessionConnection, TerminalMode};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::split_drag_from_press;
@@ -36,7 +36,7 @@ use crate::{
 use creation::{
     created_pane, created_tab, created_workspace, created_workspace_pane, created_workspace_tab,
 };
-use relocation::{layout_event, parked_pane_json, send_events, single_pane_layout, temp_tab};
+use relocation::{parked_pane_json, single_pane_layout, temp_tab};
 
 fn install_app(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -74,226 +74,61 @@ fn open_view(cx: &mut TestAppContext) -> (Entity<OcHerdrView>, &mut VisualTestCo
     (view, cx)
 }
 
+/// A fake Herdr session host: the NDJSON public API on `herdr.sock` (one
+/// request per connection, answered on its own thread so a scripted slow
+/// response never blocks a `session.snapshot` pull) plus the endpoint
+/// generation-1 shell protocol on `herdr-client.sock` (hello → welcome →
+/// initial snapshot push, then request/response lanes, semantic input
+/// capture, and server-pushed snapshot/notification frames).
+type EndpointPushers = Arc<Mutex<Vec<(u64, mpsc::Sender<ep::ServerMessage>)>>>;
+type ClipboardImages = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
+type SnapshotMutation = Box<dyn FnOnce(&mut HierarchySnapshot) + Send>;
+
 struct FakeHerdr {
     herdr_path: PathBuf,
-    events: Option<Sender<QueuedEvent>>,
-    /// Every request the live-events server answered, in arrival order.
+    /// Authoritative hierarchy the NDJSON `session.snapshot` serves. Tests
+    /// and scripted request handlers mutate it, then push a snapshot
+    /// notification so the client resyncs the way it would against a live
+    /// Herdr.
+    state: Arc<Mutex<HierarchySnapshot>>,
+    /// Revision counter stamped onto every pushed snapshot envelope.
+    revision: Arc<AtomicU64>,
+    /// Live endpoint subscriber channels: one per connected shell client.
+    pushers: EndpointPushers,
+    /// Every NDJSON request the fake answered, in arrival order.
     requests: Arc<Mutex<Vec<Value>>>,
-    /// How the fake answers `pane.move` (scripted failures).
-    script: Arc<PaneMoveScript>,
+    /// Endpoint-lane request payloads (`{id, method, params}`), in order.
+    endpoint_requests: Arc<Mutex<Vec<Value>>>,
+    /// Semantic input the endpoint received, per pane, in arrival order.
+    pane_inputs: Arc<Mutex<HashMap<String, Vec<ep::ClientPaneInputEvent>>>>,
+    /// (pane, extension, bytes) of every clipboard image the endpoint got.
+    clipboard_images: ClipboardImages,
+    endpoint_connections: Arc<AtomicUsize>,
+    endpoint_disconnects: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
-    terminal_commands: Arc<Mutex<HashMap<String, Vec<FakeTerminalCommand>>>>,
-    terminal_server: Option<JoinHandle<()>>,
+    endpoint_server: Option<JoinHandle<()>>,
     _dir: tempfile::TempDir,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FakeTerminalCommand {
-    Attach { controlled: bool },
-    Input(Vec<u8>),
-    ClipboardImage { extension: String, bytes: Vec<u8> },
-    Detach,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-enum TestClientMessage {
-    Hello {
-        version: u32,
-        cols: u16,
-        rows: u16,
-        cell_width_px: u32,
-        cell_height_px: u32,
-        requested_encoding: TestRenderEncoding,
-        keybindings: TestClientKeybindings,
-        launch_mode: TestClientLaunchMode,
-    },
-    Input {
-        data: Vec<u8>,
-    },
-    ClipboardImage {
-        extension: String,
-        data: Vec<u8>,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-        cell_width_px: u32,
-        cell_height_px: u32,
-    },
-    Detach,
-    AttachTerminal {
-        terminal_id: String,
-        takeover: bool,
-    },
-    AttachScroll {
-        source: TestAttachScrollSource,
-        direction: TestAttachScrollDirection,
-        lines: u16,
-        column: Option<u16>,
-        row: Option<u16>,
-        modifiers: u8,
-    },
-    InputEvents {
-        events: Vec<TestClientInputEvent>,
-    },
-    ObserveTerminal {
-        target: String,
-    },
-    ControlTerminal {
-        target: String,
-        takeover: bool,
-    },
-    GraphicsTransmissionResult {
-        transfer_id: u64,
-        image_id: u32,
-        success: bool,
-    },
-    InputPixels {
-        data: Vec<u8>,
-        cols: u16,
-        rows: u16,
-        width_px: u32,
-        height_px: u32,
-    },
-    GraphicsTransmissionStarted {
-        transfer_id: u64,
-        image_id: u32,
-    },
-}
-
-// The settings handshake sends one structured F12 key. Other test input is
-// raw terminal bytes; only the key/source variants used here are mirrored.
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-enum TestClientInputEvent {
-    Key {
-        code: TestClientKeyCode,
-        modifiers: u8,
-        kind: u32,
-        repeat_count: u16,
-        generated_text: Option<String>,
-        source: u32,
-    },
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-enum TestClientKeyCode {
-    Backspace,
-    Enter,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    Tab,
-    BackTab,
-    Delete,
-    Insert,
-    Esc,
-    Char(char),
-    F(u8),
-    Null,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum TestRenderEncoding {
-    SemanticFrame,
-    TerminalAnsi,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-enum TestClientKeybindings {
-    Server,
-    Local { keys_toml: String },
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-enum TestClientLaunchMode {
-    App,
-    AppDirectGraphics,
-    TerminalAttach,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-enum TestAttachScrollDirection {
-    Up,
-    Down,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-enum TestAttachScrollSource {
-    Wheel,
-    PageKey { input: Vec<u8> },
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Serialize)]
-enum TestServerMessage {
-    Welcome {
-        version: u32,
-        encoding: TestRenderEncoding,
-        error: Option<String>,
-    },
-    Frame(()),
-    Terminal(TestTerminalFrame),
-}
-
-#[derive(Debug, Serialize)]
-struct TestTerminalFrame {
-    seq: u64,
-    width: u16,
-    height: u16,
-    full: bool,
-    bytes: Vec<u8>,
-}
-
-/// Scripted `pane.move` behaviour: how many of the next `new_tab` (step 1)
-/// and `tab` (step 2) requests the fake rejects.
+/// Scripted `pane.move` / create behaviour: how many of the next `new_tab`
+/// (step 1) and `tab` (step 2) requests the fake rejects, and which state
+/// mutation lands (and is pushed to endpoint subscribers) before the
+/// matching response.
 #[derive(Default)]
 struct PaneMoveScript {
     park_failures: AtomicUsize,
     insert_failures: AtomicUsize,
-    /// Events the fake broadcasts on the live subscription *before* it
-    /// writes the next step-1 response: events ride their own socket, so
-    /// in production they can beat the response that names the temp tab.
-    events_before_park_response: Mutex<Vec<Value>>,
-    /// Same race for `tab.create` / `workspace.create`: Herdr broadcasts
-    /// `tab.created` / `pane.created` before it answers the request.
-    events_before_create_response: Mutex<Vec<Value>>,
-    /// Events broadcast before answering `pane.move { destination: tab }`.
-    events_before_insert_response: Mutex<Vec<Value>>,
-    /// The live subscription's queue, filled in by the constructor.
-    event_queue: Mutex<Option<Sender<QueuedEvent>>>,
-}
-
-impl PaneMoveScript {
-    /// Push `events` to the subscribed stream and wait until each one is
-    /// flushed, the same proof `FakeHerdr::send_event` demands.
-    fn broadcast(&self, events: Vec<Value>) {
-        let queue = self.event_queue.lock().expect("event queue");
-        let Some(queue) = queue.as_ref() else {
-            return;
-        };
-        for payload in events {
-            let (written, observed) = mpsc::sync_channel(0);
-            queue
-                .send(QueuedEvent { payload, written })
-                .expect("queue fake Herdr event");
-            observed
-                .recv_timeout(Duration::from_secs(1))
-                .expect("fake Herdr event must be flushed to the subscribed stream");
-        }
-    }
+    /// Mutation applied and pushed *before* the fake writes the next step-1
+    /// response: a real Herdr's snapshot push rides the endpoint connection,
+    /// so it can beat the response that names the temp tab.
+    push_before_park_response: Mutex<Option<SnapshotMutation>>,
+    /// Same race for `pane.move { destination: tab }`.
+    push_before_insert_response: Mutex<Option<SnapshotMutation>>,
+    /// Same race for `tab.create` / `workspace.create`: the handler mutates
+    /// the state itself, this flag only decides whether the push lands
+    /// before the response.
+    push_before_create_response: AtomicBool,
 }
 
 impl PaneMoveScript {
@@ -304,114 +139,34 @@ impl PaneMoveScript {
     }
 }
 
-struct QueuedEvent {
-    payload: Value,
-    written: SyncSender<()>,
-}
-
-struct StalePaneHerdr {
-    socket_path: PathBuf,
-    snapshot_requests: Arc<AtomicUsize>,
-    agent_status_rejections: Arc<AtomicUsize>,
-    stop: Arc<AtomicBool>,
-    server: Option<JoinHandle<()>>,
-    _dir: tempfile::TempDir,
-}
-
-impl StalePaneHerdr {
-    fn new() -> Self {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let socket_path = dir.path().join("herdr.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind stale pane socket");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking stale pane socket");
-        let snapshot_requests = Arc::new(AtomicUsize::new(0));
-        let agent_status_rejections = Arc::new(AtomicUsize::new(0));
-        let server_snapshot_requests = snapshot_requests.clone();
-        let server_agent_status_rejections = agent_status_rejections.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let server_stop = stop.clone();
-        let snapshot = agent_snapshot();
-        let server = thread::spawn(move || {
-            serve_stale_pane_subscribe(
-                listener,
-                server_stop,
-                snapshot,
-                server_snapshot_requests,
-                server_agent_status_rejections,
-            );
-        });
-        Self {
-            socket_path,
-            snapshot_requests,
-            agent_status_rejections,
-            stop,
-            server: Some(server),
-            _dir: dir,
-        }
-    }
-}
-
-impl Drop for StalePaneHerdr {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(server) = self.server.take() {
-            let _ = server.join();
-        }
-    }
-}
-
 impl FakeHerdr {
-    fn snapshot_ok_subscribe_rejected() -> Self {
-        Self::start(None, serve_snapshot_ok_subscribe_rejected)
+    /// A pre-0.9 Herdr: the NDJSON snapshot works, but the endpoint rejects
+    /// the generation-1 hello with a handshake error.
+    fn snapshot_ok_endpoint_rejected() -> Self {
+        Self::start(
+            HierarchySnapshot::default(),
+            PaneMoveScript::default(),
+            true,
+            true,
+        )
     }
 
-    fn snapshot_with_live_events(snapshot: HierarchySnapshot) -> Self {
-        Self::snapshot_with_live_events_and_script(snapshot, PaneMoveScript::default())
+    fn serving(snapshot: HierarchySnapshot) -> Self {
+        Self::serving_with_script(snapshot, PaneMoveScript::default())
     }
 
-    fn snapshot_with_live_events_and_script(
+    fn serving_with_script(snapshot: HierarchySnapshot, script: PaneMoveScript) -> Self {
+        Self::start(snapshot, script, false, false)
+    }
+
+    /// `endpoint_error`: the endpoint welcome carries a handshake rejection.
+    /// `strict_api`: the NDJSON socket serves `session.snapshot` only and
+    /// rejects every other method (a Herdr too old for the request).
+    fn start(
         snapshot: HierarchySnapshot,
         script: PaneMoveScript,
-    ) -> Self {
-        let (events, receiver) = mpsc::channel();
-        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let log = requests.clone();
-        *script.event_queue.lock().expect("event queue") = Some(events.clone());
-        let script = Arc::new(script);
-        let server_script = script.clone();
-        let mut fake = Self::start(Some(events), move |listener, stop| {
-            serve_snapshot_with_live_events(listener, stop, snapshot, receiver, log, server_script);
-        });
-        fake.requests = requests;
-        fake.script = script;
-        fake
-    }
-
-    /// Methods of every request in arrival order.
-    fn request_methods(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .expect("fake herdr request log")
-            .iter()
-            .filter_map(|request| request.get("method")?.as_str().map(str::to_owned))
-            .collect()
-    }
-
-    fn requests_for(&self, method: &str) -> Vec<Value> {
-        self.requests
-            .lock()
-            .expect("fake herdr request log")
-            .iter()
-            .filter(|request| request.get("method") == Some(&json!(method)))
-            .cloned()
-            .collect()
-    }
-
-    fn start(
-        events: Option<Sender<QueuedEvent>>,
-        serve: impl FnOnce(UnixListener, Arc<AtomicBool>) + Send + 'static,
+        endpoint_error: bool,
+        strict_api: bool,
     ) -> Self {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let socket_path = dir.path().join("herdr.sock");
@@ -419,12 +174,12 @@ impl FakeHerdr {
         listener
             .set_nonblocking(true)
             .expect("nonblocking fake herdr socket");
-        let terminal_socket_path = dir.path().join("herdr-client.sock");
-        let terminal_listener =
-            UnixListener::bind(&terminal_socket_path).expect("bind fake private protocol socket");
-        terminal_listener
+        let endpoint_socket_path = dir.path().join("herdr-client.sock");
+        let endpoint_listener =
+            UnixListener::bind(&endpoint_socket_path).expect("bind fake endpoint socket");
+        endpoint_listener
             .set_nonblocking(true)
-            .expect("nonblocking fake private protocol socket");
+            .expect("nonblocking fake endpoint socket");
 
         let sessions = json!({
             "sessions": [
@@ -447,129 +202,242 @@ impl FakeHerdr {
         std::fs::set_permissions(&herdr_path, permissions).expect("chmod fake herdr");
 
         let stop = Arc::new(AtomicBool::new(false));
-        let server_stop = stop.clone();
-        let server = thread::spawn(move || serve(listener, server_stop));
-        let terminal_commands = Arc::new(Mutex::new(HashMap::new()));
-        let terminal_server_commands = terminal_commands.clone();
-        let terminal_server_stop = stop.clone();
-        let terminal_server = thread::spawn(move || {
-            serve_private_terminal_protocol(
-                terminal_listener,
-                terminal_server_commands,
-                terminal_server_stop,
-            )
+        let state = Arc::new(Mutex::new(snapshot));
+        let revision = Arc::new(AtomicU64::new(1));
+        let pushers: EndpointPushers = Arc::new(Mutex::new(Vec::new()));
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let endpoint_requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let pane_inputs: Arc<Mutex<HashMap<String, Vec<ep::ClientPaneInputEvent>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let clipboard_images: ClipboardImages = Arc::new(Mutex::new(Vec::new()));
+        let endpoint_connections = Arc::new(AtomicUsize::new(0));
+        let endpoint_disconnects = Arc::new(AtomicUsize::new(0));
+        let script = Arc::new(script);
+
+        let server = thread::spawn({
+            let (stop, state, revision, pushers, requests, script) = (
+                stop.clone(),
+                state.clone(),
+                revision.clone(),
+                pushers.clone(),
+                requests.clone(),
+                script.clone(),
+            );
+            move || {
+                serve_fake_herdr_api(
+                    listener, stop, state, revision, requests, pushers, script, strict_api,
+                );
+            }
+        });
+        let endpoint_server = thread::spawn({
+            let (stop, revision, pushers, endpoint_requests, pane_inputs) = (
+                stop.clone(),
+                revision.clone(),
+                pushers.clone(),
+                endpoint_requests.clone(),
+                pane_inputs.clone(),
+            );
+            let (clipboard_images, endpoint_connections, endpoint_disconnects) = (
+                clipboard_images.clone(),
+                endpoint_connections.clone(),
+                endpoint_disconnects.clone(),
+            );
+            move || {
+                serve_fake_endpoint(
+                    endpoint_listener,
+                    endpoint_error,
+                    revision,
+                    pushers,
+                    endpoint_requests,
+                    pane_inputs,
+                    clipboard_images,
+                    endpoint_connections,
+                    endpoint_disconnects,
+                    stop,
+                );
+            }
         });
         Self {
             herdr_path,
-            events,
-            requests: Arc::new(Mutex::new(Vec::new())),
-            script: Arc::new(PaneMoveScript::default()),
+            state,
+            revision,
+            pushers,
+            requests,
+            endpoint_requests,
+            pane_inputs,
+            clipboard_images,
+            endpoint_connections,
+            endpoint_disconnects,
             stop,
             server: Some(server),
-            terminal_commands,
-            terminal_server: Some(terminal_server),
+            endpoint_server: Some(endpoint_server),
             _dir: dir,
         }
     }
 
-    /// Lossless payloads of every private-protocol `Input` for one pane.
-    #[cfg(target_os = "macos")]
-    fn terminal_inputs(&self, pane_id: &str) -> Vec<Vec<u8>> {
-        self.terminal_commands
+    /// Methods of every NDJSON request in arrival order.
+    fn request_methods(&self) -> Vec<String> {
+        self.requests
             .lock()
-            .expect("fake terminal command log")
-            .get(pane_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|command| match command {
-                FakeTerminalCommand::Input(bytes) => Some(bytes.clone()),
-                FakeTerminalCommand::Attach { .. }
-                | FakeTerminalCommand::ClipboardImage { .. }
-                | FakeTerminalCommand::Detach => None,
-            })
+            .expect("fake herdr request log")
+            .iter()
+            .filter_map(|request| request.get("method")?.as_str().map(str::to_owned))
             .collect()
     }
 
-    #[cfg(target_os = "macos")]
-    fn terminal_images(&self, pane_id: &str) -> Vec<(String, Vec<u8>)> {
-        self.terminal_commands
+    fn requests_for(&self, method: &str) -> Vec<Value> {
+        self.requests
             .lock()
-            .expect("fake terminal command log")
-            .get(pane_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|command| match command {
-                FakeTerminalCommand::ClipboardImage { extension, bytes } => {
-                    Some((extension.clone(), bytes.clone()))
-                }
-                FakeTerminalCommand::Attach { .. }
-                | FakeTerminalCommand::Input(_)
-                | FakeTerminalCommand::Detach => None,
-            })
+            .expect("fake herdr request log")
+            .iter()
+            .filter(|request| request.get("method") == Some(&json!(method)))
+            .cloned()
             .collect()
     }
 
-    fn terminal_attach_count(&self, pane_id: &str) -> usize {
-        self.terminal_attach_modes(pane_id).len()
-    }
-
-    fn terminal_attach_modes(&self, pane_id: &str) -> Vec<bool> {
-        self.terminal_commands
+    /// Endpoint-lane request payloads for one method, in arrival order.
+    #[allow(dead_code)]
+    fn endpoint_requests_for(&self, method: &str) -> Vec<Value> {
+        self.endpoint_requests
             .lock()
-            .expect("fake terminal command log")
-            .get(pane_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|command| match command {
-                FakeTerminalCommand::Attach { controlled } => Some(*controlled),
-                FakeTerminalCommand::Input(_)
-                | FakeTerminalCommand::ClipboardImage { .. }
-                | FakeTerminalCommand::Detach => None,
-            })
+            .expect("fake herdr endpoint request log")
+            .iter()
+            .filter(|request| request.get("method") == Some(&json!(method)))
+            .cloned()
             .collect()
     }
 
-    fn terminal_detach_count(&self, pane_id: &str) -> usize {
-        self.terminal_commands
+    /// Semantic input events the endpoint received for one pane, in order.
+    fn pane_inputs(&self, pane_id: &str) -> Vec<ep::ClientPaneInputEvent> {
+        self.pane_inputs
             .lock()
-            .expect("fake terminal command log")
+            .expect("fake herdr pane input log")
             .get(pane_id)
-            .into_iter()
-            .flatten()
-            .filter(|command| matches!(command, FakeTerminalCommand::Detach))
-            .count()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// (pane, extension, bytes) of every bridged clipboard image, in order.
+    fn clipboard_images(&self) -> Vec<(String, String, Vec<u8>)> {
+        self.clipboard_images
+            .lock()
+            .expect("fake herdr clipboard image log")
+            .clone()
+    }
+
+    fn endpoint_connections(&self) -> usize {
+        self.endpoint_connections.load(Ordering::Relaxed)
+    }
+
+    fn endpoint_disconnects(&self) -> usize {
+        self.endpoint_disconnects.load(Ordering::Relaxed)
     }
 
     fn socket_path(&self) -> PathBuf {
         self._dir.path().join("herdr.sock")
     }
 
-    /// Do not return until the live subscription has accepted and flushed the
-    /// event. This makes the fixture prove its injection happened before the
-    /// view assertions use that event as evidence.
-    fn send_event(&self, payload: Value) {
-        let events = self.events.as_ref().expect("live event fixture");
-        let (written, observed) = mpsc::sync_channel(0);
-        events
-            .send(QueuedEvent { payload, written })
-            .expect("queue fake Herdr event");
-        observed
-            .recv_timeout(Duration::from_secs(1))
-            .expect("fake Herdr event must be flushed to the subscribed stream");
+    /// The endpoint snapshot envelope every push carries. The payload only
+    /// needs to parse: the client treats it as an invalidation cue and pulls
+    /// the authoritative hierarchy over NDJSON.
+    fn snapshot_push(revision: u64) -> ep::ServerMessage {
+        ep::ServerMessage::EndpointControl {
+            kind: ep::ENDPOINT_SNAPSHOT_KIND.into(),
+            data: serde_json::to_string(&json!({
+                "boot_id": "boot-1",
+                "revision": revision,
+                "config_diagnostic": null,
+                "product_announcement": null,
+                "update_available": null,
+                "update_install_command": "",
+                "server_keybindings_toml": null,
+                "latest_release_notes_available": false,
+                "integration_updates_available": false,
+                "worktree_directory": "",
+                "release_notes": null,
+                "focused_workspace_id": null,
+                "focused_tab_id": null,
+                "focused_pane_id": null,
+                "tab_bar_right": [],
+                "tab_bar_right_separator": "",
+                "agent_view_label": null,
+                "agent_order": [],
+                "workspaces": [],
+                "tabs": [],
+                "panes": [],
+                "agents": [],
+                "commands": []
+            }))
+            .expect("snapshot push json"),
+        }
+    }
+
+    /// Apply `mutate` to the served hierarchy, then push a snapshot envelope
+    /// to every connected endpoint — exactly how a live Herdr broadcasts a
+    /// change.
+    fn mutate_and_push(&self, mutate: impl FnOnce(&mut HierarchySnapshot)) {
+        {
+            let mut state = self.state.lock().expect("fake herdr state");
+            mutate(&mut state);
+        }
+        let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let message = Self::snapshot_push(revision);
+        for (_, pusher) in self.pushers.lock().expect("fake herdr pushers").iter() {
+            let _ = pusher.send(message.clone());
+        }
     }
 }
 
-fn serve_private_terminal_protocol(
+/// Mutate the served hierarchy and push the new revision to every endpoint
+/// subscriber before answering the request.
+fn push_state_before_response(
+    state: &Mutex<HierarchySnapshot>,
+    revision: &AtomicU64,
+    pushers: &Mutex<Vec<(u64, mpsc::Sender<ep::ServerMessage>)>>,
+    mutate: Option<SnapshotMutation>,
+) {
+    {
+        let mut state = state.lock().expect("fake herdr state");
+        if let Some(mutate) = mutate {
+            mutate(&mut state);
+        }
+    }
+    let revision = revision.fetch_add(1, Ordering::Relaxed) + 1;
+    let message = FakeHerdr::snapshot_push(revision);
+    for (_, pusher) in pushers.lock().expect("fake herdr pushers").iter() {
+        let _ = pusher.send(message.clone());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_fake_herdr_api(
     listener: UnixListener,
-    commands: Arc<Mutex<HashMap<String, Vec<FakeTerminalCommand>>>>,
     stop: Arc<AtomicBool>,
+    state: Arc<Mutex<HierarchySnapshot>>,
+    revision: Arc<AtomicU64>,
+    requests: Arc<Mutex<Vec<Value>>>,
+    pushers: EndpointPushers,
+    script: Arc<PaneMoveScript>,
+    strict_api: bool,
 ) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let commands = commands.clone();
-                let stop = stop.clone();
-                thread::spawn(move || handle_private_terminal(stream, commands, stop));
+                let (state, revision, requests, pushers, script) = (
+                    state.clone(),
+                    revision.clone(),
+                    requests.clone(),
+                    pushers.clone(),
+                    script.clone(),
+                );
+                // One request per connection, each on its own thread: a
+                // scripted sleep before a `pane.move` response must not stall
+                // the `session.snapshot` pull its own push just triggered.
+                thread::spawn(move || {
+                    reply_to_fake_api_request(
+                        stream, &state, &revision, &requests, &pushers, &script, strict_api,
+                    )
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(2));
@@ -579,177 +447,510 @@ fn serve_private_terminal_protocol(
     }
 }
 
-fn handle_private_terminal(
-    mut stream: UnixStream,
-    commands: Arc<Mutex<HashMap<String, Vec<FakeTerminalCommand>>>>,
-    stop: Arc<AtomicBool>,
+#[allow(clippy::too_many_arguments)]
+fn reply_to_fake_api_request(
+    stream: UnixStream,
+    state: &Mutex<HierarchySnapshot>,
+    revision: &AtomicU64,
+    requests: &Mutex<Vec<Value>>,
+    pushers: &Mutex<Vec<(u64, mpsc::Sender<ep::ServerMessage>)>>,
+    script: &PaneMoveScript,
+    strict_api: bool,
 ) {
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-    let Ok(TestClientMessage::Hello {
-        version,
-        cols,
-        rows,
-        requested_encoding: TestRenderEncoding::TerminalAnsi,
-        launch_mode,
-        ..
-    }) = read_test_wire_message(&mut stream)
-    else {
-        return;
-    };
-    if version != 20 {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
-    if write_test_wire_message(
-        &mut stream,
-        &TestServerMessage::Welcome {
-            version: 20,
-            encoding: TestRenderEncoding::TerminalAnsi,
-            error: None,
+    let request: Value = serde_json::from_str(&line).expect("parse fake request");
+    requests
+        .lock()
+        .expect("fake herdr request log")
+        .push(request.clone());
+    let id = request.get("id").cloned().unwrap_or(json!(""));
+    if strict_api {
+        let response = match request.get("method").and_then(Value::as_str) {
+            Some("session.snapshot") => json!({
+                "id": id,
+                "result": { "snapshot": state.lock().expect("fake herdr state").clone() },
+            }),
+            other => json!({
+                "id": id,
+                "error": {
+                    "code": "unexpected",
+                    "message": format!("unexpected method {other:?}"),
+                },
+            }),
+        };
+        write_fake_response(stream, response);
+        return;
+    }
+    match request.get("method").and_then(Value::as_str) {
+        Some("session.snapshot") => {
+            let snapshot = state.lock().expect("fake herdr state").clone();
+            write_fake_response(
+                stream,
+                json!({
+                    "id": id,
+                    "result": { "snapshot": snapshot },
+                }),
+            )
+        }
+        Some("tab.create") | Some("workspace.create") => {
+            let result = {
+                let mut state = state.lock().expect("fake herdr state");
+                if request["method"] == json!("tab.create") {
+                    state.tabs.push(created_tab());
+                    state.panes.push(created_pane());
+                    json!({
+                        "type": "tab_created",
+                        "tab": created_tab(),
+                        "root_pane": created_pane(),
+                    })
+                } else {
+                    state.workspaces.push(created_workspace());
+                    state.tabs.push(created_workspace_tab());
+                    state.panes.push(created_workspace_pane());
+                    json!({
+                        "type": "workspace_created",
+                        "workspace": created_workspace(),
+                        "tab": created_workspace_tab(),
+                        "root_pane": created_workspace_pane(),
+                    })
+                }
+            };
+            if script
+                .push_before_create_response
+                .swap(false, Ordering::Relaxed)
+            {
+                push_state_before_response(state, revision, pushers, None);
+            }
+            write_fake_response(stream, json!({ "id": id, "result": result }))
+        }
+        Some("agent.focus") => {
+            write_fake_response(stream, json!({ "id": id, "result": { "type": "ok" } }))
+        }
+        Some("tab.rename") => {
+            let tab_id = request["params"]["tab_id"].as_str().unwrap_or_default();
+            let label = request["params"]["label"].as_str().unwrap_or_default();
+            let mut state = state.lock().expect("fake herdr state");
+            let Some(tab) = state.tabs.iter_mut().find(|tab| tab.tab_id == tab_id) else {
+                write_fake_response(
+                    stream,
+                    json!({
+                        "id": id,
+                        "error": {
+                            "code": "tab_not_found",
+                            "message": format!("tab {tab_id} not found"),
+                        },
+                    }),
+                );
+                return;
+            };
+            tab.label = label.to_owned();
+            write_fake_response(
+                stream,
+                json!({
+                    "id": id,
+                    "result": { "type": "tab_info", "tab": tab },
+                }),
+            );
+        }
+        Some("tab.move") | Some("layout.set_split_ratio") => write_fake_response(
+            stream,
+            json!({
+                "id": id,
+                "result": { "type": "ok" },
+            }),
+        ),
+        // A swap against `reject` plays a Herdr that refuses (for example a
+        // zoomed tab); anything else is accepted and the test pushes the
+        // matching layout change itself.
+        Some("pane.swap") if request["params"]["target_pane_id"] == json!("reject") => {
+            write_fake_response(
+                stream,
+                json!({
+                    "id": id,
+                    "error": {
+                        "code": "zoomed_tab",
+                        "message": "cannot swap panes in a zoomed tab",
+                    },
+                }),
+            )
+        }
+        Some("pane.swap") => write_fake_response(
+            stream,
+            json!({
+                "id": id,
+                "result": {
+                    "type": "pane_swap",
+                    "swap": {
+                        "changed": true,
+                        "source_pane_id": request["params"]["source_pane_id"],
+                        "target_pane_id": request["params"]["target_pane_id"],
+                        "focused_pane_id": request["params"]["source_pane_id"],
+                        "layout": Value::Null,
+                    },
+                },
+            }),
+        ),
+        Some("pane.focus") => write_fake_response(
+            stream,
+            json!({
+                "id": id,
+                "result": {
+                    "type": "pane_info",
+                    "pane": { "pane_id": request["params"]["pane_id"] },
+                },
+            }),
+        ),
+        // The fixture plays an old Herdr when asked to move into
+        // `unsupported`: the request enum fails to deserialize.
+        Some("pane.move") if request["params"]["target_tab_id"] == json!("unsupported") => {
+            write_fake_response(
+                stream,
+                json!({
+                    "id": id,
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "invalid request: unknown variant `pane.move`, expected one of `pane.list`, `pane.get`",
+                    },
+                }),
+            )
+        }
+        // Step 1 of an edge relocation: park in a new tab. Mirrors Herdr's
+        // `PaneMoveResult` shape (`created_tab`, `pane`).
+        Some("pane.move") if request["params"]["destination"]["type"] == json!("new_tab") => {
+            if PaneMoveScript::take_failure(&script.park_failures) {
+                write_fake_response(
+                    stream,
+                    json!({
+                        "id": id,
+                        "error": { "code": "pane_move_failed", "message": "park refused" },
+                    }),
+                );
+                return;
+            }
+            let early = script
+                .push_before_park_response
+                .lock()
+                .expect("early park push")
+                .take();
+            if early.is_some() {
+                push_state_before_response(state, revision, pushers, early);
+            }
+            let pane_id = request["params"]["pane_id"].clone();
+            write_fake_response(
+                stream,
+                json!({
+                    "id": id,
+                    "result": {
+                        "type": "pane_move",
+                        "move_result": {
+                            "changed": true,
+                            "previous_pane_id": pane_id,
+                            "previous_workspace_id": "w",
+                            "previous_tab_id": "t-a",
+                            "pane": parked_pane_json(pane_id.as_str().unwrap_or("")),
+                            "target_layout": single_pane_layout("t-tmp", pane_id.as_str().unwrap_or("")),
+                            "created_tab": temp_tab(),
+                            "focused_pane_id": pane_id,
+                        },
+                    },
+                }),
+            )
+        }
+        // Step 2: back into the original tab beside the target.
+        Some("pane.move") if request["params"]["destination"]["type"] == json!("tab") => {
+            if PaneMoveScript::take_failure(&script.insert_failures) {
+                write_fake_response(
+                    stream,
+                    json!({
+                        "id": id,
+                        "error": { "code": "pane_move_failed", "message": "target pane could not be split" },
+                    }),
+                );
+                return;
+            }
+            let early = script
+                .push_before_insert_response
+                .lock()
+                .expect("early insert push")
+                .take();
+            if early.is_some() {
+                push_state_before_response(state, revision, pushers, early);
+            }
+            let pane_id = request["params"]["pane_id"].clone();
+            write_fake_response(
+                stream,
+                json!({
+                    "id": id,
+                    "result": {
+                        "type": "pane_move",
+                        "move_result": {
+                            "changed": true,
+                            "previous_pane_id": pane_id,
+                            "previous_workspace_id": "w",
+                            "previous_tab_id": "t-tmp",
+                            "pane": { "pane_id": pane_id, "tab_id": "t-a" },
+                            "target_layout": Value::Null,
+                            "closed_tab_id": "t-tmp",
+                            "focused_pane_id": pane_id,
+                        },
+                    },
+                }),
+            )
+        }
+        Some("pane.move") => write_fake_response(
+            stream,
+            json!({
+                "id": id,
+                "result": {
+                    "type": "ok",
+                    "pane": { "pane_id": request["params"]["pane_id"] },
+                    "created_tab": { "tab_id": "t-created", "number": 9 },
+                },
+            }),
+        ),
+        other => write_fake_response(
+            stream,
+            json!({
+                "id": id,
+                "error": {
+                    "code": "unexpected",
+                    "message": format!("unexpected method {other:?}"),
+                },
+            }),
+        ),
+    }
+}
+
+/// The endpoint accept loop: every connected shell client gets its own
+/// connection thread.
+#[allow(clippy::too_many_arguments)]
+fn serve_fake_endpoint(
+    listener: UnixListener,
+    endpoint_error: bool,
+    revision: Arc<AtomicU64>,
+    pushers: EndpointPushers,
+    endpoint_requests: Arc<Mutex<Vec<Value>>>,
+    pane_inputs: Arc<Mutex<HashMap<String, Vec<ep::ClientPaneInputEvent>>>>,
+    clipboard_images: ClipboardImages,
+    connections: Arc<AtomicUsize>,
+    disconnects: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut next_id = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                next_id += 1;
+                let (revision, pushers, endpoint_requests, pane_inputs) = (
+                    revision.clone(),
+                    pushers.clone(),
+                    endpoint_requests.clone(),
+                    pane_inputs.clone(),
+                );
+                let (clipboard_images, connections, disconnects) = (
+                    clipboard_images.clone(),
+                    connections.clone(),
+                    disconnects.clone(),
+                );
+                thread::spawn(move || {
+                    handle_endpoint_connection(
+                        stream,
+                        next_id,
+                        endpoint_error,
+                        &revision,
+                        &pushers,
+                        &endpoint_requests,
+                        &pane_inputs,
+                        &clipboard_images,
+                        &connections,
+                        &disconnects,
+                    )
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// One endpoint connection: handshake, initial snapshot push, then a reader
+/// loop for the request/input lanes while a writer thread drains pushed
+/// server messages onto the same socket.
+#[allow(clippy::too_many_arguments)]
+fn handle_endpoint_connection(
+    stream: UnixStream,
+    connection_id: u64,
+    endpoint_error: bool,
+    revision: &AtomicU64,
+    pushers: &Mutex<Vec<(u64, mpsc::Sender<ep::ServerMessage>)>>,
+    endpoint_requests: &Mutex<Vec<Value>>,
+    pane_inputs: &Mutex<HashMap<String, Vec<ep::ClientPaneInputEvent>>>,
+    clipboard_images: &Mutex<Vec<(String, String, Vec<u8>)>>,
+    connections: &AtomicUsize,
+    disconnects: &AtomicUsize,
+) {
+    connections.fetch_add(1, Ordering::Relaxed);
+    // Blocking reads: `read_message` consumes bytes as it goes, so a timed
+    // read that fires mid-frame would misalign every following frame. The
+    // connection worker retires on the client's Detach/EOF instead of a
+    // polling timeout. macOS accepts inherit the listener's nonblocking flag,
+    // so the mode has to be reset explicitly.
+    let _ = stream.set_nonblocking(false);
+    let mut reader = stream.try_clone().expect("clone endpoint stream");
+    let mut writer = stream;
+    let hello = match ep::read_message::<_, ep::ClientMessage>(&mut reader, ep::MAX_FRAME_SIZE) {
+        Ok(message) => message,
+        Err(_) => {
+            disconnects.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    let ep::ClientMessage::EndpointControl { kind, .. } = &hello else {
+        disconnects.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if kind != ep::ENDPOINT_HELLO_KIND {
+        disconnects.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let welcome = ep::EndpointServerWelcome {
+        generation: ep::ENDPOINT_PROTOCOL_GENERATION,
+        server_version: "herdr 0.9.1".into(),
+        snapshot_codec: ep::ENDPOINT_SNAPSHOT_KIND.into(),
+        surface_codec: ep::SURFACE_CODEC_V1.into(),
+        input_codec: ep::INPUT_CODEC_V1.into(),
+        blob_codec: ep::BLOB_CODEC_V1.into(),
+        methods: vec![
+            "client_shell.surface.set".into(),
+            "workspace.focus".into(),
+            "tab.focus".into(),
+            "pane.focus".into(),
+        ],
+        capabilities: Vec::new(),
+        error: endpoint_error.then(|| ep::EndpointHandshakeError {
+            code: "unsupported_generation".into(),
+            message: "endpoint generation 1 is not supported by this herdr".into(),
+        }),
+    };
+    if ep::write_message(
+        &mut writer,
+        &ep::ServerMessage::EndpointControl {
+            kind: ep::ENDPOINT_WELCOME_KIND.into(),
+            data: serde_json::to_string(&welcome).expect("welcome json"),
         },
     )
     .is_err()
     {
+        disconnects.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if welcome.error.is_some() {
+        // A rejected hello is terminal for the client: it hangs up. Wait for
+        // that so the disconnect accounting stays exact.
+        while ep::read_message::<_, ep::ClientMessage>(&mut reader, ep::MAX_FRAME_SIZE).is_ok() {}
+        disconnects.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if ep::write_message(
+        &mut writer,
+        &FakeHerdr::snapshot_push(revision.load(Ordering::Relaxed)),
+    )
+    .is_err()
+    {
+        disconnects.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
-    let settings = matches!(launch_mode, TestClientLaunchMode::App);
-    let (target, controlled) = loop {
-        match read_test_wire_message::<TestClientMessage>(&mut stream) {
-            Ok(TestClientMessage::InputEvents { events }) if settings => {
-                assert!(matches!(
-                    events.as_slice(),
-                    [TestClientInputEvent::Key {
-                        code: TestClientKeyCode::F(12),
-                        ..
-                    }]
-                ));
-                break ("__settings".into(), false);
-            }
-            Ok(TestClientMessage::ObserveTerminal { target }) => break (target, false),
-            Ok(TestClientMessage::ControlTerminal { target, .. }) => break (target, true),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) && !stop.load(Ordering::Relaxed) => {}
-            _ => return,
-        }
-    };
-    commands
+    let (tx, rx) = mpsc::channel::<ep::ServerMessage>();
+    let responses = tx.clone();
+    pushers
         .lock()
-        .expect("fake terminal command log")
-        .entry(target.clone())
-        .or_default()
-        .push(FakeTerminalCommand::Attach { controlled });
-    let mut sequence = 0u64;
-    if write_test_terminal_frame(&mut stream, sequence, cols, rows).is_err() {
-        return;
-    }
-
-    while !stop.load(Ordering::Relaxed) {
-        let message = match read_test_wire_message::<TestClientMessage>(&mut stream) {
-            Ok(message) => message,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
-            Err(_) => break,
-        };
-        match message {
-            TestClientMessage::Input { data } => commands
-                .lock()
-                .expect("fake terminal command log")
-                .entry(target.clone())
-                .or_default()
-                .push(FakeTerminalCommand::Input(data)),
-            TestClientMessage::ClipboardImage { extension, data } => commands
-                .lock()
-                .expect("fake terminal command log")
-                .entry(target.clone())
-                .or_default()
-                .push(FakeTerminalCommand::ClipboardImage {
-                    extension,
-                    bytes: data,
-                }),
-            TestClientMessage::Resize { cols, rows, .. } => {
-                sequence = sequence.saturating_add(1);
-                if write_test_terminal_frame(&mut stream, sequence, cols, rows).is_err() {
-                    break;
-                }
-            }
-            TestClientMessage::Detach => {
-                commands
-                    .lock()
-                    .expect("fake terminal command log")
-                    .entry(target.clone())
-                    .or_default()
-                    .push(FakeTerminalCommand::Detach);
+        .expect("fake herdr pushers")
+        .push((connection_id, tx));
+    thread::spawn(move || {
+        while let Ok(message) = rx.recv() {
+            if ep::write_message(&mut writer, &message).is_err() {
                 break;
             }
+        }
+    });
+
+    loop {
+        let message = match ep::read_message::<_, ep::ClientMessage>(
+            &mut reader,
+            ep::MAX_GRAPHICS_FRAME_SIZE,
+        ) {
+            Ok(message) => message,
+            Err(ep::FramingError::UnexpectedEof) => break,
+            Err(error) => {
+                eprintln!("fake endpoint post-handshake read error: {error}");
+                break;
+            }
+        };
+        match message {
+            ep::ClientMessage::ClientShellEndpointRequest { boot_id, request } => {
+                let request: Value = serde_json::from_str(&request).expect("endpoint request json");
+                endpoint_requests
+                    .lock()
+                    .expect("fake herdr endpoint request log")
+                    .push(request.clone());
+                let request_id = request
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let _ = responses.send(ep::ServerMessage::ClientShellEndpointResponseChunk {
+                    boot_id,
+                    request_id,
+                    final_chunk: true,
+                    data: serde_json::to_vec(&json!({ "type": "ok" })).expect("lane response"),
+                });
+            }
+            ep::ClientMessage::ClientShellPaneInput { pane_id, events } => {
+                pane_inputs
+                    .lock()
+                    .expect("fake herdr pane input log")
+                    .entry(pane_id)
+                    .or_default()
+                    .extend(events);
+            }
+            ep::ClientMessage::ClipboardImage {
+                target: ep::ClientClipboardImageTarget::Pane(pane_id),
+                extension,
+                data,
+            } => {
+                clipboard_images
+                    .lock()
+                    .expect("fake herdr clipboard image log")
+                    .push((pane_id, extension, data));
+            }
+            ep::ClientMessage::Detach => break,
             _ => {}
         }
     }
-}
-
-fn write_test_terminal_frame(
-    stream: &mut UnixStream,
-    seq: u64,
-    width: u16,
-    height: u16,
-) -> std::io::Result<()> {
-    write_test_wire_message(
-        stream,
-        &TestServerMessage::Terminal(TestTerminalFrame {
-            seq,
-            width,
-            height,
-            full: true,
-            bytes: b"\x1b[2J\x1b[H".to_vec(),
-        }),
-    )
-}
-
-fn write_test_wire_message<T: Serialize>(
-    stream: &mut UnixStream,
-    message: &T,
-) -> std::io::Result<()> {
-    let payload = bincode::serde::encode_to_vec(message, bincode::config::standard())
-        .map_err(std::io::Error::other)?;
-    let length = u32::try_from(payload.len()).map_err(std::io::Error::other)?;
-    stream.write_all(&length.to_le_bytes())?;
-    stream.write_all(&payload)?;
-    stream.flush()
-}
-
-fn read_test_wire_message<T: for<'de> Deserialize<'de>>(
-    stream: &mut UnixStream,
-) -> std::io::Result<T> {
-    let mut length = [0; 4];
-    stream.read_exact(&mut length)?;
-    let mut payload = vec![0; u32::from_le_bytes(length) as usize];
-    stream.read_exact(&mut payload)?;
-    let (message, consumed) =
-        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
-            .map_err(std::io::Error::other)?;
-    if consumed != payload.len() {
-        return Err(std::io::Error::other("trailing private protocol bytes"));
-    }
-    Ok(message)
+    pushers
+        .lock()
+        .expect("fake herdr pushers")
+        .retain(|(id, _)| *id != connection_id);
+    drop(responses);
+    disconnects.fetch_add(1, Ordering::Relaxed);
 }
 
 impl Drop for FakeHerdr {
     fn drop(&mut self) {
-        self.events = None;
         self.stop.store(true, Ordering::Relaxed);
+        self.pushers.lock().expect("fake herdr pushers").clear();
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
-        if let Some(server) = self.terminal_server.take() {
+        if let Some(server) = self.endpoint_server.take() {
             let _ = server.join();
         }
     }
@@ -920,469 +1121,6 @@ fn session_json(name: &str, socket_path: &std::path::Path, session_dir: &std::pa
         "session_dir": session_dir.join(name),
         "default": false,
     })
-}
-
-fn serve_snapshot_ok_subscribe_rejected(listener: UnixListener, stop: Arc<AtomicBool>) {
-    while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, _)) => reply_to_herdr_socket(stream),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(2));
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn reply_to_herdr_socket(stream: UnixStream) {
-    let _ = stream.set_nonblocking(false);
-    let mut reader = BufReader::new(stream.try_clone().expect("clone fake herdr stream"));
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
-    }
-    let request: Value = serde_json::from_str(&line).unwrap_or_else(|_| json!({}));
-    let id = request.get("id").cloned().unwrap_or(json!(""));
-    let response = match request.get("method").and_then(Value::as_str) {
-        Some("session.snapshot") => json!({
-            "id": id,
-            "result": { "snapshot": HierarchySnapshot::default() },
-        }),
-        Some("events.subscribe") => json!({
-            "id": id,
-            "error": {
-                "code": "unknown_type",
-                "message": "events.subscribe rejected",
-            },
-        }),
-        other => json!({
-            "id": id,
-            "error": {
-                "code": "unexpected",
-                "message": format!("unexpected method {other:?}"),
-            },
-        }),
-    };
-    let mut payload = serde_json::to_vec(&response).expect("encode fake herdr reply");
-    payload.push(b'\n');
-    let mut stream = stream;
-    let _ = stream.write_all(&payload);
-    let _ = stream.flush();
-}
-
-fn serve_snapshot_with_live_events(
-    listener: UnixListener,
-    stop: Arc<AtomicBool>,
-    snapshot: HierarchySnapshot,
-    events: Receiver<QueuedEvent>,
-    requests: Arc<Mutex<Vec<Value>>>,
-    script: Arc<PaneMoveScript>,
-) {
-    let mut events = Some(events);
-    // Grows with what the fake creates, the way a real Herdr's snapshot
-    // would: the resync that follows an agent-status resubscribe must not
-    // erase a tab this fake just answered `tab.create` with.
-    let mut snapshot = snapshot;
-    while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                // Accepted streams inherit the listener's non-blocking mode;
-                // a request that has not fully arrived yet must block, not
-                // kill the server thread with `WouldBlock`.
-                let _ = stream.set_nonblocking(false);
-                let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-                    continue;
-                }
-                let request: Value = serde_json::from_str(&line).expect("parse fake request");
-                requests
-                    .lock()
-                    .expect("fake herdr request log")
-                    .push(request.clone());
-                let id = request.get("id").cloned().unwrap_or(json!(""));
-                match request.get("method").and_then(Value::as_str) {
-                    Some("events.subscribe") => match events.take() {
-                        Some(receiver) => {
-                            thread::spawn(move || stream_fake_events(stream, id, receiver));
-                        }
-                        // A snapshot with panes makes the view open a second
-                        // subscription for agent status: acknowledge it and
-                        // hold the stream open without ever emitting.
-                        None => {
-                            thread::spawn(move || hold_fake_subscription(stream, id));
-                        }
-                    },
-                    Some("session.snapshot") => write_fake_response(
-                        stream,
-                        json!({
-                            "id": id,
-                            "result": { "snapshot": snapshot },
-                        }),
-                    ),
-                    Some("tab.create") | Some("workspace.create") => {
-                        let early = std::mem::take(
-                            &mut *script
-                                .events_before_create_response
-                                .lock()
-                                .expect("early create events"),
-                        );
-                        if !early.is_empty() {
-                            script.broadcast(early);
-                            thread::sleep(Duration::from_millis(60));
-                        }
-                        let result = if request["method"] == json!("tab.create") {
-                            snapshot.tabs.push(created_tab());
-                            snapshot.panes.push(created_pane());
-                            json!({
-                                "type": "tab_created",
-                                "tab": created_tab(),
-                                "root_pane": created_pane(),
-                            })
-                        } else {
-                            snapshot.workspaces.push(created_workspace());
-                            snapshot.tabs.push(created_workspace_tab());
-                            snapshot.panes.push(created_workspace_pane());
-                            json!({
-                                "type": "workspace_created",
-                                "workspace": created_workspace(),
-                                "tab": created_workspace_tab(),
-                                "root_pane": created_workspace_pane(),
-                            })
-                        };
-                        write_fake_response(stream, json!({ "id": id, "result": result }))
-                    }
-                    Some("agent.focus") => {
-                        write_fake_response(stream, json!({ "id": id, "result": { "type": "ok" } }))
-                    }
-                    Some("tab.rename") => {
-                        let tab_id = request["params"]["tab_id"].as_str().unwrap_or_default();
-                        let label = request["params"]["label"].as_str().unwrap_or_default();
-                        let Some(tab) = snapshot.tabs.iter_mut().find(|tab| tab.tab_id == tab_id)
-                        else {
-                            write_fake_response(
-                                stream,
-                                json!({
-                                    "id": id,
-                                    "error": {
-                                        "code": "tab_not_found",
-                                        "message": format!("tab {tab_id} not found"),
-                                    },
-                                }),
-                            );
-                            continue;
-                        };
-                        tab.label = label.to_owned();
-                        write_fake_response(
-                            stream,
-                            json!({
-                                "id": id,
-                                "result": { "type": "tab_info", "tab": tab },
-                            }),
-                        );
-                    }
-                    Some("tab.move") | Some("layout.set_split_ratio") => write_fake_response(
-                        stream,
-                        json!({
-                            "id": id,
-                            "result": { "type": "ok" },
-                        }),
-                    ),
-                    // A swap against `reject` plays a Herdr that refuses (for
-                    // example a zoomed tab); anything else is accepted and the
-                    // test injects the matching `layout.updated` itself.
-                    Some("pane.swap") if request["params"]["target_pane_id"] == json!("reject") => {
-                        write_fake_response(
-                            stream,
-                            json!({
-                                "id": id,
-                                "error": {
-                                    "code": "zoomed_tab",
-                                    "message": "cannot swap panes in a zoomed tab",
-                                },
-                            }),
-                        )
-                    }
-                    Some("pane.swap") => write_fake_response(
-                        stream,
-                        json!({
-                            "id": id,
-                            "result": {
-                                "type": "pane_swap",
-                                "swap": {
-                                    "changed": true,
-                                    "source_pane_id": request["params"]["source_pane_id"],
-                                    "target_pane_id": request["params"]["target_pane_id"],
-                                    "focused_pane_id": request["params"]["source_pane_id"],
-                                    "layout": Value::Null,
-                                },
-                            },
-                        }),
-                    ),
-                    Some("pane.focus") => write_fake_response(
-                        stream,
-                        json!({
-                            "id": id,
-                            "result": {
-                                "type": "pane_info",
-                                "pane": { "pane_id": request["params"]["pane_id"] },
-                            },
-                        }),
-                    ),
-                    // The fixture plays an old Herdr when asked to move into
-                    // `unsupported`: the request enum fails to deserialize.
-                    Some("pane.move")
-                        if request["params"]["target_tab_id"] == json!("unsupported") =>
-                    {
-                        write_fake_response(
-                            stream,
-                            json!({
-                                "id": id,
-                                "error": {
-                                    "code": "invalid_request",
-                                    "message": "invalid request: unknown variant `pane.move`, expected one of `pane.list`, `pane.get`",
-                                },
-                            }),
-                        )
-                    }
-                    // Step 1 of an edge relocation: park in a new tab. Mirrors
-                    // Herdr's `PaneMoveResult` shape (`created_tab`, `pane`).
-                    Some("pane.move")
-                        if request["params"]["destination"]["type"] == json!("new_tab") =>
-                    {
-                        if PaneMoveScript::take_failure(&script.park_failures) {
-                            write_fake_response(
-                                stream,
-                                json!({
-                                    "id": id,
-                                    "error": { "code": "pane_move_failed", "message": "park refused" },
-                                }),
-                            );
-                            continue;
-                        }
-                        let early = std::mem::take(
-                            &mut *script
-                                .events_before_park_response
-                                .lock()
-                                .expect("early park events"),
-                        );
-                        if !early.is_empty() {
-                            script.broadcast(early);
-                            // Let the client's reader thread queue them before
-                            // the response can be read.
-                            thread::sleep(Duration::from_millis(60));
-                        }
-                        let pane_id = request["params"]["pane_id"].clone();
-                        write_fake_response(
-                            stream,
-                            json!({
-                                "id": id,
-                                "result": {
-                                    "type": "pane_move",
-                                    "move_result": {
-                                        "changed": true,
-                                        "previous_pane_id": pane_id,
-                                        "previous_workspace_id": "w",
-                                        "previous_tab_id": "t-a",
-                                        "pane": parked_pane_json(pane_id.as_str().unwrap_or("")),
-                                        "target_layout": single_pane_layout("t-tmp", pane_id.as_str().unwrap_or("")),
-                                        "created_tab": temp_tab(),
-                                        "focused_pane_id": pane_id,
-                                    },
-                                },
-                            }),
-                        )
-                    }
-                    // Step 2: back into the original tab beside the target.
-                    Some("pane.move")
-                        if request["params"]["destination"]["type"] == json!("tab") =>
-                    {
-                        if PaneMoveScript::take_failure(&script.insert_failures) {
-                            write_fake_response(
-                                stream,
-                                json!({
-                                    "id": id,
-                                    "error": { "code": "pane_move_failed", "message": "target pane could not be split" },
-                                }),
-                            );
-                            continue;
-                        }
-                        let early = std::mem::take(
-                            &mut *script
-                                .events_before_insert_response
-                                .lock()
-                                .expect("early insert events"),
-                        );
-                        if !early.is_empty() {
-                            script.broadcast(early);
-                            thread::sleep(Duration::from_millis(60));
-                        }
-                        let pane_id = request["params"]["pane_id"].clone();
-                        write_fake_response(
-                            stream,
-                            json!({
-                                "id": id,
-                                "result": {
-                                    "type": "pane_move",
-                                    "move_result": {
-                                        "changed": true,
-                                        "previous_pane_id": pane_id,
-                                        "previous_workspace_id": "w",
-                                        "previous_tab_id": "t-tmp",
-                                        "pane": { "pane_id": pane_id, "tab_id": "t-a" },
-                                        "target_layout": Value::Null,
-                                        "closed_tab_id": "t-tmp",
-                                        "focused_pane_id": pane_id,
-                                    },
-                                },
-                            }),
-                        )
-                    }
-                    Some("pane.move") => write_fake_response(
-                        stream,
-                        json!({
-                            "id": id,
-                            "result": {
-                                "type": "ok",
-                                "pane": { "pane_id": request["params"]["pane_id"] },
-                                "created_tab": { "tab_id": "t-created", "number": 9 },
-                            },
-                        }),
-                    ),
-                    other => write_fake_response(
-                        stream,
-                        json!({
-                            "id": id,
-                            "error": {
-                                "code": "unexpected",
-                                "message": format!("unexpected method {other:?}"),
-                            },
-                        }),
-                    ),
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(2));
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn stream_fake_events(mut stream: UnixStream, id: Value, events: Receiver<QueuedEvent>) {
-    write_fake_response(
-        stream.try_clone().expect("clone event stream"),
-        json!({
-            "id": id,
-            "result": { "type": "subscription_started" },
-        }),
-    );
-    for event in events {
-        let mut payload = serde_json::to_vec(&event.payload).expect("encode fake Herdr event");
-        payload.push(b'\n');
-        if stream.write_all(&payload).is_err() || stream.flush().is_err() {
-            return;
-        }
-        event
-            .written
-            .send(())
-            .expect("confirm fake Herdr event write");
-    }
-}
-
-fn hold_fake_subscription(mut stream: UnixStream, id: Value) {
-    write_fake_response(
-        stream.try_clone().expect("clone event stream"),
-        json!({
-            "id": id,
-            "result": { "type": "subscription_started" },
-        }),
-    );
-    // Blocks until the client drops its end.
-    let mut byte = [0u8; 1];
-    let _ = stream.read(&mut byte);
-}
-
-fn serve_stale_pane_subscribe(
-    listener: UnixListener,
-    stop: Arc<AtomicBool>,
-    snapshot: HierarchySnapshot,
-    snapshot_requests: Arc<AtomicUsize>,
-    agent_status_rejections: Arc<AtomicUsize>,
-) {
-    while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, _)) => reply_to_stale_pane_request(
-                stream,
-                &snapshot,
-                &snapshot_requests,
-                &agent_status_rejections,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(2));
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn reply_to_stale_pane_request(
-    stream: UnixStream,
-    snapshot: &HierarchySnapshot,
-    snapshot_requests: &AtomicUsize,
-    agent_status_rejections: &AtomicUsize,
-) {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone fake Herdr stream"));
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .expect("read fake Herdr request");
-    let request: Value = serde_json::from_str(&line).expect("decode fake Herdr request");
-    let id = request.get("id").cloned().expect("request id");
-    match request.get("method").and_then(Value::as_str) {
-        Some("session.snapshot") => {
-            snapshot_requests.fetch_add(1, Ordering::Relaxed);
-            write_fake_response(
-                stream,
-                json!({
-                    "id": id,
-                    "result": { "snapshot": snapshot },
-                }),
-            );
-        }
-        Some("events.subscribe")
-            if request["params"]["subscriptions"]
-                .as_array()
-                .is_some_and(|subscriptions| {
-                    subscriptions.iter().any(|subscription| {
-                        subscription.get("type") == Some(&json!("pane.agent_status_changed"))
-                            && subscription.get("pane_id").is_some()
-                    })
-                }) =>
-        {
-            agent_status_rejections.fetch_add(1, Ordering::Relaxed);
-            write_fake_response(
-                stream,
-                json!({
-                    "id": id,
-                    "error": {
-                        "code": "pane_not_found",
-                        "message": "pane w19:p3 not found",
-                    },
-                }),
-            );
-        }
-        other => write_fake_response(
-            stream,
-            json!({
-                "id": id,
-                "error": {
-                    "code": "unexpected",
-                    "message": format!("unexpected method {other:?}"),
-                },
-            }),
-        ),
-    }
 }
 
 fn write_fake_response(mut stream: UnixStream, response: Value) {
@@ -1637,11 +1375,12 @@ fn pane_move_capable_snapshot() -> HierarchySnapshot {
     }
 }
 
-/// Wire the view to the fake socket directly and pull the snapshot through
-/// `resync_snapshot`, the same path every live refresh takes. This skips
-/// `reload`'s `herdr session list` process spawn, which is the one step in
-/// that path that can fail under fork pressure and would otherwise leave the
-/// capability assertions racing the host's load rather than the code.
+/// Wire the view to the fake socket directly, spawn the endpoint session the
+/// way `reload` does, and pull the snapshot through `resync_snapshot` — the
+/// same path every live refresh takes. This skips `reload`'s `herdr session
+/// list` process spawn, which is the one step in that path that can fail
+/// under fork pressure and would otherwise leave the capability assertions
+/// racing the host's load rather than the code.
 fn connect_view_to_fake_and_resync(
     view: &Entity<OcHerdrView>,
     fake: &FakeHerdr,
@@ -1662,36 +1401,200 @@ fn connect_view_to_fake_and_resync(
         );
         this.sessions = vec![session];
         this.session_index = Some(0);
-        // Subscribe the way `reload` does, so injected fake events reach the
-        // production `apply_event_batch` path.
-        let subscription = this
-            .connection
-            .as_ref()
-            .expect("connected above")
-            .subscribe_background()
-            .expect("subscribe to fake herdr events");
         let owner = this.current_session_key().expect("connected session key");
-        this.event_listen = Some(OcHerdrView::listen_events(owner, subscription, cx));
-        this.event_stream = EventStreamState::Live;
+        if super::support::session_panes_plan(
+            this.session_panes.as_ref().map(|session| &session.owner),
+            &owner,
+        ) == super::support::SessionPanesPlan::Replace
+        {
+            this.session_panes = Some(crate::SessionPanes::new(owner));
+        }
+        this.spawn_endpoint_session_for_test(cx);
         let epoch = this.event_epoch;
         this.resync_snapshot(epoch, cx);
     });
-    cx.run_until_parked();
+    // The handshake, the initial snapshot push, and the NDJSON resync all
+    // land on executor tasks fed by worker threads: pump the executor and
+    // yield real time until the view is Live with an applied snapshot.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let (ready, state_debug) = view.read_with(cx, |this, _| {
+            let ready = matches!(this.event_stream, EventStreamState::Live)
+                && this.snapshot.is_some()
+                && !this.snapshot_refreshing;
+            let has_endpoint = this
+                .session_panes
+                .as_ref()
+                .is_some_and(|session| session.endpoint.is_some());
+            (
+                ready,
+                format!(
+                    "stream={:?} snapshot={} refreshing={} endpoint_runtime={} fake_connections={} fake_disconnects={}",
+                    this.event_stream,
+                    this.snapshot.is_some(),
+                    this.snapshot_refreshing,
+                    has_endpoint,
+                    fake.endpoint_connections(),
+                    fake.endpoint_disconnects(),
+                ),
+            )
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fake endpoint never went live: {state_debug}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     view.read_with(cx, |this, _| {
         assert!(
             this.connection.is_some(),
             "the direct connection stays wired"
         );
+    });
+}
+
+/// Mutate the fake's hierarchy, push the new revision to the view's endpoint,
+/// and wait until the resync it triggers applies a snapshot that satisfies
+/// `applied`.
+fn push_state(
+    fake: &FakeHerdr,
+    view: &Entity<OcHerdrView>,
+    cx: &mut VisualTestContext,
+    mutate: impl FnOnce(&mut HierarchySnapshot),
+    applied: impl Fn(&HierarchySnapshot) -> bool,
+) {
+    fake.mutate_and_push(mutate);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let done = view.read_with(cx, |this, _| {
+            !this.snapshot_refreshing && this.snapshot.as_ref().is_some_and(&applied)
+        });
+        if done {
+            return;
+        }
         assert!(
-            this.snapshot.is_some() && !this.snapshot_refreshing,
-            "the fake's snapshot must be applied before the capability is read"
+            Instant::now() < deadline,
+            "the pushed snapshot never landed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn blank_cell() -> ep::CellData {
+    ep::CellData {
+        symbol: " ".into(),
+        fg: 0,
+        bg: 0,
+        modifier: 0,
+        skip: false,
+        hyperlink: None,
+    }
+}
+
+/// A surface pane whose outer and inner rects coincide, with pixel metrics
+/// derived from a 9×18 cell so pointer math stays deterministic.
+fn surface_pane(
+    pane_id: &str,
+    rect: (u16, u16, u16, u16),
+    focused: bool,
+    mouse_reporting: bool,
+    sgr_pixel_mouse: bool,
+) -> ep::PaneSurfacePane {
+    let (x, y, width, height) = rect;
+    let rect = ep::SurfaceRect {
+        x,
+        y,
+        width,
+        height,
+    };
+    ep::PaneSurfacePane {
+        pane_id: pane_id.into(),
+        content_revision: 1,
+        rect,
+        inner_rect: rect,
+        scrollbar_rect: None,
+        scroll: None,
+        focused,
+        mouse_reporting,
+        sgr_pixel_mouse,
+        alternate_screen_active: false,
+        pixel_width: u32::from(width) * 9,
+        pixel_height: u32::from(height) * 18,
+    }
+}
+
+/// A full surface frame sized to cover `panes`, every cell blank.
+fn surface_frame(panes: Vec<ep::PaneSurfacePane>) -> Box<ep::PaneSurfaceFrame> {
+    let width = panes
+        .iter()
+        .map(|pane| pane.rect.x + pane.rect.width)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let height = panes
+        .iter()
+        .map(|pane| pane.rect.y + pane.rect.height)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    Box::new(ep::PaneSurfaceFrame {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        surface_revision: 1,
+        frame: ep::FrameData {
+            cells: vec![blank_cell(); usize::from(width) * usize::from(height)],
+            width,
+            height,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        },
+        panes,
+        splits: Vec::new(),
+        popup: None,
+        graphics: ep::SurfaceGraphicsScene::default(),
+    })
+}
+
+/// Apply the pushed hierarchy before polling the queued API request. GPUI's
+/// deterministic executor runs blocking background work on its test thread,
+/// so sleeping in a fake response cannot model two concurrent socket lanes.
+fn apply_snapshot_before_response(
+    fake: &FakeHerdr,
+    view: &Entity<OcHerdrView>,
+    mutate: impl FnOnce(&mut HierarchySnapshot),
+    cx: &mut VisualTestContext,
+) {
+    fake.mutate_and_push(mutate);
+    let snapshot = fake.state.lock().unwrap().clone();
+    view.update(cx, |this, cx| this.apply_session_snapshot(snapshot, cx));
+}
+
+/// Feed a surface frame through the production batch path, exactly as the
+/// endpoint listener would deliver it.
+fn push_surface_frame(
+    view: &Entity<OcHerdrView>,
+    frame: Box<ep::PaneSurfaceFrame>,
+    cx: &mut VisualTestContext,
+) {
+    view.update(cx, |this, cx| {
+        let owner = this.current_session_key().expect("connected session key");
+        assert!(
+            this.apply_endpoint_batch(&owner, vec![Ok(EndpointEvent::Surface(frame))], cx),
+            "the endpoint batch applies to the live session"
         );
     });
+    cx.run_until_parked();
 }
 
 #[gpui::test]
 fn invoke_with_response_hands_the_whole_result_to_the_callback(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(pane_move_capable_snapshot());
+    let fake = FakeHerdr::serving(pane_move_capable_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -1701,7 +1604,7 @@ fn invoke_with_response_hands_the_whole_result_to_the_callback(cx: &mut TestAppC
     view.update(cx, |this, cx| {
         assert!(
             this.pane_move_supported(),
-            "snapshot advertises protocol 14"
+            "a live connection enables pane moves"
         );
         this.invoke_with_response(
             "pane.move",
@@ -1734,10 +1637,8 @@ fn invoke_with_response_hands_the_whole_result_to_the_callback(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn an_unknown_pane_move_method_degrades_the_capability_and_reports_the_error(
-    cx: &mut TestAppContext,
-) {
-    let fake = FakeHerdr::snapshot_with_live_events(pane_move_capable_snapshot());
+fn an_unknown_pane_move_method_reports_the_error(cx: &mut TestAppContext) {
+    let fake = FakeHerdr::serving(pane_move_capable_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -1747,7 +1648,7 @@ fn an_unknown_pane_move_method_degrades_the_capability_and_reports_the_error(
     view.update(cx, |this, cx| {
         assert!(
             this.pane_move_supported(),
-            "snapshot advertises protocol 14"
+            "a live connection enables pane moves"
         );
         this.invoke_with_response(
             "pane.move",
@@ -1769,21 +1670,22 @@ fn an_unknown_pane_move_method_degrades_the_capability_and_reports_the_error(
     view.read_with(cx, |this, _| {
         assert!(this.operation.is_none());
         assert!(
-            !this.pane_move_supported(),
-            "an unknown-method rejection flips the capability off"
+            this.pane_move_supported(),
+            "the capability tracks the connection, not one request's outcome"
         );
     });
 }
 
 #[gpui::test]
-fn a_snapshot_without_pane_move_metadata_leaves_the_capability_off(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(three_tab_snapshot());
+fn pane_move_requires_a_connection(cx: &mut TestAppContext) {
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
-    connect_view_to_fake_and_resync(&view, &fake, cx);
+    view.update(cx, |this, _| {
+        this.snapshot = Some(three_tab_snapshot());
+    });
 
     view.read_with(cx, |this, _| {
-        assert!(this.connection.is_some());
+        assert!(this.connection.is_none());
         assert!(!this.pane_move_supported());
     });
 }
@@ -1868,7 +1770,7 @@ const SURFACE: (f32, f32, f32, f32) = (100., 50., 600., 400.);
 fn connect_two_pane_view(
     cx: &mut TestAppContext,
 ) -> (FakeHerdr, Entity<OcHerdrView>, &mut VisualTestContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(two_pane_snapshot());
+    let fake = FakeHerdr::serving(two_pane_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     view.update(cx, |this, _| this.headless_terminals = true);
@@ -1892,16 +1794,6 @@ fn drag_left_pane_to(view: &Entity<OcHerdrView>, release: (f32, f32), cx: &mut V
         assert!(this.update_pane_drag(release, cx));
         assert!(this.finish_pane_drag(release, window, cx));
     });
-}
-
-fn swapped_layout_event() -> Value {
-    json!({
-        "event": "layout_updated",
-        "data": {
-            "type": "layout_updated",
-            "layout": two_pane_layout("p-right", "p-left"),
-        }
-    })
 }
 
 mod aggregate;

@@ -4,3 +4,7 @@
 vendor/libghostty-vt/zig-out/
 vendor/libghostty-vt/.zig-cache/
 vendor/ghosttykit/GhosttyKit.xcframework/
+
+# Exact source snapshots for coordinated UI development
+/.cargo/local-sources/
+/.cargo/local-ui.toml

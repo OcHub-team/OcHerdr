@@ -146,6 +146,18 @@ impl OcHerdrView {
                     .px_3()
                     .child(status),
             )
+            .child(div().flex_1())
+            .child(
+                button(
+                    "shortcut-help",
+                    i18n.text(k::SHORTCUTS_TITLE),
+                    ButtonTone::Ghost,
+                    ButtonSize::Sm,
+                )
+                .flex_none()
+                .mr_2()
+                .on_click(cx.listener(|this, _, _, cx| this.open_shortcut_help(cx))),
+            )
     }
 
     pub(crate) fn render_terminal(
@@ -165,6 +177,7 @@ impl OcHerdrView {
             .into_any_element();
             return div()
                 .id("empty-terminals")
+                .track_focus(&self.focus)
                 .role(ochub_ui::gpui::Role::Button)
                 .tab_stop(false)
                 .aria_label(i18n.text(k::TERMINAL_NO_RUNNING_SESSION))
@@ -184,6 +197,7 @@ impl OcHerdrView {
         let Some(tab_id) = self.selection.tab_id.clone() else {
             return div()
                 .id("empty-tabs")
+                .track_focus(&self.focus)
                 .role(ochub_ui::gpui::Role::Button)
                 .tab_stop(false)
                 .aria_label(i18n.text(k::TERMINAL_NO_TABS))

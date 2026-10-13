@@ -131,7 +131,7 @@ fn hidden_files_toggle_refreshes_inflight_and_cached_directories(cx: &mut TestAp
 #[gpui::test]
 #[cfg(target_os = "macos")]
 fn focused_file_path_input_keeps_text_out_of_the_terminal(cx: &mut TestAppContext) {
-    let fake = FakeHerdr::snapshot_with_live_events(three_tab_snapshot());
+    let fake = FakeHerdr::serving(three_tab_snapshot());
     let (view, cx) = open_view(cx);
     cx.executor().allow_parking();
     connect_view_to_fake_and_resync(&view, &fake, cx);
@@ -163,7 +163,7 @@ fn focused_file_path_input_keeps_text_out_of_the_terminal(cx: &mut TestAppContex
         );
     });
     assert!(
-        fake.terminal_inputs("p-a").is_empty(),
+        fake.pane_inputs("p-a").is_empty(),
         "typing in the file path input must never reach the terminal"
     );
     cx.simulate_keystrokes("cmd-left cmd-right cmd-up cmd-down alt-left alt-right ctrl-b ctrl-f cmd-shift-left cmd-c cmd-right");
@@ -176,7 +176,7 @@ fn focused_file_path_input_keeps_text_out_of_the_terminal(cx: &mut TestAppContex
         );
     });
     assert!(
-        fake.terminal_inputs("p-a").is_empty(),
+        fake.pane_inputs("p-a").is_empty(),
         "editing shortcuts leaked into the pane"
     );
 }

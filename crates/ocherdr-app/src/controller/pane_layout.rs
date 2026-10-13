@@ -260,7 +260,7 @@ impl OcHerdrView {
 
     /// Temporary tabs of in-flight inserts, kept out of the tab strip and
     /// tab navigation (design §7.2): the id the step-1 response named, plus
-    /// any tab the event stream added for the plan before or after that
+    /// any tab a snapshot push added for the plan before or after that
     /// response (`RelocationPlan::unlisted_temp_tabs`). A parked plan shows
     /// its tab on purpose.
     pub(crate) fn hidden_tab_ids(&self) -> HashSet<String> {
@@ -332,42 +332,6 @@ impl OcHerdrView {
                 .collect();
         }
         snapshot.panes_for(tab_id).cloned().collect()
-    }
-
-    /// A pending insert keeps the source pane selected in its original tab
-    /// even while Herdr has it in the temporary tab (the record's `tab_id`
-    /// changes twice before the plan settles).
-    pub(super) fn pin_relocation_selection(&mut self) {
-        let Some(tab_id) = self.selection.tab_id.clone() else {
-            return;
-        };
-        if let Some(pending) = self.pane_template_commits.get(&tab_id) {
-            let source = pending.source_pane_id.clone();
-            if self
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.pane(&source).is_some())
-            {
-                self.selection.pane_id = Some(source);
-            }
-            return;
-        }
-        let Some(pending) = self.pane_relocations.get(&tab_id) else {
-            return;
-        };
-        if !matches!(pending.plan.intent, RelocationIntent::Insert { .. })
-            || !pending.phase.locks_tab()
-        {
-            return;
-        }
-        let source = pending.plan.source_pane_id.clone();
-        if self
-            .snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.pane(&source).is_some())
-        {
-            self.selection.pane_id = Some(source);
-        }
     }
 
     /// Disconnect: nothing in flight can be cancelled. Remember a pane that

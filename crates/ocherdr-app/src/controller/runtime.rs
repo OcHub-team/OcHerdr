@@ -63,36 +63,24 @@ impl OcHerdrView {
             cx.stop_propagation();
             return;
         }
-        let direction = if lines > 0 {
-            TerminalScrollDirection::Up
-        } else {
-            TerminalScrollDirection::Down
-        };
         let count = lines.unsigned_abs().min(u32::from(u16::MAX)) as u16;
-        if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
-            // The server owns scrollback: wheel scroll becomes a semantic
-            // scroll event, which Herdr routes to mouse-reporting apps or to
-            // its own scrollback view.
-            let kind = match direction {
-                TerminalScrollDirection::Up => ClientMouseKind::ScrollUp,
-                TerminalScrollDirection::Down => ClientMouseKind::ScrollDown,
-            };
-            let event = endpoint_mouse_event(
-                kind,
-                (f32::from(event.position.x), f32::from(event.position.y)),
-                runtime,
-                endpoint_modifiers(event.modifiers),
-                count,
-                scale_factor,
-            );
-            self.endpoint_pane_input(pane_id, vec![event]);
-            cx.stop_propagation();
-            return;
-        }
-        let _ = runtime.session.send(TerminalCommand::Scroll {
-            direction,
-            lines: count,
-        });
+        // The server owns scrollback: wheel scroll becomes a semantic scroll
+        // event, which Herdr routes to mouse-reporting apps or to its own
+        // scrollback view.
+        let kind = if lines > 0 {
+            ClientMouseKind::ScrollUp
+        } else {
+            ClientMouseKind::ScrollDown
+        };
+        let event = endpoint_mouse_event(
+            kind,
+            (f32::from(event.position.x), f32::from(event.position.y)),
+            runtime,
+            endpoint_modifiers(event.modifiers),
+            count,
+            scale_factor,
+        );
+        self.endpoint_pane_input(pane_id, vec![event]);
         cx.stop_propagation();
     }
 
@@ -139,14 +127,13 @@ impl OcHerdrView {
         on_response: Option<InvokeResponseCallback>,
         cx: &mut Context<Self>,
     ) -> Option<Task<()>> {
-        let connection = self.connection.as_ref()?;
-        let socket = connection.socket_path().to_owned();
+        let client = self.connection.as_ref()?.api_client();
         self.operation = Some(self.i18n.running_operation(method).into());
         Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn({
                     let params = params.clone();
-                    async move { request_socket(&socket, method, params) }
+                    async move { client.request(method, params) }
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -158,10 +145,10 @@ impl OcHerdrView {
                         }
                     }
                     Err(error) => {
-                        // A rejected move never produces a `moved` event, so the
-                        // gate has to open here or it would never open at all.
+                        // A rejected move never produces a snapshot push, so
+                        // the gate has to open here or it would never open at
+                        // all.
                         this.pending_reorder = None;
-                        this.note_unsupported_method(method, error);
                         this.maybe_offer_force_remove_worktree(&params, error, cx);
                         this.notify_command_failure(method, error, cx);
                     }
@@ -177,21 +164,7 @@ impl OcHerdrView {
 
     #[allow(dead_code)] // consumed by the pane drag drop-zone gating (design §8)
     pub(crate) fn pane_move_supported(&self) -> bool {
-        self.connection.is_some() && self.herdr_capabilities.pane_move
-    }
-
-    /// The snapshot said `pane.move` exists but Herdr rejected the method
-    /// itself: degrade to swap-only for the rest of this connection.
-    pub(super) fn note_unsupported_method(&mut self, method: &str, error: &HerdrError) {
-        if method != "pane.move" || !self.herdr_capabilities.pane_move {
-            return;
-        }
-        if is_unknown_method_error(error) {
-            self.herdr_capabilities.pane_move = false;
-            eprintln!(
-                "ocherdr: Herdr rejected `pane.move` as an unknown method; disabling pane relocation for this connection ({error})"
-            );
-        }
+        self.connection.is_some()
     }
 
     pub(crate) fn accepts_ime(&self) -> bool {
@@ -218,35 +191,20 @@ impl OcHerdrView {
             return;
         };
         self.take_terminal_control(pane_id.clone(), cx);
-        let stream_closed = {
+        {
             let Some(runtime) = self.pane_mut(&pane_id) else {
                 return;
             };
             if !runtime.mode.is_controlled() {
                 return;
             }
-            if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
-                self.endpoint_pane_input(
-                    &pane_id,
-                    vec![ClientPaneInputEvent::TextCommit(text.to_owned())],
-                );
-                false
-            } else {
-                let closed = runtime
-                    .session
-                    .send(TerminalCommand::Input(text.as_bytes().to_vec()))
-                    .is_err();
-                if closed {
-                    runtime.exit_seen = true;
-                }
-                closed
-            }
-        };
+            self.endpoint_pane_input(
+                &pane_id,
+                vec![ClientPaneInputEvent::TextCommit(text.to_owned())],
+            );
+        }
         window.invalidate_character_coordinates();
         cx.notify();
-        if stream_closed {
-            self.resync_snapshot(self.event_epoch, cx);
-        }
     }
 
     pub(crate) fn set_ime_preedit(

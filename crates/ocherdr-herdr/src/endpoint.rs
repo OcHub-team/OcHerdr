@@ -3,13 +3,16 @@
 //!
 //! One endpoint connection carries the session snapshot feed, the composited
 //! pane surface, semantic pane input, and an endpoint-scoped JSON API channel.
-//! Unlike the numbered private codecs, the handshake negotiates named codecs
-//! instead of comparing build versions, so this path is intended to stay
-//! compatible across Herdr releases.
+//! The byte stream is abstract: a direct unix-socket connection for local
+//! sessions, or an `ssh … herdr remote-client-bridge` stdio bridge for remote
+//! sessions. Unlike the numbered private codecs, the handshake negotiates
+//! named codecs instead of comparing build versions, so this path is intended
+//! to stay compatible across Herdr releases.
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,14 +22,174 @@ use uds_windows::UnixStream;
 
 use futures::SinkExt as _;
 use futures::channel::mpsc::{self as futures_mpsc, Receiver};
+use ocherdr_core::{ConnectionProfile, MINIMUM_HERDR_VERSION};
 use serde_json::{Value, json};
+use std::io::{Read, Write};
 use std::sync::mpsc::{self as std_mpsc, Sender as StdSender};
 
 use crate::endpoint_v1 as ep;
-use crate::{HerdrError, Result, TerminalEndpoint};
+use crate::{HerdrError, Result, SshBridgeState, TerminalEndpoint, spawn_ssh_bridge};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ENDPOINT_EVENT_QUEUE_CAPACITY: usize = 4;
+
+/// How an endpoint byte stream is established. Remote sessions carry the same
+/// framed protocol over an SSH stdio bridge instead of a local socket.
+#[derive(Clone)]
+pub enum EndpointTransport {
+    Local(TerminalEndpoint),
+    Ssh(SshEndpointBridge),
+}
+
+#[derive(Clone)]
+pub struct SshEndpointBridge {
+    profile: ConnectionProfile,
+    session_name: String,
+}
+
+impl EndpointTransport {
+    pub(crate) fn local(socket_path: PathBuf) -> Self {
+        Self::Local(TerminalEndpoint::new(socket_path))
+    }
+
+    pub(crate) fn ssh(profile: ConnectionProfile, session_name: String) -> Self {
+        Self::Ssh(SshEndpointBridge {
+            profile,
+            session_name,
+        })
+    }
+
+    fn connect(&self) -> Result<EndpointIo> {
+        match self {
+            Self::Local(endpoint) => {
+                let stream = endpoint.connect()?;
+                stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+                stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+                let reader = stream.try_clone()?;
+                let control = stream.try_clone()?;
+                Ok(EndpointIo {
+                    reader: Box::new(reader),
+                    writer: Box::new(stream),
+                    control: TransportControl::Local(control),
+                    watchdog: None,
+                    ssh_state: None,
+                })
+            }
+            Self::Ssh(bridge) => {
+                let process = spawn_ssh_bridge(
+                    &bridge.profile,
+                    &bridge.session_name,
+                    "remote-client-bridge",
+                )?;
+                let state = process.state;
+                // Pipes have no read timeout; a watchdog kills the child when
+                // the handshake overruns, turning a hung negotiation into EOF.
+                let watchdog = Arc::new(AtomicBool::new(false));
+                thread::spawn({
+                    let watchdog = watchdog.clone();
+                    let state = state.clone();
+                    move || {
+                        thread::sleep(HANDSHAKE_TIMEOUT);
+                        if !watchdog.load(Ordering::Acquire) {
+                            state.kill();
+                        }
+                    }
+                });
+                Ok(EndpointIo {
+                    reader: Box::new(process.stdout),
+                    writer: Box::new(process.stdin),
+                    control: TransportControl::Ssh(state.clone()),
+                    watchdog: Some(watchdog),
+                    ssh_state: Some(state),
+                })
+            }
+        }
+    }
+}
+
+/// Terminates the whole transport so the blocked peer half unblocks.
+enum TransportControl {
+    Local(UnixStream),
+    Ssh(Arc<SshBridgeState>),
+}
+
+impl TransportControl {
+    fn terminate(&self) {
+        match self {
+            Self::Local(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            Self::Ssh(state) => state.kill(),
+        }
+    }
+}
+
+/// A connected endpoint byte stream before/while the handshake runs.
+struct EndpointIo {
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    control: TransportControl,
+    watchdog: Option<Arc<AtomicBool>>,
+    ssh_state: Option<Arc<SshBridgeState>>,
+}
+
+impl EndpointIo {
+    /// Disarms the SSH watchdog and clears local handshake timeouts.
+    fn handshake_finished(&mut self) -> Result<()> {
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.store(true, Ordering::Release);
+        }
+        if let TransportControl::Local(stream) = &self.control {
+            stream.set_read_timeout(None)?;
+            stream.set_write_timeout(None)?;
+        }
+        Ok(())
+    }
+
+    fn watchdog_fired(&self) -> bool {
+        self.watchdog
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    fn negotiation_error(&self, error: HerdrError) -> HerdrError {
+        negotiation_error(error, self.ssh_state.as_ref())
+    }
+
+    /// Mid-stream failure; attaches captured bridge stderr when available.
+    fn bridge_error(&self, error: HerdrError) -> HerdrError {
+        let Some(state) = &self.ssh_state else {
+            return error;
+        };
+        let Some(stderr) = state.stderr_tail() else {
+            return error;
+        };
+        HerdrError::Ssh(format!("{error}\nremote bridge stderr: {stderr}"))
+    }
+}
+
+/// Negotiation failure with remote diagnostics and the version floor made
+/// explicit: Herdr older than 0.9 has no endpoint protocol at all, so any
+/// connect or handshake failure is most likely an outdated server.
+fn negotiation_error(error: HerdrError, ssh_state: Option<&Arc<SshBridgeState>>) -> HerdrError {
+    let mut message = error.to_string();
+    let location = if let Some(state) = ssh_state {
+        if let Some(stderr) = state.stderr_tail() {
+            message = format!("{message}\nremote bridge stderr: {stderr}");
+        }
+        "the remote machine"
+    } else {
+        "this machine"
+    };
+    let message = format!(
+        "{message}\nOcHerdr requires Herdr {MINIMUM_HERDR_VERSION} or newer on {location}; upgrade Herdr and retry"
+    );
+    if ssh_state.is_some() {
+        HerdrError::Ssh(message)
+    } else {
+        HerdrError::Protocol(message)
+    }
+}
 
 /// Outcome of a completed `endpoint.hello.v1` negotiation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,20 +343,29 @@ impl EndpointRequestLane {
 }
 
 struct EndpointWireReader {
-    stream: UnixStream,
+    stream: Box<dyn Read + Send>,
     boot_id: Arc<Mutex<String>>,
     pending_responses: HashMap<String, Vec<u8>>,
 }
 
 struct EndpointWireWriter {
-    stream: UnixStream,
+    stream: Box<dyn Write + Send>,
+    control: TransportControl,
     boot_id: Arc<Mutex<String>>,
     requests: Arc<Mutex<EndpointRequestLane>>,
     resubmit: StdSender<EndpointCommand>,
 }
 
+impl Drop for EndpointWireWriter {
+    /// Writer exit tears the transport down so the reader unblocks and, for
+    /// SSH bridges, the remote process is reaped.
+    fn drop(&mut self) {
+        self.control.terminate();
+    }
+}
+
 fn connect(
-    endpoint: &TerminalEndpoint,
+    transport: &EndpointTransport,
     cols: u16,
     rows: u16,
     cell_width_px: u32,
@@ -206,10 +378,68 @@ fn connect(
     EndpointWelcome,
     Option<Box<ep::ClientShellSnapshot>>,
 )> {
-    let mut stream = endpoint.connect()?;
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let mut io = match transport.connect() {
+        Ok(io) => io,
+        // A missing client socket is the pre-0.9 signature: the API socket
+        // answered but no endpoint listener exists. Report it with the same
+        // upgrade guidance a refused handshake gets.
+        Err(error) if matches!(transport, EndpointTransport::Local(_)) => {
+            return Err(negotiation_error(error, None));
+        }
+        Err(error) => return Err(error),
+    };
 
+    let handshake = handshake(&mut io, cols, rows, cell_width_px, cell_height_px);
+    let EndpointHandshake {
+        welcome,
+        boot_id,
+        snapshot,
+    } = match handshake {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            io.control.terminate();
+            return Err(error);
+        }
+    };
+    io.handshake_finished()?;
+
+    let EndpointIo {
+        reader,
+        writer,
+        control,
+        ..
+    } = io;
+    Ok((
+        EndpointWireReader {
+            stream: reader,
+            boot_id: boot_id.clone(),
+            pending_responses: HashMap::new(),
+        },
+        EndpointWireWriter {
+            stream: writer,
+            control,
+            boot_id,
+            requests,
+            resubmit,
+        },
+        welcome,
+        snapshot,
+    ))
+}
+
+struct EndpointHandshake {
+    welcome: EndpointWelcome,
+    boot_id: Arc<Mutex<String>>,
+    snapshot: Option<Box<ep::ClientShellSnapshot>>,
+}
+
+fn handshake(
+    io: &mut EndpointIo,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+) -> Result<EndpointHandshake> {
     let hello = ep::EndpointClientHello::new(
         ep::ClientSurfaceSize {
             cols: cols.max(1),
@@ -222,35 +452,23 @@ fn connect(
         kind: ep::ENDPOINT_HELLO_KIND.into(),
         data: serde_json::to_string(&hello)?,
     };
-    ep::write_message(&mut stream, &hello).map_err(endpoint_protocol_error)?;
+    ep::write_message(&mut io.writer, &hello)
+        .map_err(endpoint_protocol_error)
+        .map_err(|error| io.negotiation_error(error))?;
 
-    let welcome = read_welcome(&mut stream)?;
+    let welcome = read_welcome(&mut io.reader).map_err(|error| io.negotiation_error(error))?;
 
     // Endpoint requests carry the snapshot's boot_id, and the caller can
     // queue activation requests the moment spawn returns. Capture the
     // initial snapshot now so those requests always find a boot_id. The
     // snapshot itself is still emitted on the event stream.
     let boot_id = Arc::new(Mutex::new(String::new()));
-    let snapshot = read_initial_snapshot(&mut stream, &boot_id)?;
-
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    let writer = stream.try_clone()?;
-    Ok((
-        EndpointWireReader {
-            stream,
-            boot_id: boot_id.clone(),
-            pending_responses: HashMap::new(),
-        },
-        EndpointWireWriter {
-            stream: writer,
-            boot_id,
-            requests,
-            resubmit,
-        },
+    let snapshot = read_initial_snapshot(io, &boot_id)?;
+    Ok(EndpointHandshake {
         welcome,
+        boot_id,
         snapshot,
-    ))
+    })
 }
 
 /// Reads until the first `shell.snapshot.v1` lands, captures its `boot_id`,
@@ -260,11 +478,11 @@ fn connect(
 /// requests then fail locally until the reader sees a snapshot, which the
 /// request lane absorbs.
 fn read_initial_snapshot(
-    stream: &mut UnixStream,
+    io: &mut EndpointIo,
     boot_id: &Arc<Mutex<String>>,
 ) -> Result<Option<Box<ep::ClientShellSnapshot>>> {
     loop {
-        let message = match ep::read_message(stream, ep::MAX_GRAPHICS_FRAME_SIZE) {
+        let message = match ep::read_message(&mut io.reader, ep::MAX_GRAPHICS_FRAME_SIZE) {
             Ok(message) => message,
             Err(ep::FramingError::Io(error))
                 if matches!(
@@ -274,7 +492,16 @@ fn read_initial_snapshot(
             {
                 return Ok(None);
             }
-            Err(error) => return Err(endpoint_protocol_error(error)),
+            // The SSH watchdog kills a stalled handshake; treat that like the
+            // local timeout above rather than a broken stream.
+            Err(ep::FramingError::UnexpectedEof | ep::FramingError::Io(_))
+                if io.watchdog_fired() =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(io.bridge_error(endpoint_protocol_error(error)));
+            }
         };
         match message {
             ep::ServerMessage::EndpointControl { kind, data } => match kind.as_str() {
@@ -290,13 +517,14 @@ fn read_initial_snapshot(
                 }
                 ep::HEALTH_PING_KIND => {
                     ep::write_message(
-                        stream,
+                        &mut io.writer,
                         &ep::ClientMessage::EndpointControl {
                             kind: ep::HEALTH_PONG_KIND.into(),
                             data,
                         },
                     )
-                    .map_err(endpoint_protocol_error)?;
+                    .map_err(endpoint_protocol_error)
+                    .map_err(|error| io.bridge_error(error))?;
                 }
                 _ => {}
             },
@@ -309,9 +537,9 @@ fn read_initial_snapshot(
     }
 }
 
-fn read_welcome(stream: &mut UnixStream) -> Result<EndpointWelcome> {
+fn read_welcome(reader: &mut dyn Read) -> Result<EndpointWelcome> {
     let message: ep::ServerMessage =
-        ep::read_message(stream, ep::MAX_FRAME_SIZE).map_err(endpoint_protocol_error)?;
+        ep::read_message(reader, ep::MAX_FRAME_SIZE).map_err(endpoint_protocol_error)?;
     let ep::ServerMessage::EndpointControl { kind, data } = message else {
         return Err(HerdrError::Protocol(format!(
             "expected {} endpoint welcome, received {message:?}",
@@ -339,6 +567,26 @@ fn read_welcome(stream: &mut UnixStream) -> Result<EndpointWelcome> {
             welcome.generation,
             ep::ENDPOINT_PROTOCOL_GENERATION
         )));
+    }
+    for (lane, selected, supported) in [
+        (
+            "snapshot",
+            welcome.snapshot_codec.as_str(),
+            ep::ENDPOINT_SNAPSHOT_KIND,
+        ),
+        (
+            "surface",
+            welcome.surface_codec.as_str(),
+            ep::SURFACE_CODEC_V1,
+        ),
+        ("input", welcome.input_codec.as_str(), ep::INPUT_CODEC_V1),
+        ("blob", welcome.blob_codec.as_str(), ep::BLOB_CODEC_V1),
+    ] {
+        if selected != supported {
+            return Err(HerdrError::Protocol(format!(
+                "server selected unsupported {lane} codec {selected:?}; expected {supported:?}"
+            )));
+        }
     }
     Ok(EndpointWelcome {
         server_version: welcome.server_version,
@@ -486,10 +734,10 @@ impl EndpointWireWriter {
         match &result {
             // Only an I/O failure means the wire is broken. Local failures —
             // a missing boot_id, an oversized frame, a serde error — never
-            // reached the server, so the socket stays up and the request
+            // reached the server, so the transport stays up and the request
             // lane advances past a call that can never be answered.
             Err(HerdrError::Io(_)) => {
-                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                self.control.terminate();
             }
             Err(_) => {
                 if let Some(request_id) = request_id {
@@ -502,7 +750,7 @@ impl EndpointWireWriter {
             Ok(()) => {}
         }
         if release {
-            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            self.control.terminate();
         }
         result
     }
@@ -679,7 +927,7 @@ impl EndpointSession {
     /// Connects and performs `endpoint.hello.v1`. The negotiated welcome is the
     /// first item delivered on the event receiver.
     pub fn spawn(
-        endpoint: TerminalEndpoint,
+        transport: EndpointTransport,
         cols: u16,
         rows: u16,
         cell_width_px: u32,
@@ -695,7 +943,7 @@ impl EndpointSession {
         let worker_requests = requests.clone();
         thread::spawn(move || {
             let connection = connect(
-                &endpoint,
+                &transport,
                 cols,
                 rows,
                 cell_width_px,
@@ -813,6 +1061,57 @@ impl Drop for EndpointSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn welcome_frame(value: Value) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ep::write_message(
+            &mut bytes,
+            &ep::ServerMessage::EndpointControl {
+                kind: ep::ENDPOINT_WELCOME_KIND.into(),
+                data: value.to_string(),
+            },
+        )
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn welcome_rejects_any_unnegotiated_core_codec() {
+        let original: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-0.9.4/endpoint-welcome-v1.json"
+        ))
+        .unwrap();
+        assert!(read_welcome(&mut welcome_frame(original.clone()).as_slice()).is_ok());
+        for lane in ["snapshot", "surface", "input", "blob"] {
+            let mut value = original.clone();
+            value[format!("{lane}_codec")] = "future.codec.v2".into();
+            let error = read_welcome(&mut welcome_frame(value).as_slice()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unsupported {lane} codec"))
+            );
+        }
+    }
+
+    #[test]
+    fn welcome_accepts_new_optional_capabilities_without_changing_the_core() {
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-0.9.4/endpoint-welcome-v1.json"
+        ))
+        .unwrap();
+        value["server_version"] = "0.9.4".into();
+        value["capabilities"] = json!(["surface_scroll", "agent_completions", "future_optional"]);
+        value["future_service"] = json!({"version": 2});
+        let welcome = read_welcome(&mut welcome_frame(value).as_slice()).unwrap();
+        assert_eq!(welcome.server_version, "0.9.4");
+        assert!(
+            welcome
+                .capabilities
+                .iter()
+                .any(|value| value == "future_optional")
+        );
+    }
 
     #[test]
     fn request_lane_serializes_calls() {

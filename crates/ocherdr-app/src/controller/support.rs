@@ -97,14 +97,11 @@ pub(super) fn snapshot_runtime_targets(
         .collect()
 }
 
-pub(super) fn demote_terminal_control(session: &mut SessionPanes, pane_id: &str) -> bool {
-    session.controls.remove(pane_id).is_some()
-}
-
 /// Give every newly visible pane one non-takeover control attempt. Successful
 /// control resizes the real PTY to the measured OcHerdr viewport. If another
-/// client already owns the pane, loss handling removes the control entry while
-/// this attempted set prevents an observe/control reconnect loop.
+/// client already owns the pane the server refuses the request, and this
+/// attempted set prevents an observe/control reconnect loop; an explicit
+/// interaction can still take over.
 pub(super) fn prime_automatic_terminal_control(
     session: &mut SessionPanes,
     visible_pane_ids: &HashSet<String>,
@@ -127,8 +124,9 @@ pub(super) fn prime_automatic_terminal_control(
 pub(super) enum PaneResizePlan {
     /// Grid frozen by a pending relocation or split drag, or pixels unchanged.
     Skip,
-    /// Refit the local grid and report it to the stream. Herdr uses this as
-    /// either the control PTY size or an observer's independent viewport.
+    /// Refit the local grid; the endpoint surface resize reports the new
+    /// canvas to Herdr, which retiles and answers with each pane's
+    /// authoritative `inner_rect`.
     ResizeAndReport,
 }
 
@@ -147,9 +145,9 @@ pub(super) fn pane_grid_mountable(cols: u16, rows: u16) -> bool {
 }
 
 /// What a measured pane body means for the terminal: the grid follows the
-/// body once it is authoritative, and every stream receives the size. Herdr
-/// applies it to the shared PTY only for control streams; observe streams get
-/// their own render viewport.
+/// body once it is authoritative. Herdr sizes the shared PTY from the
+/// endpoint surface the canvas belongs to and answers with the pane's
+/// `inner_rect` cells.
 pub(super) fn pane_resize_plan(
     frozen: bool,
     current_pixels: (u32, u32),
@@ -207,18 +205,6 @@ pub(super) fn cmd_w_close_target(
     })
 }
 
-/// A measured local grid owns the on-screen surface. Until Herdr sends a
-/// frame for that same client viewport, retain the last compatible frame;
-/// applying an earlier 80×24 bootstrap frame would only paint its upper-left
-/// corner. The initial frame waits for a measured viewport at the call site.
-pub(super) fn incoming_frame_should_apply(
-    viewport_ready: bool,
-    local_grid: (u16, u16),
-    frame_grid: (u16, u16),
-) -> bool {
-    viewport_ready && local_grid == frame_grid
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionPanesPlan {
     Keep,
@@ -261,52 +247,8 @@ pub(super) fn visible_pane_plan(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TerminalControlLoss {
-    Busy,
-    TakenOver,
-}
-
-pub(super) fn terminal_control_loss(error: &HerdrError) -> Option<TerminalControlLoss> {
-    let HerdrError::TerminalClosed(reason) = error else {
-        return None;
-    };
-    if reason.contains("already has an attached client") {
-        Some(TerminalControlLoss::Busy)
-    } else if reason == "terminal attach taken over" {
-        Some(TerminalControlLoss::TakenOver)
-    } else {
-        None
-    }
-}
-
-pub(super) fn is_expected_terminal_exit(error: &HerdrError) -> bool {
-    matches!(error, HerdrError::TerminalClosed(_))
-}
-
 pub(super) fn snapshot_refresh_should_queue(refreshing: bool) -> bool {
     refreshing
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AgentStatusSubscribeFailureAction {
-    Resync,
-    Report,
-}
-
-pub(super) fn agent_status_subscribe_failure_action(
-    error: &HerdrError,
-) -> AgentStatusSubscribeFailureAction {
-    match error {
-        HerdrError::Api { code, .. } if code == "pane_not_found" => {
-            AgentStatusSubscribeFailureAction::Resync
-        }
-        _ => AgentStatusSubscribeFailureAction::Report,
-    }
-}
-
-pub(super) fn snapshot_handoff_should_release(refreshing: bool) -> bool {
-    !refreshing
 }
 
 pub(super) type InvokeResponseCallback = Box<
@@ -328,69 +270,6 @@ pub(super) fn created_tab_id(result: &Value) -> Option<String> {
 
 pub(super) fn command_needs_snapshot_resync(method: &str) -> bool {
     matches!(method, "pane.rename" | "pane.close")
-}
-
-/// `pane.move` shipped in Herdr 0.7.0 / socket protocol 14.
-pub(super) const PANE_MOVE_MIN_PROTOCOL: u32 = 14;
-pub(super) const PANE_MOVE_MIN_VERSION: [u64; 3] = [0, 7, 0];
-
-/// Features the connected Herdr is known to support, read off the
-/// `version` / `protocol` metadata every `session.snapshot` carries.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct HerdrCapabilities {
-    pub pane_move: bool,
-}
-
-impl HerdrCapabilities {
-    pub(crate) fn from_snapshot(snapshot: &HierarchySnapshot) -> Self {
-        Self::detect(&snapshot.version, snapshot.protocol)
-    }
-
-    pub(crate) fn detect(version: &str, protocol: u32) -> Self {
-        Self {
-            pane_move: protocol >= PANE_MOVE_MIN_PROTOCOL
-                || parse_semver(version).is_some_and(|parsed| parsed >= PANE_MOVE_MIN_VERSION),
-        }
-    }
-}
-
-/// Lenient `major.minor.patch` extraction: tolerates a `herdr ` / `v` prefix
-/// and pre-release suffixes, returns `None` when no leading number exists.
-pub(super) fn parse_semver(version: &str) -> Option<[u64; 3]> {
-    let token = version
-        .split_whitespace()
-        .find(|part| {
-            part.trim_start_matches('v')
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit())
-        })?
-        .trim_start_matches('v');
-    let mut numbers = token
-        .split(['.', '-', '+'])
-        .take_while(|part| part.chars().all(|c| c.is_ascii_digit()))
-        .filter(|part| !part.is_empty())
-        .map(|part| part.parse::<u64>().ok());
-    let major = numbers.next()??;
-    let minor = numbers.next().flatten().unwrap_or(0);
-    let patch = numbers.next().flatten().unwrap_or(0);
-    Some([major, minor, patch])
-}
-
-/// An older Herdr fails to deserialize the request enum for a method it does
-/// not know and answers `invalid_request` / "unknown variant `pane.move`".
-pub(super) fn is_unknown_method_error(error: &HerdrError) -> bool {
-    let HerdrError::Api { code, message } = error else {
-        return false;
-    };
-    if matches!(code.as_str(), "unknown_method" | "method_not_found") {
-        return true;
-    }
-    let message = message.to_ascii_lowercase();
-    code == "invalid_request"
-        && (message.contains("unknown variant")
-            || message.contains("unknown method")
-            || message.contains("method not found"))
 }
 
 pub(super) fn worktree_repo_params(workspace: &WorkspaceInfo) -> serde_json::Map<String, Value> {
@@ -459,19 +338,16 @@ pub(super) fn agent_panel_target_missing(
         .is_none_or(|pane| pane.display_agent.is_none() && pane.agent.is_none())
 }
 
-pub(super) fn agent_panel_refresh_from_batch(
+pub(super) fn agent_panel_refresh_needed(
     overlay: &Overlay,
-    batch: Option<&[std::result::Result<HerdrEvent, HerdrError>]>,
+    old_status: Option<AgentStatus>,
+    snapshot: Option<&HierarchySnapshot>,
 ) -> bool {
-    let Some(pane_id) = agent_panel_pane(overlay) else {
-        return false;
-    };
-    let Some(items) = batch else {
-        return false;
-    };
-    items.iter().any(|item| {
-        item.as_ref()
-            .is_ok_and(|event| agent_output_should_refresh(pane_id, event))
+    agent_panel_pane(overlay).is_some_and(|pane_id| {
+        snapshot
+            .and_then(|snapshot| snapshot.pane(pane_id))
+            .map(|pane| pane.agent_status)
+            != old_status
     })
 }
 
@@ -598,139 +474,6 @@ pub(super) fn dirty_worktree_remove_offer(
         .get("workspace_id")
         .and_then(Value::as_str)
         .map(str::to_owned)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum EventPollAction {
-    /// Replace Live with Lost. A dead stream has nothing left to poll.
-    Disconnect(SharedString),
-    Idle,
-    Applied {
-        /// A `workspace.moved` / `tab.moved` landed, so Herdr has published the
-        /// order a pending reorder was waiting for.
-        reordered: bool,
-    },
-    Resync {
-        error: Option<SharedString>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PollEffects {
-    pub(super) resync: bool,
-    pub(super) apply_local: bool,
-    pub(super) notify: bool,
-    pub(super) reschedule: bool,
-    /// Drop `worktree_list_task` and its Loading overlay. A dead stream
-    /// keeps the same session id, so the list callback would otherwise apply.
-    pub(super) abandon_worktree_list: bool,
-    /// Release the reorder gate: the authoritative order has arrived, is being
-    /// refetched, or will never arrive because the stream died.
-    pub(super) settle_reorder: bool,
-    pub(super) error: Option<SharedString>,
-}
-
-pub(super) fn effects_for(action: &EventPollAction) -> PollEffects {
-    match action {
-        EventPollAction::Disconnect(_) => PollEffects {
-            resync: false,
-            apply_local: false,
-            notify: true,
-            reschedule: false,
-            abandon_worktree_list: true,
-            settle_reorder: true,
-            error: None,
-        },
-        EventPollAction::Idle => PollEffects {
-            resync: false,
-            apply_local: false,
-            notify: false,
-            reschedule: true,
-            abandon_worktree_list: false,
-            settle_reorder: false,
-            error: None,
-        },
-        EventPollAction::Applied { reordered } => PollEffects {
-            resync: false,
-            apply_local: true,
-            notify: true,
-            reschedule: true,
-            abandon_worktree_list: false,
-            settle_reorder: *reordered,
-            error: None,
-        },
-        EventPollAction::Resync { error } => PollEffects {
-            resync: true,
-            apply_local: false,
-            notify: false,
-            reschedule: true,
-            settle_reorder: true,
-            abandon_worktree_list: false,
-            error: error.clone(),
-        },
-    }
-}
-
-impl EventPollAction {
-    pub(super) fn event_stream(&self) -> Option<EventStreamState> {
-        match self {
-            Self::Disconnect(detail) => Some(EventStreamState::Lost(detail.clone())),
-            Self::Idle | Self::Applied { .. } | Self::Resync { .. } => None,
-        }
-    }
-}
-
-pub(super) fn apply_event_stream(
-    snapshot: &mut HierarchySnapshot,
-    selection: &mut Selection,
-    next: impl FnMut() -> std::result::Result<Option<HerdrEvent>, HerdrError>,
-) -> EventPollAction {
-    let action = poll_event_stream(snapshot, next);
-    if effects_for(&action).apply_local {
-        selection.reconcile(snapshot);
-    }
-    action
-}
-
-pub(super) fn poll_event_stream(
-    snapshot: &mut HierarchySnapshot,
-    mut next: impl FnMut() -> std::result::Result<Option<HerdrEvent>, HerdrError>,
-) -> EventPollAction {
-    let mut seen = false;
-    let mut resync = false;
-    let mut reordered = false;
-    let mut error = None;
-    for _ in 0..128 {
-        match next() {
-            Ok(Some(event)) => {
-                seen = true;
-                // Every event that republishes a whole order settles a pending
-                // reorder, whichever command produced it.
-                reordered |= matches!(
-                    event,
-                    HerdrEvent::WorkspaceMoved { .. }
-                        | HerdrEvent::WorkspaceReordered { .. }
-                        | HerdrEvent::TabMoved { .. }
-                );
-                if snapshot.apply(&event) == SnapshotUpdate::Resync {
-                    resync = true;
-                }
-            }
-            Ok(None) => break,
-            Err(err) if err.is_event_payload_error() => {
-                resync = true;
-                error = Some(err.to_string().into());
-            }
-            Err(err) => return EventPollAction::Disconnect(err.to_string().into()),
-        }
-    }
-    if resync {
-        EventPollAction::Resync { error }
-    } else if seen {
-        EventPollAction::Applied { reordered }
-    } else {
-        EventPollAction::Idle
-    }
 }
 
 pub(super) fn mouse_point(position: ochub_ui::gpui::Point<ochub_ui::gpui::Pixels>) -> (f32, f32) {
@@ -1028,7 +771,7 @@ pub(super) fn copy_terminal_selection(runtime: &PaneRuntime, cx: &mut Context<Oc
 pub(super) fn flush_pane_surface(runtime: &mut PaneRuntime) {
     runtime.terminal.refresh();
     let _ = Terminal::tick_runtime();
-    let _ = forward_terminal_input(runtime);
+    discard_terminal_input(runtime);
     if let Ok(Some(frame)) = runtime.terminal.try_frame()
         && frame.host_context == runtime.frame_context
     {
@@ -1188,78 +931,20 @@ pub(super) fn visible_pane_ids(
         .unwrap_or_default()
 }
 
-pub(super) fn sync_pane_session(
-    runtime: &mut PaneRuntime,
-    wanted: TerminalMode,
-    focused: bool,
-    endpoint: ocherdr_herdr::TerminalEndpoint,
-    protocol: u32,
-    pane_id: String,
-) -> Option<TerminalEventReceiver> {
+/// Endpoint panes share the session connection; mode flips are bookkeeping
+/// only — the server already streams every visible pane.
+pub(super) fn sync_pane_session(runtime: &mut PaneRuntime, wanted: TerminalMode, focused: bool) {
     if runtime.focused != focused {
         runtime.terminal.set_focus(focused);
         runtime.focused = focused;
     }
-    if matches!(runtime.session, PaneChannel::Endpoint { .. }) {
-        // Endpoint panes share the session connection; mode flips are
-        // bookkeeping only — the server already streams every visible pane.
-        runtime.mode = wanted;
-        return None;
-    }
-    if runtime.mode == wanted {
-        return None;
-    }
-    runtime.listen = None;
-    let (cols, rows) = runtime.size;
-    let (session, frames) = TerminalSession::spawn(
-        endpoint,
-        protocol,
-        pane_id,
-        wanted,
-        cols.max(1),
-        rows.max(1),
-    );
-    runtime.session = PaneChannel::Private(session);
     runtime.mode = wanted;
-    if wanted.is_controlled() {
-        send_session_resize(runtime);
-    }
-    Some(frames)
 }
 
-pub(super) fn send_session_resize(runtime: &PaneRuntime) {
-    let size = runtime.terminal.surface_size();
-    if size.columns == 0 || size.rows == 0 {
-        return;
-    }
-    let _ = runtime.session.send(TerminalCommand::Resize {
-        cols: size.columns,
-        rows: size.rows,
-        cell_width_px: size.cell_width_px.max(1),
-        cell_height_px: size.cell_height_px.max(1),
-    });
-}
-
-pub(super) fn forward_terminal_input(runtime: &PaneRuntime) -> Result<(), ()> {
-    while let Some(bytes) = runtime.terminal.try_input() {
-        if runtime.mode.is_controlled()
-            && runtime.session.send(TerminalCommand::Input(bytes)).is_err()
-        {
-            return Err(());
-        }
-    }
-    Ok(())
-}
-
-/// Hand Ghostty's queued pty writes to the pane's stream. Returns whether
-/// the stream is closed; the pane is then marked exited.
-pub(super) fn drain_terminal_input(runtime: &mut PaneRuntime) -> bool {
-    let _ = Terminal::tick_runtime();
-    let closed = forward_terminal_input(runtime).is_err();
-    if closed {
-        runtime.exit_seen = true;
-    }
-    closed
+/// Ghostty queues pty writes for input OcHerdr now sends as semantic endpoint
+/// events; drain the queue so stale bytes never accumulate.
+pub(super) fn discard_terminal_input(runtime: &PaneRuntime) {
+    while runtime.terminal.try_input().is_some() {}
 }
 
 pub(super) fn merge_settings_persist(
@@ -1341,20 +1026,7 @@ pub(super) fn overlay_confirm_or_cancel(event: &KeyDownEvent) -> Option<bool> {
 }
 
 pub(super) fn tab_index_from_keystroke(key: &str, key_char: Option<&str>) -> Option<usize> {
-    for candidate in [Some(key), key_char].into_iter().flatten() {
-        if let Some(digit) = candidate.chars().rev().find_map(digit_from_char) {
-            return Some(digit);
-        }
-    }
-    None
-}
-
-pub(super) fn digit_from_char(character: char) -> Option<usize> {
-    if character.is_ascii_digit() {
-        return Some((character as u8 - b'0') as usize);
-    }
-    const FULLWIDTH: [char; 10] = ['０', '１', '２', '３', '４', '５', '６', '７', '８', '９'];
-    FULLWIDTH.iter().position(|&digit| digit == character)
+    ochub_ui::shortcuts::navigation_digit(key, key_char)
 }
 
 pub(super) fn tab_id_for_shortcut<'a>(

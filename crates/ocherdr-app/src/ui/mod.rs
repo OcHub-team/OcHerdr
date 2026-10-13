@@ -7,6 +7,7 @@ mod hierarchy;
 mod overlays;
 mod remote;
 mod render_cache;
+mod shortcut_help;
 mod update;
 
 pub(crate) use appearance::AppearanceUi;
@@ -17,6 +18,12 @@ impl Render for OcHerdrView {
         self.apply_pending_focus(window, cx);
         self.apply_pending_host_target(window, cx);
         self.sync_file_panel_source(cx);
+        self.shortcut_help_focus.sync(
+            matches!(self.overlay, Overlay::ShortcutHelp),
+            Some(&self.shortcut_help_search.read(cx).focus_handle(cx)),
+            window,
+            cx,
+        );
         let chrome = self.chrome_a11y();
         let file_panel_overlay =
             f32::from(window.viewport_size().width) < FILE_PANEL_OVERLAY_BREAKPOINT;
@@ -76,12 +83,27 @@ impl Render for OcHerdrView {
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _window, cx| {
                 this.set_command_held(primary_modifier(event.modifiers), cx);
             }))
+            .capture_action(cx.listener(|this, _: &ochub_ui::modal::Dismiss, _, cx| {
+                if this.notifications.read(cx).is_center_open() {
+                    this.consumed_key_releases.record(&Keystroke::parse("escape").expect("valid Escape key"));
+                }
+                cx.propagate();
+            }))
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                // Record before a bound action can close the notification layer.
+                if this.notifications.read(cx).is_center_open() {
+                    this.consumed_key_releases.record(&event.keystroke);
+                }
+            }))
             .on_key_down(cx.listener(|this, event, window, cx| {
+                if this.notifications.read(cx).is_center_open() {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.handle_overlay_key(event, window, cx) {
                     return;
                 }
-                #[cfg(target_os = "macos")]
-                if this.handle_text_input_macos_editing(event, window, cx) {
+                if ochub_ui::text_input::dispatch_focused_editing_key(event, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
@@ -101,7 +123,13 @@ impl Render for OcHerdrView {
             .on_action(cx.listener(
                 |this, _: &CheckForUpdates, _window, cx| this.open_update_dialog(cx),
             ))
-            .on_key_up(cx.listener(|this, event, window, cx| {
+            .on_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, window, cx| {
+                if this.consumed_key_releases.consume(&event.keystroke)
+                    || this.notifications.read(cx).is_center_open()
+                {
+                    cx.stop_propagation();
+                    return;
+                }
                 if key_goes_to_terminal(&this.overlay)
                     && !this.file_panel_input_focused(window, cx)
                 {
@@ -142,6 +170,9 @@ impl Render for OcHerdrView {
                 root = root.child(self.render_appearance(cx));
             }
             Overlay::HerdrSettings => {}
+            Overlay::ShortcutHelp => {
+                root = root.child(self.render_shortcut_help(window, cx));
+            }
             Overlay::ContextMenu(menu) => {
                 root = root.child(self.render_context_menu(menu, cx));
             }
