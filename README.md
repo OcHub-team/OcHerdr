@@ -56,7 +56,7 @@ Text fields use `ochub-ui` directly, including native word/line selection,
 undo, Find, macOS `Ctrl+T` transpose, `Cmd+Shift+V` plain-text paste, and input
 method composition protection. Terminal focus keeps terminal control sequences.
 
-OcHub and OcHerdr share `ochub-ui` 0.7.0 and the same pinned GPUI revision.
+OcHub and OcHerdr share `ochub-ui` 0.8.0 and the same pinned GPUI revision.
 For an unpublished local UI commit, run `just use-local-ui ../ochub-ui` before
 `just check` or `just qa-app`. The ignored exact-source snapshot preserves the
 Git revision in `Cargo.lock`; the normal upstream dependency remains intact.
