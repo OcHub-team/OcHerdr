@@ -100,8 +100,10 @@ struct FakeHerdr {
     /// Endpoint-lane request payloads (`{id, method, params}`), in order.
     endpoint_requests: Arc<Mutex<Vec<Value>>>,
     /// Semantic input the endpoint received, per pane, in arrival order.
+    #[cfg(target_os = "macos")]
     pane_inputs: Arc<Mutex<HashMap<String, Vec<ep::ClientPaneInputEvent>>>>,
     /// (pane, extension, bytes) of every clipboard image the endpoint got.
+    #[cfg(target_os = "macos")]
     clipboard_images: ClipboardImages,
     endpoint_connections: Arc<AtomicUsize>,
     endpoint_disconnects: Arc<AtomicUsize>,
@@ -264,7 +266,9 @@ impl FakeHerdr {
             pushers,
             requests,
             endpoint_requests,
+            #[cfg(target_os = "macos")]
             pane_inputs,
+            #[cfg(target_os = "macos")]
             clipboard_images,
             endpoint_connections,
             endpoint_disconnects,
@@ -308,6 +312,7 @@ impl FakeHerdr {
     }
 
     /// Semantic input events the endpoint received for one pane, in order.
+    #[cfg(target_os = "macos")]
     fn pane_inputs(&self, pane_id: &str) -> Vec<ep::ClientPaneInputEvent> {
         self.pane_inputs
             .lock()
@@ -318,6 +323,7 @@ impl FakeHerdr {
     }
 
     /// (pane, extension, bytes) of every bridged clipboard image, in order.
+    #[cfg(target_os = "macos")]
     fn clipboard_images(&self) -> Vec<(String, String, Vec<u8>)> {
         self.clipboard_images
             .lock()

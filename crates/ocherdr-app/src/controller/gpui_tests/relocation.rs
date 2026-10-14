@@ -639,6 +639,7 @@ fn measure_two_terminal_bodies(view: &Entity<OcHerdrView>, cx: &mut VisualTestCo
     cx.run_until_parked();
 }
 
+#[cfg(target_os = "macos")]
 fn pane_test_point(
     view: &Entity<OcHerdrView>,
     cx: &VisualTestContext,
