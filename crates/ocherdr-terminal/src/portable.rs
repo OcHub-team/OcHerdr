@@ -281,9 +281,8 @@ impl Terminal {
         self.input
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .try_next()
+            .try_recv()
             .ok()
-            .flatten()
     }
 
     /// Wait for the next encoded pty write. Mirrors the macOS surface so the
