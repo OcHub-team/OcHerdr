@@ -70,7 +70,7 @@ impl OcHerdrView {
         self.spawn_endpoint_session(cx);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn spawn_endpoint_session_for_test(&mut self, cx: &mut Context<Self>) {
         self.spawn_endpoint_session(cx);
     }
